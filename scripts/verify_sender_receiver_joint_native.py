@@ -7,7 +7,6 @@ uses fresh storage; prior native held originals and failures stay untouched.
 from __future__ import annotations
 
 import argparse
-from contextlib import ExitStack
 import hashlib
 import json
 import os
@@ -17,6 +16,7 @@ import time
 
 # This is a direct host CLI; application modules live beside scripts/.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from verify_miniflux_pause_native import (Harness, CLIENT, MEMORY, PIDS, save, sha,
                                         image_checks, resource_checks, source_binding)
@@ -28,6 +28,7 @@ from durable_handoff_cutover import durable_write, private_directory, require
 from services import admission_fence as gate
 
 STRATEGY = "native-joint-synthetic-v1"
+CASE = "CASE_REAL_GO_FLASK_DURABLE_DRAIN_AND_FROZEN_INVENTORY.json"
 
 
 def operation(name):
@@ -189,34 +190,63 @@ class Joint(Harness):
         # sender POSTs its unchanged body/signature. No SQL ACK is seeded here.
         acked = self.wait(lambda: self.proved_row("joint-original"), seconds=75)
         require(acked["delivery_id"] == rows[0]["delivery_id"], "Go ACK changed original identity")
-        consume = json.loads(self.command(["exec", "-i", self.names["receiver"], "python", "-B", "-c", CLIENT],
-            stdin=json.dumps({"url":"http://127.0.0.1:5000/__synthetic__/consume","method":"POST","value":None,"auth":"Bearer "+self.token})))
-        require(consume["status"] == 200 and json.loads(consume["body"])["consumed"] is True, "real queued task did not complete")
-        require(not (self.state / "unused.sqlite").exists(), "synthetic receiver initialized an unrequested application database")
         pause = operation("sender-pause")
         try:
             frozen_sender = driver.freeze(pause, stop, "native independently drained sender full pause")
         except PausePending:
             frozen_sender = driver.query_freeze(pause)
-        frozen_receiver = receiver.operate("freeze", operation("receiver-freeze"), "native real queue completed")
-        from independent_drain_inventory import locked_inventory, directory_identity, _identity
+        from independent_drain_inventory import directory_identity, _identity
+        from joint_drain_controller import JointDrainController, sources as joint_sources, _file_identity
+        from services.receiver_drain_storage import create_lock
         spec = {"spool":str(self.state / "spool"),"journal":str(self.state / "journal"),
                 "database":str(self.state / "fixture.sqlite"),"identities":{
                     "spool":directory_identity(self.state / "spool"),"journal":directory_identity(self.state / "journal"),
                     "database":_identity((self.state / "fixture.sqlite").stat())}}
-        with ExitStack() as stack:
-            for name in ("controller", "activity"):
-                stack.enter_context(gate._locked(self.fence.root / "locks" / (name + ".lock"), True, 1))
-            def actual_sender():
-                held = stack.enter_context(driver.postgres.locked(pause, self.manifest))
-                return held.snapshot
-            inventory = stack.enter_context(locked_inventory(spec, postgres=actual_sender, seconds=10))
-            require(inventory["storage_drained"] and not inventory["blockers"], "joint independent inventory is not empty")
-            self.case("REAL_GO_FLASK_DURABLE_DRAIN_AND_FROZEN_INVENTORY", {
-                "sender_stop":stopped,"receiver_stop":receiver_stop,"transfer":receipt,"go_acked_original":acked,
-                "sender_pause":frozen_sender,"receiver_freeze":frozen_receiver,"independent_inventory":inventory,
-                "scoring":"explicit synthetic fake; real models=0","switch_authorized":False,
-                "old_uninstrumented_originals_proven":False,"webhook_and_receipt_store_are_real":True})
+        for name in ("release", "refresh"):
+            create_lock(self.state / (name + ".lock"))
+        plan = {"schema":1,"scope":"instrumented_joint_drain_only","sender_plan_sha256":driver.plan_sha256,
+                "receiver_plan_sha256":receiver.plan_sha256,"operations":{
+                    "sender_stop":stop,"receiver_stop":receiver_stop["operation_id"],"transfer":request["operation_id"],
+                    "sender_freeze":pause,"receiver_freeze":operation("receiver-freeze")},
+                "transfer_policy":{key:request[key] for key in ("endpoint","contract","config_sha256","body_limit",
+                                                               "max_batches","max_replays","source_sha256")},
+                "inventory":spec,"locks":{name:_file_identity(self.state / (name + ".lock")) for name in ("release","refresh")},
+                "source_sha256":joint_sources()}
+        controller = JointDrainController(driver, receiver, plan, self.output / "joint-controller")
+        boundary = controller.confirm_existing_boundaries(transfer)
+        # Real sender ACK is transfer of durable ownership, not receiver queue
+        # completion. The joint controller must leave these consumers enabled.
+        try:
+            controller.freeze_receiver()
+        except Exception as failure:
+            require("not independently drained" in str(failure), "unexpected negative joint freeze failure")
+        else:
+            raise ValueError("receiver froze while its real accepted task remained")
+        blocked = self.fence.snapshot()
+        require(blocked["phase"] == "draining"
+                and not (controller.root / "receiver_freeze.intent.json").exists()
+                and not (self.fence.root / "operations" / (operation("receiver-freeze") + ".intent.json")).exists(),
+                "nonempty receiver created a freeze intent or stopped consumers")
+        save(self.output / "REAL_QUEUE_BLOCKED_FREEZE.json", {"boundary":boundary,"fence":blocked,
+             "freeze_intent_absent":True,"receiver_consumers_remain_enabled":True,"switch_authorized":False})
+        consume = json.loads(self.command(["exec", "-i", self.names["receiver"], "python", "-B", "-c", CLIENT],
+            stdin=json.dumps({"url":"http://127.0.0.1:5000/__synthetic__/consume","method":"POST","value":None,"auth":"Bearer "+self.token})))
+        require(consume["status"] == 200 and json.loads(consume["body"])["consumed"] is True, "real queued task did not complete")
+        require(not (self.state / "unused.sqlite").exists(), "synthetic receiver initialized an unrequested application database")
+        scores = gate._read(self.state / "synthetic-scores.json")
+        require(scores["real_model_calls"] == 0 and len(scores["calls"]) == 1
+                and scores["calls"][0]["strategy"] == STRATEGY, "synthetic scoring evidence differs")
+        frozen_receiver = controller.freeze_receiver()
+        observed = frozen_receiver["inventory"]
+        require(observed["storage_drained"] and not observed["blockers"]
+                and observed["receiver"]["states"]["completed"] == 1, "real completed receipt or locked zero proof absent")
+        self.case("REAL_GO_FLASK_DURABLE_DRAIN_AND_FROZEN_INVENTORY", {
+            "sender_stop":stopped,"receiver_stop":receiver_stop,"transfer":receipt,"go_acked_original":acked,
+            "sender_pause":frozen_sender,"receiver_freeze":frozen_receiver,"independent_inventory":observed,
+            "synthetic_scoring_evidence":scores,"nonempty_freeze_refused":blocked,
+            "scoring":"explicit synthetic fake; real models=0","switch_authorized":False,
+            "old_uninstrumented_originals_proven":False,"webhook_and_receipt_store_are_real":True})
+
 
 
 def run(repo, source, sender_image, receiver_image, binary, output):
@@ -229,6 +259,7 @@ def run(repo, source, sender_image, receiver_image, binary, output):
         harness.prepare()
         harness.prepare_receiver_files(receiver_image)
         harness.scenario()
+        require((output / CASE).is_file(), "complete real joint stage evidence absent")
     except Exception as failure:
         error = {"type":type(failure).__name__,"message":harness.redacted(str(failure))}
         save(output / "FAILURE.json", error)

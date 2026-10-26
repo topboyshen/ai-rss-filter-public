@@ -36,9 +36,14 @@ ReceiptStore, and accepts only their exact authenticated duplicates. Go's normal
 outbox POST receives the actual Flask durable receipt and records its ACK in
 PostgreSQL. No ACK is injected with SQL. The fake scorer consumes the real task,
 and SenderDriver independently observes no unfinished/held originals before
-full pause. ReceiverDriver freezes; a final independent inventory holds actual
-receiver controller/activity and spool/journal locks plus both PostgreSQL
-protocol locks and checks the confirmed pause operation.
+full pause. JointDrainController revalidates the original stop/pause intent
+chain, raw bundle and exact completed transfer, and queries the actual current
+sender pause and receiver stop. While the receiver task is still queued, a
+freeze attempt must fail without writing a freeze intent or disabling drain.
+After the real queue task completes, the controller holds release/refresh,
+receiver controller/activity, spool/journal and both PostgreSQL protocol locks,
+checks the confirmed pause operation, independently observes zero unfinished
+storage, and only then writes the receiver freeze intent and receipt.
 
 Success is one `CASE_REAL_GO_FLASK_DURABLE_DRAIN_AND_FROZEN_INVENTORY.json` plus
 `RESULT.json` with `status=passed`. All commands, phase receipts, raw synthetic
