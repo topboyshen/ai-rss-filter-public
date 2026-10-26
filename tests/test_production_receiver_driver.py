@@ -306,6 +306,8 @@ class TransportBounds(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     native_receiver.run(Path("unused"), Path("unused"))
         workflow = (ROOT / ".github/workflows/handoff-operations.yml").read_text()
+        self.assertIn(".github/workflows/handoff-operations.yml", operations.READONLY_MOUNTS)
+        self.assertIn(".github/workflows/handoff-operations.yml", operations.FILES)
         pull = workflow.split("  pull_request:", 1)[1].split("  push:", 1)[0]
         push = workflow.split("  push:", 1)[1].split("  workflow_dispatch:", 1)[0]
         for path in ("services/receiver_handoff_control.py", "scripts/production_receiver_driver.py",
