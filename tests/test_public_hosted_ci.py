@@ -1,6 +1,7 @@
 """Public pull requests run synthetic gates on GitHub-hosted machines only."""
 
 from pathlib import Path
+from fnmatch import fnmatchcase
 
 import pytest
 import yaml
@@ -105,3 +106,16 @@ def test_only_superseded_pull_requests_cancel_previous_runs(name):
     assert concurrency["cancel-in-progress"] == "${{ github.event_name == 'pull_request' }}"
     assert "github.run_id" in concurrency["group"]
     assert "format('pr-{0}', github.event.pull_request.number)" in concurrency["group"]
+
+
+@pytest.mark.parametrize("event", ["pull_request", "push"])
+@pytest.mark.parametrize("changed_path,expected", [
+    ("tests/test_private_release_contract.py", True),
+    ("tests/test_private_release_native.py", True),
+    ("docs/private-release-config.md", False),
+    ("tests/test_unrelated_feature.py", False),
+])
+def test_private_release_workflow_covers_its_tests_without_unrelated_paths(event, changed_path, expected):
+    _, workflow = _workflow("private-release-config.yml")
+    triggers = workflow.get("on", workflow.get(True))
+    assert any(fnmatchcase(changed_path, pattern) for pattern in triggers[event]["paths"]) is expected
