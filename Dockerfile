@@ -23,6 +23,8 @@ ARG AI_FILTER_BUILD_GIT_SHA=unknown
 ARG AI_FILTER_BUILD_MANIFEST_SHA=unknown
 ARG AI_FILTER_BUILD_CONFIG_SHA=unknown
 ARG AI_FILTER_BUILD_SOURCE_ID=unknown
+ARG AI_FILTER_PRIVATE_RELEASE_SHA=none
+ARG AI_FILTER_RUNTIME_CONFIG_SHA=unknown
 ARG AI_FILTER_MAPPING_MIGRATION_GENERATION=event-mapping-store-v5-provider-attribution-v1
 ENV AI_FILTER_VERSION=${AI_FILTER_BUILD_VERSION}
 ENV AI_FILTER_REVISION=${AI_FILTER_BUILD_GIT_SHA}
@@ -31,6 +33,8 @@ LABEL org.opencontainers.image.revision=${AI_FILTER_BUILD_GIT_SHA}
 LABEL io.ai-filter.compose-manifest.sha256=${AI_FILTER_BUILD_MANIFEST_SHA}
 LABEL io.ai-filter.config.sha256=${AI_FILTER_BUILD_CONFIG_SHA}
 LABEL io.ai-filter.source.identity=${AI_FILTER_BUILD_SOURCE_ID}
+LABEL io.ai-filter.private-release.sha256=${AI_FILTER_PRIVATE_RELEASE_SHA}
+LABEL io.ai-filter.runtime-config.sha256=${AI_FILTER_RUNTIME_CONFIG_SHA}
 LABEL io.ai-filter.event-mapping-generation=${AI_FILTER_MAPPING_MIGRATION_GENERATION}
 COPY config.yaml .
 COPY app.py .

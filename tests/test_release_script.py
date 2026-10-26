@@ -2586,6 +2586,8 @@ def test_release_dockerfile_and_ci_share_exact_contract_label_names():
         "io.ai-filter.config.sha256",
         "io.ai-filter.source.identity",
         "io.ai-filter.event-mapping-generation",
+        "io.ai-filter.private-release.sha256",
+        "io.ai-filter.runtime-config.sha256",
     }
     release = RELEASE_SCRIPT.read_text(encoding="utf-8")
     dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
@@ -2603,6 +2605,39 @@ def test_release_dockerfile_and_ci_share_exact_contract_label_names():
     assert release_labels == expected
     assert dockerfile_labels == expected
     assert ci_labels == expected
+
+
+@pytest.mark.parametrize("override", [
+    {"RELEASE_ALLOW_DIRTY_TREE": "1"},
+    {"RELEASE_REQUIRE_BUILD_CONTRACT": "0"},
+    {"RELEASE_AUTO_ROLLBACK": "1"},
+    {"RELEASE_COMPOSE_FILE": "/private/unreviewed-compose.json"},
+])
+def test_private_release_rejects_existing_escape_hatches_before_docker(release_env, override):
+    env, log, _registry, _old_manifest = release_env
+    env.update({"RELEASE_PRIVATE_CONTRACT": "/private/missing-contract.json",
+                "RELEASE_ALLOW_DIRTY_TREE": "0", "RELEASE_REQUIRE_BUILD_CONTRACT": "1",
+                "RELEASE_AUTO_ROLLBACK": "0", **override})
+    result = _run_release(env, "build", "my-ai-filter:2026.10.26.1")
+    assert result.returncode == 8
+    assert "Private release requires clean source" in result.stderr
+    assert not log.exists()
+
+
+def test_private_build_contract_cannot_be_verified_as_public_release(release_env):
+    env, log, registry, _old_manifest = release_env
+    ref = "my-ai-filter:2026.10.26.2"
+    contracts = registry / "build-contracts"
+    contracts.mkdir(parents=True)
+    key = hashlib.sha256(ref.encode()).hexdigest()
+    (contracts / f"{key}.state").write_text("\n".join([
+        ref, IMAGE_ID, "a" * 64, "b" * 64, "c" * 40 + ":clean",
+        "event-mapping-store-v5-provider-attribution-v1", "d" * 64,
+    ]) + "\n")
+    result = _run_release(env, "verify", ref)
+    assert result.returncode == 3
+    assert "Private build contract is missing or mismatched" in result.stderr
+    assert " up " not in log.read_text()
 
 
 def test_compose_and_ci_forbid_latest_and_target_master():
