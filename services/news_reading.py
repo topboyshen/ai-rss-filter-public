@@ -2,7 +2,46 @@
 
 import re
 
+from scoring_provenance import NON_SUBSTANTIVE_SCORE_PATHS
 from utils.helpers import escape_html, plain_text_from_markup
+
+
+_PATH_LABELS = {
+    "llm": "模型评分", "stage2": "模型二阶段评分",
+    "fast_pass": "本地快速规则", "local_reject": "本地拒绝规则",
+    "fallback_local": "本地兜底", "similarity": "相似结果复用",
+    "radar": "雷达路径", "parse_error": "解析失败",
+    "quality_quarantine": "质量隔离",
+}
+
+
+def render_evidence_context(entry: dict) -> str:
+    """Show only persisted path metadata; do not infer per-field score ownership."""
+    raw_title = entry.get("raw_title")
+    # Older projections collapse absent/NULL titles to "". Neither absence
+    # nor an empty display value establishes what the scorer originally saw.
+    has_title = isinstance(raw_title, str) and bool(plain_text_from_markup(raw_title).strip())
+    path = str(entry.get("score_path") or "").strip().casefold()
+    if path in NON_SUBSTANTIVE_SCORE_PATHS:
+        path_label = "缓存处理记录：系统兜底（保守中性）"
+    else:
+        path_label = "缓存处理记录：" + _PATH_LABELS.get(path, "未知")
+    title_label = "本卡片提供原始标题" if has_title else "本卡片未提供原始标题"
+    lines = (
+        title_label,
+        "无法从本卡片确认评分时使用的正文范围",
+        path_label,
+        "当前展示分数与方向的逐项生成来源未确认；分数仅为阅读优先级",
+        "保守中性是处理结果，不表示新闻不重要",
+        "标题点名仅说明提及，不支持投资结论；主题背景与规则池不是本文点名或受益证据",
+    )
+    return (
+        '<details class="home-news-evidence" style="margin-top:8px;">'
+        '<summary style="cursor:pointer;font-size:11px;">证据与处理范围</summary>'
+        '<div style="margin-top:6px;font-size:11px;line-height:1.7;">'
+        + "<br>".join(escape_html(line) for line in lines)
+        + '</div></details>'
+    )
 
 
 def preferred_news_title(raw_title: str = "", title: str = "") -> str:
@@ -139,6 +178,7 @@ def restore_reading_titles(selected: list[dict], candidates: list[dict]) -> list
 def render_news_card(
     *, title, link, source, time_label, score, direction, selection_reason,
     level, evidence_note, duplicate_note, rule_pool_html, score_source_label="",
+    evidence_context_html="",
 ) -> str:
     """Render supplied card facts; analysis stays in native closed details."""
     metadata = " · ".join(str(value) for value in (source, time_label) if value)
@@ -165,5 +205,5 @@ def render_news_card(
         '<div style="margin-top:6px;font-size:12px;line-height:1.7;'
         'color:var(--color-text-subdue,inherit);">'
         f'{escape_html(explanation)}</div></details>'
-        f'{rule_pool_html}</article>'
+        f'{evidence_context_html}{rule_pool_html}</article>'
     )
