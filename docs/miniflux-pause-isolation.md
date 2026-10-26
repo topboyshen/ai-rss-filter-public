@@ -43,6 +43,12 @@ draining 自动恢复生产。stop-new 必须预留最后一个完整 pause 操�
 升级与回退限制继续适用。现有 `MinifluxControlBridge.stop()` 仍调用完整 `/pause`，不会隐式改成
 stop-new。外部切换控制器若要采用排空流程，须显式接线 `/stop-new → 独立库存 → /pause` 并核验动作。
 
+**不能直接回退到旧133补丁镜像。** 旧 `Begin` 只允许open，所以遇到draining会拒绝业务生产与消费者；
+但旧 `readReceipt` 不认识stop_new，会把该动作的状态投影成open。旧数据库版本检查只拒绝低于预期的
+schema，不能指望schema134阻止旧程序启动。因此旧镜像的启动成功、query或普通HTTP成功都不能当成
+新状态证明，不能笼统声称所有旧控制路径都会fail closed。必须持续绑定新镜像、源码锁、manifest和
+精确action/state；回退需要独立核验及明确方案，不能降版本号、改操作记录或删除lease来凑兼容。
+
 暂停保护的是**新版本中实际接入的入口和在途生命周期**。它不能回溯已运行的未打补丁旧 Miniflux
 goroutine，也不能恢复以前未保留的 raw body。旧实例的在途消息仍须在受控切换前单独保全和核清。
 lease 归零说明这些工作已结束，不代表 outbox、held、接收端 queue/journal 或第三方投递全成功。
