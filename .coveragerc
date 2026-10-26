@@ -1,0 +1,23 @@
+[run]
+branch = True
+source = .
+omit =
+    tests/*
+    */tests/*
+    .venv/*
+    */.venv/*
+    */__pycache__/*
+    .pytest_cache/*
+    */.pytest_cache/*
+    .cache/*
+    */.cache/*
+    cache/*
+    */cache/*
+
+[report]
+precision = 2
+show_missing = True
+skip_empty = True
+
+[xml]
+output = coverage.xml

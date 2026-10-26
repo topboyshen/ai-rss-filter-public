@@ -1,0 +1,33 @@
+{
+  "event_id": "10000009-0000-4000-8000-000000000001",
+  "event_version": 1,
+  "evidence": [
+    {
+      "evidence_id": "4000009a-0000-4000-8000-000000000001",
+      "snapshot_hash": "9c6478b96f83ff408d5f5c3b9d21e74efcd04475938c4fa403bc838b5eba70ac",
+      "source_uri": "https://example.invalid/synthetic-correction/9/evidence/1",
+      "version": 1
+    },
+    {
+      "evidence_id": "4000009b-0000-4000-8000-000000000001",
+      "snapshot_hash": "be955088e496baae4f98fa1d37d85cb9470c2399e18ae85716fd47418137d12b",
+      "source_uri": "https://example.invalid/synthetic-correction/9/evidence/2",
+      "version": 1
+    },
+    {
+      "evidence_id": "4000009c-0000-4000-8000-000000000001",
+      "snapshot_hash": "74635bb1d7fea57332688086be2ef82e42121b38c3cbb1e90481870a4703263b",
+      "source_uri": "https://example.invalid/synthetic-correction/9/evidence/3",
+      "version": 1
+    }
+  ],
+  "mapping": {
+    "mapping_id": "20000009-0000-4000-8000-000000000001",
+    "mapping_version": "asset-map:event-mapping-store-v7:manifest-c27ab17041461a1854f64fe8e52d372e4450457a60aa2c0cd04ceaa38d07e203:rules-488c3eab890a:master-f00e91850b05250e6db4a7aa7c89825fbf998a39312ffb5684b9afd72962eca2",
+    "relation_type": "direct",
+    "revision": 2,
+    "security_id": "30000001-0000-4000-8000-000000000001"
+  },
+  "reason": "SYNTHETIC TEST EXAMPLE ONLY; not reviewed or authorized for any production database.",
+  "schema": 1
+}

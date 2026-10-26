@@ -1,0 +1,141 @@
+{
+  "event_id": "10000002-0000-4000-8000-000000000001",
+  "event_version": 3,
+  "evidence": [
+    {
+      "evidence_id": "40000008-0000-4000-8000-000000000001",
+      "snapshot_hash": "d792cb0e57e8e49ec734468468d3bbac759bff89ab5e7471ec361231f8deac8f",
+      "source_uri": "https://example.invalid/synthetic-correction/2/evidence/1",
+      "version": 1
+    },
+    {
+      "evidence_id": "40000009-0000-4000-8000-000000000001",
+      "snapshot_hash": "f3df4ce25aeb606e35b97961ede94d16bb11987197ed290824dd7ce1f33fb308",
+      "source_uri": "https://example.invalid/synthetic-correction/2/evidence/2",
+      "version": 1
+    },
+    {
+      "evidence_id": "4000000a-0000-4000-8000-000000000001",
+      "snapshot_hash": "565fa16b8d559d58de64224263c85771a7c68e7b7bd9254e71a5438c00c7ba5d",
+      "source_uri": "https://example.invalid/synthetic-correction/2/evidence/3",
+      "version": 1
+    },
+    {
+      "evidence_id": "4000000b-0000-4000-8000-000000000001",
+      "snapshot_hash": "e0d4e7a696a36810b7391f39020b88869980e84158dc8fb66db13767b17e642e",
+      "source_uri": "https://example.invalid/synthetic-correction/2/evidence/4",
+      "version": 1
+    },
+    {
+      "evidence_id": "4000000c-0000-4000-8000-000000000001",
+      "snapshot_hash": "460289e718528bed53aec4b4f4c86de6049993000b63a1b3bf04b53016164c38",
+      "source_uri": "https://example.invalid/synthetic-correction/2/evidence/5",
+      "version": 1
+    },
+    {
+      "evidence_id": "4000000d-0000-4000-8000-000000000001",
+      "snapshot_hash": "5f121c9ff97e0fb79433d652181657e9da7d6ed080b21278241bea047a10e176",
+      "source_uri": "https://example.invalid/synthetic-correction/2/evidence/6",
+      "version": 1
+    },
+    {
+      "evidence_id": "4000000e-0000-4000-8000-000000000001",
+      "snapshot_hash": "4c4c26f5ab5e0c87fe0fc4880cfc58be42b1f56fd6da0487ebc611c66f60ad67",
+      "source_uri": "https://example.invalid/synthetic-correction/2/evidence/7",
+      "version": 1
+    },
+    {
+      "evidence_id": "4000000f-0000-4000-8000-000000000001",
+      "snapshot_hash": "e63ac5bfd8739e266c04cceac53f06fcb4912b237677f2ce5220f1d5f3f1b92a",
+      "source_uri": "https://example.invalid/synthetic-correction/2/evidence/8",
+      "version": 1
+    },
+    {
+      "evidence_id": "40000010-0000-4000-8000-000000000001",
+      "snapshot_hash": "49382617ddbb0becd2d0ae2183d6edee9aa7c133a891f8c277bb56ffc5e07569",
+      "source_uri": "https://example.invalid/synthetic-correction/2/evidence/9",
+      "version": 1
+    },
+    {
+      "evidence_id": "40000011-0000-4000-8000-000000000001",
+      "snapshot_hash": "e61272319e22fca6f7175e34eea48ea0b930c2b5bbd20c4fbe9d021fa330fe60",
+      "source_uri": "https://example.invalid/synthetic-correction/2/evidence/10",
+      "version": 1
+    },
+    {
+      "evidence_id": "40000012-0000-4000-8000-000000000001",
+      "snapshot_hash": "8faa80a92f8a662f1cfaf8dca96b7fa2deb25fbcfa529bd279721b3af2bd279e",
+      "source_uri": "https://example.invalid/synthetic-correction/2/evidence/11",
+      "version": 1
+    },
+    {
+      "evidence_id": "40000013-0000-4000-8000-000000000001",
+      "snapshot_hash": "17ebc0cf17db22df107665bd25ea38e2ee2c1bbb4d63f7ebe1ab83e16eb03f4c",
+      "source_uri": "https://example.invalid/synthetic-correction/2/evidence/12",
+      "version": 1
+    },
+    {
+      "evidence_id": "40000014-0000-4000-8000-000000000001",
+      "snapshot_hash": "5b421ab01e499aa589740507336f69143752be5b663a97e270bddf321deebc80",
+      "source_uri": "https://example.invalid/synthetic-correction/2/evidence/13",
+      "version": 1
+    },
+    {
+      "evidence_id": "40000015-0000-4000-8000-000000000001",
+      "snapshot_hash": "edfa0129725bc5f7b4f9772ca56d65183ec000b2a29896a81596037c9976c2c3",
+      "source_uri": "https://example.invalid/synthetic-correction/2/evidence/14",
+      "version": 1
+    },
+    {
+      "evidence_id": "40000016-0000-4000-8000-000000000001",
+      "snapshot_hash": "ffb7da7152d8d6594e5faea459bfdebcdd3b32e312a4fbbd72b77837dffe7448",
+      "source_uri": "https://example.invalid/synthetic-correction/2/evidence/15",
+      "version": 1
+    },
+    {
+      "evidence_id": "40000017-0000-4000-8000-000000000001",
+      "snapshot_hash": "4030babc9a16d4b56015d156231546013872b94713ff396949984fe95682884a",
+      "source_uri": "https://example.invalid/synthetic-correction/2/evidence/16",
+      "version": 1
+    },
+    {
+      "evidence_id": "40000018-0000-4000-8000-000000000001",
+      "snapshot_hash": "498841f7bce7ecda9084fea7af3b8c3d36db0a331c282400b312ffba3ab599df",
+      "source_uri": "https://example.invalid/synthetic-correction/2/evidence/17",
+      "version": 1
+    },
+    {
+      "evidence_id": "40000019-0000-4000-8000-000000000001",
+      "snapshot_hash": "0bf960a73362ad4393258af1d263beb82c01917f2ac7a45838d0edc97e902893",
+      "source_uri": "https://example.invalid/synthetic-correction/2/evidence/18",
+      "version": 1
+    },
+    {
+      "evidence_id": "4000001a-0000-4000-8000-000000000001",
+      "snapshot_hash": "c5ecd2924d339238c7f2b809b39c9fe6427f7948c23988472f6ca94909147eab",
+      "source_uri": "https://example.invalid/synthetic-correction/2/evidence/19",
+      "version": 1
+    },
+    {
+      "evidence_id": "4000001b-0000-4000-8000-000000000001",
+      "snapshot_hash": "d0552ace7e0d171a6bd24d07b54e71b1485ecfc0fadbf90ec14ea5f1410db95f",
+      "source_uri": "https://example.invalid/synthetic-correction/2/evidence/20",
+      "version": 1
+    },
+    {
+      "evidence_id": "4000001c-0000-4000-8000-000000000001",
+      "snapshot_hash": "3ef4880e9abef916c34818afaf7b2b634c4d03faeca72612e30c5ea85deba5b8",
+      "source_uri": "https://example.invalid/synthetic-correction/2/evidence/21",
+      "version": 1
+    }
+  ],
+  "mapping": {
+    "mapping_id": "20000002-0000-4000-8000-000000000001",
+    "mapping_version": "asset-map:event-mapping-store-v7:manifest-c27ab17041461a1854f64fe8e52d372e4450457a60aa2c0cd04ceaa38d07e203:master-f00e91850b05250e6db4a7aa7c89825fbf998a39312ffb5684b9afd72962eca2",
+    "relation_type": "direct",
+    "revision": 6,
+    "security_id": "30000001-0000-4000-8000-000000000001"
+  },
+  "reason": "SYNTHETIC TEST EXAMPLE ONLY; not reviewed or authorized for any production database.",
+  "schema": 1
+}

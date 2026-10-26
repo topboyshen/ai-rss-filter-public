@@ -1,0 +1,11 @@
+[Unit]
+Description=Repair historical A-share pending closes after the same-day window
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 16:30:00 Asia/Shanghai
+Persistent=false
+AccuracySec=30s
+Unit=ai-filter-market-close-history.service
+
+[Install]
+WantedBy=timers.target

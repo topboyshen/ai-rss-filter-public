@@ -1,0 +1,57 @@
+{
+  "event_id": "10000004-0000-4000-8000-000000000001",
+  "event_version": 1,
+  "evidence": [
+    {
+      "evidence_id": "40000022-0000-4000-8000-000000000001",
+      "snapshot_hash": "835466f4fb9277ebed392d7062b2f22d4a7d2a3f7bf31470d07d446b6b880dab",
+      "source_uri": "https://example.invalid/synthetic-correction/4/evidence/1",
+      "version": 1
+    },
+    {
+      "evidence_id": "40000023-0000-4000-8000-000000000001",
+      "snapshot_hash": "8477dfbb2ef40de7f044343eefcbcd95a069c8001b18188ede232fc229978946",
+      "source_uri": "https://example.invalid/synthetic-correction/4/evidence/2",
+      "version": 1
+    },
+    {
+      "evidence_id": "40000024-0000-4000-8000-000000000001",
+      "snapshot_hash": "0a17a4db588333e04915e5bd3e1695bad8c1d9a36bd16da2cbacb58bf56a20c6",
+      "source_uri": "https://example.invalid/synthetic-correction/4/evidence/3",
+      "version": 1
+    },
+    {
+      "evidence_id": "40000025-0000-4000-8000-000000000001",
+      "snapshot_hash": "90b9c69b5287ef90968d20489525b513a595ef4500a163dd1176421d0702b9c9",
+      "source_uri": "https://example.invalid/synthetic-correction/4/evidence/4",
+      "version": 1
+    },
+    {
+      "evidence_id": "40000026-0000-4000-8000-000000000001",
+      "snapshot_hash": "bb4cc062c4edcd69057e337f111851aa5c5a0a73e8579b2296115bfbfd0f74cb",
+      "source_uri": "https://example.invalid/synthetic-correction/4/evidence/5",
+      "version": 1
+    },
+    {
+      "evidence_id": "40000027-0000-4000-8000-000000000001",
+      "snapshot_hash": "7c538d6cfd7f977c38c1c3173e0093a9df9001905f15da8785c6c655d1f4a5b0",
+      "source_uri": "https://example.invalid/synthetic-correction/4/evidence/6",
+      "version": 1
+    },
+    {
+      "evidence_id": "40000028-0000-4000-8000-000000000001",
+      "snapshot_hash": "4b6fccbf2b94a43f0e9eeff94779c2489f350b81506fbbaf01e6729195f6b803",
+      "source_uri": "https://example.invalid/synthetic-correction/4/evidence/7",
+      "version": 1
+    }
+  ],
+  "mapping": {
+    "mapping_id": "20000004-0000-4000-8000-000000000001",
+    "mapping_version": "asset-map:event-mapping-store-v7:manifest-c27ab17041461a1854f64fe8e52d372e4450457a60aa2c0cd04ceaa38d07e203:master-f00e91850b05250e6db4a7aa7c89825fbf998a39312ffb5684b9afd72962eca2",
+    "relation_type": "direct",
+    "revision": 6,
+    "security_id": "30000001-0000-4000-8000-000000000001"
+  },
+  "reason": "SYNTHETIC TEST EXAMPLE ONLY; not reviewed or authorized for any production database.",
+  "schema": 1
+}

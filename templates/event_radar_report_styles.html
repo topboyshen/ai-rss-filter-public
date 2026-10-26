@@ -1,0 +1,63 @@
+    :root {
+      color-scheme: dark;
+      --bg: #080d17; --surface: #0f1726; --surface-raised: #131d2f;
+      --border: rgba(148, 163, 184, .17); --text: #f4f7fb; --muted: #a5b1c4;
+      --accent: #65d8f2; --amber: #f2c66d; --danger: #ff9a9f; --green: #62dfa7;
+      --sans: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+        "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.6 var(--sans); }
+    a { color: var(--accent); }
+    .page-shell { max-width: 1080px; margin: 0 auto; padding: 24px 18px 64px; }
+    .topbar { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; align-items: flex-end; }
+    h1 { margin: 0; font-size: 26px; }
+    .top-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+    .top-link { padding: 6px 12px; border: 1px solid var(--border); border-radius: 999px; text-decoration: none; color: var(--text); }
+    .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 16px 18px; margin-top: 16px; }
+    .meta-grid { display: grid; gap: 4px; color: var(--muted); font-size: 13px; }
+    .meta-grid strong { color: var(--text); font-weight: 600; }
+    .state-warning { color: var(--amber); font-weight: 600; }
+    .date-form { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    .date-form input, .date-form button { background: var(--surface-raised); color: var(--text); border: 1px solid var(--border); border-radius: 10px; padding: 6px 10px; }
+    .block-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+    .block-head h2 { margin: 0; font-size: 19px; }
+    .block-count { color: var(--muted); font-size: 13px; }
+    .empty-block { margin: 10px 0 0; color: var(--muted); }
+    .event-card { border-top: 1px solid var(--border); padding: 14px 0 6px; }
+    .event-card:first-of-type { border-top: 0; }
+    .event-title { font-size: 16px; font-weight: 650; margin: 0 0 6px; }
+    .event-badges { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+    dl.chain { display: grid; grid-template-columns: 7.5em 1fr; gap: 4px 12px; margin: 0; font-size: 14px; }
+    dl.chain dt { color: var(--muted); }
+    dl.chain dd { margin: 0; }
+    dl.chain ul { margin: 0; padding-left: 1.1em; }
+    .denial { color: var(--danger); }
+    .request { color: var(--amber); }
+    .historical-badge { display: inline-block; margin-top: 6px; padding: 2px 10px; border-radius: 999px; border: 1px solid var(--amber); color: var(--amber); font-size: 12px; }
+    .assoc { color: var(--muted); font-size: 13px; }
+    .notes { color: var(--muted); font-size: 13px; margin: 0; padding-left: 1.2em; }
+    .event-report .block-head { flex-wrap: wrap; }
+    .event-report .block-head h2 { flex: 0 0 auto; }
+    .event-report .block-count { min-width: 0; }
+    .event-report dl.chain { grid-template-columns: 7.5em minmax(0, 1fr); }
+    .event-report .event-card, .event-report .meta-grid,
+    .event-report .report-highlights { min-width: 0; overflow-wrap: anywhere; }
+    .event-report .date-form input { max-width: 100%; }
+    .event-report .block-pagination, .event-report .weekly-page-context {
+      display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px;
+      min-width: 0; margin-top: 16px; overflow-wrap: anywhere;
+    }
+    .event-report .block-pagination { border-top: 1px solid var(--border); padding-top: 14px; }
+    .event-report .pagination-label, .event-report .weekly-page-context span { color: var(--muted); font-size: 13px; }
+    .event-report .pagination-links { display: flex; flex-wrap: wrap; gap: 10px; min-width: 0; }
+    @media (max-width: 600px) {
+      .event-report .page-shell { padding: 18px 12px 40px; }
+      .event-report .panel { padding: 14px 12px; }
+      .event-report .topbar > div { min-width: 0; width: 100%; }
+      .event-report h1 { font-size: 23px; }
+      .event-report .block-head { align-items: flex-start; gap: 4px 10px; }
+      .event-report .block-count { flex-basis: 100%; }
+      .event-report dl.chain { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+      .event-report dl.chain dt:not(:first-child) { margin-top: 8px; }
+    }

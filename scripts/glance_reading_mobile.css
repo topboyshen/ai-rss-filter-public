@@ -1,0 +1,31 @@
+/* Glance v0.8.4: scope the reading layout to its marked home widgets. */
+@media (max-width: 1190px) {
+  body:has(.ai-home-news) .page-columns:has(> .page-column > .ai-home-news) {
+    flex-direction: column;
+  }
+
+  body:has(.ai-home-news) .page-columns:has(> .page-column > .ai-home-news) > .page-column {
+    display: block !important;
+    width: 100%;
+    min-width: 0;
+    flex: none;
+    animation: none;
+  }
+
+  /* Both columns are now in reading order; keep the native page menu/top link. */
+  body:has(.ai-home-news) .mobile-navigation-label:has(> .mobile-navigation-input) {
+    display: none;
+  }
+
+  body:has(.ai-home-news) .mobile-navigation-page-links {
+    flex-wrap: wrap;
+  }
+
+  /* Keep the existing custom-footer HTML/links; only unpin its outer wrapper. */
+  body:has(.ai-home-news) footer.footer > div > div:has(> a[href*="beian.miit.gov.cn"]):has(> a[href*="beian.mps.gov.cn"]) {
+    position: static !important;
+    z-index: auto !important;
+    max-width: 100%;
+    overflow-wrap: anywhere;
+  }
+}

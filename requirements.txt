@@ -1,0 +1,9 @@
+# 开发/CI：使用 Python 3.11 的 .venv-release-gate 安装，再运行隔离测试入口
+# 复用生产依赖版本，仅在此增加测试依赖
+-r requirements-prod.txt
+iniconfig==2.3.0
+pluggy==1.6.0
+Pygments==2.21.0
+pytest==9.1.1
+pytest-cov==7.1.0
+coverage==7.16.2

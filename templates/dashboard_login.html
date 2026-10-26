@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>AI-Filter 管理登录</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 24px;
+      background: radial-gradient(circle at 20% 10%, #23234a 0, #111122 38%, #090912 100%);
+      color: #ececf7; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    main { width: min(430px, 100%); padding: 30px; border-radius: 20px; background: rgba(25,25,47,.94);
+      border: 1px solid #323253; box-shadow: 0 26px 80px rgba(0,0,0,.42); }
+    .mark { width: 44px; height: 44px; display: grid; place-items: center; border-radius: 13px;
+      background: #f0c040; color: #171720; font-size: 23px; font-weight: 900; }
+    h1 { margin: 18px 0 7px; font-size: 24px; color: #f5cf59; }
+    p { color: #aaaac0; line-height: 1.65; font-size: 14px; }
+    label { display: block; margin: 22px 0 8px; color: #d7d7e5; font-size: 13px; font-weight: 700; }
+    input { width: 100%; border: 1px solid #3b3b5b; border-radius: 11px; padding: 12px 13px;
+      background: #0d0d1a; color: #fff; font-size: 15px; outline: none; }
+    input:focus { border-color: #f0c040; box-shadow: 0 0 0 3px rgba(240,192,64,.12); }
+    button { width: 100%; margin-top: 16px; border: 0; border-radius: 11px; padding: 12px;
+      background: #f0c040; color: #171720; font-weight: 850; font-size: 15px; cursor: pointer; }
+    .error { margin-top: 16px; border: 1px solid #7f3038; background: rgba(127,29,29,.32);
+      color: #fecaca; padding: 10px 12px; border-radius: 10px; font-size: 13px; }
+    .meta { margin-top: 18px; font-size: 12px; color: #77778f; }
+    a { color: #f5cf59; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="mark">AI</div>
+    <h1>管理 Dashboard</h1>
+    <p>请输入现有 AI-Filter API Key。密钥只在本次 HTTPS 登录请求中提交；成功后使用最长 {{ session_hours }} 小时的安全会话。</p>
+    {% if error %}<div class="error" role="alert">{{ error }}</div>{% endif %}
+    {% if configured %}
+    <form method="post" action="/dashboard/login" autocomplete="on">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="next" value="{{ next_path }}">
+      <label for="api-key">AI-Filter API Key</label>
+      <input id="api-key" name="api_key" type="password" maxlength="4096" required
+        autocomplete="current-password" spellcheck="false" autofocus>
+      <button type="submit">安全登录</button>
+    </form>
+    {% endif %}
+    <div class="meta"><a href="/briefing?format=html">返回公开情报 Briefing</a></div>
+  </main>
+</body>
+</html>

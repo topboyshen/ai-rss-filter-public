@@ -1,0 +1,86 @@
+{% macro event_change(item) -%}
+<article class="event-radar-summary-item" data-event-id="{{ item.event_id }}" data-block="{{ item.block }}">
+  <div class="event-radar-summary-top">
+    <span class="event-radar-summary-type{% if item.correction_kind %} is-correction{% endif %}">{% if item.correction_kind == 'request' %}要求澄清／问询 · 非否认{% elif item.correction_kind == 'denial' %}澄清／更正线索{% elif item.block == 'pending' %}待验证{% elif item.block == 'advanced' %}推进{% else %}新增{% endif %}</span>
+  </div>
+  <h4 class="event-radar-summary-title"><a href="{{ dashboard_origin }}/dashboard/events?event_id={{ item.event_id|urlencode }}&amp;tab=overview#event-detail" target="_blank" rel="noopener noreferrer">{{ item.title or '未命名事件' }}</a></h4>
+  <p class="event-radar-summary-change">{{ item.change }}</p>
+  {% if item.background_note %}<p class="event-radar-summary-background">{{ item.background_note }}</p>{% endif %}
+  {% if item.companies %}<p class="event-radar-summary-companies">原文提及：{{ item.companies[:3]|join('、') }}</p>{% endif %}
+  {% set source = item.sources[0] if item.sources else none %}
+  <div class="event-radar-summary-source">
+    {% if source %}
+      {% if source.url and (source.url.startswith('https://') or source.url.startswith('http://')) %}<a href="{{ source.url }}" target="_blank" rel="noopener noreferrer">{{ source.publisher or '原始来源' }} ↗</a>{% else %}<span>{{ source.publisher or '来源链接不可用' }}</span>{% endif %}
+      <span>{{ source.observed_label or '入库时间未知' }}</span>
+    {% else %}<span>来源证据不足</span>{% endif %}
+  </div>
+</article>
+{%- endmacro %}
+<div class="event-radar-summary" data-report-date="{{ digest.date }}">
+  <style>
+    .event-radar-summary, .event-radar-summary * { box-sizing:border-box; }
+    .event-radar-summary { min-width:0;max-width:100%;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif;color:var(--color-text-base,inherit);overflow-wrap:anywhere; }
+    .event-radar-summary-head { margin-bottom:10px; }
+    .event-radar-summary-heading { margin:0;font-size:15px;font-weight:800;line-height:1.45; }
+    .ai-home-event-changes .event-radar-summary-heading { display:none; }
+    .event-radar-summary-note { margin:4px 0 0;color:var(--color-text-subdue,inherit);font-size:10px;line-height:1.6; }
+    .event-radar-summary-state { margin:7px 0 0;padding:7px 9px;border:1px solid rgba(242,198,109,.35);border-radius:8px;font-size:11px;line-height:1.5; }
+    .event-radar-summary-coverage { margin:5px 0 0;font-size:11px;line-height:1.5; }
+    .event-radar-summary-section + .event-radar-summary-section { margin-top:12px; }
+    .event-radar-summary-section-title { margin:0 0 6px;font-size:12px;font-weight:750;line-height:1.5; }
+    .event-radar-summary-grid { display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,250px),1fr));gap:7px; }
+    .event-radar-summary-item { min-width:0;padding:10px 11px;border:1px solid rgba(148,163,184,.22);border-radius:10px;background:rgba(148,163,184,.04); }
+    .event-radar-summary-top { display:flex;align-items:flex-start;gap:6px;min-width:0; }
+    .event-radar-summary-type { display:inline-block;max-width:100%;padding:2px 6px;border-radius:5px;background:rgba(101,216,242,.08);color:var(--color-text-subdue,inherit);font-size:10px;line-height:1.45; }
+    .event-radar-summary-type.is-correction { border:1px solid rgba(242,198,109,.30);background:rgba(242,198,109,.06); }
+    .event-radar-summary-title { display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3;overflow:hidden;margin:6px 0 5px;font-size:12px;font-weight:750;line-height:1.5; }
+    .event-radar-summary-title a { color:inherit;text-decoration:none; }
+    .event-radar-summary-title a:hover { text-decoration:underline; }
+    .event-radar-summary-change { display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3;overflow:hidden;margin:0;font-size:11px;line-height:1.6; }
+    .event-radar-summary-background { margin:5px 0 0;padding-left:7px;border-left:2px solid rgba(242,198,109,.45);font-size:10px;line-height:1.55; }
+    .event-radar-summary-companies { margin:6px 0 0;color:var(--color-text-subdue,inherit);font-size:10px;line-height:1.5; }
+    .event-radar-summary-source { display:flex;flex-wrap:wrap;gap:3px 8px;margin-top:7px;color:var(--color-text-subdue,inherit);font-size:10px;line-height:1.5; }
+    .event-radar-summary-source > * { min-width:0;max-width:100%; }
+    .event-radar-summary-source a, .event-radar-summary-nav a { color:var(--color-primary,#65d8f2);text-decoration:none; }
+    .event-radar-summary-source a:hover, .event-radar-summary-nav a:hover { text-decoration:underline; }
+    .event-radar-summary-empty { margin:0;padding:10px 11px;border:1px dashed rgba(148,163,184,.30);border-radius:10px;color:var(--color-text-subdue,inherit);font-size:11px;line-height:1.6; }
+    .event-radar-summary-nav { display:flex;flex-wrap:wrap;gap:6px 12px;margin-top:11px;font-size:11px;line-height:1.6; }
+    .event-radar-summary-nav a { min-width:0;max-width:100%;padding:3px 0; }
+    .event-radar-summary a:focus-visible { outline:2px solid var(--color-primary,#65d8f2);outline-offset:3px; }
+    .event-radar-summary-foot { margin:6px 0 0;color:var(--color-text-subdue,inherit);font-size:10px;line-height:1.55; }
+  </style>
+
+  <header class="event-radar-summary-head">
+    <h2 class="event-radar-summary-heading">今日事件变化</h2>
+    <p class="event-radar-summary-note">{{ digest.date }} · {{ digest.cutoff_label }}</p>
+    <p class="event-radar-summary-note">最近入库：{{ digest.freshness.latest_label }}{% if digest.freshness.age_label %} · {{ digest.freshness.age_label }}{% endif %}</p>
+    {% if coverage_text %}<p class="event-radar-summary-coverage" data-coverage-state="{{ coverage_state }}">{{ coverage_text }}</p>{% endif %}
+    {% if digest.data_state != 'ok' %}<p class="event-radar-summary-state" data-state="{{ digest.data_state }}">{{ digest.data_state_label or '证据不足：当前数据状态未知，不代表没有发生事件。' }}</p>{% elif digest.freshness.stale %}<p class="event-radar-summary-state" data-state="stale">事件数据可能已过期，当前状态未知。</p>{% endif %}
+  </header>
+
+  {% if digest.highlights or digest.corrections %}
+    {% if digest.highlights %}
+    <section class="event-radar-summary-section" aria-label="今日重点">
+      <h3 class="event-radar-summary-section-title">今日重点</h3>
+      <div class="event-radar-summary-grid">{% for item in digest.highlights[:3] %}{{ event_change(item) }}{% endfor %}</div>
+    </section>
+    {% endif %}
+    {% if digest.corrections %}
+    <section class="event-radar-summary-section" aria-label="澄清／更正线索">
+      <h3 class="event-radar-summary-section-title">澄清／更正线索</h3>
+      <div class="event-radar-summary-grid">{% for item in digest.corrections[:2] %}{{ event_change(item) }}{% endfor %}</div>
+    </section>
+    {% endif %}
+  {% elif digest.data_state == 'ok' and not digest.freshness.stale %}
+    <p class="event-radar-summary-empty">{{ digest.empty_label }}</p>
+  {% else %}
+    <p class="event-radar-summary-empty">证据不足，暂无法判断当前事件变化；不代表没有发生。</p>
+  {% endif %}
+
+  <nav class="event-radar-summary-nav" aria-label="事件报告入口">
+    <a href="{{ dashboard_origin }}{{ digest.daily_url }}" target="_blank" rel="noopener noreferrer">今日日报 →</a>
+    <a href="{{ dashboard_origin }}{{ digest.weekly_url }}" target="_blank" rel="noopener noreferrer">本周周报 →</a>
+    <a href="{{ dashboard_origin }}/dashboard/events" target="_blank" rel="noopener noreferrer">完整事件雷达 →</a>
+  </nav>
+  <p class="event-radar-summary-foot">仅摘录已入库报告中的变化，非全网覆盖；原文提及不代表推荐或受益。完整来源与验证说明请看日报、周报。</p>
+</div>

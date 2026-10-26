@@ -1,0 +1,72 @@
+<div class="event-radar-summary">
+  <style>
+    .event-radar-summary, .event-radar-summary * { box-sizing: border-box; }
+    .event-radar-summary { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif; }
+    .event-radar-summary-head { display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin-bottom:11px; }
+    .event-radar-summary-kicker-row { display:flex;align-items:center;gap:7px;flex-wrap:wrap; }
+    .event-radar-summary-kicker { color:#62dfa7;font-size:10px;font-weight:800;letter-spacing:.08em;text-transform:uppercase; }
+    .event-radar-summary-note { margin-top:3px;color:var(--color-text-subdue,inherit);font-size:11px;line-height:1.45; }
+    .event-radar-summary-open { flex:none;padding:6px 9px;border:1px solid rgba(101,216,242,.28);border-radius:9px;color:#65d8f2;font-size:11px;font-weight:750;text-decoration:none; }
+    .event-radar-summary-open:hover { border-color:rgba(101,216,242,.58); }
+    .event-radar-summary-grid { display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));gap:8px; }
+    .event-radar-summary-item { display:block;min-width:0;padding:11px 12px;border:1px solid hsla(var(--bgh),var(--bgs),calc(var(--bgl) + 18%),.12);border-radius:13px;background:hsla(var(--bgh),var(--bgs),calc(var(--bgl) + 5%),.30);color:inherit;text-decoration:none; }
+    .event-radar-summary-item:hover { border-color:rgba(101,216,242,.32);background:hsla(var(--bgh),var(--bgs),calc(var(--bgl) + 8%),.38); }
+    .event-radar-summary-top, .event-radar-summary-bottom { display:flex;align-items:center;justify-content:space-between;gap:8px; }
+    .event-radar-summary-badges { display:flex;min-width:0;align-items:center;gap:5px; }
+    .event-radar-summary-type, .event-radar-summary-stock-flag, .event-radar-summary-direction { display:inline-flex;min-height:21px;align-items:center;padding:2px 7px;border:1px solid rgba(148,163,184,.20);border-radius:999px;font-size:9px;font-weight:780;white-space:nowrap; }
+    .event-radar-summary-type { max-width:130px;overflow:hidden;color:var(--color-text-subdue,inherit);text-overflow:ellipsis; }
+    .event-radar-summary-stock-flag { border-color:rgba(98,223,167,.32);background:rgba(98,223,167,.09);color:#62dfa7; }
+    .event-radar-summary-time, .event-radar-summary-source { flex:none;color:var(--color-text-subdue,inherit);font-size:9px;white-space:nowrap; }
+    .event-radar-summary-title { display:-webkit-box;margin:7px 0;overflow:hidden;color:var(--color-text-base,inherit);font-size:12px;font-weight:760;line-height:1.48;-webkit-box-orient:vertical;-webkit-line-clamp:2;word-break:break-word; }
+    .event-radar-summary-stocks { display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px; }
+    .event-radar-summary-stock { min-width:0;max-width:100%;padding:2px 6px;border-radius:9px;background:rgba(101,216,242,.08);color:#65d8f2;font-size:9px;font-weight:720;white-space:normal;overflow-wrap:anywhere;line-height:1.5; }
+    .event-radar-summary-relation { margin-left:2px;opacity:.72;font-size:8px;font-weight:640; }
+    .event-radar-summary-direction { color:var(--color-text-subdue,inherit); }
+    .event-radar-summary-direction.is-bull { border-color:rgba(255,133,140,.24);background:rgba(255,133,140,.08);color:#ff858c; }
+    .event-radar-summary-direction.is-bear { border-color:rgba(116,167,255,.26);background:rgba(116,167,255,.08);color:#74a7ff; }
+    .event-radar-summary-score { color:#f2c66d;font-size:11px;font-weight:850;white-space:nowrap; }
+    .event-radar-summary-score-label { margin-right:3px;color:var(--color-text-subdue,inherit);font-size:9px;font-weight:650; }
+    .event-radar-summary-empty { padding:22px;text-align:center;border:1px dashed rgba(148,163,184,.35);border-radius:14px;color:var(--color-text-subdue,inherit);font-size:12px; }
+    .event-radar-summary-foot { margin-top:9px;color:var(--color-text-subdue,inherit);font-size:10px;line-height:1.45; }
+    @media (max-width:520px) { .event-radar-summary-head { align-items:flex-start;flex-direction:column; }.event-radar-summary-open { width:100%;text-align:center; }.event-radar-summary-grid { grid-template-columns:1fr; } }
+  </style>
+
+  <div class="event-radar-summary-head">
+    <div>
+      <div class="event-radar-summary-kicker-row">
+        <div class="event-radar-summary-kicker">Stable event core</div>
+      </div>
+      <div class="event-radar-summary-note">展示 6 分以上且有留存关联记录的非概念个股事件。历史映射保留但未按当前规则重算；只有契约与来源均匹配时才标为当前标题映射。“事件重要度”不是个股评分。</div>
+    </div>
+    <a class="event-radar-summary-open" href="{{ dashboard_origin }}/dashboard/events?has_stocks=1" target="_blank" rel="noopener noreferrer">打开完整事件雷达 ↗</a>
+  </div>
+
+  {% if events %}
+  <div class="event-radar-summary-grid">
+    {% for event in events %}
+    {% set direction = event.direction or '中性' %}
+    <a class="event-radar-summary-item" href="{{ dashboard_origin }}/dashboard/events?event_id={{ event.event_id|urlencode }}&amp;has_stocks=1&amp;tab=overview#event-detail" target="_blank" rel="noopener noreferrer">
+      <div class="event-radar-summary-top">
+        <span class="event-radar-summary-badges">
+          <span class="event-radar-summary-type">{{ event.event_type or '其他事件' }}</span>
+          <span class="event-radar-summary-stock-flag">有留存股票关联</span>
+        </span>
+        <time class="event-radar-summary-time"{% if event.occurred_at_iso %} datetime="{{ event.occurred_at_iso }}"{% endif %}>{{ event.occurred_at_short_label }}</time>
+      </div>
+      <div class="event-radar-summary-title">{{ event.title or '未命名事件' }}</div>
+      <div class="event-radar-summary-stocks" aria-label="相关股票前三名">
+        {% for stock in event.stocks[:3] %}<span class="event-radar-summary-stock">{{ stock.name or stock.ticker or '未命名股票' }}<span class="event-radar-summary-relation">·{% if stock.relation_type in ['direct', 'direct_impact', 'affected'] %}直接{% elif stock.relation_type == 'upstream' %}上游{% elif stock.relation_type == 'downstream' %}下游{% elif stock.relation_type == 'ecosystem' %}生态{% else %}关联{% endif %} · {{ stock.mapping_contract_label or '历史映射 · 写入契约未知' }}</span></span>{% endfor %}
+      </div>
+      <div class="event-radar-summary-bottom">
+        <span class="event-radar-summary-direction{% if direction in ['看多','利多','bullish','positive','up'] %} is-bull{% elif direction in ['看空','利空','bearish','negative','down'] %} is-bear{% endif %}">{{ direction }}</span>
+        <span class="event-radar-summary-source">{{ event.source_count or 0 }} 条原文链接 · 转载关系未核验</span>
+        <span class="event-radar-summary-score"><span class="event-radar-summary-score-label">事件重要度</span>{{ event.priority_label or '0.0' }}/10</span>
+      </div>
+    </a>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="event-radar-summary-empty">当前没有 6 分以上且具有留存个股关联记录的事件。</div>
+  {% endif %}
+  <div class="event-radar-summary-foot">历史映射不等于当前有原文映射证据，当前标题映射也不代表受益或后验有效。原始链接、留存记录、映射理由、市场反应和历史相似事件仅在登录后的事件雷达中查看{% if has_more %}；还有更多事件未在本卡片展开{% endif %}。</div>
+</div>

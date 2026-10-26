@@ -1,0 +1,13 @@
+[Unit]
+Description=AI Filter daily-K repair for missing official index closes
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/ai-rss-filter
+ExecStart=/usr/bin/python3 /root/ai-rss-filter/scripts/repair_market_close.py
+TimeoutStartSec=5min
+UMask=0077
+Nice=10
+NoNewPrivileges=true

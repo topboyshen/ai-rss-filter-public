@@ -1,0 +1,17 @@
+[Unit]
+Description=Collect verified A-share closes on weekdays at 15:10
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 15:10:00 Asia/Shanghai
+# Do not replay a prior-day trigger. This collector intentionally validates
+# only today's live close and cannot reconstruct a missed historical session;
+# a morning catch-up would correctly fail its pre-close guard and poison the
+# latest systemd Result despite an otherwise current database.
+Persistent=false
+AccuracySec=30s
+RandomizedDelaySec=0
+Unit=ai-filter-market-close.service
+
+[Install]
+WantedBy=timers.target
+

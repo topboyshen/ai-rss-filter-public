@@ -1,0 +1,11 @@
+[Unit]
+Description=Repair missing A-share official closes at 15:25 weekdays
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 15:25:00 Asia/Shanghai
+Persistent=true
+AccuracySec=30s
+Unit=ai-filter-market-close-repair.service
+
+[Install]
+WantedBy=timers.target

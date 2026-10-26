@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    {% if (cfg.get('dashboard_auto_refresh_seconds') or 0) | int > 0 %}
+    <meta http-equiv="refresh" content="{{ (cfg.get('dashboard_auto_refresh_seconds') or 0) | int }}">
+    {% endif %}
+    <title>AI-Filter 后台管理</title>
+    <style>
+        * { box-sizing:border-box; }
+        body { background:#0f0f1a; color:#e0e0e0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; margin:0 auto; padding:24px; max-width:1600px; }
+        h1 { color:#f0c040; margin-bottom:8px; font-size:24px; }
+        .subtitle { color:#888; font-size:13px; margin-bottom:24px; }
+        .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:16px; margin-bottom:24px; }
+        .card { background:#1a1a2e; border-radius:12px; padding:20px; border:1px solid #2a2a3e; }
+        .card-label { color:#888; font-size:12px; text-transform:uppercase; letter-spacing:1px; margin-bottom:8px; }
+        .card-value { font-size:32px; font-weight:700; color:#f0c040; }
+        .card-sub { color:#888; font-size:12px; margin-top:4px; }
+        .section { background:#1a1a2e; border-radius:12px; padding:20px; border:1px solid #2a2a3e; margin-bottom:20px; }
+        .section h2 { color:#f0c040; font-size:16px; margin:0 0 16px 0; }
+        table { width:100%; border-collapse:collapse; font-size:13px; }
+        th { text-align:left; color:#888; font-weight:500; padding:8px; border-bottom:1px solid #2a2a3e; }
+        td { padding:8px; border-bottom:1px solid #1f1f2e; }
+        tr:hover { background:#151525; }
+        .badge { display:inline-block; padding:2px 8px; border-radius:4px; font-size:11px; background:#2a2a3e; color:#888; }
+        .bar-chart { display:flex; align-items:flex-end; height:120px; }
+        .config-row { display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px solid #1f1f2e; font-size:13px; }
+        .config-label { color:#888; }
+        .config-value { color:#e0e0e0; }
+        .topbar { display:flex; justify-content:space-between; align-items:flex-start; gap:16px; }
+        .top-actions { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+        .top-link, .logout-button { display:inline-block; color:#d8d8e8; background:#202035; border:1px solid #34344b; border-radius:7px; padding:7px 10px; font-size:12px; text-decoration:none; cursor:pointer; }
+        .logout-button:hover, .top-link:hover { border-color:#f0c040; color:#f0c040; }
+        a:focus-visible, button:focus-visible, summary:focus-visible { outline:2px solid #f0c040; outline-offset:4px; }
+        .ops-intro { color:#a7a7ba; font-size:13px; line-height:1.7; margin:0 0 16px; }
+        .attention-section { border-top:3px solid #f0c040; }
+        .attention-list { display:grid; gap:10px; list-style:none; padding:0; margin:0; }
+        .attention-item { display:flex; justify-content:space-between; gap:20px; align-items:center; padding:14px 16px; border:1px solid #574631; border-radius:8px; background:#282331; }
+        .attention-item h3 { font-size:14px; color:#f2d49b; margin:0 0 6px; }
+        .attention-item p { font-size:13px; color:#c5c5d4; margin:0 0 4px; line-height:1.6; overflow-wrap:anywhere; }
+        .attention-item .attention-timing { color:#a7a7ba; font-size:12px; margin:0; }
+        .attention-item a { flex-shrink:0; }
+        .attention-empty { color:#d2d7e0; background:#202235; border-radius:8px; padding:14px 16px; font-size:14px; }
+        .ops-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:16px; margin:0 0 16px; }
+        .ops-card { background:#1a1a2e; border:1px solid #34344b; border-radius:12px; padding:20px; min-width:0; }
+        .ops-card h2 { color:#e0e0ec; font-size:16px; margin:0 0 12px; }
+        .ops-card p { color:#b5b5c8; font-size:13px; line-height:1.7; margin:10px 0; overflow-wrap:anywhere; }
+        .status-label { display:inline-block; font-size:12px; line-height:1.5; border-radius:5px; padding:3px 8px; background:#252b3e; color:#b7c8ec; }
+        .status-ok { background:#18392e; color:#91d8b2; }
+        .status-warn, .status-unknown { background:#3b3023; color:#f1ce85; }
+        .status-info { background:#252b3e; color:#b7c8ec; }
+        .ops-facts { margin:12px 0 0; font-size:12px; line-height:1.7; }
+        .ops-facts dt { color:#9696ad; }
+        .ops-facts dd { margin:0 0 8px; color:#d1d1df; overflow-wrap:anywhere; }
+        .queue-status { border-top:1px solid #34344b; padding-top:12px; margin-top:12px; }
+        .queue-status h3 { display:inline; font-size:13px; margin-right:8px; }
+        .receipt-summary { display:flex; justify-content:space-between; align-items:flex-start; gap:8px; padding:10px 0; border-bottom:1px solid #34344b; font-size:13px; }
+        .receipt-summary small { display:block; color:#9999b1; font-size:12px; margin-top:5px; }
+        .ops-boundary { color:#b5b5c8; font-size:12px; line-height:1.8; margin:0 0 20px; padding:0 4px; }
+        .ops-links { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
+        .secondary-section > summary { cursor:pointer; color:#d1d1df; font-size:15px; }
+        .secondary-section > summary h2 { display:inline; color:#d1d1df; font-size:15px; margin:0; }
+        .secondary-section > summary .summary-hint { font-size:12px; color:#9696ad; margin-left:8px; }
+        .secondary-section[open] > summary { margin-bottom:18px; }
+        .secondary-section .grid:last-child { margin-bottom:0; }
+        .secondary-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:20px; }
+        .table-scroll { overflow-x:auto; }
+        .receipt-details { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:16px; }
+        .receipt-details article { border:1px solid #34344b; border-radius:8px; padding:16px; }
+        .receipt-details h3 { font-size:14px; margin:0 0 12px; }
+        .receipt-details p { color:#b5b5c8; font-size:12px; line-height:1.7; overflow-wrap:anywhere; }
+        @media (max-width:900px) { .ops-grid, .receipt-details { grid-template-columns:1fr; } .topbar { flex-direction:column; margin-bottom:20px; } .subtitle { margin-bottom:0; } }
+        @media (max-width:600px) { body { padding:14px; } .secondary-grid { grid-template-columns:1fr; gap:0; } .attention-item { flex-direction:column; align-items:flex-start; gap:10px; } .section, .ops-card { padding:16px; } .summary-hint { display:block; margin:6px 0 0 !important; } }
+    </style></head><body>
+    <div class="topbar">
+        <div>
+            <h1>AI-Filter 后台管理</h1>
+            <div class="subtitle">最后更新：{{ now }} | 版本：{{ release_version }}</div>
+        </div>
+        <nav class="top-actions" aria-label="后台导航">
+            <a class="top-link" href="https://example.invalid/" rel="noreferrer">返回新闻首页</a>
+            <a class="top-link" href="/dashboard/events">事件雷达</a>
+            <a class="top-link" href="/briefing?format=html">今日情报</a>
+            {% if dashboard_auth_kind == 'session' %}
+            <form method="post" action="/dashboard/logout">
+                <input type="hidden" name="csrf_token" value="{{ dashboard_csrf_token }}">
+                <button class="logout-button" type="submit">安全退出</button>
+            </form>
+            {% endif %}
+        </nav>
+    </div>
+
+    {% if dashboard_ops is defined %}
+    <section class="section attention-section" aria-labelledby="attention-heading">
+        <h2 id="attention-heading">需要处理</h2>
+        <p class="ops-intro">优先展示已有记录中的异常与缺口。未接入或缺少记录，不表示正常。</p>
+        {% if dashboard_ops.attention %}
+        <ul class="attention-list">
+            {% for item in dashboard_ops.attention %}
+            <li class="attention-item">
+                <div>
+                    <h3>{{ item.title }}</h3>
+                    <p>{{ item.impact }}</p>
+                    <p class="attention-timing">{{ item.timing }}</p>
+                </div>
+                <a class="top-link" href="{{ item.href }}">{{ item.link_label }}</a>
+            </li>
+            {% endfor %}
+        </ul>
+        {% else %}
+        <div class="attention-empty">已接入检查未见需处理项</div>
+        {% endif %}
+        <div class="ops-links" aria-label="处理说明入口">
+            <a class="top-link" href="/ops-feeds">零输出原因</a>
+            <a class="top-link" href="https://example.invalid/quality">模型质量</a>
+            <a class="top-link" href="/dashboard/neutral-records">保守处理记录</a>
+        </div>
+    </section>
+
+    <div class="ops-grid">
+        <section class="ops-card" id="host-checks" aria-labelledby="service-heading">
+            <h2 id="service-heading">宿主巡检</h2>
+            <span class="status-label status-{{ dashboard_ops.service.status }}">{{ dashboard_ops.service.label }}</span>
+            <p>{{ dashboard_ops.service.detail }}</p>
+            <dl class="ops-facts">
+                <dt>最近检查完成时间</dt><dd>{{ dashboard_ops.service.checked_at or '未记录' }}</dd>
+            </dl>
+            <p>复用每小时巡检；超过 90 分钟或版本不匹配时显示未知。打开本页不触发巡检。</p>
+            {% for check in dashboard_ops.service.checks %}
+            <div class="receipt-summary">
+                <span>{{ check.title }}</span>
+                <span class="status-label status-{{ check.status }}">{{ check.label }}</span>
+            </div>
+            {% endfor %}
+        </section>
+        <section class="ops-card" id="news-status" aria-labelledby="news-heading">
+            <h2 id="news-heading">新闻更新</h2>
+            <span class="status-label status-{{ dashboard_ops.news.status }}">{{ dashboard_ops.news.label }}</span>
+            <p>{{ dashboard_ops.news.detail }}</p>
+            <dl class="ops-facts">
+                <dt>上次完整刷新</dt><dd>{{ dashboard_ops.news.last_full or '未记录' }}</dd>
+                <dt>最近一次尝试</dt><dd>{{ dashboard_ops.news.attempt_time or '未记录' }}</dd>
+                <dt>最近一次结果（非累计）</dt><dd>{{ dashboard_ops.news.attempt_result or '未记录' }}</dd>
+            </dl>
+            <div class="queue-status">
+                <h3>处理队列</h3>
+                <span class="status-label status-{{ dashboard_ops.queue.status }}">{{ dashboard_ops.queue.label }}</span>
+                <p>{{ dashboard_ops.queue.detail }}</p>
+            </div>
+        </section>
+        <section class="ops-card" aria-labelledby="market-heading">
+            <h2 id="market-heading">收盘记录</h2>
+            <p>分别查看采集、补齐与历史处理收据，不把一项成功当作全部完成。</p>
+            {% for receipt in dashboard_ops.market %}
+            <div class="receipt-summary">
+                <div>{{ receipt.title }}<small>交易日期：{{ receipt.trade_date or '未记录' }}</small></div>
+                <span class="status-label status-{{ receipt.status }}">{{ receipt.label }}</span>
+            </div>
+            {% endfor %}
+            <p>收据记录不等于本次自然收盘验收。</p>
+        </section>
+    </div>
+    <p class="ops-boundary">服务、新闻刷新与收盘记录不能互相证明。没有正式达标文章（passed=0）或出现保守中性，本身不作为故障；请查看已记录原因。</p>
+
+    <details class="section secondary-section" id="market-close-details">
+        <summary><h2>收盘收据详情</h2><span class="summary-hint">交易日期 · 执行时间 · 结果来源</span></summary>
+        <div class="receipt-details">
+            {% for receipt in dashboard_ops.market %}
+            <article>
+                <h3>{{ receipt.title }}</h3>
+                <span class="status-label status-{{ receipt.status }}">{{ receipt.label }}</span>
+                <dl class="ops-facts">
+                    <dt>交易日期</dt><dd>{{ receipt.trade_date or '未记录' }}</dd>
+                    <dt>执行时间（完成）</dt><dd>{{ receipt.completed_at or '未记录' }}</dd>
+                    <dt>结果来源</dt><dd>{{ receipt.origin }}</dd>
+                </dl>
+                <p>{{ receipt.detail }}</p>
+            </article>
+            {% endfor %}
+        </div>
+    </details>
+    {% endif %}
+
+    <div class="section">
+        <h2>🗞️ 今日情报 Briefing</h2>
+        {{ briefing_html | safe }}
+    </div>
+
+    <details class="section secondary-section">
+        <summary><h2>使用与评分概况</h2><span class="summary-hint">统计、当前契约与通知状态，不代表服务健康</span></summary>
+    <div class="grid">
+        <div class="card">
+            <div class="card-label">近48小时高分情报</div>
+            <div class="card-value">{{ high_score_count }}</div>
+            <div class="card-sub">分数 ≥ {{ cfg.threshold.pass }}，不要求AI总结</div>
+        </div>
+        <div class="card">
+            <div class="card-label">当前策略版本</div>
+            <div class="card-value" style="font-size:18px;word-break:break-all;">{{ strategy_version[:28] }}</div>
+            <div class="card-sub">缓存按策略指纹隔离</div>
+        </div>
+        <div class="card">
+            <div class="card-label">滚动近24小时 LLM 估算费用</div>
+            <div class="card-value">{{ '%.4f'|format(llm_cost_stats.estimated_cost) }}</div>
+            <div class="card-sub">{{ llm_cost_stats.calls }} 次 / 已记录 {{ llm_cost_stats.total_tokens }} tokens（跨评分契约）</div>
+            <div class="card-sub">已记录用量，估算非账单{% if llm_cost_stats.unknown_usage_calls|default(0) or llm_cost_stats.partial_usage_calls|default(0) %}；用量未知/未标记 {{ llm_cost_stats.unknown_usage_calls|default(0) }} 次，部分用量 {{ llm_cost_stats.partial_usage_calls|default(0) }} 次{% endif %}</div>
+            {% if llm_cost_stats.window_start_utc|default('') %}<div class="card-sub">统计窗口（UTC）：{{ llm_cost_stats.window_start_utc }} — {{ llm_cost_stats.window_end_utc }}</div>{% endif %}
+            <div class="card-sub">失败 {{ llm_cost_stats.failures|default(0) }} 次{% if llm_cost_stats.failed_unknown_usage_calls|default(0) %}，其中 {{ llm_cost_stats.failed_unknown_usage_calls }} 次用量不完整或未知{% endif %}；未知用量不按零消耗认定。</div>
+            <div class="card-sub">按配置单价估算；未配置或为0时显示0，不代表免费。预算配置尚未接入自动阻断。</div>
+        </div>
+        <div class="card">
+            <div class="card-label">静默模式</div>
+            <div class="card-value">{{ '开启' if quiet_enabled else '关闭' }}</div>
+            <div class="card-sub">通知阈值抬升 +{{ quiet_raise }}</div>
+        </div>
+    </div>
+
+    <div class="grid">
+        <div class="card">
+            <div class="card-label">总请求数</div>
+            <div class="card-value">{{ total_req }}</div>
+            <div class="card-sub">累计处理次数</div>
+        </div>
+        <div class="card">
+            <div class="card-label">API 节省率</div>
+            <div class="card-value">{{ savings_rate }}%</div>
+            <div class="card-sub">缓存+相似度+黑名单命中</div>
+        </div>
+        <div class="card">
+            <div class="card-label">通过率</div>
+            <div class="card-value">{{ pass_rate }}%</div>
+            <div class="card-sub">{{ passed }}/{{ total_processed }} 篇通过</div>
+        </div>
+        <div class="card">
+            <div class="card-label">LLM 调用</div>
+            <div class="card-value">{{ api_calls }}</div>
+            <div class="card-sub">模型 SDK 请求次数</div>
+        </div>
+    </div>
+    </details>
+
+    <div class="secondary-grid">
+        <details class="section secondary-section">
+            <summary><h2>📊 评分分布（近7天）</h2></summary>
+            {% if dist_rows %}
+                {% for r in dist_rows[:7] %}
+                <div style="margin-bottom:12px;">
+                    <div style="font-size:12px;color:#888;margin-bottom:6px;">{{ r[0] }}</div>
+                    <div style="display:flex;align-items:flex-end;">
+                        {% for i in range(11) %}
+                            {% set count = r[11 - i] %}
+                            {% set pct = [count * 5, 100] | min %}
+                            {% set color = '#e74c3c' if i >= 7 else '#f39c12' if i >= 5 else '#27ae60' %}
+                            <div style="display:flex;align-items:flex-end;flex-direction:column;margin-right:8px;">
+                                <div style="width:24px;height:{{ pct }}px;background:{{ color }};border-radius:3px 3px 0 0;"></div>
+                                <span style="font-size:10px;color:#888;margin-top:4px;">{{ i }}分</span>
+                            </div>
+                        {% endfor %}
+                    </div>
+                </div>
+                {% endfor %}
+            {% else %}
+                <p style="color:#888;font-size:13px;">暂无数据</p>
+            {% endif %}
+        </details>
+        <details class="section secondary-section">
+            <summary><h2>⚙️ 系统配置</h2></summary>
+            <div class="config-row"><span class="config-label">输出阈值</span><span class="config-value">{{ cfg.threshold.pass }}分</span></div>
+            <div class="config-row"><span class="config-label">推送阈值</span><span class="config-value">{{ cfg.threshold.notify }}分</span></div>
+            <div class="config-row"><span class="config-label">相似度阈值</span><span class="config-value">{{ cfg.threshold.similarity }}</span></div>
+            <div class="config-row"><span class="config-label">最大输出</span><span class="config-value">{{ cfg.output.max_items if cfg.output else '无限制' }}</span></div>
+            <div class="config-row"><span class="config-label">Telegram推送</span><span class="config-value">{{ '已开启' if cfg.telegram.enabled else '已关闭' }}</span></div>
+            <div class="config-row"><span class="config-label">本地降级</span><span class="config-value">{{ '已开启' if cfg.local_scoring.enabled else '已关闭' }}</span></div>
+            <div class="config-row"><span class="config-label">API Key认证</span><span class="config-value">{{ '已配置' if cfg.security.api_key else '未配置' }}</span></div>
+            <div class="config-row"><span class="config-label">AI总结</span><span class="config-value">{{ '已开启' if cfg.generate_summary else '已关闭' }}</span></div>
+        </details>
+    </div>
+
+    <details class="section secondary-section">
+        <summary><h2>LLM 成本与模型分布（近24小时）</h2></summary>
+        <div class="secondary-grid">
+            <div>
+                <h3 style="color:#888;font-size:13px;">按模型</h3>
+                {% for model, count, tokens, cost in llm_cost_stats.by_model %}<div class="config-row"><span class="config-label">{{ model }}</span><span class="config-value">{{ count }} 次 / {{ tokens }} tokens / {{ '%.4f'|format(cost) }}</span></div>{% endfor %}
+            </div>
+            <div>
+                <h3 style="color:#888;font-size:13px;">按用途</h3>
+                {% for purpose, count, tokens, cost in llm_cost_stats.by_purpose %}<div class="config-row"><span class="config-label">{{ purpose }}</span><span class="config-value">{{ count }} 次 / {{ tokens }} tokens / {{ '%.4f'|format(cost) }}</span></div>{% endfor %}
+            </div>
+        </div>
+    </details>
+
+    <details class="section secondary-section">
+        <summary><h2>🎯 质量指标（近24小时）</h2></summary>
+        <div class="grid">
+            <div class="card"><div class="card-label">Precision@7</div><div class="card-value">{{ quality_metrics.precision_at_7 if quality_metrics.precision_at_7 is not none else '-' }}{% if quality_metrics.precision_at_7 is not none %}%{% endif %}</div><div class="card-sub">人工反馈样本 {{ quality_metrics.precision_good_at_7 }}/{{ quality_metrics.precision_n_at_7 }}</div></div>
+            <div class="card"><div class="card-label">Precision@8</div><div class="card-value">{{ quality_metrics.precision_at_8 if quality_metrics.precision_at_8 is not none else '-' }}{% if quality_metrics.precision_at_8 is not none %}%{% endif %}</div><div class="card-sub">强信号样本 {{ quality_metrics.precision_good_at_8 }}/{{ quality_metrics.precision_n_at_8 }}</div></div>
+            <div class="card"><div class="card-label">平均评分耗时</div><div class="card-value">{{ quality_metrics.avg_latency_ms }}</div><div class="card-sub">毫秒，最大 {{ quality_metrics.max_latency_ms }}</div></div>
+            <div class="card"><div class="card-label">Precision@9</div><div class="card-value">{{ quality_metrics.precision_at_9 if quality_metrics.precision_at_9 is not none else '-' }}{% if quality_metrics.precision_at_9 is not none %}%{% endif %}</div><div class="card-sub">通知级样本 {{ quality_metrics.precision_good_at_9 }}/{{ quality_metrics.precision_n_at_9 }}</div></div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:20px;">
+            <div>
+                <h3 style="color:#888;font-size:13px;">评分路径</h3>
+                {% for path, count in quality_metrics.score_paths %}<div class="config-row"><span class="config-label">{{ path }}</span><span class="config-value">{{ count }}</span></div>{% endfor %}
+            </div>
+            <div>
+                <h3 style="color:#888;font-size:13px;">高分标签</h3>
+                {% for tag, count, avg in quality_metrics.top_tags[:8] %}<div class="config-row"><span class="config-label">{{ tag }}</span><span class="config-value">{{ count }} / {{ avg }}分</span></div>{% endfor %}
+            </div>
+            <div>
+                <h3 style="color:#888;font-size:13px;">错误与反馈</h3>
+                {% for err, count in quality_metrics.errors %}<div class="config-row"><span class="config-label">{{ err }}</span><span class="config-value">{{ count }}</span></div>{% endfor %}
+                {% for label, count in quality_metrics.feedback %}<div class="config-row"><span class="config-label">反馈 {{ label }}</span><span class="config-value">{{ count }}</span></div>{% endfor %}
+            </div>
+        </div>
+    </details>
+
+    <details class="section secondary-section">
+        <summary><h2>🧠 AI智能总结（近48小时已生成总结，显示 {{ summary_articles|length }} 条）</h2></summary>
+        {% if summary_articles %}
+            {% for link, title, raw_title, score, tag, logic, summary, created_at in summary_articles %}
+                {% set score_color = '#e74c3c' if score >= 8 else '#f39c12' if score >= 7 else '#27ae60' %}
+                {% set tag_display = tag or '未分类' %}
+                {% set logic_display = logic or '无' %}
+                {% set ts = datetime.fromtimestamp(created_at).strftime('%m-%d %H:%M') if created_at else 'N/A' %}
+                {% set clean_title = format_article_display_title(title, raw_title) %}
+                <div style="background:#151525;border-radius:10px;padding:16px;margin-bottom:12px;border-left:4px solid {{ score_color }};">
+                    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px;">
+                        <div style="flex:1;">
+                            <a href="{{ safe_http_url(link) }}" target="_blank" rel="noopener noreferrer" style="color:#f0c040;text-decoration:none;font-size:15px;font-weight:600;">{{ clean_title }}</a>
+                        </div>
+                        <div style="margin-left:12px;text-align:right;flex-shrink:0;">
+                            <div style="display:inline-block;padding:4px 12px;border-radius:20px;background:{{ score_color }};color:#fff;font-size:13px;font-weight:700;">⭐ {{ score }}分</div>
+                        </div>
+                    </div>
+                    <div style="margin-bottom:8px;">
+                        <span style="display:inline-block;padding:2px 8px;border-radius:4px;background:#2a2a3e;color:#888;font-size:11px;margin-right:6px;">{{ tag_display }}</span>
+                        <span style="display:inline-block;padding:2px 8px;border-radius:4px;background:#2a2a3e;color:#888;font-size:11px;">{{ logic_display }}</span>
+                        <span style="color:#666;font-size:11px;margin-left:8px;">{{ ts }}</span>
+                    </div>
+                    <div style="color:#c0c0c0;font-size:13px;line-height:1.6;background:#0f0f1a;border-radius:6px;padding:10px;">{{ summary or '暂无总结' }}</div>
+                    <form method="post" action="/feedback" style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                        {% if dashboard_auth_kind == 'session' %}<input type="hidden" name="csrf_token" value="{{ dashboard_csrf_token }}">{% endif %}
+                        <input type="hidden" name="link" value="{{ link }}">
+                        <button name="label" value="good" style="background:#14532d;color:#dcfce7;border:0;border-radius:6px;padding:4px 8px;cursor:pointer;">有效</button>
+                        <button name="label" value="bad" style="background:#7f1d1d;color:#fee2e2;border:0;border-radius:6px;padding:4px 8px;cursor:pointer;">噪音</button>
+                        <button name="label" value="duplicate" style="background:#3f3f46;color:#e4e4e7;border:0;border-radius:6px;padding:4px 8px;cursor:pointer;">重复</button>
+                        <input name="target_score" placeholder="目标分" style="width:58px;background:#0f0f1a;color:#ddd;border:1px solid #2a2a3e;border-radius:6px;padding:4px;">
+                        <input name="note" placeholder="备注" style="flex:1;min-width:120px;background:#0f0f1a;color:#ddd;border:1px solid #2a2a3e;border-radius:6px;padding:4px;">
+                    </form>
+                </div>
+            {% endfor %}
+        {% else %}
+            <p style="color:#888;font-size:13px;">暂无带AI总结的高分文章（需在配置中开含 generate_summary: true）</p>
+        {% endif %}
+    </details>
+
+    <div class="section" id="source-health">
+        <h2>📡 源健康状态</h2>
+        <p style="color:#888;font-size:12px;line-height:1.7;">近24h新闻时间、主来源统计，阈值按源配置。新增有效信号率＝正式达标 / 全部样本，不是抓取成功率；重复稿不计为新增。中性处理区分格式/字段校验与来源依据校验，不等于新闻没有价值。多源同链接仅计主来源。模型链路失败与条目处理异常单独计数，不算正式达标；仅其他评分契约的样本不计入，无法归因时写“原因未完整记录”。</p>
+        <div class="table-scroll"><table>
+            <tr><th>源名称</th><th>累计抓取成功率</th><th>数据状态</th><th>24h样本</th><th>新增有效信号率</th><th>响应时间</th><th>最后检查</th><th>上次非空</th><th>错误</th></tr>
+            {% if health_rows %}
+                {% for r in health_rows %}
+                    {% set total_checks = r[4] + r[5] %}
+                    {% set success_rate = (r[4] / total_checks * 100) | round(1) if total_checks > 0 else 0 %}
+                    {% set metric = feed_metric_details[r[0]] %}
+                    {% set status_color = '#27ae60' if success_rate >= 90 else '#f39c12' if success_rate >= 50 else '#e74c3c' %}
+                    {% set last_check = datetime.fromtimestamp(r[2]).strftime('%m-%d %H:%M') if r[2] else 'N/A' %}
+                    {% set data_health = feed_data_health(r, cfg) %}
+                    {% set empty_checks = data_health.consecutive_empty_checks %}
+                    {% set last_nonempty_ts = data_health.last_nonempty_at %}
+                    {% set data_label = data_health.data_state_label ~ (' ×' ~ empty_checks if empty_checks > 0 else '') %}
+                    {% set data_color = '#e74c3c' if data_health.data_degraded else '#f39c12' if empty_checks > 0 or data_health.data_state == 'unknown' else '#27ae60' %}
+                    {% set last_nonempty = datetime.fromtimestamp(last_nonempty_ts).strftime('%m-%d %H:%M') if last_nonempty_ts else 'N/A' %}
+                    <tr>
+                        <td>{{ r[1] or r[0] }}</td>
+                        <td><span style="color:{{ status_color }}">{{ success_rate }}%</span></td>
+                        <td><span style="color:{{ data_color }}">{{ data_label }}</span></td>
+                        <td>{{ r[6] }}</td>
+                        <td>{{ metric.rate_text }}</td>
+                        <td>{{ r[3] }}ms</td>
+                        <td>{{ last_check }}</td>
+                        <td>{{ last_nonempty }}</td>
+                        <td style="color:#e74c3c;font-size:12px;">{{ r[9] or '' }}</td>
+                    </tr>
+                    <tr><td colspan="9" style="font-size:12px;color:#888;">达标阈值 {{ '%g' | format(metric.threshold) }} 分 · {{ metric.breakdown_text }}{% if metric.other_contract_total and not metric.zero_output_reason %} · 其他评分契约 {{ metric.other_contract_total }} 条未计入{% endif %}</td></tr>
+                    {% if metric.zero_output_reason %}<tr><td colspan="9" style="font-size:12px;color:#c98a00;">零输出原因：{{ metric.zero_output_reason }}</td></tr>{% endif %}
+                {% endfor %}
+            {% else %}
+                <tr><td colspan="9" style="color:#888;text-align:center;">暂无数据</td></tr>
+            {% endif %}
+        </table></div>
+    </div>
+
+    <details class="section secondary-section">
+        <summary><h2>📝 最近20条请求日志</h2></summary>
+        <div class="table-scroll"><table>
+            <tr><th>时间</th><th>URL</th><th>总数</th><th>通过</th><th>API调用</th><th>耗时</th><th>错误</th></tr>
+            {% if log_rows %}
+                {% for r in log_rows %}
+                    {% set ts = datetime.fromtimestamp(r[0]).strftime('%m-%d %H:%M:%S') %}
+                    {% set error_style = 'color:#e74c3c;' if r[10] else '' %}
+                    <tr style="{{ error_style }}">
+                        <td>{{ ts }}</td>
+                        <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;">{{ r[1] }}</td>
+                        <td>{{ r[2] }}</td>
+                        <td>{{ r[3] }}</td>
+                        <td>{{ r[8] }}</td>
+                        <td>{{ r[9] }}ms</td>
+                        <td>{{ r[10] or '-' }}</td>
+                    </tr>
+                {% endfor %}
+            {% else %}
+                <tr><td colspan="7" style="color:#888;text-align:center;">暂无数据</td></tr>
+            {% endif %}
+        </table></div>
+    </details>
+
+    <div style="text-align:center;color:#666;font-size:12px;margin-top:20px;">
+        AI-Filter {{ release_version }} | A-Share Macro Intelligence Filter | Powered by GPT5.5
+    </div>
+    </body></html>

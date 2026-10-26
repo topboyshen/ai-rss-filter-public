@@ -1,0 +1,51 @@
+<section class="content-section" aria-labelledby="investment-title">
+  <div class="section-heading">
+    <h3 id="investment-title">同一事件，分两种周期关注</h3>
+    <span>不新增评分 · 不生成买卖指令</span>
+  </div>
+  <p class="mapping-note">下面是待人工核对的研究问题，不是已确认的交易结论。短线与波段可以有不同判断；事件重要度不等于任一周期的交易机会。</p>
+  <div class="notice">
+    <strong>本次事件：</strong>{{ selected.title }}<br>
+    <strong>系统实际可用：</strong>{{ selected.available_at_label or '时间未知' }}<br>
+    <strong>关联对象：</strong>
+    {% if equities %}
+      {% for equity in equities %}{{ equity.name or equity.ticker or '未命名证券' }}{% if not loop.last %}、{% endif %}{% endfor %}
+      （现有规则关联，非推荐排名；概念关系、映射理由及原文证据见事件概览）
+    {% else %}
+      暂无可展示的个股映射，不能据此猜测受益股票。
+    {% endif %}
+  </div>
+  <div class="notice" id="news-kind" data-news-kind="{{ news_kind.key }}">
+    <strong>消息类型（标题级提示）：</strong>{{ news_kind.label }}<br>
+    {{ news_kind.note }}
+    <p class="mapping-note">仅按与本次标题匹配的冻结原文作保守提示，不使用生成摘要或后续收益；不是整个合并事件的定性，也不判断消息是否首次披露。</p>
+  </div>
+  <div class="investment-grid">
+    {% for period in investment_views if period.key != 'other' %}
+    <article class="investment-card" aria-labelledby="investment-{{ period.key }}">
+      <h4 id="investment-{{ period.key }}">{{ period.label }} <span class="investment-period">{{ period.period }} · {{ period.horizons|join(' / ') }}</span></h4>
+      <p>{{ period.question }}</p>
+      <ul>
+        {% for check in period.checks %}<li>{{ check }}</li>{% endfor %}
+      </ul>
+      <details>
+        <summary>何时重新评估关注理由（待核对）</summary>
+        <p>{{ period.withdraw_if }}</p>
+        <p>这是检查清单，不表示上述情况已经发生；本页不自动判定催化成立、已被价格消化或逻辑失效。</p>
+      </details>
+      {% if active_tab == 'reaction' and outcomes %}
+      <p><a class="similar-link" href="#results-{{ period.key }}">查看该周期的逐条市场结果 ↓</a></p>
+      {% elif active_tab == 'reaction' %}
+      <p class="mapping-note">本页尚无可展示的市场结果，请查看下方的数据缺失说明。</p>
+      {% else %}
+      <p><a class="similar-link" href="{{ event_url(selected.event_id, 'reaction', current_cursor or '') }}">打开市场反应，按周期复盘 →</a></p>
+      <p class="mapping-note">概览未读取市场结果，不判断是否到期、上涨或下跌。</p>
+      {% endif %}
+    </article>
+    {% endfor %}
+  </div>
+  <p class="mapping-note">T+期限沿用现有事件研究基准：信号后的首个收盘，不是新闻发布时或真实买入时。后续毛收益、方向未命中、未到期与缺失状态均按原记录展示；不把事后涨幅当作可赚收益。</p>
+  {% if active_tab == 'reaction' %}
+  <a class="similar-link" href="{{ event_url(selected.event_id, 'overview', current_cursor or '') }}">回到原文、映射理由与相关股票 →</a>
+  {% endif %}
+</section>

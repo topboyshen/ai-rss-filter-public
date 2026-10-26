@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>保守处理记录 · AI Filter</title>
+    <style>
+        body { margin: 0; background: #101820; color: #e2e8f0; font: 16px/1.7 system-ui, sans-serif; }
+        main { max-width: 850px; margin: auto; padding: 24px 18px; }
+        h1 { font-size: 25px; margin-bottom: 8px; }
+        a { color: #93c5fd; }
+        .muted { color: #b2becd; font-size: 14px; }
+        .scope, article, .status { border: 1px solid #465362; padding: 16px; border-radius: 10px; margin: 16px 0; overflow-wrap: anywhere; }
+        h2 { font-size: 18px; margin: 0 0 8px; }
+        p { margin: 8px 0; }
+        code { overflow-wrap: anywhere; }
+    </style>
+</head>
+<body>
+<main>
+    <nav><a href="https://example.invalid/quality">返回模型质量</a> · <a href="/dashboard">后台首页</a></nav>
+    <h1>保守处理记录</h1>
+    <section class="scope" aria-label="查看范围">
+        <p>仅当前评分契约 · 近24小时收录 · 最新50条以内 · 按收录时间倒序</p>
+        <p class="muted">收录时间不是发布时间或评分时间。此处读取现存新闻缓存，不是完整历史账本，也不是统计分母；已清理的缓存不在此列。</p>
+        <p class="muted">说明来自评分时已记录的原因；未记录则显示未知，不事后推测。未通过校验不等于新闻虚假或没有价值；“初次中性”也不等于校验失败。</p>
+        <p class="muted">来源为当前配置中该记录的主订阅源，不代表独立发布方确认。Glance 实时流的筛选不变。</p>
+        {% if snapshot.strategy_version %}<p class="muted">当前契约：<code>{{ snapshot.strategy_version }}</code></p>{% endif %}
+    </section>
+    {% if not snapshot.available %}
+        <p class="status" role="status">记录暂不可读取，无法判断是否存在保守处理记录。请稍后重新打开。</p>
+    {% elif not records %}
+        <p class="status" role="status">近24小时现存缓存中暂无当前契约的保守中性记录；这不代表没有新文章，也不代表模型质量已通过。</p>
+    {% else %}
+        <p class="muted">本次显示 {{ records|length }} 条。{% if snapshot.has_more %}还有更早的记录未展示（本页最多50条）。{% endif %}</p>
+        {% for record in records %}
+        <article>
+            <h2>{% if record.link %}<a href="{{ record.link }}" target="_blank" rel="noopener noreferrer">{{ record.title }}</a>{% else %}{{ record.title }}{% endif %}</h2>
+            <p class="muted">订阅来源：{{ record.source }} · {{ record.ingested_at }}</p>
+            <p>{{ record.explanation }}</p>
+        </article>
+        {% endfor %}
+    {% endif %}
+</main>
+</body>
+</html>

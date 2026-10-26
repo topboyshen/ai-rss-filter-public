@@ -1,0 +1,451 @@
+# AI-Filter Docker Compose
+#
+# 发布：
+#   cp .env.example .env   # 首次部署时填写密钥
+#   ./scripts/release.sh build my-ai-filter:2026.07.12.1
+#   ./scripts/release.sh deploy my-ai-filter:2026.07.12.1
+#
+# 架构：
+# - ai-filter-web：固定 digest 的轻量入口，仅按路径转发，不运行 Python
+# - ai-filter-api：Gunicorn 普通 HTTP API与只读 Glance HTML卡片
+# - ai-filter-worker：持久有界 webhook 队列调度、评分、行情与 Quant 轮询
+# - redis：带 TTL 的会话、限流和跨进程共享缓存
+# - RSSHub：镜像固定 digest，禁止 Watchtower 无验证滚动
+#
+# 发布/回滚：见 scripts/release.sh
+
+services:
+  redis:
+    image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+    # Leave headroom above Redis maxmemory for AOF rewrite and allocator
+    # overhead, while preventing one cache process from exhausting the host.
+    mem_limit: 384m
+    pids_limit: 128
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --auto-aof-rewrite-percentage
+      - "100"
+      - --auto-aof-rewrite-min-size
+      - 64mb
+      # 共享缓存均带 TTL，可按 LRU 回收。
+      - --maxmemory
+      - 128mb
+      - --maxmemory-policy
+      - volatile-lru
+    volumes:
+      - redis-data:/data
+    networks:
+      - ai-net
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  ai-filter-api:
+    build: .
+    image: ${IMAGE_REF:?set IMAGE_REF to an immutable version or sha256 digest}
+    mem_limit: 768m
+    pids_limit: 256
+    command: /app/start.sh
+    expose:
+      - "5000"
+    environment:
+      # .env is interpolation input only. Project just the credentials this
+      # role consumes; behavior stays fixed in this manifest or config.yaml.
+      AI_FILTER_API_KEY: ${AI_FILTER_API_KEY:-}
+      KIMI_CODE_API_KEY: ${KIMI_CODE_API_KEY:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      MINIFLUX_WEBHOOK_SECRET: ${MINIFLUX_WEBHOOK_SECRET:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      AI_FILTER_DB_PATH: /app/data/cache.db
+      AI_FILTER_CONFIG_PATH: /app/config.yaml
+      # Opt-in only after private provision and separately verified runtime binding.
+      # All app roles share this existing data bind; never auto-create an open gate.
+      AI_FILTER_ADMISSION_MODE: disabled
+      AI_FILTER_ADMISSION_ROOT: /app/data/admission_fence
+      AI_FILTER_MAPPING_MIGRATION_ENFORCE_GATE: "1"
+      AI_FILTER_MAPPING_MIGRATION_REQUIRED_GENERATION: event-mapping-store-v5-provider-attribution-v1
+      AI_FILTER_RSSHUB_BASE_URL: http://rsshub:1200
+      AI_FILTER_WEB_BASE_URL: http://ai-filter-web:5000
+      AI_FILTER_ROLE: web
+      AI_FILTER_DASHBOARD_SNAPSHOTS: "1"
+      AI_FILTER_DASHBOARD_SNAPSHOT_DIR: /app/data/dashboard_snapshots
+      AI_FILTER_TRUSTED_PROXY_HOST: ai-filter-web
+      AI_FILTER_SESSION_SECRET: ""
+      AI_FILTER_SESSION_SECRET_FILE: /run/secrets/dashboard_session_secret
+      AI_FILTER_INTEGRATION_TOKEN: ""
+      AI_FILTER_INTEGRATION_TOKEN_FILE: /run/secrets/ai_filter_integration_token
+      AI_FILTER_DASHBOARD_SESSION_TTL_SECONDS: 28800
+      PUBLIC_BASE_URL: https://example.invalid
+      REDIS_URL: redis://redis:6379/0
+      WEBHOOK_SPOOL_DIR: /app/data/webhook_spool
+      JIN10_SOURCE_URL: http://rsshub:1200/jin10
+      # Rate limiting is process-local; keep one Web process unless its state
+      # is moved to Redis.
+      WEB_CONCURRENCY: 1
+      GUNICORN_THREADS: 16
+      # Reserve most API threads for Dashboard/cached reads when RSS/LLM cold
+      # paths are slow. Excess authenticated cold requests fail fast with 503.
+      AI_FILTER_COLD_FILTER_MAX_CONCURRENCY: 2
+      TZ: Asia/Shanghai
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+      NO_PROXY: localhost,127.0.0.1,ai-filter-api,ai-filter-web,ai-filter-worker,rsshub,redis
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # SECURITY: data/releases is the root-owned release registry. Never use
+      # a host-side recursive chown on ./data when enabling non-root. The
+      # nested read-only volume hides that registry from the application.
+      - ./data:/app/data
+      - release-registry-mask:/app/data/releases:ro
+    secrets:
+      - dashboard_session_secret
+      - ai_filter_integration_token
+    depends_on:
+      redis:
+        condition: service_healthy
+      rsshub:
+        condition: service_healthy
+    networks:
+      - ai-net
+    restart: unless-stopped
+    # Gunicorn allows 30 seconds for graceful connection draining.  Docker's
+    # default 10-second stop window previously forced a healthy recovery into
+    # SIGKILL while a request was still draining.
+    stop_grace_period: 45s
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
+    healthcheck:
+      # /health performs the browser-auth check inside the warm Gunicorn
+      # process.  The probe process only opens HTTP, avoiding repeated heavy
+      # application imports when the host is under memory pressure.
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:5000/health', timeout=3).read()"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+
+  # Keep the historical service name and host port at the gateway boundary.
+  # Old manifests used ai-filter-web for Flask itself, so rollback replaces
+  # this same service instead of racing a second container for host port 5000.
+  ai-filter-web:
+    image: nginx:stable-alpine@sha256:0d3b80406a13a767339fbe2f41406d6c7da727ab89cf8fae399e81f780f814d1
+    mem_limit: 128m
+    pids_limit: 64
+    ports:
+      - "127.0.0.1:5000:5000"
+      - "172.17.0.1:5000:5000"
+    configs:
+      - source: ai-filter-gateway-nginx
+        target: /etc/nginx/nginx.conf
+        mode: "0444"
+    depends_on:
+      ai-filter-api:
+        condition: service_healthy
+    networks:
+      - ai-net
+    restart: unless-stopped
+    stop_grace_period: 15s
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:5000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  ai-filter-worker:
+    build: .
+    image: ${IMAGE_REF:?set IMAGE_REF to an immutable version or sha256 digest}
+    mem_limit: 768m
+    pids_limit: 256
+    command: python worker_main.py
+    environment:
+      AI_FILTER_API_KEY: ${AI_FILTER_API_KEY:-}
+      KIMI_CODE_API_KEY: ${KIMI_CODE_API_KEY:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      AI_FILTER_DB_PATH: /app/data/cache.db
+      AI_FILTER_CONFIG_PATH: /app/config.yaml
+      AI_FILTER_MAPPING_MIGRATION_ENFORCE_GATE: "1"
+      AI_FILTER_MAPPING_MIGRATION_REQUIRED_GENERATION: event-mapping-store-v5-provider-attribution-v1
+      AI_FILTER_RSSHUB_BASE_URL: http://rsshub:1200
+      AI_FILTER_WEB_BASE_URL: http://ai-filter-web:5000
+      AI_FILTER_ROLE: worker
+      AI_FILTER_ADMISSION_MODE: disabled
+      AI_FILTER_ADMISSION_ROOT: /app/data/admission_fence
+      AI_FILTER_DASHBOARD_SNAPSHOTS: "1"
+      AI_FILTER_DASHBOARD_SNAPSHOT_DIR: /app/data/dashboard_snapshots
+      AI_FILTER_SESSION_SECRET: ""
+      REDIS_URL: redis://redis:6379/0
+      WEBHOOK_SPOOL_DIR: /app/data/webhook_spool
+      AI_FILTER_REFRESH_LOCK: /app/data/.refresh-execution.lock
+      # Read-only Quant context crosses only the host-side private tunnel.
+      # The Bearer credential is a worker-only Docker secret, never .env.
+      AI_FILTER_QUANT_CONTEXT_URL: http://host.docker.internal:18092/integration/v1/market-context
+      AI_FILTER_QUANT_TOKEN_FILE: /run/secrets/quant_market_context_token
+      AI_FILTER_QUANT_CONTEXT_POLL_SECONDS: 45
+      AI_FILTER_QUANT_CONTEXT_TIMEOUT_SECONDS: 3
+      # 10-22 实测 107137 字节（含本服务不用的 research_pool）；留约 2.4 倍余量。
+      AI_FILTER_QUANT_CONTEXT_MAX_BYTES: 262144
+      AI_FILTER_QUANT_CONTEXT_CACHE_TTL_SECONDS: 150
+      AI_FILTER_QUANT_CONTEXT_MAX_AGE_SECONDS: 120
+      JIN10_SOURCE_URL: http://rsshub:1200/jin10
+      TZ: Asia/Shanghai
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+      NO_PROXY: localhost,127.0.0.1,host.docker.internal,ai-filter-api,ai-filter-web,ai-filter-worker,rsshub,redis
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Keep the same warning as API: host ownership changes must be allowlisted.
+      - ./data:/app/data
+      - release-registry-mask:/app/data/releases:ro
+    secrets:
+      - quant_market_context_token
+    depends_on:
+      redis:
+        condition: service_healthy
+      ai-filter-web:
+        condition: service_healthy
+    networks:
+      - ai-net
+    restart: unless-stopped
+    stop_grace_period: 90s
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
+    healthcheck:
+      test: ["CMD", "python", "-m", "services.worker_health", "check"]
+      interval: 10s
+      timeout: 8s
+      retries: 3
+      start_period: 20s
+
+  # 收盘行情采集器是显式 cron profile；普通 docker compose up 不会启动。
+  market-close-collector:
+    profiles: ["cron"]
+    build: .
+    image: ${IMAGE_REF:?set IMAGE_REF to an immutable version or sha256 digest}
+    mem_limit: 384m
+    pids_limit: 128
+    command: python workers/market_close_collector.py
+    # This one-shot only needs the explicitly scoped settings below. Do not
+    # expose API, LLM, Telegram, or webhook credentials from the shared .env.
+    environment:
+      AI_FILTER_DB_PATH: /app/data/cache.db
+      AI_FILTER_CONFIG_PATH: /app/config.yaml
+      AI_FILTER_ADMISSION_MODE: disabled
+      AI_FILTER_ADMISSION_ROOT: /app/data/admission_fence
+      AI_FILTER_SESSION_SECRET: ""
+      TZ: Asia/Shanghai
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+      NO_PROXY: localhost,127.0.0.1,redis
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data:/app/data
+      - release-registry-mask:/app/data/releases:ro
+    networks:
+      - ai-net
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
+    healthcheck:
+      disable: true
+
+  # Event mapping and graph resolution run against the exact image/config
+  # recorded by the release registry. The host
+  # cron wrapper invokes this profile by archived manifest and image digest.
+  event-enrichment:
+    profiles: ["cron"]
+    build: .
+    image: ${IMAGE_REF:?set IMAGE_REF to an immutable version or sha256 digest}
+    mem_limit: 768m
+    pids_limit: 256
+    command: python scripts/run_event_enrichment.py --days 7 --limit 5000 --max-pairs 10000
+    environment:
+      AI_FILTER_DB_PATH: /app/data/cache.db
+      AI_FILTER_CONFIG_PATH: /app/config.yaml
+      AI_FILTER_ADMISSION_MODE: disabled
+      AI_FILTER_ADMISSION_ROOT: /app/data/admission_fence
+      AI_FILTER_MAPPING_MIGRATION_ENFORCE_GATE: "1"
+      AI_FILTER_MAPPING_MIGRATION_REQUIRED_GENERATION: event-mapping-store-v5-provider-attribution-v1
+      AI_FILTER_SESSION_SECRET: ""
+      TZ: Asia/Shanghai
+    volumes:
+      - ./data:/app/data
+      - release-registry-mask:/app/data/releases:ro
+    network_mode: "none"
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
+    # This polling worker exposes no HTTP port; inheriting the image's Flask
+    # healthcheck would make the optional profile permanently unhealthy.
+    healthcheck:
+      disable: true
+
+  # 证券主数据同步是显式维护任务；默认命令只读演练，应用时必须覆盖命令并传 --apply。
+  security-master-sync:
+    profiles: ["security-master"]
+    build: .
+    image: ${IMAGE_REF:?set IMAGE_REF to an immutable version or sha256 digest}
+    mem_limit: 384m
+    pids_limit: 128
+    command: python workers/security_master_collector.py
+    # The fixed CNINFO/Tencent adapters need no application or LLM secrets.
+    environment:
+      AI_FILTER_DB_PATH: /app/data/cache.db
+      AI_FILTER_ADMISSION_MODE: disabled
+      AI_FILTER_ADMISSION_ROOT: /app/data/admission_fence
+      TZ: Asia/Shanghai
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      ALL_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+      all_proxy: ""
+      NO_PROXY: localhost,127.0.0.1
+    volumes:
+      - ./data:/app/data
+      - release-registry-mask:/app/data/releases:ro
+    networks:
+      - ai-net
+    read_only: true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
+    healthcheck:
+      disable: true
+
+  rsshub:
+    # Derived from fixed e7cd1bd8; compatibility context 210bc6246409e212.
+    # Pin the validated derived artifact, not its unpatched upstream base.
+    image: ghcr.io/topboyshen/ai-rss-filter-rsshub-compat@sha256:9554a2cbf77ea112b51072ad7a9fd65f3540444542b60abc5e67ff9ec7d43a2b
+    mem_limit: 768m
+    pids_limit: 256
+    # Publish for Glance (host-gateway/172.17.0.1) and Miniflux (127.0.0.1).
+    # Internal stack clients still use http://rsshub:1200 on ai-net.
+    ports:
+      - "172.17.0.1:1200:1200"
+      - "127.0.0.1:1200:1200"
+    environment:
+      NODE_ENV: production
+      CACHE_TYPE: memory
+      TZ: Asia/Shanghai
+    networks:
+      - ai-net
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:1200/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+# The gateway configuration is embedded in the archived Compose manifest.
+# Rollback therefore restores routing behavior together with service topology;
+# it never reads a newer mutable file from the working tree.
+configs:
+  ai-filter-gateway-nginx:
+    content: |
+      worker_processes 1;
+      worker_shutdown_timeout 10s;
+      pid /tmp/nginx.pid;
+
+      events {
+          worker_connections 1024;
+      }
+
+      http {
+          include /etc/nginx/mime.types;
+          default_type application/octet-stream;
+          server_tokens off;
+          access_log /dev/stdout;
+          error_log /dev/stderr warn;
+          resolver 127.0.0.11 valid=10s ipv6=off;
+
+          server {
+              listen 5000;
+              client_max_body_size 1m;
+
+              location / {
+                  set $$api_upstream http://ai-filter-api:5000;
+                  proxy_pass $$api_upstream$$request_uri;
+                  proxy_http_version 1.1;
+                  proxy_set_header Host $$host;
+                  proxy_set_header X-Real-IP $$remote_addr;
+                  proxy_set_header X-Forwarded-For $$proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $$http_x_forwarded_proto;
+                  proxy_set_header X-AI-Filter-Client-IP $$http_x_real_ip;
+                  proxy_set_header Connection "";
+                  proxy_connect_timeout 3s;
+                  proxy_read_timeout 120s;
+                  proxy_send_timeout 120s;
+              }
+          }
+      }
+
+# Secrets are scoped to their one consumer and never placed in the shared
+# .env: the API alone receives Dashboard and AI -> Quant credentials, while
+# the worker alone receives the independent Quant -> AI credential.
+secrets:
+  dashboard_session_secret:
+    file: ./secrets/dashboard_session_secret
+  ai_filter_integration_token:
+    file: ./secrets/ai_filter_integration_token
+  quant_market_context_token:
+    file: ./secrets/quant_market_context_token
+
+networks:
+  ai-net:
+    driver: bridge
+
+volumes:
+  postgres-data:
+    driver: local
+  redis-data:
+  # Application containers never need the host release registry. This empty,
+  # read-only nested mount prevents a compromised process from rewriting
+  # current.state or archived manifests through the broader ./data bind mount.
+  release-registry-mask:

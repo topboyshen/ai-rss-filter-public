@@ -1,0 +1,47 @@
+    {% for block in report.blocks %}
+    <section class="panel" id="block-{{ block.key }}" data-block="{{ block.key }}" aria-labelledby="block-title-{{ block.key }}">
+      <div class="block-head">
+        <h2 id="block-title-{{ block.key }}">{{ block.label }}</h2>
+        <span class="block-count">{% if block.pagination %}{% if block.pagination.eligible_total %}展示第 {{ block.pagination.start_index }}–{{ block.pagination.end_index }} 条 / 可展示 {{ block.pagination.eligible_total }} 条{% else %}可展示 0 条{% endif %} · 共 {{ block.total }}{% else %}展开 {{ block.entries|length }} / 共 {{ block.total }}{% endif %}{% if block.hidden_low_priority %} · 低于门槛未展开 {{ block.hidden_low_priority }}{% endif %}{% if not block.pagination and block.hidden_overflow %} · 超出条数上限 {{ block.hidden_overflow }}{% endif %}</span>
+      </div>
+      {% if block.pagination and block.pagination.next_url and not report.pagination_block %}
+      <p class="overflow-entry"><a href="{{ block.pagination.next_url }}">查看更多{{ block.label }} →</a></p>
+      {% endif %}
+      {% if block.entries %}
+        {% for item in block.entries %}
+        <article class="event-card" id="report-event-{{ item.event_id }}" data-event-id="{{ item.event_id }}">
+          <h3 class="event-title">{{ item.title }}</h3>
+          <div class="event-badges">{{ item.event_type or '其他事件' }} · 事件评分 {{ item.priority_label }}{% if item.merged_group_count > 1 %} · 已合并 {{ item.merged_group_count }} 个同标题事件{% endif %}{% if item.report_count > 1 %} · {{ report_period|default('当日') }} {{ item.report_count }} 条报道已合并（数量不代表重要程度）{% endif %}</div>
+          <dl class="chain">
+            <dt>事件</dt><dd><a href="/dashboard/events?event_id={{ item.event_id|urlencode }}&amp;tab=overview#event-detail">{{ item.title }}</a></dd>
+            <dt>相比上次的变化</dt>
+            <dd class="{% if item.correction_kind == 'denial' %}denial{% elif item.correction_kind == 'request' %}request{% endif %}">{{ item.change }}{% if item.previous %}<br><span class="assoc">上次记录：{{ item.previous.claim_text }} · {{ item.previous.time_label }}</span>{% endif %}{% if item.earliest %}<br><span class="assoc">最早记录：{{ item.earliest.claim_text }} · {{ item.earliest.time_label }}</span>{% endif %}</dd>
+            <dt>原始来源与时间</dt>
+            <dd><ul>
+              {% for source in item.sources %}
+              <li{% if source.correction_kind == 'denial' %} class="denial"{% elif source.correction_kind == 'request' %} class="request"{% endif %}>{% if source.url %}<a href="{{ source.url }}" target="_blank" rel="noopener noreferrer">{{ source.publisher or source.source_name or '来源' }}</a>{% else %}{{ source.publisher or '来源' }}{% endif %}：{{ source.claim_text }}{% if source.correction_kind == 'request' %}（要求澄清/问询，非否认）{% endif %}{% if source.outlet_known == false %}（来源媒体未能识别）{% endif %} · {{ source.published_label }} · {{ source.observed_label }}{% if source.same_link_previous %}<br><span class="assoc">同一链接此前记录为：{{ source.same_link_previous }}</span>{% endif %}</li>
+              {% endfor %}
+              {% if item.sources_more %}<li>另有 {{ item.sources_more }} 个来源未展开</li>{% endif %}
+            </ul></dd>
+            <dt>尚未确认之处</dt>
+            <dd><ul>{% for note in item.uncertainties %}<li>{{ note }}</li>{% endfor %}</ul></dd>
+            <dt>下一验证点</dt><dd>{{ item.next_check }}</dd>
+            <dt>关联（非推荐）</dt>
+            <dd class="assoc" data-testid="associations">原文点名公司：{% if item.companies %}{{ item.companies|join('、') }}{% else %}无{% endif %} · 主题规则池关联 {{ item.rule_association_count }} 只证券（规则池，不列出，不代表受益）</dd>
+          </dl>
+        </article>
+        {% endfor %}
+      {% else %}
+        <p class="empty-block" data-testid="empty-{{ block.key }}">{{ block.empty_label }}</p>
+      {% endif %}
+      {% if block.pagination and block.pagination.eligible_total and block.pagination.page_count > 1 %}
+      <nav class="block-pagination" aria-label="{{ block.label }}分页" data-testid="pagination-{{ block.key }}">
+        <span class="pagination-label">第 {{ block.pagination.page }} / {{ block.pagination.page_count }} 页</span>
+        <div class="pagination-links">
+          {% if block.pagination.previous_url %}<a class="top-link" href="{{ block.pagination.previous_url }}">← 上一页</a>{% endif %}
+          {% if block.pagination.next_url %}<a class="top-link" href="{{ block.pagination.next_url }}">下一页 →</a>{% endif %}
+        </div>
+      </nav>
+      {% endif %}
+    </section>
+    {% endfor %}

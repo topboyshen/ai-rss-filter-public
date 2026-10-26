@@ -1,0 +1,11 @@
+/var/log/ai-filter-health.log /var/log/ai-filter-refresh.log /var/log/ai-filter-ops-check.log /var/log/ai-filter-restore-drill.log /var/log/ai-filter-event-enrichment.log /root/backups/system/backup.log {
+    daily
+    rotate 14
+    maxsize 20M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    create 0600 root root
+}

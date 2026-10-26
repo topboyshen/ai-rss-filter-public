@@ -1,0 +1,105 @@
+{
+  "event_id": "10000006-0000-4000-8000-000000000001",
+  "event_version": 3,
+  "evidence": [
+    {
+      "evidence_id": "40000031-0000-4000-8000-000000000001",
+      "snapshot_hash": "3f982ddf64c98c270519b5af11e70977475d8600efbe7a15860c3ab5a2785388",
+      "source_uri": "https://example.invalid/synthetic-correction/6/evidence/1",
+      "version": 1
+    },
+    {
+      "evidence_id": "40000032-0000-4000-8000-000000000001",
+      "snapshot_hash": "fca0527f988bbd2c7b557ec1627e3dabf67eec18f738f348ff739f9cfc844841",
+      "source_uri": "https://example.invalid/synthetic-correction/6/evidence/2",
+      "version": 1
+    },
+    {
+      "evidence_id": "40000033-0000-4000-8000-000000000001",
+      "snapshot_hash": "720537260015682b4e428b93d84ea5c84cb5c8f8cda1b710af01ba0eb8ce5722",
+      "source_uri": "https://example.invalid/synthetic-correction/6/evidence/3",
+      "version": 1
+    },
+    {
+      "evidence_id": "40000034-0000-4000-8000-000000000001",
+      "snapshot_hash": "2d6b036175eaae476f98ce5bad63ad40ea477999a8eb6f84a2906cfad304de0d",
+      "source_uri": "https://example.invalid/synthetic-correction/6/evidence/4",
+      "version": 1
+    },
+    {
+      "evidence_id": "40000035-0000-4000-8000-000000000001",
+      "snapshot_hash": "16313110420304b8e3b81bc8ea9008abc6d2da8a86cdfb1e582bf767f55afcee",
+      "source_uri": "https://example.invalid/synthetic-correction/6/evidence/5",
+      "version": 1
+    },
+    {
+      "evidence_id": "40000036-0000-4000-8000-000000000001",
+      "snapshot_hash": "20f6dbcaffd6dcd3296d45c5810a68f3738c5e719162a27a8cf58d6774627721",
+      "source_uri": "https://example.invalid/synthetic-correction/6/evidence/6",
+      "version": 1
+    },
+    {
+      "evidence_id": "40000037-0000-4000-8000-000000000001",
+      "snapshot_hash": "7df4a34751e6890542864d4c5c90c46ef905c76d9272271fc802d9742445c12c",
+      "source_uri": "https://example.invalid/synthetic-correction/6/evidence/7",
+      "version": 1
+    },
+    {
+      "evidence_id": "40000038-0000-4000-8000-000000000001",
+      "snapshot_hash": "d7c7a649573fd2036ced94bdae51a4446e0f6456b5bd753f93f0776a1e7c756d",
+      "source_uri": "https://example.invalid/synthetic-correction/6/evidence/8",
+      "version": 1
+    },
+    {
+      "evidence_id": "40000039-0000-4000-8000-000000000001",
+      "snapshot_hash": "7f217fadd55592e7d0408773a382b0bf23e7e44a25f07965ce299ec1a7790e6c",
+      "source_uri": "https://example.invalid/synthetic-correction/6/evidence/9",
+      "version": 1
+    },
+    {
+      "evidence_id": "4000003a-0000-4000-8000-000000000001",
+      "snapshot_hash": "c9760530674e956f825a4bef4d232d6c997700cd3c403888e848e3ca9bae4e84",
+      "source_uri": "https://example.invalid/synthetic-correction/6/evidence/10",
+      "version": 1
+    },
+    {
+      "evidence_id": "4000003b-0000-4000-8000-000000000001",
+      "snapshot_hash": "22129be55ec0dcbb2f2dd0af684a07d52fa86720cacc55c9aa4156b30bb54c68",
+      "source_uri": "https://example.invalid/synthetic-correction/6/evidence/11",
+      "version": 1
+    },
+    {
+      "evidence_id": "4000003c-0000-4000-8000-000000000001",
+      "snapshot_hash": "a8aa0029e4140d6706b94d744bfb9a53a0b840e0a6e31f4576338e9eef78e4f6",
+      "source_uri": "https://example.invalid/synthetic-correction/6/evidence/12",
+      "version": 1
+    },
+    {
+      "evidence_id": "4000003d-0000-4000-8000-000000000001",
+      "snapshot_hash": "5a6a6faf12b05e1c1e4470b88f00a72d73ac02f4a954e41ec8f6864591e1541d",
+      "source_uri": "https://example.invalid/synthetic-correction/6/evidence/13",
+      "version": 1
+    },
+    {
+      "evidence_id": "4000003e-0000-4000-8000-000000000001",
+      "snapshot_hash": "a776ae989b96f8d235317c6c7c2da0e4b884a0407c09b69bbed552fffb7c3695",
+      "source_uri": "https://example.invalid/synthetic-correction/6/evidence/14",
+      "version": 1
+    },
+    {
+      "evidence_id": "4000003f-0000-4000-8000-000000000001",
+      "snapshot_hash": "73f9516f07f14124aa2d95eb200aa24bf952dddbb44d1f14a51044e3a7884676",
+      "source_uri": "https://example.invalid/synthetic-correction/6/evidence/15",
+      "version": 1
+    }
+  ],
+  "mapping": {
+    "mapping_id": "20000006-0000-4000-8000-000000000001",
+    "mapping_version": "asset-map:event-mapping-store-v7:manifest-c27ab17041461a1854f64fe8e52d372e4450457a60aa2c0cd04ceaa38d07e203:master-f00e91850b05250e6db4a7aa7c89825fbf998a39312ffb5684b9afd72962eca2",
+    "relation_type": "direct",
+    "revision": 4,
+    "security_id": "30000001-0000-4000-8000-000000000001"
+  },
+  "reason": "SYNTHETIC TEST EXAMPLE ONLY; not reviewed or authorized for any production database.",
+  "schema": 1
+}

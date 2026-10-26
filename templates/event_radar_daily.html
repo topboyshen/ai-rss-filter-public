@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>事件日报 {{ report.date }}{% if report.pagination_block %} · {{ report.blocks[0].label }} · 第 {{ report.blocks[0].pagination.page }} 页{% endif %} · AI-Filter</title>
+  <style>
+    {% include 'event_radar_report_styles.html' %}
+  </style>
+</head>
+<body class="event-report daily-report">
+  <div class="page-shell">
+    <header class="topbar">
+      <div>
+        <h1>事件日报{% if report.pagination_block %} · {{ report.blocks[0].label }}{% endif %} · {{ report.date }}</h1>
+        {% if report.is_historical %}<div class="historical-badge" data-testid="historical-badge">按历史入库记录重建的视图，非当日封存日报</div>{% endif %}
+        <div class="meta-grid">
+          <span>{{ report.cutoff_label }} · {{ report.generated_at_label }}{% if release_version %} · AI-Filter {{ release_version }}{% endif %}</span>
+        </div>
+      </div>
+      <nav class="top-actions" aria-label="管理导航">
+        <a class="top-link" href="/dashboard/events">返回事件雷达</a>
+        <a class="top-link" href="/dashboard/events/weekly">事件周报</a>
+        <a class="top-link" href="/dashboard">管理总览</a>
+      </nav>
+    </header>
+
+    <section class="panel" aria-label="报告范围与数据新鲜度" data-testid="report-scope">
+      <form class="date-form" method="get" action="/dashboard/events/daily">
+        <a href="/dashboard/events/daily?date={{ report.prev_date }}">← 前一天</a>
+        <label>查看日期 <input type="date" name="date" value="{{ report.date }}" min="{{ report.min_date }}" max="{{ report.max_date }}"></label>
+        <button type="submit">查看</button>
+        {% if report.next_date %}<a href="/dashboard/events/daily?date={{ report.next_date }}">后一天 →</a>{% endif %}
+      </form>
+      <div class="meta-grid" style="margin-top:10px">
+        <span><strong>{{ report.cutoff_label }}</strong></span>
+        <span data-testid="freshness">数据新鲜度：最近一次入库 {{ report.freshness.latest_label }}{% if report.freshness.age_label %}，{{ report.freshness.age_label }}{% endif %}</span>
+        <span>{{ report.coverage_label }}</span>
+        {% if report.historical_note %}<span>{{ report.historical_note }}</span>{% endif %}
+        {% if report.data_state != 'ok' %}<span class="state-warning" data-testid="data-state">{{ report.data_state_label }}</span>{% endif %}
+        <span>当日入库原文 {{ report.evidence_count }} 条 · 归并后事件 {{ report.event_group_count }} 个 · 合并同标题重复展示 {{ report.duplicate_groups_folded }} 组 · 既有事件的同标题重复报道 {{ report.repeat_event_count }} 个（不算新变化，未列出）</span>
+        <span>新增 / 推进 / 待验证仅展开事件评分 ≥ {{ '%.0f'|format(report.display_min_priority) }} 的事件（评分为已有事件评分，不按报道数量排序）；澄清／更正线索中的否认/更正全部展开，要求澄清/问询按同一评分门槛展开。</span>
+        {% if report.pagination_notice %}<span data-testid="pagination-notice">{{ report.pagination_notice }}</span>{% endif %}
+      </div>
+    </section>
+
+    {% if report.pagination_block %}
+    <nav class="weekly-page-context" aria-label="日报分页视图">
+      <a href="{{ report.overview_url }}">← 返回当日概览</a>
+      <span>当前仅展示{{ report.blocks[0].label }} · 第 {{ report.blocks[0].pagination.page }} / {{ report.blocks[0].pagination.page_count }} 页</span>
+    </nav>
+    {% endif %}
+
+    {% include 'event_radar_report_blocks.html' %}
+
+    <section class="panel" aria-label="口径说明">
+      <ul class="notes">{% for note in report.notes %}<li>{{ note }}</li>{% endfor %}</ul>
+    </section>
+  </div>
+</body>
+</html>

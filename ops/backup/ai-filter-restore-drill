@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Root-owned launcher for the immutable restore-drill libexec bundle.
+
+set -euo pipefail
+
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+prefix="$(dirname -- "$script_dir")"
+bundle_root="$prefix/libexec/ai-filter"
+current_file="$bundle_root/restore-drill-current"
+
+if [[ ! -f "$current_file" || -L "$current_file" ]]; then
+    printf 'restore drill bundle selector is missing or unsafe\n' >&2
+    exit 78
+fi
+IFS= read -r bundle_name < "$current_file" || true
+if [[ ! "$bundle_name" =~ ^restore-drill-[0-9a-f]{64}$ ]]; then
+    printf 'restore drill bundle selector is invalid\n' >&2
+    exit 78
+fi
+bundle_dir="$bundle_root/$bundle_name"
+drill="$bundle_dir/restore_drill.py"
+verifier="$bundle_dir/event_core.py"
+if [[ ! -f "$drill" || -L "$drill" || ! -f "$verifier" || -L "$verifier" ]]; then
+    printf 'restore drill bundle is incomplete or unsafe\n' >&2
+    exit 78
+fi
+
+exec python3 -I "$drill" "$@"

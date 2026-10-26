@@ -1,0 +1,209 @@
+{
+  "synthetic_only": true,
+  "entries": [
+    {
+      "event_id": "10000001-0000-4000-8000-000000000001",
+      "event_version": 1,
+      "mapping_id": "20000001-0000-4000-8000-000000000001",
+      "revision": 6,
+      "mapping_version": "asset-map:event-mapping-store-v7:manifest-c27ab17041461a1854f64fe8e52d372e4450457a60aa2c0cd04ceaa38d07e203:master-f00e91850b05250e6db4a7aa7c89825fbf998a39312ffb5684b9afd72962eca2",
+      "security_id": "30000001-0000-4000-8000-000000000001",
+      "security_label": "SSE:600617",
+      "group": [
+        [
+          "10000001-0000-4000-8000-000000000001",
+          1
+        ]
+      ],
+      "evidence_count": 7,
+      "evidence_sha256": "679893db7f26d3327bc2108bec9fb7223ef6b68b9201079b2376f5fb557daa7a",
+      "retained_mappings": []
+    },
+    {
+      "event_id": "10000002-0000-4000-8000-000000000001",
+      "event_version": 3,
+      "mapping_id": "20000002-0000-4000-8000-000000000001",
+      "revision": 6,
+      "mapping_version": "asset-map:event-mapping-store-v7:manifest-c27ab17041461a1854f64fe8e52d372e4450457a60aa2c0cd04ceaa38d07e203:master-f00e91850b05250e6db4a7aa7c89825fbf998a39312ffb5684b9afd72962eca2",
+      "security_id": "30000001-0000-4000-8000-000000000001",
+      "security_label": "SSE:600617",
+      "group": [
+        [
+          "10000002-0000-4000-8000-000000000001",
+          3
+        ],
+        [
+          "1000000a-0000-4000-8000-000000000001",
+          2
+        ],
+        [
+          "1000000b-0000-4000-8000-000000000001",
+          2
+        ]
+      ],
+      "evidence_count": 21,
+      "evidence_sha256": "8929d84a4f59ba65f70c3f1d03c5e3afa354663f6eabd04d35896f61f27ae252",
+      "retained_mappings": []
+    },
+    {
+      "event_id": "10000003-0000-4000-8000-000000000001",
+      "event_version": 1,
+      "mapping_id": "20000003-0000-4000-8000-000000000001",
+      "revision": 4,
+      "mapping_version": "asset-map:event-mapping-store-v7:manifest-c27ab17041461a1854f64fe8e52d372e4450457a60aa2c0cd04ceaa38d07e203:master-f00e91850b05250e6db4a7aa7c89825fbf998a39312ffb5684b9afd72962eca2",
+      "security_id": "30000001-0000-4000-8000-000000000001",
+      "security_label": "SSE:600617",
+      "group": [
+        [
+          "10000003-0000-4000-8000-000000000001",
+          1
+        ]
+      ],
+      "evidence_count": 5,
+      "evidence_sha256": "e4b0a417f7408aead48073dab9cb829d9ef16aa5014acfb78d72a0e9b26bf563",
+      "retained_mappings": []
+    },
+    {
+      "event_id": "10000004-0000-4000-8000-000000000001",
+      "event_version": 1,
+      "mapping_id": "20000004-0000-4000-8000-000000000001",
+      "revision": 6,
+      "mapping_version": "asset-map:event-mapping-store-v7:manifest-c27ab17041461a1854f64fe8e52d372e4450457a60aa2c0cd04ceaa38d07e203:master-f00e91850b05250e6db4a7aa7c89825fbf998a39312ffb5684b9afd72962eca2",
+      "security_id": "30000001-0000-4000-8000-000000000001",
+      "security_label": "SSE:600617",
+      "group": [
+        [
+          "10000004-0000-4000-8000-000000000001",
+          1
+        ]
+      ],
+      "evidence_count": 7,
+      "evidence_sha256": "d00132bad13da716e66feb13f28f3b6cb6758e458cb7855ca85fee4356fd24e8",
+      "retained_mappings": []
+    },
+    {
+      "event_id": "10000005-0000-4000-8000-000000000001",
+      "event_version": 1,
+      "mapping_id": "20000005-0000-4000-8000-000000000001",
+      "revision": 7,
+      "mapping_version": "asset-map:event-mapping-store-v7:manifest-c27ab17041461a1854f64fe8e52d372e4450457a60aa2c0cd04ceaa38d07e203:master-f00e91850b05250e6db4a7aa7c89825fbf998a39312ffb5684b9afd72962eca2",
+      "security_id": "30000001-0000-4000-8000-000000000001",
+      "security_label": "SSE:600617",
+      "group": [
+        [
+          "10000005-0000-4000-8000-000000000001",
+          1
+        ]
+      ],
+      "evidence_count": 8,
+      "evidence_sha256": "88c7400f95b598a82fafd4ec5880f6fe36c76634ec2f6e3ff8298e1b367b23c8",
+      "retained_mappings": []
+    },
+    {
+      "event_id": "10000006-0000-4000-8000-000000000001",
+      "event_version": 3,
+      "mapping_id": "20000006-0000-4000-8000-000000000001",
+      "revision": 4,
+      "mapping_version": "asset-map:event-mapping-store-v7:manifest-c27ab17041461a1854f64fe8e52d372e4450457a60aa2c0cd04ceaa38d07e203:master-f00e91850b05250e6db4a7aa7c89825fbf998a39312ffb5684b9afd72962eca2",
+      "security_id": "30000001-0000-4000-8000-000000000001",
+      "security_label": "SSE:600617",
+      "group": [
+        [
+          "10000006-0000-4000-8000-000000000001",
+          3
+        ],
+        [
+          "1000000c-0000-4000-8000-000000000001",
+          2
+        ],
+        [
+          "1000000d-0000-4000-8000-000000000001",
+          2
+        ]
+      ],
+      "evidence_count": 15,
+      "evidence_sha256": "9960f4339e2b1b77b7576b407420d2d8ffc076e5695eb8b6b7b61476a78a505d",
+      "retained_mappings": []
+    },
+    {
+      "event_id": "10000007-0000-4000-8000-000000000001",
+      "event_version": 3,
+      "mapping_id": "20000007-0000-4000-8000-000000000001",
+      "revision": 5,
+      "mapping_version": "asset-map:event-mapping-store-v7:manifest-c27ab17041461a1854f64fe8e52d372e4450457a60aa2c0cd04ceaa38d07e203:master-f00e91850b05250e6db4a7aa7c89825fbf998a39312ffb5684b9afd72962eca2",
+      "security_id": "30000001-0000-4000-8000-000000000001",
+      "security_label": "SSE:600617",
+      "group": [
+        [
+          "10000007-0000-4000-8000-000000000001",
+          3
+        ],
+        [
+          "1000000e-0000-4000-8000-000000000001",
+          2
+        ],
+        [
+          "1000000f-0000-4000-8000-000000000001",
+          2
+        ]
+      ],
+      "evidence_count": 33,
+      "evidence_sha256": "62c11693bc3ba2f335a3781f242ff4fc6201aa0ab98afa5d8f5deb50d493589c",
+      "retained_mappings": [
+        [
+          "2000000a-0000-4000-8000-000000000001",
+          5
+        ]
+      ]
+    },
+    {
+      "event_id": "10000008-0000-4000-8000-000000000001",
+      "event_version": 5,
+      "mapping_id": "20000008-0000-4000-8000-000000000001",
+      "revision": 14,
+      "mapping_version": "asset-map:event-mapping-store-v7:manifest-c27ab17041461a1854f64fe8e52d372e4450457a60aa2c0cd04ceaa38d07e203:master-f00e91850b05250e6db4a7aa7c89825fbf998a39312ffb5684b9afd72962eca2",
+      "security_id": "30000001-0000-4000-8000-000000000001",
+      "security_label": "SSE:600617",
+      "group": [
+        [
+          "10000008-0000-4000-8000-000000000001",
+          5
+        ]
+      ],
+      "evidence_count": 57,
+      "evidence_sha256": "829aba6c5a5e1c964fb6311dd8ebb4c10b00adead0689b1e6a58efbaf141a3d8",
+      "retained_mappings": [
+        [
+          "2000000b-0000-4000-8000-000000000001",
+          14
+        ],
+        [
+          "2000000c-0000-4000-8000-000000000001",
+          14
+        ],
+        [
+          "2000000d-0000-4000-8000-000000000001",
+          14
+        ]
+      ]
+    },
+    {
+      "event_id": "10000009-0000-4000-8000-000000000001",
+      "event_version": 1,
+      "mapping_id": "20000009-0000-4000-8000-000000000001",
+      "revision": 2,
+      "mapping_version": "asset-map:event-mapping-store-v7:manifest-c27ab17041461a1854f64fe8e52d372e4450457a60aa2c0cd04ceaa38d07e203:rules-488c3eab890a:master-f00e91850b05250e6db4a7aa7c89825fbf998a39312ffb5684b9afd72962eca2",
+      "security_id": "30000001-0000-4000-8000-000000000001",
+      "security_label": "SSE:600617",
+      "group": [
+        [
+          "10000009-0000-4000-8000-000000000001",
+          1
+        ]
+      ],
+      "evidence_count": 3,
+      "evidence_sha256": "4114363ffee32c5862cdc93fdcce8d383fd5ec044a83e03aaf8dc7556f52b77f",
+      "retained_mappings": []
+    }
+  ]
+}

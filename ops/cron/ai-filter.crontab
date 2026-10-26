@@ -1,0 +1,16 @@
+# BEGIN AI_FILTER_MANAGED
+# NO_BACKUP 2026-09-10 | 30 3 * * * timeout --signal=TERM --kill-after=60s 45m /root/backup_system.sh
+# NO_BACKUP 2026-09-10: historical weekly schedule retained as a comment; no automatic drill.
+# NO_BACKUP 2026-09-10 | 30 4 * * 0 umask 077; timeout --signal=TERM --kill-after=60s 45m /usr/local/sbin/ai-filter-restore-drill >> /var/log/ai-filter-restore-drill.log 2>&1
+* * * * * /root/health_check.sh
+0 * * * * umask 077; timeout --signal=TERM --kill-after=5s 90s /usr/local/sbin/ai-filter-ops-check --quiet >> /var/log/ai-filter-ops-check.log 2>&1
+# Trading session: fresh intelligence every 30 minutes on weekdays.
+*/30 8-16 * * 1-5 umask 077; /root/ai-rss-filter/scripts/cron_refresh.sh >> /var/log/ai-filter-refresh.log 2>&1
+# Weekday off-hours and weekends: retain coverage without 48 full sweeps/day.
+5 0,2,4,6,18,20,22 * * 1-5 umask 077; /root/ai-rss-filter/scripts/cron_refresh.sh >> /var/log/ai-filter-refresh.log 2>&1
+5 */2 * * 0,6 umask 077; /root/ai-rss-filter/scripts/cron_refresh.sh >> /var/log/ai-filter-refresh.log 2>&1
+# Event enrichment: replay real-equity mappings and merge cross-source wire duplicates.
+15,45 * * * * umask 077; timeout --signal=TERM --kill-after=60s 18m /root/ai-rss-filter/scripts/cron_event_enrichment.sh >> /var/log/ai-filter-event-enrichment.log 2>&1
+# AI-RSS-Filter: DB maintenance (Sunday 3am); runner retains the Docker-client timeout.
+0 3 * * 0 umask 077; python3 /root/ai-rss-filter/scripts/run_db_maintenance.py --host >> /var/log/ai-filter-db-maintenance.log 2>&1
+# END AI_FILTER_MANAGED

@@ -1,0 +1,425 @@
+/* Shared editorial identity is opt-in. Inner-page layout deliberately excludes
+   the existing homepage so its news groups and hero layout remain untouched. */
+html:root:has(.ai-site-shell) {
+  color-scheme: light;
+  --ai-paper: #fff;
+  --ai-soft: #f3f1eb;
+  --ai-navy: #102c41;
+  --ai-ink: #132f44;
+  --ai-muted: #52636d;
+  --ai-line: #ccd3d5;
+  --ai-brass: #9a7b4f;
+  --ai-serif: "Songti SC", "STSong", "Noto Serif CJK SC", Georgia, serif;
+  --ai-inset: 52px;
+  --ai-column-gap: 44px;
+  --color-background: #e6e8e7;
+  --color-widget-background: #fff;
+  --color-widget-background-highlight: #f3f1eb;
+  --color-widget-content-border: #ccd3d5;
+  --color-separator: #ccd3d5;
+  --color-primary: #254b63;
+  --color-text-highlight: #132f44;
+  --color-text-paragraph: #344e5f;
+  --color-text-base: #132f44;
+  --color-text-base-muted: #52636d;
+  --color-text-subdue: #52636d;
+  --border-radius: 0px;
+  --content-bounds-padding: 52px;
+  --widget-gap: 28px;
+  scrollbar-color: #aab5ba #e6e8e7;
+}
+body:has(.ai-site-shell) {
+  background: #e6e8e7;
+  color: var(--ai-ink);
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+body:has(.ai-site-shell) .header-container { display: none; }
+body:has(.ai-site-shell) .content-bounds {
+  max-width: 1440px;
+  padding-inline: var(--ai-inset);
+  background: var(--ai-paper);
+}
+body:has(.ai-site-shell) .page { padding-block: 0 36px; }
+body:has(.ai-site-shell) :is(a, summary, button):focus-visible {
+  outline: 2px solid #0075a3;
+  outline-offset: 4px;
+}
+body:has(.ai-site-shell) .ai-site-shell { min-width: 0; }
+body:has(.ai-site-shell) .ai-institutional-masthead {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  color: var(--ai-ink);
+}
+body:has(.ai-site-shell) .ai-institutional-utility {
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 14px;
+  margin-inline: calc(-1 * var(--ai-inset));
+  padding: 8px var(--ai-inset);
+  background: var(--ai-navy);
+  color: #edf0f1;
+  font-size: 11px;
+  letter-spacing: .05em;
+}
+body:has(.ai-site-shell) .ai-institutional-brand {
+  grid-column: 1;
+  display: flex;
+  flex-direction: column;
+  padding-block: 24px;
+  border-bottom: 1px solid var(--ai-line);
+}
+body:has(.ai-site-shell) .ai-institutional-wordmark {
+  width: fit-content;
+  font: 36px/1 Georgia, "Times New Roman", serif;
+  letter-spacing: -1.5px;
+  color: var(--ai-ink);
+  text-decoration: none;
+}
+body:has(.ai-site-shell) .ai-institutional-tagline {
+  margin-top: 9px;
+  font-size: 11px;
+  line-height: 1.4;
+  letter-spacing: 2px;
+}
+body:has(.ai-site-shell) .ai-institutional-nav {
+  grid-column: 2;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 30px;
+  min-height: 62px;
+  margin: 0;
+  padding-block: 24px;
+  border-bottom: 1px solid var(--ai-line);
+}
+body:has(.ai-site-shell) .ai-institutional-nav a {
+  display: inline-block;
+  padding: 9px 0;
+  border-bottom: 2px solid transparent;
+  color: var(--ai-ink);
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+body:has(.ai-site-shell) .ai-institutional-nav a[aria-current="page"] {
+  border-bottom-color: var(--ai-brass);
+}
+body:has(.ai-site-shell) .ai-institutional-nav a:hover { border-bottom-color: var(--ai-ink); }
+body:has(.ai-site-shell) .ai-institutional-intro {
+  grid-column: 1 / -1;
+  padding-block: 28px 24px;
+}
+body:has(.ai-site-shell) .ai-institutional-kicker {
+  font-size: 11px;
+  letter-spacing: 2px;
+  font-weight: 500;
+}
+body:has(.ai-site-shell) .ai-institutional-intro h1 {
+  margin-top: 8px;
+  color: var(--ai-ink);
+  font: 600 40px/1.25 var(--ai-serif);
+  letter-spacing: .025em;
+}
+body:has(.ai-site-shell) .ai-institutional-disclaimer {
+  color: var(--ai-muted);
+  font-size: 12px;
+  line-height: 1.7;
+  margin-top: -24px;
+  text-align: right;
+}
+
+/* A full-width masthead precedes the unchanged original columns. No flattening
+   or reordering: source order remains meaningful on narrow screens. */
+body:has(.ai-site-shell):not(:has(.ai-home-institutional-masthead)) .page-columns {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  gap: 0 var(--ai-column-gap);
+  align-items: start;
+}
+body:has(.ai-site-shell.ai-site-page-ops) .page-columns {
+  grid-template-columns: 300px minmax(0, 1fr);
+}
+body:has(.ai-site-shell):not(:has(.ai-home-institutional-masthead)) .page-columns > .page-column {
+  min-width: 0;
+  width: auto;
+  max-width: 100%;
+}
+body:has(.ai-site-shell):not(:has(.ai-home-institutional-masthead)) .page-columns > .page-column:has(.ai-site-shell),
+body:has(.ai-site-shell):not(:has(.ai-home-institutional-masthead)) .page-columns:not(:has(> .page-column-small)) > .page-column {
+  grid-column: 1 / -1;
+}
+body:has(.ai-site-shell):not(:has(.ai-home-institutional-masthead)) .widget {
+  min-width: 0;
+  margin-top: 0;
+  margin-bottom: 28px;
+}
+body:has(.ai-site-shell):not(:has(.ai-home-institutional-masthead)) .widget-header {
+  margin-bottom: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--ai-ink);
+}
+body:has(.ai-site-shell):not(:has(.ai-home-institutional-masthead)) .widget-title {
+  color: var(--ai-ink);
+  font: 600 19px/1.5 var(--ai-serif);
+  text-transform: none;
+  letter-spacing: .025em;
+}
+body:has(.ai-site-shell):not(:has(.ai-home-institutional-masthead)) .widget-content {
+  min-width: 0;
+  padding: 20px;
+  background: var(--ai-paper);
+  border: 1px solid var(--ai-line);
+  border-radius: 0;
+  box-shadow: none;
+}
+body:has(.ai-site-shell):not(:has(.ai-home-institutional-masthead)) .page-column-small .widget-content {
+  background: var(--ai-soft);
+}
+body:has(.ai-site-shell):not(:has(.ai-home-institutional-masthead)) .widget-content :is(p, a, summary) {
+  overflow-wrap: anywhere;
+}
+
+/* Event facts and relation labels use dark ink, not pastel text on white. */
+body:has(.ai-site-shell) .event-radar-summary { color: var(--ai-ink); }
+body:has(.ai-site-shell) .event-radar-summary-head { gap: 14px; margin-bottom: 18px; }
+body:has(.ai-site-shell) .event-radar-summary-kicker { color: #365f59; letter-spacing: .13em; }
+body:has(.ai-site-shell) .event-radar-summary-note { color: var(--ai-muted); font-size: 12px; line-height: 1.7; }
+body:has(.ai-site-shell) .event-radar-summary-open {
+  color: var(--ai-ink);
+  border: 1px solid var(--ai-line);
+  border-radius: 0;
+  background: var(--ai-soft);
+}
+body:has(.ai-site-shell) .event-radar-summary-grid {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+  gap: 16px;
+}
+body:has(.ai-site-shell) .event-radar-summary-item {
+  min-width: 0;
+  padding: 18px;
+  color: var(--ai-ink);
+  border: 1px solid var(--ai-line);
+  border-top: 2px solid var(--ai-navy);
+  border-radius: 0;
+  background: var(--ai-paper);
+  box-shadow: none;
+}
+body:has(.ai-site-shell) .event-radar-summary-item:hover { background: #f8f7f3; border-color: #94a3aa; }
+body:has(.ai-site-shell) .event-radar-summary-title {
+  margin-block: 12px;
+  color: var(--ai-ink);
+  font: 600 18px/1.65 var(--ai-serif);
+}
+body:has(.ai-site-shell) .event-radar-summary-type,
+body:has(.ai-site-shell) .event-radar-summary-stock-flag,
+body:has(.ai-site-shell) .event-radar-summary-stock {
+  border-radius: 2px;
+  border-color: #c8d0cf;
+  background: #f0f3f1;
+  color: #315b55;
+  font-size: 11px;
+  line-height: 1.6;
+}
+body:has(.ai-site-shell) .event-radar-summary-type { color: #52616a; background: #f3f1eb; }
+body:has(.ai-site-shell) .event-radar-summary-stocks { flex-wrap: wrap; }
+body:has(.ai-site-shell) .event-radar-summary-relation { color: #52616a; opacity: 1; font-size: 10px; }
+body:has(.ai-site-shell) .event-radar-summary-bottom { flex-wrap: wrap; row-gap: 9px; }
+body:has(.ai-site-shell) .event-radar-summary-time,
+body:has(.ai-site-shell) .event-radar-summary-source { color: var(--ai-muted); font-size: 10px; }
+body:has(.ai-site-shell) .event-radar-summary-source { white-space: normal; }
+body:has(.ai-site-shell) .event-radar-summary-direction { color: var(--ai-muted); font-size: 10px; }
+body:has(.ai-site-shell) .event-radar-summary-direction.is-bull { color: #a42b35; background: #f8eeee; }
+body:has(.ai-site-shell) .event-radar-summary-direction.is-bear { color: #245690; background: #edf2f8; }
+body:has(.ai-site-shell) .event-radar-summary-score { color: var(--ai-ink); font-size: 13px; }
+body:has(.ai-site-shell) .event-radar-summary-score-label { color: var(--ai-muted); font-size: 10px; }
+body:has(.ai-site-shell) .event-radar-summary-foot { margin-top: 18px; color: var(--ai-muted); font-size: 12px; line-height: 1.8; }
+body:has(.ai-site-shell) .event-radar-summary-empty {
+  color: var(--ai-muted);
+  background: var(--ai-soft);
+  border: 1px dashed #b7c1c4;
+  border-radius: 0;
+  font-size: 13px;
+}
+
+/* The metrics are different units, not a scorecard or a success-rate funnel. */
+body:has(.ai-site-shell) .model-quality-overview { color: var(--ai-ink); }
+body:has(.ai-site-shell) .mq-context { padding-bottom: 18px; overflow-wrap: anywhere; }
+body:has(.ai-site-shell) .mq-context h3 { font: 600 24px/1.5 var(--ai-serif); }
+body:has(.ai-site-shell) .mq-context p { color: var(--ai-muted); font-size: 12px; }
+body:has(.ai-site-shell) .mq-processing { padding-block: 18px; border-top: 2px solid var(--ai-navy); }
+body:has(.ai-site-shell) .mq-processing > p:first-child { font-weight: 600; font-size: 14px; }
+body:has(.ai-site-shell) .mq-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 200px), 1fr));
+  gap: 12px;
+  margin-block: 18px;
+}
+body:has(.ai-site-shell) .mq-metric {
+  min-width: 0;
+  padding: 17px;
+  border: 1px solid var(--ai-line);
+  background: #f8f9f8;
+}
+body:has(.ai-site-shell) .mq-metric-label { color: var(--ai-muted); font-size: 12px; font-weight: 600; }
+body:has(.ai-site-shell) .mq-metric-value { margin-top: 9px; color: var(--ai-ink); font-size: 15px; line-height: 1.85; }
+body:has(.ai-site-shell) .mq-note { margin-block: 10px; color: var(--ai-muted); font-size: 12px; line-height: 1.8; }
+body:has(.ai-site-shell) .mq-assessment {
+  margin-bottom: 20px;
+  padding: 18px;
+  border-left: 3px solid var(--ai-brass);
+  background: var(--ai-soft);
+}
+body:has(.ai-site-shell) .mq-assessment > p:first-child { color: var(--ai-ink); font-size: 14px; line-height: 1.85; }
+body:has(.ai-site-shell) .mq-assessment details { margin-block: 14px; }
+body:has(.ai-site-shell) .mq-assessment summary { color: var(--ai-ink); cursor: pointer; }
+body:has(.ai-site-shell) .mq-assessment a { color: #235c79; text-decoration: underline; text-underline-offset: 3px; }
+body:has(.ai-site-shell) .mq-research { padding-top: 18px; border-top: 1px solid var(--ai-line); }
+body:has(.ai-site-shell) .quality-market-research,
+body:has(.ai-site-shell) .quality-full-statistics {
+  padding: 16px;
+  border: 1px solid var(--ai-line);
+  background: var(--ai-paper);
+}
+body:has(.ai-site-shell) .quality-market-research > summary,
+body:has(.ai-site-shell) .quality-full-statistics > summary { color: var(--ai-ink); line-height: 1.7; cursor: pointer; }
+body:has(.ai-site-shell) .quality-market-research [style*="color:#fbbf24"],
+body:has(.ai-site-shell) .quality-market-research .score-validity-badge,
+body:has(.ai-site-shell) .quality-market-research .score-validity-maturity b { color: #8a5900 !important; }
+body:has(.ai-site-shell) .quality-market-research [style*="color:#60a5fa"],
+body:has(.ai-site-shell) .quality-market-research .score-bridge-note b { color: #245690 !important; }
+body:has(.ai-site-shell) .quality-market-research [style*="color:#34d399"] { color: #18704d !important; }
+body:has(.ai-site-shell) .quality-market-research [style*="color:#a1a1aa"] { color: #62626d !important; }
+
+/* Existing status text and colors retain their meaning; other numbers are ink. */
+body:has(.ai-site-shell) .ops-summary { padding: 0 !important; color: var(--ai-ink); }
+body:has(.ai-site-shell) .ops-summary-head { align-items: flex-start !important; gap: 16px; margin-bottom: 20px !important; }
+body:has(.ai-site-shell) .ops-summary-title { color: var(--ai-ink) !important; font: 600 24px/1.5 var(--ai-serif) !important; }
+body:has(.ai-site-shell) .ops-summary-subtitle { line-height: 1.7; }
+body:has(.ai-site-shell) .ops-summary-status { flex-shrink: 0; border-radius: 2px !important; line-height: 1.5; }
+body:has(.ai-site-shell) .ops-summary-grid {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 170px), 1fr)) !important;
+  gap: 12px !important;
+}
+body:has(.ai-site-shell) .ops-summary-card {
+  min-width: 0;
+  padding: 18px !important;
+  background: var(--ai-soft) !important;
+  border: 1px solid var(--ai-line) !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+}
+body:has(.ai-site-shell) .ops-summary-label { color: var(--ai-muted) !important; font-size: 12px !important; }
+body:has(.ai-site-shell) .ops-summary-value { font-size: 22px !important; line-height: 1.5; font-variant-numeric: tabular-nums; }
+body:has(.ai-site-shell) .ops-summary-card:not(:first-child) .ops-summary-value { color: var(--ai-ink) !important; }
+body:has(.ai-site-shell) .ops-summary-note { color: var(--ai-muted) !important; white-space: normal !important; overflow: visible !important; line-height: 1.7; }
+body:has(.ai-site-shell) .ops-summary-status[style*="color:#16a34a"],
+body:has(.ai-site-shell) .ops-summary-card:first-child .ops-summary-value[style*="color:#16a34a"] { color: #18703e !important; }
+body:has(.ai-site-shell) .ops-summary-status[style*="color:#d97706"],
+body:has(.ai-site-shell) .ops-summary-card:first-child .ops-summary-value[style*="color:#d97706"] { color: #935000 !important; }
+
+body:has(.ai-site-shell) footer.footer {
+  max-width: 1440px;
+  margin-inline: auto;
+  padding: 24px var(--ai-inset);
+  background: var(--ai-navy);
+  color: #d8e0e4;
+}
+body:has(.ai-site-shell) footer.footer a { color: #edf0f1; }
+body:has(.ai-site-shell) footer.footer > div > div:has(> a[href*="beian.miit.gov.cn"]):has(> a[href*="beian.mps.gov.cn"]),
+body:has(.ai-site-shell) footer.footer > div > div:has(> a[href*="beian.miit.gov.cn"]):has(> a[href*="beian.mps.gov.cn"]) > a { color: #d8e0e4 !important; }
+body:has(.ai-site-shell) .mobile-navigation { color: var(--ai-ink); background: var(--ai-paper); }
+body:has(.ai-site-shell) .mobile-navigation-page-links { flex-wrap: wrap; }
+
+@media (max-width: 1190px) {
+  html:root:has(.ai-site-shell) { --ai-inset: 32px; --ai-column-gap: 30px; }
+  body:has(.ai-site-shell) .ai-institutional-nav { gap: 23px; }
+  body:has(.ai-site-shell):not(:has(.ai-home-institutional-masthead)) .page-columns > .page-column {
+    display: block !important;
+    width: auto;
+    flex: none;
+    animation: none;
+  }
+  body:has(.ai-site-shell):not(:has(.ai-home-institutional-masthead)) .mobile-navigation-label:has(> .mobile-navigation-input) { display: none; }
+  body:has(.ai-site-shell) footer.footer > div:has(> div > a[href*="beian.miit.gov.cn"]):has(> div > a[href*="beian.mps.gov.cn"]) {
+    position: static !important;
+    width: auto !important;
+    transform: none !important;
+  }
+}
+@media (max-width: 900px) {
+  html:root:has(.ai-site-shell) { --ai-inset: 24px; }
+  body:has(.ai-site-shell) .ai-institutional-masthead { grid-template-columns: minmax(0, 1fr); }
+  body:has(.ai-site-shell) .ai-institutional-brand { padding-bottom: 0; border-bottom: 0; }
+  body:has(.ai-site-shell) .ai-institutional-nav {
+    grid-column: 1;
+    justify-content: flex-start;
+    margin-top: 14px;
+    min-height: 0;
+    padding-block: 0;
+    gap: 25px;
+  }
+  body:has(.ai-site-shell) .ai-institutional-nav a { padding-block: 12px; font-size: 12px; }
+  body:has(.ai-site-shell) .ai-institutional-intro { padding-block: 24px; }
+  body:has(.ai-site-shell) .ai-institutional-intro h1 { font-size: 35px; }
+  body:has(.ai-site-shell) .ai-institutional-disclaimer { text-align: left; margin-top: 12px; }
+  body:has(.ai-site-shell):not(:has(.ai-home-institutional-masthead)) .page-columns { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 750px) {
+  /* The existing feed renderer has no classes. Match its exact five-column
+     contract rather than changing unrelated grids or clipping source details. */
+  body:has(.ai-site-shell.ai-site-page-ops) div:has(> div[style*="grid-template-columns:minmax(150px,1.3fr) 82px 52px 100px 88px"]) > div:first-child {
+    flex-wrap: wrap;
+  }
+  body:has(.ai-site-shell.ai-site-page-ops) div[style*="grid-template-columns:minmax(150px,1.3fr) 82px 52px 100px 88px"] {
+    grid-template-columns: repeat(3, minmax(0, 1fr)) !important;
+    min-width: 0;
+    gap: 12px 8px !important;
+    background: var(--ai-soft) !important;
+    border-color: var(--ai-line) !important;
+    border-radius: 0 !important;
+  }
+  body:has(.ai-site-shell.ai-site-page-ops) div[style*="grid-template-columns:minmax(150px,1.3fr) 82px 52px 100px 88px"] > div {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+  body:has(.ai-site-shell.ai-site-page-ops) div[style*="grid-template-columns:minmax(150px,1.3fr) 82px 52px 100px 88px"] > div:first-child {
+    grid-column: 1 / 3;
+  }
+  body:has(.ai-site-shell.ai-site-page-ops) div[style*="grid-template-columns:minmax(150px,1.3fr) 82px 52px 100px 88px"] > div:first-child > div {
+    white-space: normal !important;
+    overflow: visible !important;
+  }
+  body:has(.ai-site-shell.ai-site-page-ops) div[style*="grid-template-columns:minmax(150px,1.3fr) 82px 52px 100px 88px"] > div:nth-child(3) { text-align: left !important; }
+  body:has(.ai-site-shell.ai-site-page-ops) div[style*="grid-template-columns:minmax(150px,1.3fr) 82px 52px 100px 88px"] > div:nth-child(4) { text-align: center !important; }
+}
+@media (max-width: 550px) {
+  html:root:has(.ai-site-shell) { --ai-inset: 20px; }
+  body:has(.ai-site-shell) .ai-institutional-brand { padding-top: 20px; }
+  body:has(.ai-site-shell) .ai-institutional-wordmark { font-size: 34px; }
+  body:has(.ai-site-shell) .ai-institutional-nav { justify-content: space-between; gap: 8px; }
+  body:has(.ai-site-shell) .ai-institutional-intro { padding-block: 20px 17px; }
+  body:has(.ai-site-shell) .ai-institutional-intro h1 { font-size: 33px; }
+  body:has(.ai-site-shell) .ai-institutional-disclaimer { font-size: 11px; }
+  body:has(.ai-site-shell):not(:has(.ai-home-institutional-masthead)) .widget-content { padding: 16px; }
+  body:has(.ai-site-shell) .event-radar-summary-item { padding: 16px; }
+  body:has(.ai-site-shell) .event-radar-summary-title { font-size: 17px; }
+  body:has(.ai-site-shell) .event-radar-summary-top { flex-wrap: wrap; }
+  body:has(.ai-site-shell) .mq-context h3,
+  body:has(.ai-site-shell) .ops-summary-title { font-size: 21px !important; }
+  body:has(.ai-site-shell) .ops-summary-head { flex-wrap: wrap; }
+  body:has(.ai-site-shell) footer.footer { padding-bottom: 76px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  html:root:has(.ai-site-shell),
+  body:has(.ai-site-shell) *,
+  body:has(.ai-site-shell) *::before,
+  body:has(.ai-site-shell) *::after {
+    transition: none !important;
+    animation: none !important;
+    scroll-behavior: auto !important;
+  }
+}

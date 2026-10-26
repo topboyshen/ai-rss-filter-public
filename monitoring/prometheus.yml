@@ -1,0 +1,19 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+# Inactive optional template, not the production monitoring path.
+# The host ops checker already requests /metrics with X-API-Key. The pinned
+# Prometheus 2.48 stack cannot send that custom header through its scrape
+# configuration. Authorization/Bearer is not accepted by this endpoint.
+# Do not put keys in URLs, enable query-key auth, or weaken endpoint protection
+# to make this legacy stack work. Re-enabling it needs a separately reviewed
+# header/secret-file integration and an authenticated end-to-end scrape test.
+scrape_configs: []
+
+# Correct service/path for a future authenticated integration (not active):
+# - job_name: 'ai-rss-filter'
+#   static_configs:
+#     - targets: ['ai-filter-api:5000']
+#   metrics_path: '/metrics'
+#   scrape_interval: 10s

@@ -1,0 +1,12 @@
+.venv
+.pytest_cache
+__pycache__
+.git
+data/
+.env
+secrets/
+.coverage
+*.pyc
+docker-compose*.bak
+htmlcov
+*.md

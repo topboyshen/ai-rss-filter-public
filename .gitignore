@@ -1,0 +1,56 @@
+.env
+secrets/
+data/*.db
+data/*.db-*
+cache.db
+*.db
+*.db-*
+*.db-journal
+*.sqlite
+*.sqlite3
+__pycache__/
+.pytest_cache/
+.pytest-*/
+.venv/
+.venv-*/
+*.pyc
+htmlcov/
+.coverage
+*.log
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.bak
+*.bak.*
+*.bak-*
+*.backup
+*.backup-*
+# Durable webhook outbox / release records (runtime artifacts)
+data/webhook_spool/*.json
+# Root-level atomic writes and health probes; nested spool dirs are already ignored.
+/data/webhook_spool/.tmp-*
+/data/webhook_spool/.health-*
+data/webhook_spool/.completed-digests
+data/webhook_spool/.lock
+data/webhook_spool/inflight/
+data/webhook_spool/dead-letter/
+data/dashboard_snapshots/
+# Collector/repair receipts are persistent host runtime state, not source.
+data/market_close/
+# Private natural-score continuation inputs, checkpoints and locks are runtime state.
+/data/natural_score_continuations/
+# Private scoring sources/model responses; never commit or auto-upload.
+data/score_evidence/
+data/.auto-refresh.lock
+data/.cron-refresh.lock
+data/.digest-scheduler.lock
+data/.heartbeat.lock
+data/.refresh-execution.lock
+data/.last-refresh-trigger
+data/.event-mapping-migration-required
+data/releases/
+*.patch
+
+# Private local review/transport evidence must never enter the public repository.
+/data/diagnostics/

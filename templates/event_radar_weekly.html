@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>事件周报 {{ report.start_date }} — {{ report.end_date }}{% if report.pagination_block %} · {{ report.blocks[0].label }} · 第 {{ report.blocks[0].pagination.page }} 页{% endif %} · AI-Filter</title>
+  <style>
+    {% include 'event_radar_report_styles.html' %}
+    .weekly-report .week-range { margin-top: 4px; color: var(--muted); }
+    .weekly-report .report-highlights { padding-left: 1.3em; margin-bottom: 0; }
+    .weekly-report .report-highlights li + li { margin-top: 14px; }
+    .weekly-report .highlight-change { margin: 4px 0; }
+    .weekly-report .coverage-days { display: grid; grid-template-columns: repeat(auto-fit, minmax(115px, 1fr)); gap: 8px; padding: 0; list-style: none; }
+    .weekly-report .coverage-days li { padding: 6px 8px; border: 1px solid var(--border); border-radius: 8px; }
+    .weekly-report .top-actions form { margin: 0; }
+    .weekly-report .logout-button { background: none; cursor: pointer; font: inherit; }
+    .weekly-report details.panel summary { cursor: pointer; font-weight: 600; }
+    .weekly-report details.panel[open] summary { margin-bottom: 10px; }
+  </style>
+</head>
+<body class="event-report weekly-report">
+  <div class="page-shell">
+    <header class="topbar">
+      <div>
+        <h1>事件周报{% if report.pagination_block %} · {{ report.blocks[0].label }}{% endif %}</h1>
+        <div class="week-range">{{ report.start_date }} — {{ report.end_date }} · 北京时间，周一至周日</div>
+        <div class="historical-badge" data-testid="historical-badge">按历史入库记录重建的视图，非当周封存周报</div>
+        <div class="meta-grid"><span>{{ report.cutoff_label }} · {{ report.generated_at_label }}{% if release_version %} · AI-Filter {{ release_version }}{% endif %}</span></div>
+      </div>
+      <nav class="top-actions" aria-label="管理导航">
+        <a class="top-link" href="/dashboard/events">返回事件雷达</a>
+        <a class="top-link" href="/dashboard/events/daily">事件日报</a>
+        <a class="top-link" href="/dashboard">管理总览</a>
+        {% if auth and auth.kind == 'session' %}
+        <form method="post" action="/dashboard/logout">
+          <input type="hidden" name="csrf_token" value="{{ auth.csrf_token }}">
+          <button class="top-link logout-button" type="submit">安全退出</button>
+        </form>
+        {% endif %}
+      </nav>
+    </header>
+
+    <section class="panel" aria-label="报告范围与数据新鲜度" data-testid="report-scope">
+      <form class="date-form" method="get" action="/dashboard/events/weekly">
+        {% if report.prev_week %}<a href="/dashboard/events/weekly?week={{ report.prev_week }}">← 前一周</a>{% endif %}
+        <label>周一起始日期 <input type="date" name="week" value="{{ report.week }}" min="{{ report.min_week }}" max="{{ report.max_week }}" step="7" required></label>
+        <button type="submit">查看</button>
+        {% if report.next_week %}<a href="/dashboard/events/weekly?week={{ report.next_week }}">后一周 →</a>{% endif %}
+      </form>
+      <div class="meta-grid" style="margin-top:10px">
+        <span><strong>{{ report.cutoff_label }}</strong></span>
+        {% if report.is_current_week %}<span class="state-warning" data-testid="partial-week">本周尚未结束，仅展示截至当前已入库的记录。</span>{% endif %}
+        <span data-testid="freshness">数据新鲜度：最近一次入库 {{ report.freshness.latest_label }}{% if report.freshness.age_label %}，{{ report.freshness.age_label }}{% endif %}</span>
+        <span>{{ report.coverage_label }}</span>
+        {% if report.historical_note %}<span>{{ report.historical_note }}</span>{% endif %}
+        {% if report.data_state == 'incomplete' and report.missing_dates %}
+        <span class="state-warning" data-testid="missing-dates">{{ report.data_state_label }}</span>
+        {% else %}
+        {% if report.data_state != 'ok' %}<span class="state-warning" data-testid="data-state">{{ report.data_state_label }}</span>{% endif %}
+        {% if report.missing_dates %}<span class="state-warning" data-testid="missing-dates">已结束但无公开入库记录的日期：{{ report.missing_dates|join('、') }}；可能存在采集缺口，不代表当天没有事件。</span>{% endif %}
+        {% endif %}
+        {% if not report.coverage_complete and report.data_state == 'ok' %}<span class="state-warning" data-testid="coverage-incomplete">周内覆盖不完整，不能据此认定全周没有其他变化。</span>{% endif %}
+        <span>本周入库原文 {{ report.evidence_count }} 条 · 归并后事件 {{ report.event_group_count }} 个 · 合并同标题重复展示 {{ report.duplicate_groups_folded }} 组 · 仅有重复报道的既有事件 {{ report.repeat_event_count }} 个（未列出）</span>
+        <span>新增 / 推进 / 待验证仅展开事件评分 ≥ {{ '%.0f'|format(report.display_min_priority) }} 的事件（已有评分，不按报道数量排序）；否认/更正线索不设评分门槛，要求澄清/问询按同一评分门槛展开。</span>
+        {% if report.pagination_notice %}<span data-testid="pagination-notice">{{ report.pagination_notice }}</span>{% endif %}
+        <ul class="coverage-days" aria-label="周内每日入库覆盖">
+          {% for day in report.coverage_days %}<li>{{ day.date }}<br>{% if day.evidence_count is not none %}{{ day.evidence_count }} 条入库{% elif day.has_evidence %}已入库，计数不完整{% else %}无入库记录{% endif %}{% if day.partial %} · 当日未结束{% endif %}</li>{% endfor %}
+        </ul>
+      </div>
+    </section>
+
+    {% if report.pagination_block %}
+    <nav class="weekly-page-context" aria-label="周报分页视图">
+      <a href="{{ report.overview_url }}">← 返回本周概览</a>
+      <span>当前仅展示{{ report.blocks[0].label }} · 第 {{ report.blocks[0].pagination.page }} / {{ report.blocks[0].pagination.page_count }} 页</span>
+    </nav>
+    {% else %}
+    <section class="panel" aria-labelledby="highlights-title" data-testid="weekly-highlights">
+      <div class="block-head"><h2 id="highlights-title">本周关注条目</h2></div>
+      <p class="assoc">{{ report.highlights_label }}；最多 5 条，以下文字来自对应事件的已有记录。</p>
+      {% if report.highlights %}
+      <ol class="report-highlights">
+        {% for item in report.highlights[:5] %}
+        <li data-highlight-event-id="{{ item.event_id }}">
+          <a href="#report-event-{{ item.event_id|urlencode }}">{{ item.title }}</a>
+          <p class="highlight-change">{{ item.change }}</p>
+          <span class="assoc">下一验证点：{{ item.next_check }}</span>
+        </li>
+        {% endfor %}
+      </ol>
+      {% else %}<p class="empty-block">暂无达到展示门槛的关注条目。</p>{% endif %}
+    </section>
+    {% endif %}
+
+    {% set report_period = '本周' %}
+    {% include 'event_radar_report_blocks.html' %}
+
+    <details class="panel" aria-label="口径说明">
+      <summary>口径说明</summary>
+      <ul class="notes">{% for note in report.notes %}<li>{{ note }}</li>{% endfor %}</ul>
+    </details>
+  </div>
+</body>
+</html>

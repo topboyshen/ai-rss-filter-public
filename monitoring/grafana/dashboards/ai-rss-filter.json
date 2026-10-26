@@ -1,0 +1,25 @@
+{
+  "dashboard": {
+    "title": "AI RSS Filter Monitoring",
+    "panels": [
+      {
+        "title": "LLM API Success Rate",
+        "targets": [{
+          "expr": "rate(ai_filter_llm_calls_success[5m]) / rate(ai_filter_llm_calls_total[5m]) * 100"
+        }]
+      },
+      {
+        "title": "LLM API Latency",
+        "targets": [{
+          "expr": "ai_filter_llm_latency_avg_ms"
+        }]
+      },
+      {
+        "title": "Stage1 Local Fallback Rate",
+        "targets": [{
+          "expr": "rate(ai_filter_score_stage1_local_fallback[5m]) / rate(ai_filter_score_stage1_total[5m]) * 100"
+        }]
+      }
+    ]
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "event_id": "10000003-0000-4000-8000-000000000001",
+  "event_version": 1,
+  "evidence": [
+    {
+      "evidence_id": "4000001d-0000-4000-8000-000000000001",
+      "snapshot_hash": "9a010e0b1fd341a84308cee7f4f59d7e91e62d06a1ff9581c8048878570f89e5",
+      "source_uri": "https://example.invalid/synthetic-correction/3/evidence/1",
+      "version": 1
+    },
+    {
+      "evidence_id": "4000001e-0000-4000-8000-000000000001",
+      "snapshot_hash": "75a77ec737abfbf708437a48806ea99a529c7d4ba64369923d371f0e880125f4",
+      "source_uri": "https://example.invalid/synthetic-correction/3/evidence/2",
+      "version": 1
+    },
+    {
+      "evidence_id": "4000001f-0000-4000-8000-000000000001",
+      "snapshot_hash": "b030e012e2bfef2f6ed0b3769d5ead3aeee1b7c47b54e3197f07b1d1f9be87e9",
+      "source_uri": "https://example.invalid/synthetic-correction/3/evidence/3",
+      "version": 1
+    },
+    {
+      "evidence_id": "40000020-0000-4000-8000-000000000001",
+      "snapshot_hash": "130f3b5a11bf7d10b9675360eaeec7bff96643596678a8809d0534e40591bbbb",
+      "source_uri": "https://example.invalid/synthetic-correction/3/evidence/4",
+      "version": 1
+    },
+    {
+      "evidence_id": "40000021-0000-4000-8000-000000000001",
+      "snapshot_hash": "fd7bbddc0225bf8c33a0428ac16cb92cbc52706e747b4e89b6c1f2ecb7b0e9bf",
+      "source_uri": "https://example.invalid/synthetic-correction/3/evidence/5",
+      "version": 1
+    }
+  ],
+  "mapping": {
+    "mapping_id": "20000003-0000-4000-8000-000000000001",
+    "mapping_version": "asset-map:event-mapping-store-v7:manifest-c27ab17041461a1854f64fe8e52d372e4450457a60aa2c0cd04ceaa38d07e203:master-f00e91850b05250e6db4a7aa7c89825fbf998a39312ffb5684b9afd72962eca2",
+    "relation_type": "direct",
+    "revision": 4,
+    "security_id": "30000001-0000-4000-8000-000000000001"
+  },
+  "reason": "SYNTHETIC TEST EXAMPLE ONLY; not reviewed or authorized for any production database.",
+  "schema": 1
+}

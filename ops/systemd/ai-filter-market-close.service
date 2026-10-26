@@ -1,0 +1,20 @@
+[Unit]
+Description=AI Filter verified market-close collector
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/ai-rss-filter
+ExecStart=/bin/bash /root/ai-rss-filter/scripts/run_market_close.sh
+# The runner may wait up to 5 minutes for the release lock and then use its
+# own 15-minute collection deadline. Leave room for Compose startup and the
+# runner's TERM/KILL grace period so systemd is not the first timeout to fire.
+TimeoutStartSec=25min
+TimeoutStopSec=45s
+UMask=0077
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+NoNewPrivileges=true

@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ security.name }} · 个股事件历史</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #071018;
+      --panel: #0c1822;
+      --panel-2: #101f2b;
+      --line: #243541;
+      --text: #edf5f7;
+      --muted: #91a6af;
+      --cyan: #41d7d1;
+      --amber: #f5c66a;
+      --up: #ff6b6b;
+      --down: #45d49d;
+      --neutral: #9eb1ba;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-width: 320px;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 12% 0%, rgba(65, 215, 209, .11), transparent 32rem),
+        var(--bg);
+      font: 14px/1.55 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    a { color: inherit; }
+    .shell { width: min(1500px, calc(100% - 32px)); margin: 0 auto; padding: 24px 0 44px; }
+    .topbar, .stock-head, .panel, .event-card {
+      border: 1px solid var(--line);
+      background: rgba(12, 24, 34, .94);
+      box-shadow: 0 18px 55px rgba(0, 0, 0, .2);
+    }
+    .topbar {
+      display: flex; align-items: center; justify-content: space-between; gap: 20px;
+      padding: 14px 18px; border-radius: 16px; margin-bottom: 14px;
+    }
+    .brand { color: var(--cyan); letter-spacing: .15em; font-size: 12px; font-weight: 800; }
+    .top-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+    .top-link, .logout-button, .window-link, .event-link {
+      display: inline-flex; align-items: center; justify-content: center;
+      border: 1px solid var(--line); border-radius: 999px; padding: 7px 12px;
+      color: var(--muted); background: transparent; text-decoration: none; font: inherit;
+    }
+    .top-link:hover, .window-link:hover, .event-link:hover { border-color: var(--cyan); color: var(--text); }
+    .logout-button { cursor: pointer; }
+    .stock-head {
+      display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 20px;
+      padding: 22px; border-radius: 18px; margin-bottom: 14px;
+    }
+    .eyebrow { color: var(--cyan); font-size: 12px; font-weight: 800; letter-spacing: .12em; }
+    h1 { margin: 4px 0 5px; font-size: clamp(28px, 4vw, 46px); line-height: 1.08; }
+    .security-meta, .chip-row, .event-meta, .mapping-row, .outcome-row {
+      display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+    }
+    .security-code, .muted, .event-meta { color: var(--muted); }
+    .price-block { text-align: right; align-self: center; }
+    .latest-price { font-size: 34px; font-weight: 800; font-variant-numeric: tabular-nums; }
+    .latest-change { font-size: 15px; font-weight: 800; }
+    .bullish { color: var(--up); }
+    .bearish { color: var(--down); }
+    .neutral { color: var(--neutral); }
+    .chip, .type-badge, .relation-badge, .confidence-badge, .number-badge, .outcome-chip {
+      display: inline-flex; align-items: center; border: 1px solid var(--line);
+      border-radius: 999px; padding: 3px 9px; color: var(--muted); background: var(--panel-2);
+      font-size: 12px;
+    }
+    .number-badge { min-width: 28px; justify-content: center; color: var(--bg); background: var(--amber); border-color: var(--amber); font-weight: 900; }
+    .relation-badge { color: var(--cyan); }
+    .layout { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(350px, .75fr); gap: 14px; align-items: start; }
+    .panel { border-radius: 18px; overflow: hidden; }
+    .panel-head { display: flex; align-items: start; justify-content: space-between; gap: 16px; padding: 18px 20px; border-bottom: 1px solid var(--line); }
+    .panel-title { margin: 0; font-size: 19px; }
+    .panel-note { color: var(--muted); font-size: 12px; margin-top: 3px; }
+    .window-nav { display: flex; flex-wrap: wrap; gap: 6px; }
+    .window-link[aria-current="page"] { color: var(--bg); background: var(--cyan); border-color: var(--cyan); font-weight: 800; }
+    .notice { margin: 16px 20px 0; padding: 11px 13px; border: 1px solid #3b4d58; border-radius: 10px; color: #c9d7dc; background: #111f29; font-size: 12px; }
+    .chart-wrap { padding: 10px 12px 16px; overflow-x: auto; }
+    .kline { display: block; width: 100%; min-width: 700px; height: auto; }
+    .grid-line { stroke: #20323e; stroke-width: 1; }
+    .axis-label { fill: #8ba0aa; font-size: 11px; font-variant-numeric: tabular-nums; }
+    .wick { stroke-width: 1.2; }
+    .candle.up .wick, .candle.up .body { stroke: var(--up); fill: var(--up); }
+    .candle.down .wick, .candle.down .body { stroke: var(--down); fill: var(--down); }
+    .candle.flat .wick, .candle.flat .body { stroke: var(--neutral); fill: var(--neutral); }
+    .event-marker line { stroke: var(--amber); stroke-width: 1; stroke-dasharray: 2 2; }
+    .event-marker circle { fill: var(--amber); stroke: #fff4c9; stroke-width: 1; }
+    .event-marker text { fill: #071018; font-size: 9px; font-weight: 900; text-anchor: middle; dominant-baseline: central; }
+    .chart-legend { display: flex; flex-wrap: wrap; gap: 14px; padding: 0 20px 16px; color: var(--muted); font-size: 12px; }
+    .legend-dot { display: inline-block; width: 8px; height: 8px; margin-right: 5px; border-radius: 50%; background: var(--amber); }
+    .empty { display: grid; min-height: 270px; place-items: center; padding: 35px; text-align: center; color: var(--muted); }
+    .empty strong { display: block; color: var(--text); font-size: 18px; margin-bottom: 5px; }
+    .events { padding: 12px; display: grid; gap: 10px; max-height: 900px; overflow: auto; }
+    .event-card { border-radius: 13px; padding: 14px; scroll-margin-top: 18px; }
+    .event-card:target { border-color: var(--amber); box-shadow: 0 0 0 2px rgba(245, 198, 106, .15); }
+    .event-head { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 10px; align-items: start; }
+    .event-title { margin: 0 0 5px; font-size: 15px; line-height: 1.4; }
+    .mapping-row { margin-top: 10px; }
+    .mapping-reason { margin-top: 9px; color: #c9d7dc; }
+    .baseline-row { margin-top: 9px; padding: 8px 10px; border-left: 2px solid var(--cyan); color: var(--muted); background: rgba(65, 215, 209, .05); font-size: 12px; }
+    .evidence-list { margin: 10px 0 0; padding: 0; list-style: none; display: grid; gap: 6px; }
+    .evidence-link { color: #b9dadc; text-decoration: none; font-size: 12px; }
+    .evidence-link:hover { color: var(--cyan); text-decoration: underline; }
+    .no-evidence { margin-top: 8px; color: var(--muted); font-size: 12px; }
+    .outcome-row { margin-top: 10px; }
+    .outcome-chip { display: inline-grid; grid-template-columns: auto auto; gap: 5px; border-radius: 8px; }
+    .outcome-chip strong { color: var(--text); }
+    .event-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 12px; }
+    .event-link.primary { color: var(--bg); background: var(--cyan); border-color: var(--cyan); font-weight: 800; }
+    .history-pager { display: flex; justify-content: space-between; gap: 10px; padding: 12px; border-top: 1px solid var(--line); }
+    .footer { padding-top: 18px; text-align: center; color: var(--muted); font-size: 12px; }
+    @media (max-width: 980px) {
+      .layout { grid-template-columns: 1fr; }
+      .events { max-height: none; }
+    }
+    @media (max-width: 620px) {
+      .shell { width: min(100% - 18px, 1500px); padding-top: 9px; }
+      .topbar, .stock-head { grid-template-columns: 1fr; padding: 15px; }
+      .topbar { align-items: flex-start; }
+      .stock-head { display: grid; }
+      .price-block { text-align: left; }
+      .panel-head { display: grid; padding: 15px; }
+      .notice { margin: 12px 12px 0; }
+      .chart-wrap { padding-inline: 4px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div>
+        <div class="brand">STOCK ↔ EVENT ↔ PRICE</div>
+        <div class="muted">数据截至 {{ now }}{% if release_version %} · AI-Filter {{ release_version }}{% endif %}</div>
+      </div>
+      <nav class="top-actions" aria-label="管理导航">
+        <a class="top-link" href="/dashboard/events">统一事件雷达</a>
+        <a class="top-link" href="/dashboard">管理总览</a>
+        {% if auth and auth.kind == 'session' %}
+        <form method="post" action="/dashboard/logout">
+          <input type="hidden" name="csrf_token" value="{{ auth.csrf_token }}">
+          <button class="logout-button" type="submit">安全退出</button>
+        </form>
+        {% endif %}
+      </nav>
+    </header>
+
+    <section class="stock-head" aria-labelledby="stock-title">
+      <div>
+        <div class="eyebrow">个股反向事件历史</div>
+        <h1 id="stock-title">{{ security.name }}</h1>
+        <div class="security-meta">
+          <span class="security-code">{{ security.exchange }} · {{ security.ticker }}</span>
+          {% if security.industry %}<span class="chip">{{ security.industry }}</span>{% endif %}
+          {% for concept in security.concepts[:8] %}<span class="chip">{{ concept }}</span>{% endfor %}
+        </div>
+      </div>
+      <div class="price-block">
+        <div class="latest-price">{{ security.latest_close_display }}</div>
+        <div class="latest-change {{ security.latest_change_class }}">{{ security.latest_change_display or '涨跌幅不可用' }}</div>
+        <div class="muted">{% if price_end_date %}最新日线 {{ price_end_date }}{% else %}暂无日线缓存{% endif %}</div>
+      </div>
+    </section>
+
+    <main class="layout">
+      <section class="panel" aria-labelledby="kline-title">
+        <div class="panel-head">
+          <div>
+            <h2 class="panel-title" id="kline-title">日 K 与事件基准联动</h2>
+            <div class="panel-note">事件编号与右侧历史一致；标记落在事件之后首个可用开盘交易日</div>
+          </div>
+          <nav class="window-nav" aria-label="K线窗口">
+            {% for option in (60, 120, 240) %}
+            <a class="window-link" href="?window={{ option }}"{% if price_window == option %} aria-current="page"{% endif %}>{{ option }} 日</a>
+            {% endfor %}
+          </nav>
+        </div>
+        <div class="notice"><strong>历史关联验证，非交易回测。</strong> K 线来自版本化日线；黄色编号表示事件的可交易基准候选日，不代表该日开盘能够按图示价格成交，也不构成买卖信号。</div>
+        {% if chart %}
+        <div class="chart-wrap">
+          <svg class="kline" viewBox="0 0 {{ chart.width }} {{ chart.height }}" role="img" aria-labelledby="kline-svg-title kline-svg-desc">
+            <title id="kline-svg-title">{{ security.name }} 日 K 线与事件标记</title>
+            <desc id="kline-svg-desc">{{ price_start_date }} 至 {{ price_end_date }}，共 {{ chart.ohlc_rows }} 根完整 OHLC 日线，黄色编号可跳转到对应事件。</desc>
+            {% for tick in chart.ticks %}
+            <line class="grid-line" x1="{{ chart.plot_left }}" y1="{{ tick.y }}" x2="{{ chart.plot_right }}" y2="{{ tick.y }}"></line>
+            <text class="axis-label" x="8" y="{{ tick.y + 4 }}">{{ tick.label }}</text>
+            {% endfor %}
+            {% for tick in chart.date_ticks %}<text class="axis-label" x="{{ tick.x }}" y="{{ chart.height - 20 }}" text-anchor="middle">{{ tick.label }}</text>{% endfor %}
+            {% for candle in chart.candles %}
+            <g class="candle {{ candle.direction }}">
+              <title>{{ candle.trade_date }} 开 {{ candle.open }} 高 {{ candle.high }} 低 {{ candle.low }} 收 {{ candle.close }} · {{ candle.tradability_state }} · {{ candle.limit_state }} · {{ candle.suspension_state }}</title>
+              <line class="wick" x1="{{ candle.x }}" y1="{{ candle.high_y }}" x2="{{ candle.x }}" y2="{{ candle.low_y }}"></line>
+              <rect class="body" x="{{ candle.body_x }}" y="{{ candle.body_y }}" width="{{ candle.body_width }}" height="{{ candle.body_height }}"></rect>
+            </g>
+            {% endfor %}
+            {% for marker in chart.markers %}
+            <a class="event-marker" href="#event-{{ marker.event_id }}">
+              <title>#{{ marker.number }} {{ marker.title }} · 可交易基准候选 {{ marker.trade_date }}</title>
+              <line x1="{{ marker.x }}" y1="{{ marker.y + 6 }}" x2="{{ marker.x }}" y2="{{ marker.line_y }}"></line>
+              <circle cx="{{ marker.x }}" cy="{{ marker.y }}" r="7"></circle>
+              <text x="{{ marker.x }}" y="{{ marker.y + 0.5 }}">{{ marker.number }}</text>
+            </a>
+            {% endfor %}
+          </svg>
+        </div>
+        <div class="chart-legend">
+          <span><span class="legend-dot"></span>事件后首个可用开盘交易日</span>
+          <span class="bullish">红色：收涨</span><span class="bearish">绿色：收跌</span>
+          <span>{{ price_start_date }} — {{ price_end_date }}</span>
+        </div>
+        {% else %}
+        <div class="empty"><div><strong>暂无完整 OHLC 日线</strong>该股票刚进入事件关系图或行情源暂缺数据；页面不会用指数 K 线冒充个股行情。</div></div>
+        {% endif %}
+      </section>
+
+      <section class="panel" aria-labelledby="history-title">
+        <div class="panel-head">
+          <div>
+            <h2 class="panel-title" id="history-title">影响该股的事件</h2>
+            <div class="panel-note">按事件发生时间倒序 · 仅当前有效股票关系 · 合并后按规范 UUID 去重</div>
+          </div>
+          <span class="chip">{{ events|length }} 条{% if events_truncated %}+{% endif %}</span>
+        </div>
+        {% if events %}
+        <div class="events">
+          {% for event in events %}
+          <article class="event-card" id="event-{{ event.event_id }}">
+            <div class="event-head">
+              <span class="number-badge">{{ event.history_number }}</span>
+              <div>
+                <h3 class="event-title">{{ event.title }}</h3>
+                <div class="event-meta">
+                  <span class="type-badge">{{ event.event_type_label }}</span>
+                  <span>{{ event.occurred_at_label }}</span>
+                  <span>重要度 {{ '%.1f'|format(event.priority) }}/10</span>
+                </div>
+              </div>
+            </div>
+            <div class="mapping-row">
+              <span class="relation-badge">{{ event.relation_label }}</span>
+              <span class="{{ event.direction_class }}">{{ event.direction or '中性' }}</span>
+              <span class="confidence-badge">映射把握 {{ event.mapping_confidence_display }}</span>
+              <span class="confidence-badge">预期差 {{ event.expected_gap_display or '未评估' }}</span>
+            </div>
+            <div class="mapping-reason">{{ event.rationale or '暂无映射理由' }}</div>
+            <div class="baseline-row">
+              实际可用 {{ event.available_at_label }} · 事件研究基准 {{ event.baseline_trade_date or '不可用' }} 收盘 · 可交易基准候选 {{ event.tradable_trade_date or '不可用' }} 开盘
+              {% if event.marker_state == 'not_due' %} · 尚未到期{% elif event.marker_state == 'outside_window' %} · 位于当前 K 线窗口之外{% elif event.marker_state == 'missing_price' %} · 个股当日行情缺失{% endif %}
+            </div>
+            {% if event.outcomes %}
+            <div class="outcome-row" aria-label="四期限历史表现">
+              {% for outcome in event.outcomes %}
+              <span class="outcome-chip"><strong>{{ outcome.horizon }}</strong><span>原始 {{ outcome.gross_return_display or '—' }} · 超额 {{ outcome.excess_return_display or '—' }}</span></span>
+              {% endfor %}
+            </div>
+            {% endif %}
+            {% if event.evidence %}
+            <ul class="evidence-list">
+              {% for evidence in event.evidence %}
+              <li>
+                {% if evidence.source_uri %}<a class="evidence-link" href="{{ evidence.source_uri }}" target="_blank" rel="noopener noreferrer">{{ evidence.claim_text or '映射证据' }} · 来源可信度 {{ evidence.reliability_display }} ↗</a>
+                {% else %}<span class="no-evidence">{{ evidence.claim_text or '证据链接不可用' }} · 来源可信度 {{ evidence.reliability_display }}</span>{% endif %}
+              </li>
+              {% endfor %}
+            </ul>
+            {% else %}<div class="no-evidence">暂无绑定到当前股票关系的原文证据</div>{% endif %}
+            <div class="event-actions">
+              <a class="event-link primary" href="{{ event.event_url }}">查看事件与全部来源 →</a>
+              <a class="event-link" href="{{ event.reaction_url }}">查看四期限与可交易性 →</a>
+            </div>
+          </article>
+          {% endfor %}
+        </div>
+        {% else %}
+        <div class="empty"><div><strong>暂无当前有效事件关系</strong>该页只展示稳定事件核心中的可审计映射，不从行业或概念标签临时推断历史事件。</div></div>
+        {% endif %}
+        {% if event_cursor or next_event_cursor %}
+        <nav class="history-pager" aria-label="个股事件历史分页">
+          {% if event_cursor %}<a class="event-link" href="?window={{ price_window }}">返回最新事件</a>{% else %}<span></span>{% endif %}
+          {% if next_event_cursor %}<a class="event-link primary" href="?window={{ price_window }}&amp;cursor={{ next_event_cursor|urlencode }}">更早事件 →</a>{% endif %}
+        </nav>
+        {% endif %}
+      </section>
+    </main>
+    <footer class="footer">股票 → 规范事件 UUID → 原文证据 → 版本化 K 线 → 四期限结果</footer>
+  </div>
+</body>
+</html>
