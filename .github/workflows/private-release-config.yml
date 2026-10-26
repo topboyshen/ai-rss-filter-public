@@ -26,6 +26,10 @@ on:
       - 'core/config.py'
       - '.github/workflows/private-release-config.yml'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   native-amd64:
     runs-on: ubuntu-24.04
