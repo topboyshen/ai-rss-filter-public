@@ -12,7 +12,7 @@ on:
       - 'scripts/verify_private_release_native.py'
       - 'scripts/release.sh'
       - 'scripts/run-release-gate.sh'
-      - 'tests/test_private_release_contract.py'
+      - 'tests/test_private_release_*.py'
       - 'tests/test_release_script.py'
       - 'Dockerfile'
       - 'core/config.py'
@@ -21,7 +21,7 @@ on:
     branches: [master]
     paths:
       - 'scripts/*release*'
-      - 'tests/test_private_release_contract.py'
+      - 'tests/test_private_release_*.py'
       - 'Dockerfile'
       - 'core/config.py'
       - '.github/workflows/private-release-config.yml'
