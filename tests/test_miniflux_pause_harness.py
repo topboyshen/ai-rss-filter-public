@@ -78,6 +78,31 @@ class FixtureTests(unittest.TestCase):
 
 
 class NativeGuardTests(unittest.TestCase):
+    def test_stop_new_confirmation_requires_exact_producer_counts_and_distinct_state(self):
+        harness = object.__new__(native.Harness)
+        harness.manifest = "a" * 64
+        receipt = {"confirmed": True, "result": {"schema": 1, "manifest": harness.manifest,
+            "operation_id": "b" * 64, "action": "stop_new", "state": "draining", "durable": True,
+            "confirmed": True, "previous_generation": 0, "generation": 1,
+            "active_leases": 2, "uncertain_leases": 0,
+            "active_producer_leases": 0, "uncertain_producer_leases": 0}}
+        self.assertEqual(harness.checked_draining(receipt, "b" * 64), receipt["result"])
+        for field in ("active_producer_leases", "uncertain_producer_leases"):
+            for value in (None, True, -1, 1):
+                wrong = copy.deepcopy(receipt)
+                wrong["result"][field] = value
+                with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                    harness.checked_draining(wrong, "b" * 64)
+        for field, value in (("action", "pause"), ("state", "closed"), ("generation", 3)):
+            wrong = copy.deepcopy(receipt)
+            wrong["result"][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                harness.checked_draining(wrong, "b" * 64)
+        pending = copy.deepcopy(receipt)
+        pending["confirmed"] = pending["result"]["confirmed"] = False
+        pending["result"]["active_producer_leases"] = 1
+        self.assertEqual(harness.checked_draining(pending, "b" * 64, confirmed=False), pending["result"])
+
     def test_consecutive_commands_share_remaining_phase_budget(self):
         with tempfile.TemporaryDirectory(prefix="phase-command-") as directory:
             harness = object.__new__(native.Harness)

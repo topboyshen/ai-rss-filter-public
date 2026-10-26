@@ -126,10 +126,10 @@ index 28687c6..d52ca6d 100644
 +		httpServers = append(httpServers, server.StartWebServer(store, pool)...)
 diff --git a/internal/cli/handoff_control.go b/internal/cli/handoff_control.go
 new file mode 100644
-index 0000000..b84fb39
+index 0000000..43d7384
 --- /dev/null
 +++ b/internal/cli/handoff_control.go
-@@ -0,0 +1,114 @@
+@@ -0,0 +1,116 @@
 +// SPDX-License-Identifier: Apache-2.0
 +package cli
 +
@@ -209,6 +209,8 @@ index 0000000..b84fb39
 +				switch r.URL.Path {
 +				case "/initialize":
 +					result, err = store.InitializeHandoff(ctx, fields["operation_id"])
++				case "/stop-new":
++					result, err = store.StopNewHandoff(ctx, fields["operation_id"])
 +				case "/pause":
 +					result, err = store.PauseHandoff(ctx, fields["operation_id"])
 +				case "/resume":
@@ -440,10 +442,10 @@ index 9859e41..0d5122e 100644
 +	}
 diff --git a/internal/database/handoff.go b/internal/database/handoff.go
 new file mode 100644
-index 0000000..eda55ec
+index 0000000..2704180
 --- /dev/null
 +++ b/internal/database/handoff.go
-@@ -0,0 +1,14 @@
+@@ -0,0 +1,16 @@
 +// SPDX-License-Identifier: Apache-2.0
 +package database
 +
@@ -458,6 +460,8 @@ index 0000000..eda55ec
 +	}
 +	return legacyHandoffMigration(tx)
 +}
++
++func handoffDrainMigration(tx *sql.Tx) error { return handoff.MigrateDrain(tx) }
 diff --git a/internal/database/legacy_handoff.go b/internal/database/legacy_handoff.go
 new file mode 100644
 index 0000000..9c25c89
@@ -491,11 +495,12 @@ index 0000000..9c25c89
 +	return err
 +}
 diff --git a/internal/database/migrations.go b/internal/database/migrations.go
-index 84cbe03..348ab1c 100644
+index 84cbe03..38e1bd1 100644
 --- a/internal/database/migrations.go
 +++ b/internal/database/migrations.go
-@@ -1548,0 +1549 @@ var migrations = [...]func(tx *sql.Tx) error{
+@@ -1548,0 +1549,2 @@ var migrations = [...]func(tx *sql.Tx) error{
 +	handoffMigration,
++	handoffDrainMigration,
 diff --git a/internal/fever/handler.go b/internal/fever/handler.go
 index 3945e42..162b371 100644
 --- a/internal/fever/handler.go
@@ -541,12 +546,314 @@ index 9450ed0..c0aba63 100644
 +	if !request.AcquireAuthenticatedHandoff(w, r) {
 +		return
 +	}
+diff --git a/internal/handoff/drain.go b/internal/handoff/drain.go
+new file mode 100644
+index 0000000..b920da3
+--- /dev/null
++++ b/internal/handoff/drain.go
+@@ -0,0 +1,114 @@
++// SPDX-License-Identifier: Apache-2.0
++package handoff
++
++import (
++	"context"
++	"database/sql"
++	"errors"
++)
++
++// Migration 134 upgrades the existing 133 gate without rewriting its evidence.
++// Migration 133 remains byte-for-byte compatible with the previous release.
++const DrainSchemaSQL = `
++ALTER TABLE handoff_state DROP CONSTRAINT handoff_state_phase_check;
++ALTER TABLE handoff_state ADD CONSTRAINT handoff_state_phase_check CHECK(phase IN ('open','draining','closing','closed'));
++ALTER TABLE handoff_operations DROP CONSTRAINT handoff_operations_action_check;
++ALTER TABLE handoff_operations ADD CONSTRAINT handoff_operations_action_check CHECK(action IN ('initialize','stop_new','pause','resume'));
++`
++
++func MigrateDrain(tx *sql.Tx) error { _, err := tx.Exec(DrainSchemaSQL); return err }
++
++// StopNew durably closes producer admission, leaving durable outbox consumers
++// enabled. Confirmation waits for prior producers, NOT queue emptiness or ACKs.
++// After inventory is drained, Pause freezes consumers before any cutover.
++func StopNew(ctx context.Context, db *sql.DB, manifest, op string) (Receipt, error) {
++	var empty Receipt
++	if db == nil {
++		return empty, ErrConflict
++	}
++	if err := validate(manifest, op); err != nil {
++		return empty, err
++	}
++	conn, err := db.Conn(ctx)
++	if err != nil {
++		return empty, err
++	}
++	defer discard(conn)
++	tx, err := beginTx(ctx, conn)
++	if err != nil {
++		return empty, err
++	}
++	defer tx.Rollback()
++	s, err := readState(ctx, tx)
++	if errors.Is(err, sql.ErrNoRows) {
++		return empty, ErrClosed
++	}
++	if err != nil {
++		return empty, err
++	}
++	if s.manifest != manifest {
++		return empty, ErrConflict
++	}
++	if s.operation == op {
++		r, e := readReceipt(ctx, tx, manifest, op)
++		if e != nil || r.Action != "stop_new" {
++			return empty, ErrConflict
++		}
++		if e = tx.Commit(); e != nil {
++			return empty, e
++		}
++		return confirmStopNew(ctx, conn, manifest, op)
++	}
++	if s.phase != "open" {
++		return empty, ErrClosed
++	}
++	if err = insertOperation(ctx, tx, manifest, op, "stop_new", s.operation, s.generation, false); err != nil {
++		return empty, err
++	}
++	_, err = tx.ExecContext(ctx, `UPDATE handoff_state SET phase='draining',generation=generation+1,current_operation=$1 WHERE id=1`, op)
++	if err != nil {
++		return empty, err
++	}
++	if err = tx.Commit(); err != nil {
++		return empty, err
++	}
++	return confirmStopNew(ctx, conn, manifest, op)
++}
++
++func confirmStopNew(ctx context.Context, conn *sql.Conn, manifest, op string) (Receipt, error) {
++	tx, err := beginTx(ctx, conn)
++	if err != nil {
++		return Receipt{}, err
++	}
++	defer tx.Rollback()
++	s, err := readState(ctx, tx)
++	if err != nil {
++		return Receipt{}, err
++	}
++	if s.manifest != manifest || s.operation != op || s.phase != "draining" {
++		return Receipt{}, ErrConflict
++	}
++	r, err := readReceipt(ctx, tx, manifest, op)
++	if err != nil {
++		return r, err
++	}
++	if r.Action != "stop_new" || r.Generation != s.generation || r.ActiveProducerLeases == nil || r.UncertainProducerLeases == nil {
++		return r, ErrConflict
++	}
++	settled := *r.ActiveProducerLeases == 0 && *r.UncertainProducerLeases == 0
++	if settled && !r.Confirmed {
++		_, err = tx.ExecContext(ctx, `UPDATE handoff_operations SET status='confirmed',confirmed_at=clock_timestamp() WHERE operation_id=$1 AND status='pending'`, op)
++		if err != nil {
++			return r, err
++		}
++		r.Confirmed = true
++	}
++	if r.Confirmed && !settled {
++		return r, ErrConflict
++	}
++	if err = tx.Commit(); err != nil {
++		return Receipt{}, err
++	}
++	r.Durable = true
++	return r, nil
++}
+diff --git a/internal/handoff/drain_integration_test.go b/internal/handoff/drain_integration_test.go
+new file mode 100644
+index 0000000..1d786c0
+--- /dev/null
++++ b/internal/handoff/drain_integration_test.go
+@@ -0,0 +1,176 @@
++// SPDX-License-Identifier: Apache-2.0
++package handoff
++
++import (
++	"context"
++	"database/sql"
++	"errors"
++	"strings"
++	"testing"
++)
++
++const stopNewOp = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
++
++func upgradeDrain(t *testing.T, f fixture) {
++	t.Helper()
++	tx, err := f.db.Begin()
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer tx.Rollback()
++	if err = MigrateDrain(tx); err != nil {
++		t.Fatal(err)
++	}
++	if err = tx.Commit(); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestPGStopNewPreservesOldEvidenceAndLetsOnlyOutboxDrain(t *testing.T) {
++	f := startGate(t) // Original migration 133 and evidence exist before upgrade.
++	ctx := context.Background()
++	producer, err := Begin(ctx, f.pool, testManifest, "manual_save")
++	if err != nil {
++		t.Fatal(err)
++	}
++	upgradeDrain(t, f)
++	consumer, err := BeginOutbox(ctx, f.pool, testManifest, "outbox_sender")
++	if err != nil {
++		t.Fatal(err)
++	}
++	r, err := StopNew(ctx, f.db, testManifest, stopNewOp)
++	if err != nil || !r.Durable || r.Confirmed || r.State != "draining" || r.Generation != 1 || r.ActiveProducerLeases == nil || *r.ActiveProducerLeases != 1 || r.ActiveLeases != 2 {
++		t.Fatalf("pending %#v %v", r, err)
++	}
++	for _, source := range []string{"scheduler", "queued_refresh", "http", "manual_save", "legacy_async"} {
++		if _, err = Begin(ctx, f.pool, testManifest, source); !errors.Is(err, ErrClosed) {
++			t.Fatalf("producer %s admitted: %v", source, err)
++		}
++	}
++	if _, err = Begin(ctx, f.pool, testManifest, "outbox_sender"); !errors.Is(err, ErrConflict) {
++		t.Fatal("source label granted consumer privilege", err)
++	}
++	if _, err = BeginOutbox(ctx, f.pool, testManifest, "manual_save"); !errors.Is(err, ErrConflict) {
++		t.Fatal("arbitrary consumer source", err)
++	}
++	if err = producer.Finish(); err != nil {
++		t.Fatal(err)
++	}
++	r, err = Query(ctx, f.db, testManifest, stopNewOp)
++	if err != nil || !r.Confirmed || *r.ActiveProducerLeases != 0 || *r.UncertainProducerLeases != 0 || r.ActiveLeases != 1 {
++		t.Fatalf("producer confirmation %#v %v", r, err)
++	}
++	// New process/pool must observe durable draining rather than auto-opening.
++	restarted, err := sql.Open("postgres", f.dsn)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer restarted.Close()
++	if _, err = Begin(ctx, restarted, testManifest, "scheduler"); !errors.Is(err, ErrClosed) {
++		t.Fatal(err)
++	}
++	second, err := BeginOutbox(ctx, restarted, testManifest, "outbox_pass")
++	if err != nil {
++		t.Fatal("restart could not drain", err)
++	}
++	if _, err = Resume(ctx, f.db, testManifest, stopNewOp, resumeOp); err == nil {
++		t.Fatal("draining resumed without full pause")
++	}
++	r, err = Pause(ctx, f.db, testManifest, pauseOp)
++	if err != nil || r.Confirmed || r.State != "closing" || r.ActiveLeases != 2 {
++		t.Fatalf("freeze %#v %v", r, err)
++	}
++	if _, err = BeginOutbox(ctx, restarted, testManifest, "outbox_sender"); !errors.Is(err, ErrClosed) {
++		t.Fatal("consumer admitted during freeze", err)
++	}
++	if _, err = Query(ctx, f.db, testManifest, stopNewOp); !errors.Is(err, ErrConflict) {
++		t.Fatal("stale stop receipt certified current state", err)
++	}
++	if err = consumer.Finish(); err != nil {
++		t.Fatal(err)
++	}
++	if err = second.Finish(); err != nil {
++		t.Fatal(err)
++	}
++	r, err = Query(ctx, f.db, testManifest, pauseOp)
++	if err != nil || !r.Confirmed || r.State != "closed" || r.ActiveLeases != 0 {
++		t.Fatalf("closed %#v %v", r, err)
++	}
++	if _, err = BeginOutbox(ctx, restarted, testManifest, "outbox_sender"); !errors.Is(err, ErrClosed) {
++		t.Fatal(err)
++	}
++	var original int
++	if err = f.db.QueryRow(`SELECT count(*) FROM handoff_operations WHERE operation_id=$1 AND action='initialize' AND generation=0`, initializeOp).Scan(&original); err != nil || original != 1 {
++		t.Fatal("upgrade lost original operation", err)
++	}
++}
++
++func TestPGStopNewCannotConfirmUncertainProducer(t *testing.T) {
++	f := startGate(t)
++	upgradeDrain(t, f)
++	ctx := context.Background()
++	producer, err := Begin(ctx, f.pool, testManifest, "manual_save")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = producer.Abort(); err != nil {
++		t.Fatal(err)
++	}
++	for range 2 {
++		r, err := StopNew(ctx, f.db, testManifest, stopNewOp)
++		if err != nil || r.Confirmed || !r.Durable || r.UncertainProducerLeases == nil || *r.UncertainProducerLeases != 1 {
++			t.Fatalf("uncertain %#v %v", r, err)
++		}
++	}
++	consumer, err := BeginOutbox(ctx, f.pool, testManifest, "outbox_sender")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = consumer.Finish(); err != nil {
++		t.Fatal(err)
++	}
++	r, err := Pause(ctx, f.db, testManifest, pauseOp)
++	if err != nil || r.Confirmed || r.UncertainLeases != 1 {
++		t.Fatal(r, err)
++	}
++}
++
++func TestPGStopNewReservesFinalPauseCapacity(t *testing.T) {
++	f := startGate(t)
++	upgradeDrain(t, f)
++	_, err := f.db.Exec(`INSERT INTO handoff_operations(operation_id,manifest,action,previous_generation,generation,prior_operation,status,confirmed_at)
++ SELECT lpad(to_hex(n),64,'0'),$1,'initialize',-1,0,'','confirmed',now() FROM generate_series(1,$2) n`, testManifest, MaxRetainedRecords-2)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err = StopNew(context.Background(), f.db, testManifest, stopNewOp); err == nil {
++		t.Fatal("stop-new consumed final pause slot")
++	}
++	var phase string
++	if err = f.db.QueryRow(`SELECT phase FROM handoff_state`).Scan(&phase); err != nil || phase != "open" {
++		t.Fatal(phase, err)
++	}
++	r, err := Pause(context.Background(), f.db, testManifest, pauseOp)
++	if err != nil || !r.Confirmed {
++		t.Fatal(r, err)
++	}
++}
++
++func TestDrainEntryPointsRejectFabricatedIdentityWithoutDatabase(t *testing.T) {
++	ctx := context.Background()
++	if _, err := StopNew(ctx, nil, testManifest, stopNewOp); err == nil {
++		t.Fatal("nil DB")
++	}
++	if _, err := BeginOutbox(ctx, nil, testManifest, "outbox_sender"); err == nil {
++		t.Fatal("nil DB")
++	}
++	if _, err := Begin(ctx, nil, testManifest, "outbox_sender"); !errors.Is(err, ErrConflict) {
++		t.Fatal(err)
++	}
++	if _, err := BeginOutbox(ctx, nil, testManifest, "scheduler"); !errors.Is(err, ErrConflict) {
++		t.Fatal(err)
++	}
++	if strings.Contains(DrainSchemaSQL, "DELETE") || strings.Contains(DrainSchemaSQL, "UPDATE") || strings.Contains(DrainSchemaSQL, "INSERT") {
++		t.Fatal("upgrade modifies old evidence")
++	}
++}
 diff --git a/internal/handoff/handoff.go b/internal/handoff/handoff.go
 new file mode 100644
-index 0000000..b4db6f2
+index 0000000..506df89
 --- /dev/null
 +++ b/internal/handoff/handoff.go
-@@ -0,0 +1,695 @@
+@@ -0,0 +1,725 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Package handoff implements a durable admission gate, not a delivery ACK.
 +// A retained active/uncertain lease blocks closing even after its backend dies.
@@ -638,17 +945,19 @@ index 0000000..b4db6f2
 +func Migrate(tx *sql.Tx) error { _, err := tx.Exec(SchemaSQL); return err }
 +
 +type Receipt struct {
-+	Schema             int    `json:"schema"`
-+	Manifest           string `json:"manifest"`
-+	OperationID        string `json:"operation_id"`
-+	Action             string `json:"action"`
-+	State              string `json:"state"`
-+	PreviousGeneration int64  `json:"previous_generation"`
-+	Generation         int64  `json:"generation"`
-+	Durable            bool   `json:"durable"`
-+	Confirmed          bool   `json:"confirmed"`
-+	ActiveLeases       int64  `json:"active_leases"`
-+	UncertainLeases    int64  `json:"uncertain_leases"`
++	Schema                  int    `json:"schema"`
++	Manifest                string `json:"manifest"`
++	OperationID             string `json:"operation_id"`
++	Action                  string `json:"action"`
++	State                   string `json:"state"`
++	PreviousGeneration      int64  `json:"previous_generation"`
++	Generation              int64  `json:"generation"`
++	Durable                 bool   `json:"durable"`
++	Confirmed               bool   `json:"confirmed"`
++	ActiveLeases            int64  `json:"active_leases"`
++	UncertainLeases         int64  `json:"uncertain_leases"`
++	ActiveProducerLeases    *int64 `json:"active_producer_leases,omitempty"`
++	UncertainProducerLeases *int64 `json:"uncertain_producer_leases,omitempty"`
 +}
 +
 +type state struct {
@@ -723,7 +1032,26 @@ index 0000000..b4db6f2
 +	done         string
 +}
 +
++// Begin admits producers only. Reserved consumer names cannot grant drain access.
 +func Begin(ctx context.Context, db *sql.DB, manifest, source string) (*Lease, error) {
++	if outboxSource(source) {
++		return nil, ErrConflict
++	}
++	return begin(ctx, db, manifest, source, false)
++}
++
++func outboxSource(source string) bool { return source == "outbox_pass" || source == "outbox_sender" }
++
++// BeginOutbox is exclusively for consuming already durable webhook rows.
++// It cannot authorize refresh, manual saves, or direct legacy webhook sends.
++func BeginOutbox(ctx context.Context, db *sql.DB, manifest, source string) (*Lease, error) {
++	if !outboxSource(source) {
++		return nil, ErrConflict
++	}
++	return begin(ctx, db, manifest, source, true)
++}
++
++func begin(ctx context.Context, db *sql.DB, manifest, source string, consumer bool) (*Lease, error) {
 +	if db == nil || !identifier.MatchString(manifest) || !sourceName.MatchString(source) {
 +		return nil, ErrConflict
 +	}
@@ -759,7 +1087,7 @@ index 0000000..b4db6f2
 +	if s.manifest != manifest {
 +		return nil, ErrConflict
 +	}
-+	if s.phase != "open" {
++	if s.phase != "open" && !(consumer && s.phase == "draining") {
 +		return nil, ErrClosed
 +	}
 +	var count int
@@ -912,8 +1240,8 @@ index 0000000..b4db6f2
 +		return err
 +	}
 +	limit := MaxRetainedRecords
-+	if action == "resume" {
-+		// Reopening must retain one slot for the next durable pause operation.
++	if action == "resume" || action == "stop_new" {
++		// Opening or draining must retain a slot for a full durable pause.
 +		limit--
 +	}
 +	if count >= limit {
@@ -946,6 +1274,12 @@ index 0000000..b4db6f2
 +		}
 +	}
 +	err = tx.QueryRowContext(ctx, `SELECT count(*) FILTER(WHERE status='active'),count(*) FILTER(WHERE status='uncertain') FROM handoff_leases WHERE status<>'finished'`).Scan(&r.ActiveLeases, &r.UncertainLeases)
++	if err == nil && r.Action == "stop_new" {
++		r.State = "draining"
++		var active, uncertain int64
++		err = tx.QueryRowContext(ctx, `SELECT count(*) FILTER(WHERE status='active'),count(*) FILTER(WHERE status='uncertain') FROM handoff_leases WHERE status<>'finished' AND source NOT IN ('outbox_pass','outbox_sender')`).Scan(&active, &uncertain)
++		r.ActiveProducerLeases, r.UncertainProducerLeases = &active, &uncertain
++	}
 +	return r, err
 +}
 +
@@ -1053,7 +1387,7 @@ index 0000000..b4db6f2
 +		}
 +		return confirmPause(ctx, conn, manifest, op)
 +	}
-+	if s.phase != "open" {
++	if s.phase != "open" && s.phase != "draining" {
 +		return empty, ErrClosed
 +	}
 +	if err = insertOperation(ctx, tx, manifest, op, "pause", s.operation, s.generation, false); err != nil {
@@ -1154,6 +1488,9 @@ index 0000000..b4db6f2
 +	}
 +	if r.Action == "pause" {
 +		return confirmPause(ctx, conn, manifest, op)
++	}
++	if r.Action == "stop_new" {
++		return confirmStopNew(ctx, conn, manifest, op)
 +	}
 +	r.Durable = true
 +	return r, nil
@@ -3383,10 +3720,10 @@ index 09ae115..c942514 100644
 +			}
 diff --git a/internal/storage/handoff.go b/internal/storage/handoff.go
 new file mode 100644
-index 0000000..cf71841
+index 0000000..9682c83
 --- /dev/null
 +++ b/internal/storage/handoff.go
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,71 @@
 +// SPDX-License-Identifier: Apache-2.0
 +package storage
 +
@@ -3440,6 +3777,23 @@ index 0000000..cf71841
 +}
 +func (s *Storage) ResumeHandoff(ctx context.Context, closed, op string) (handoff.Receipt, error) {
 +	return handoff.Resume(ctx, s.db, config.Opts.HandoffManifest(), closed, op)
++}
++
++// BeginOutboxHandoff is only for the durable outbox cleanup/claim/send lifecycle.
++func (s *Storage) BeginOutboxHandoff(source string) (*handoff.Lease, error) {
++	if !config.Opts.HasHandoff() {
++		return nil, nil
++	}
++	if s.handoffDB == nil {
++		return nil, errors.New("handoff lease pool not configured")
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
++	defer cancel()
++	return handoff.BeginOutbox(ctx, s.handoffDB, config.Opts.HandoffManifest(), source)
++}
++
++func (s *Storage) StopNewHandoff(ctx context.Context, op string) (handoff.Receipt, error) {
++	return handoff.StopNew(ctx, s.db, config.Opts.HandoffManifest(), op)
 +}
 diff --git a/internal/storage/legacy_handoff.go b/internal/storage/legacy_handoff.go
 new file mode 100644
@@ -3834,6 +4188,84 @@ index 99eca38..8b10827 100644
 +				return
 +			}
 +		}
+diff --git a/internal/worker/drain_integration_test.go b/internal/worker/drain_integration_test.go
+new file mode 100644
+index 0000000..e830c05
+--- /dev/null
++++ b/internal/worker/drain_integration_test.go
+@@ -0,0 +1,72 @@
++// SPDX-License-Identifier: Apache-2.0
++package worker
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync/atomic"
++	"testing"
++
++	"miniflux.app/v2/internal/handoff"
++)
++
++func TestPostgresStopNewDrainsExactExistingBodyButFullPauseStopsClaims(t *testing.T) {
++	f := idlePostgres(t)
++	ctx := context.Background()
++	body := `{"synthetic":"durable before stop-new"}`
++	var seen atomic.Int32
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		raw, err := io.ReadAll(io.LimitReader(r.Body, 2048))
++		if err != nil || string(raw) != body {
++			t.Error("body changed", err)
++		}
++		seen.Add(1)
++		sum := sha256.Sum256(raw)
++		id := hex.EncodeToString(sum[:])
++		w.Header().Set("Content-Type", "application/json")
++		w.WriteHeader(http.StatusAccepted)
++		json.NewEncoder(w).Encode(map[string]any{"schema": 1, "durable": true, "delivery_id": id, "body_sha256": id})
++	}))
++	defer server.Close()
++	f.put(t, body, server.URL, "pending", false)
++	f.put(t, "retained held original", "https://must-not-send.invalid", "held", false)
++	r, err := handoff.StopNew(ctx, f.db, strings.Repeat("a", 64), strings.Repeat("e", 64))
++	if err != nil || !r.Confirmed || r.State != "draining" {
++		t.Fatal(r, err)
++	}
++	if _, err = f.store.BeginHandoff("manual_save"); err == nil {
++		t.Fatal("manual producer admitted")
++	}
++	runWebhookOutboxPass(ctx, f.store)
++	var state string
++	var attempts int
++	var raw []byte
++	if err = f.db.QueryRow(`SELECT state,attempts,body FROM webhook_outbox WHERE target_url=$1`, server.URL).Scan(&state, &attempts, &raw); err != nil || state != "acked" || attempts != 1 || string(raw) != body || seen.Load() != 1 {
++		t.Fatal(state, attempts, seen.Load(), err)
++	}
++	if err = f.db.QueryRow(`SELECT state,attempts,body FROM webhook_outbox WHERE target_url='https://must-not-send.invalid'`).Scan(&state, &attempts, &raw); err != nil || state != "held" || attempts != 0 || string(raw) != "retained held original" {
++		t.Fatal("held changed", state, attempts, err)
++	}
++	// Synthetic direct fixture insertion represents another durable backlog row.
++	f.put(t, "pending before full freeze", server.URL, "pending", false)
++	r, err = handoff.Pause(ctx, f.db, strings.Repeat("a", 64), strings.Repeat("d", 64))
++	if err != nil || !r.Confirmed {
++		t.Fatal(r, err)
++	}
++	before := f.leaseCount(t)
++	for range 3 {
++		runWebhookOutboxPass(ctx, f.store)
++	}
++	if seen.Load() != 1 || f.leaseCount(t) != before {
++		t.Fatal("full pause allowed another claim")
++	}
++	if err = f.db.QueryRow(`SELECT attempts FROM webhook_outbox WHERE state='pending'`).Scan(&attempts); err != nil || attempts != 0 {
++		t.Fatal("pending changed", attempts, err)
++	}
++}
 diff --git a/internal/worker/handoff_integration_test.go b/internal/worker/handoff_integration_test.go
 new file mode 100644
 index 0000000..08ae8b7
@@ -4137,7 +4569,7 @@ index d0c9339..72bd29b 100644
 -		queue: make(chan model.Job),
 +		queue: make(chan admittedJob), store: store,
 diff --git a/internal/worker/webhook_outbox.go b/internal/worker/webhook_outbox.go
-index 7078fc6..60814fa 100644
+index 7078fc6..3bde058 100644
 --- a/internal/worker/webhook_outbox.go
 +++ b/internal/worker/webhook_outbox.go
 @@ -8,0 +9 @@ import (
@@ -4146,7 +4578,7 @@ index 7078fc6..60814fa 100644
 +	if !outboxWorkHint(ctx, store, true) {
 +		return
 +	}
-+	lease, gateErr := store.BeginHandoff("outbox_pass")
++	lease, gateErr := store.BeginOutboxHandoff("outbox_pass")
 +	if gateErr != nil {
 +		return
 +	}
@@ -4184,7 +4616,7 @@ index 7078fc6..60814fa 100644
 +	if !outboxWorkHint(ctx, store, false) {
 +		return false
 +	}
-+	lease, gateErr := store.BeginHandoff("outbox_sender")
++	lease, gateErr := store.BeginOutboxHandoff("outbox_sender")
 +	if gateErr != nil {
 +		return false
 +	}
