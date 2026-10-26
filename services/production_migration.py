@@ -271,6 +271,31 @@ class LockedMigration:
             gate._require(min(free.f_bavail * free.f_frsize, spool_free.f_bavail * spool_free.f_frsize)
                           >= self.permit["minimum_free_bytes"], "migration free-space floor not met")
 
+    def recheck_inventory(self):
+        """Re-read under this session's retained locks; never reacquire them."""
+        from scripts import independent_drain_inventory as inventory
+        self.check(active=True)
+        spec = self.permit["inventory"]
+        reader = inventory.Reader(5)
+        spool, journal = Path(spec["spool"]), Path(spec["journal"])
+        gate._require(inventory.directory_identity(spool) == spec["identities"]["spool"]
+                      and inventory.directory_identity(journal) == spec["identities"]["journal"], "inventory directory changed")
+        _, locks = inventory._journal(reader, journal)
+        expected_locks = {str(spool / ".lock"), str(journal / ".lock"), *map(str, locks)}
+        gate._require(expected_locks == set(self.inventory["lock_identities"]), "retained inventory lock set changed")
+        states, again = inventory._journal(reader, journal)
+        gate._require(sorted(locks) == sorted(again), "journal identity locks changed")
+        counts = inventory._queue(reader, spool)
+        receiver = inventory.capacity._receiver_locked(spool, spec["identities"]["spool"], reader.deadline, [0], [0])
+        publication = inventory._publication(reader, self.path, spec["identities"]["database"])
+        reader.tick()
+        actual = {**self.inventory, "counts": counts, "journal": states, "receiver": receiver, "publication": publication,
+                  "files_inspected": reader.files, "bytes_read": reader.bytes,
+                  "evidence_sha256": hashlib.sha256(inventory.json.dumps(reader.fingerprints, sort_keys=True).encode()).hexdigest()}
+        gate._require(inventory_fingerprint(actual) == self.permit["inventory_sha256"], "retained inventory changed")
+        self.sender.check()
+        return actual
+
     def authorize(self):
         self.check(active=True)
         gate._require(not gate._present(self.root), "migration authorization already attempted")
