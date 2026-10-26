@@ -160,6 +160,29 @@ class JointDrainController:
             self._check()
             return self._stop_new()
 
+    def query_stop_new(self):
+        """Only confirm already attempted boundaries, never start the next one."""
+        with gate._locked(self.root / ".lock", True, 1):
+            self._attempt("query_stop_new")
+            self._check(window=False)
+            result = {"sender": None, "receiver": None, "both_stopped": False, "queue_checked": False, "switch_authorized": False}
+            for name, key in (("sender_stop", "sender"), ("receiver_stop", "receiver")):
+                intent = self.root / (name + ".intent.json")
+                if not gate._present(intent) and not gate._present(intent.with_name(intent.name + ".pending")):
+                    continue
+                disk.once(intent, {"operation_id": self.plan["operations"][name], "plan_sha256": gate._hash(self.plan)})
+                if key == "sender":
+                    value = self.sender.query_stop_new(self.plan["operations"][name])
+                else:
+                    value = self.receiver.query(self.plan["operations"][name])
+                path = self.root / (name + ".json")
+                if not gate._present(path):
+                    disk.once(path, value)
+                result[key] = value
+            require(result["sender"] is not None or result["receiver"] is not None, "no original joint stop operation to query")
+            result["both_stopped"] = result["sender"] is not None and result["receiver"] is not None
+            return result
+
     def _bundle(self, stopped):
         path = self.root / "bundle.json"
         bundle = self.sender.root / "originals"

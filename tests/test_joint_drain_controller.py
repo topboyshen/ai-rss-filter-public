@@ -180,6 +180,32 @@ def test_sender_pause_lost_ack_queries_original_before_phase_or_expiry_gate(rece
 
 
 @pytest.mark.parametrize("receiver", ["open"], indirect=True)
+def test_lost_sender_stop_exact_query_after_expiry_does_not_start_receiver_stop(receiver, combined):  # noqa: F811
+    controller, _, transport = combined
+    transport.lost = True
+    with pytest.raises(TimeoutError):
+        controller.stop_new()
+    controller.sender.deadline = controller.receiver.deadline = 0
+    result = controller.query_stop_new()
+    assert result["sender"]["state"] == "draining" and result["receiver"] is None and result["both_stopped"] is False
+    assert receiver.fence.snapshot()["phase"] == "open"
+    assert not [row for row in receiver.transport.calls if row[0] == "POST"]
+    assert [path for method, path, _ in transport.calls if method == "POST"] == ["/stop-new"]
+
+
+@pytest.mark.parametrize("receiver", ["open"], indirect=True)
+def test_lost_receiver_stop_exact_query_after_expiry_confirms_both_without_repost(receiver, combined):  # noqa: F811
+    controller, _, _ = combined
+    receiver.transport.lose_ack = True
+    with pytest.raises(TimeoutError):
+        controller.stop_new()
+    controller.sender.deadline = controller.receiver.deadline = 0
+    result = controller.query_stop_new()
+    assert result["receiver"]["phase"] == "draining" and result["both_stopped"] is True
+    assert len([row for row in receiver.transport.calls if row[0] == "POST"]) == 1
+
+
+@pytest.mark.parametrize("receiver", ["open"], indirect=True)
 def test_staged_host_adopts_only_original_actual_control_queries(receiver, combined):  # noqa: F811
     controller, reader, _ = combined
     controller.transfer_originals()
