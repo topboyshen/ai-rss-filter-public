@@ -303,14 +303,14 @@ class Harness:
                                               "source_lock": sha(self.repo / "ops/miniflux/pause-source-lock.json")}, sort_keys=True).encode()).hexdigest()
         self.manifest = manifest
         self.launch("sender", self.image_id, ["--read-only", "--cap-drop=ALL", "--tmpfs", "/tmp:rw,nosuid,nodev,size=16777216",
-                    "--label", "io.ai-filter.handoff.role=miniflux-synthetic",
+                    "--label", "io.ai-filter.handoff.role=" + getattr(self, "sender_role", "miniflux-synthetic"),
                     "--mount", "type=bind,src=" + str(self.repo / "ops/miniflux/pause-source-lock.json") + ",dst=/handoff-source-lock.json,readonly",
                     "-e", "DATABASE_URL=postgres://synthetic:" + self.password + "@pg:5432/synthetic_pause?sslmode=disable",
                     "-e", "RUN_MIGRATIONS=1", "-e", "CREATE_ADMIN=1", "-e", "ADMIN_USERNAME=synthetic",
                     "-e", "ADMIN_PASSWORD=" + self.password, "-e", "LISTEN_ADDR=0.0.0.0:8080",
                     "-e", "LOG_LEVEL=debug", "-e", "POLLING_FREQUENCY=1", "-e", "WORKER_POOL_SIZE=1",
                     "-e", "INTEGRATION_ALLOW_PRIVATE_NETWORKS=1", "-e", "FETCHER_ALLOW_PRIVATE_NETWORKS=1", "-e", "WEBHOOK_OUTBOX=1",
-                    "-e", "WEBHOOK_OUTBOX_CONTRACT=synthetic-no-model-contract", "-e", "HANDOFF_ENABLED=1",
+                    "-e", "WEBHOOK_OUTBOX_CONTRACT=" + getattr(self, "sender_contract", "synthetic-no-model-contract"), "-e", "HANDOFF_ENABLED=1",
                     "-e", "HANDOFF_MANIFEST=" + manifest, "-e", "HANDOFF_CONTROL_ADDR=127.0.0.1:8787",
                     "-e", "HANDOFF_CONTROL_TOKEN=" + self.token])
         copied = self.output / "actual-miniflux"
