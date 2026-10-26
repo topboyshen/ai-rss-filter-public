@@ -22,6 +22,7 @@ from scoring_provenance import (
 from services.intelligence_query import IRRELEVANT_TAGS
 from services.news_reading import (
     attach_score_contract_labels,
+    render_evidence_context,
     preferred_news_title,
     render_news_card,
     restore_reading_titles,
@@ -698,6 +699,7 @@ def _render_one_card(e: dict, *, reading: bool = False) -> str:
             selection_reason=selection_reason, level=level, evidence_note=_neutral_evidence_note(e),
             duplicate_note=duplicate_note, rule_pool_html=rule_pool_html,
             score_source_label=score_contract_label(e),
+            evidence_context_html=render_evidence_context(e),
         )
     return (
         f'<article style="position:relative;overflow:hidden;border-radius:16px;'
@@ -715,6 +717,7 @@ def _render_one_card(e: dict, *, reading: bool = False) -> str:
         f'<span style="font-size:11px;color:var(--color-text-subdue,inherit);font-weight:600;">{escape_html(meta)}{escape_html(duplicate_note)}</span>'
         f'</div>'
         + rule_pool_html
+        + render_evidence_context(e)
         + f'</div>'
         f'<div style="flex-shrink:0;text-align:right;">'
         f'<div style="background:{badge_bg};color:{accent};padding:4px 8px;border-radius:999px;'
