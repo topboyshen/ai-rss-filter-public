@@ -850,10 +850,10 @@ index 0000000..1d786c0
 +}
 diff --git a/internal/handoff/handoff.go b/internal/handoff/handoff.go
 new file mode 100644
-index 0000000..506df89
+index 0000000..fff990b
 --- /dev/null
 +++ b/internal/handoff/handoff.go
-@@ -0,0 +1,725 @@
+@@ -0,0 +1,765 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Package handoff implements a durable admission gate, not a delivery ACK.
 +// A retained active/uncertain lease blocks closing even after its backend dies.
@@ -1051,28 +1051,64 @@ index 0000000..506df89
 +	return begin(ctx, db, manifest, source, true)
 +}
 +
-+func begin(ctx context.Context, db *sql.DB, manifest, source string, consumer bool) (*Lease, error) {
-+	if db == nil || !identifier.MatchString(manifest) || !sourceName.MatchString(source) {
-+		return nil, ErrConflict
++// BeginOutboxPass atomically admits a cleanup pass and its first sender.
++// Both retained rows and physical session locks exist before either is returned;
++// concurrent producers/passes cannot consume a merely estimated reservation.
++func BeginOutboxPass(ctx context.Context, db *sql.DB, manifest string) (*Lease, *Lease, error) {
++	leases, err := beginBatch(ctx, db, manifest, []string{"outbox_pass", "outbox_sender"}, true)
++	if err != nil {
++		return nil, nil, err
 +	}
-+	conn, err := db.Conn(ctx)
++	return leases[0], leases[1], nil
++}
++
++func begin(ctx context.Context, db *sql.DB, manifest, source string, consumer bool) (*Lease, error) {
++	leases, err := beginBatch(ctx, db, manifest, []string{source}, consumer)
 +	if err != nil {
 +		return nil, err
 +	}
++	return leases[0], nil
++}
++
++func beginBatch(ctx context.Context, db *sql.DB, manifest string, sources []string, consumer bool) ([]*Lease, error) {
++	if db == nil || !identifier.MatchString(manifest) || len(sources) < 1 || len(sources) > 2 {
++		return nil, ErrConflict
++	}
++	for _, source := range sources {
++		if !sourceName.MatchString(source) {
++			return nil, ErrConflict
++		}
++	}
++	connections := make([]*sql.Conn, 0, len(sources))
++	pids := make([]int, 0, len(sources))
 +	keep := false
 +	defer func() {
 +		if !keep {
-+			discard(conn)
++			for _, conn := range connections {
++				discard(conn)
++			}
 +		}
 +	}()
-+	got, err := activity(ctx, conn, true)
-+	if err != nil {
-+		return nil, err
++	for range sources {
++		conn, err := db.Conn(ctx)
++		if err != nil {
++			return nil, err
++		}
++		connections = append(connections, conn)
++		got, err := activity(ctx, conn, true)
++		if err != nil {
++			return nil, err
++		}
++		if !got {
++			return nil, ErrClosed
++		}
++		var pid int
++		if err = conn.QueryRowContext(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
++			return nil, err
++		}
++		pids = append(pids, pid)
 +	}
-+	if !got {
-+		return nil, ErrClosed
-+	}
-+	tx, err := beginTx(ctx, conn)
++	tx, err := beginTx(ctx, connections[0])
 +	if err != nil {
 +		return nil, err
 +	}
@@ -1094,7 +1130,7 @@ index 0000000..506df89
 +	if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM handoff_leases`).Scan(&count); err != nil {
 +		return nil, err
 +	}
-+	if count >= MaxRetainedRecords {
++	if count+len(sources) > MaxRetainedRecords {
 +		return nil, errors.New("handoff retained lease capacity reached")
 +	}
 +	if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM handoff_operations`).Scan(&count); err != nil {
@@ -1103,20 +1139,24 @@ index 0000000..506df89
 +	if count >= MaxRetainedRecords {
 +		return nil, errors.New("handoff retained operation capacity reached")
 +	}
-+	var random [16]byte
-+	if _, err = rand.Read(random[:]); err != nil {
-+		return nil, err
-+	}
-+	id := hex.EncodeToString(random[:])
-+	_, err = tx.ExecContext(ctx, `INSERT INTO handoff_leases(lease_id,manifest,source,status,backend_pid) VALUES($1,$2,$3,'active',pg_backend_pid())`, id, manifest, source)
-+	if err != nil {
-+		return nil, err
++	leases := make([]*Lease, 0, len(sources))
++	for i, source := range sources {
++		var random [16]byte
++		if _, err = rand.Read(random[:]); err != nil {
++			return nil, err
++		}
++		id := hex.EncodeToString(random[:])
++		_, err = tx.ExecContext(ctx, `INSERT INTO handoff_leases(lease_id,manifest,source,status,backend_pid) VALUES($1,$2,$3,'active',$4)`, id, manifest, source, pids[i])
++		if err != nil {
++			return nil, err
++		}
++		leases = append(leases, &Lease{db: db, conn: connections[i], manifest: manifest, id: id})
 +	}
 +	if err = tx.Commit(); err != nil {
 +		return nil, err
 +	}
 +	keep = true
-+	return &Lease{db: db, conn: conn, manifest: manifest, id: id}, nil
++	return leases, nil
 +}
 +
 +func (l *Lease) check(ctx context.Context) error {
@@ -2177,6 +2217,163 @@ index 0000000..30e809e
 +	}
 +	func() { defer FinishOnReturn(nil) }()
 +	func() { defer FinishOnReturn(&Lease{done: "finished"}) }()
++}
+diff --git a/internal/handoff/outbox_pair_integration_test.go b/internal/handoff/outbox_pair_integration_test.go
+new file mode 100644
+index 0000000..907fa7e
+--- /dev/null
++++ b/internal/handoff/outbox_pair_integration_test.go
+@@ -0,0 +1,151 @@
++// SPDX-License-Identifier: Apache-2.0
++package handoff
++
++import (
++	"context"
++	"testing"
++	"time"
++)
++
++func retainedFinished(t *testing.T, f fixture, count int) {
++	t.Helper()
++	_, err := f.db.Exec(`INSERT INTO handoff_leases(lease_id,manifest,source,status,backend_pid,finished_at)
++ SELECT lpad(to_hex(n),32,'0'),$1,'retained_fixture','finished',1,now() FROM generate_series(1,$2) n`, testManifest, count)
++	if err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestPGOutboxPairRejectsOneSlotWithoutConsumingIt(t *testing.T) {
++	f := startGate(t)
++	upgradeDrain(t, f)
++	retainedFinished(t, f, MaxRetainedRecords-1)
++	if _, _, err := BeginOutboxPass(context.Background(), f.pool, testManifest); err == nil {
++		t.Fatal("pair took only remaining slot")
++	}
++	var count int
++	if err := f.db.QueryRow(`SELECT count(*) FROM handoff_leases`).Scan(&count); err != nil || count != MaxRetainedRecords-1 {
++		t.Fatal(count, err)
++	}
++	r, err := Pause(context.Background(), f.db, testManifest, pauseOp)
++	if err != nil || !r.Confirmed {
++		t.Fatal("failed pair retained a phantom lease", r, err)
++	}
++}
++
++func TestPGConcurrentOutboxPairsCannotStealFinalTwoSlots(t *testing.T) {
++	f := startGate(t)
++	upgradeDrain(t, f)
++	retainedFinished(t, f, MaxRetainedRecords-2)
++	type result struct {
++		pass, sender *Lease
++		err          error
++	}
++	start := make(chan struct{})
++	results := make(chan result, 2)
++	for range 2 {
++		go func() {
++			<-start
++			p, s, e := BeginOutboxPass(context.Background(), f.pool, testManifest)
++			results <- result{p, s, e}
++		}()
++	}
++	close(start)
++	var accepted []result
++	for range 2 {
++		r := <-results
++		if r.err == nil {
++			accepted = append(accepted, r)
++		}
++	}
++	if len(accepted) != 1 {
++		t.Fatalf("accepted pairs %d", len(accepted))
++	}
++	var count, active int
++	if err := f.db.QueryRow(`SELECT count(*),count(*) FILTER(WHERE status='active') FROM handoff_leases`).Scan(&count, &active); err != nil || count != MaxRetainedRecords || active != 2 {
++		t.Fatal(count, active, err)
++	}
++	r, err := Pause(context.Background(), f.db, testManifest, pauseOp)
++	if err != nil || r.Confirmed || r.ActiveLeases != 2 {
++		t.Fatal(r, err)
++	}
++	if err = accepted[0].sender.Finish(); err != nil {
++		t.Fatal(err)
++	}
++	if err = accepted[0].pass.Finish(); err != nil {
++		t.Fatal(err)
++	}
++	r, err = Query(context.Background(), f.db, testManifest, pauseOp)
++	if err != nil || !r.Confirmed {
++		t.Fatal(r, err)
++	}
++}
++
++func TestPGOutboxPairSecondConnectionFailureLeavesNoRowsOrLocks(t *testing.T) {
++	f := startGate(t)
++	upgradeDrain(t, f)
++	f.pool.SetMaxOpenConns(1)
++	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
++	defer cancel()
++	if _, _, err := BeginOutboxPass(ctx, f.pool, testManifest); err == nil {
++		t.Fatal("second connection unexpectedly available")
++	}
++	var count int
++	if err := f.db.QueryRow(`SELECT count(*) FROM handoff_leases`).Scan(&count); err != nil || count != 0 {
++		t.Fatal(count, err)
++	}
++	r, err := Pause(context.Background(), f.db, testManifest, pauseOp)
++	if err != nil || !r.Confirmed {
++		t.Fatal("session lock leaked", r, err)
++	}
++}
++
++func TestPGOutboxPairSecondInsertFailureRollsBackBothRows(t *testing.T) {
++	f := startGate(t)
++	upgradeDrain(t, f)
++	_, err := f.db.Exec(`CREATE FUNCTION reject_second_pair() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.source='outbox_sender' THEN RAISE EXCEPTION 'synthetic second lease write failure'; END IF; RETURN NEW; END $$;
++ CREATE TRIGGER reject_second_pair BEFORE INSERT ON handoff_leases FOR EACH ROW EXECUTE FUNCTION reject_second_pair();`)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err = BeginOutboxPass(context.Background(), f.pool, testManifest); err == nil {
++		t.Fatal("second write accepted")
++	}
++	var count int
++	if err = f.db.QueryRow(`SELECT count(*) FROM handoff_leases`).Scan(&count); err != nil || count != 0 {
++		t.Fatal(count, err)
++	}
++	r, err := Pause(context.Background(), f.db, testManifest, pauseOp)
++	if err != nil || !r.Confirmed {
++		t.Fatal("rollback leaked lock", r, err)
++	}
++}
++
++func TestPGCommittedPairLostBeforeWorkerCannotConfirmFreeze(t *testing.T) {
++	f := startGate(t)
++	upgradeDrain(t, f)
++	pass, sender, err := BeginOutboxPass(context.Background(), f.pool, testManifest)
++	if err != nil {
++		t.Fatal(err)
++	}
++	// Actual session death after durable commit models losing the returned leases.
++	if _, err = f.db.Exec(`SELECT pg_terminate_backend(backend_pid) FROM handoff_leases WHERE status='active'`); err != nil {
++		t.Fatal(err)
++	}
++	if err = pass.Finish(); err == nil {
++		t.Fatal("dead pass falsely finished")
++	}
++	if err = sender.Finish(); err == nil {
++		t.Fatal("dead sender falsely finished")
++	}
++	stopped, err := StopNew(context.Background(), f.db, testManifest, stopNewOp)
++	if err != nil || !stopped.Confirmed || stopped.ActiveLeases != 2 {
++		t.Fatal("producer state or retained consumer evidence wrong", stopped, err)
++	}
++	for range 2 {
++		r, err := Pause(context.Background(), f.db, testManifest, pauseOp)
++		if err != nil || r.Confirmed || r.ActiveLeases != 2 {
++			t.Fatal("lost worker falsely froze", r, err)
++		}
++	}
 +}
 diff --git a/internal/http/request/handoff.go b/internal/http/request/handoff.go
 new file mode 100644
@@ -3720,10 +3917,10 @@ index 09ae115..c942514 100644
 +			}
 diff --git a/internal/storage/handoff.go b/internal/storage/handoff.go
 new file mode 100644
-index 0000000..9682c83
+index 0000000..1174a79
 --- /dev/null
 +++ b/internal/storage/handoff.go
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,84 @@
 +// SPDX-License-Identifier: Apache-2.0
 +package storage
 +
@@ -3794,6 +3991,19 @@ index 0000000..9682c83
 +
 +func (s *Storage) StopNewHandoff(ctx context.Context, op string) (handoff.Receipt, error) {
 +	return handoff.StopNew(ctx, s.db, config.Opts.HandoffManifest(), op)
++}
++
++// BeginOutboxPass reserves both actual retained leases in one transaction.
++func (s *Storage) BeginOutboxPass() (*handoff.Lease, *handoff.Lease, error) {
++	if !config.Opts.HasHandoff() {
++		return nil, nil, nil
++	}
++	if s.handoffDB == nil {
++		return nil, nil, errors.New("handoff lease pool not configured")
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
++	defer cancel()
++	return handoff.BeginOutboxPass(ctx, s.handoffDB, config.Opts.HandoffManifest())
 +}
 diff --git a/internal/storage/legacy_handoff.go b/internal/storage/legacy_handoff.go
 new file mode 100644
@@ -4190,10 +4400,10 @@ index 99eca38..8b10827 100644
 +		}
 diff --git a/internal/worker/drain_integration_test.go b/internal/worker/drain_integration_test.go
 new file mode 100644
-index 0000000..e830c05
+index 0000000..3ac1c0a
 --- /dev/null
 +++ b/internal/worker/drain_integration_test.go
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,118 @@
 +// SPDX-License-Identifier: Apache-2.0
 +package worker
 +
@@ -4266,9 +4476,55 @@ index 0000000..e830c05
 +		t.Fatal("pending changed", attempts, err)
 +	}
 +}
++
++func TestPostgresOutboxPassCannotWasteFinalLeaseSlot(t *testing.T) {
++	f := idlePostgres(t)
++	f.put(t, "pending original", "https://must-not-send.invalid", "pending", false)
++	_, err := f.db.Exec(`INSERT INTO handoff_leases(lease_id,manifest,source,status,backend_pid,finished_at)
++ SELECT lpad(to_hex(n),32,'0'),$1,'retained_fixture','finished',1,now() FROM generate_series(1,$2) n`, strings.Repeat("a", 64), handoff.MaxRetainedRecords-1)
++	if err != nil {
++		t.Fatal(err)
++	}
++	runWebhookOutboxPass(context.Background(), f.store)
++	if f.leaseCount(t) != handoff.MaxRetainedRecords-1 {
++		t.Fatal("pass consumed final slot without sender")
++	}
++	var attempts int
++	var body []byte
++	if err = f.db.QueryRow(`SELECT attempts,body FROM webhook_outbox`).Scan(&attempts, &body); err != nil || attempts != 0 || string(body) != "pending original" {
++		t.Fatal(attempts, string(body), err)
++	}
++}
++
++func TestPostgresReservedFirstSenderAlreadyClaimedFinishesWithoutSend(t *testing.T) {
++	f := idlePostgres(t)
++	f.put(t, "competing claim original", "https://must-not-send.invalid", "pending", false)
++	pass, sender, err := f.store.BeginOutboxPass()
++	if err != nil {
++		t.Fatal(err)
++	}
++	claim, err := f.store.ClaimWebhook(context.Background())
++	if err != nil || claim == nil {
++		t.Fatal(claim, err)
++	}
++	if runWebhookWithLease(context.Background(), f.store, sender, true) {
++		t.Fatal("reserved sender resent competing claim")
++	}
++	if err = pass.Finish(); err != nil {
++		t.Fatal(err)
++	}
++	var active, attempts int
++	var state string
++	if err = f.db.QueryRow(`SELECT count(*) FROM handoff_leases WHERE status<>'finished'`).Scan(&active); err != nil || active != 0 {
++		t.Fatal(active, err)
++	}
++	if err = f.db.QueryRow(`SELECT state,attempts FROM webhook_outbox`).Scan(&state, &attempts); err != nil || state != "inflight" || attempts != 1 {
++		t.Fatal(state, attempts, err)
++	}
++}
 diff --git a/internal/worker/handoff_integration_test.go b/internal/worker/handoff_integration_test.go
 new file mode 100644
-index 0000000..08ae8b7
+index 0000000..5cf06dc
 --- /dev/null
 +++ b/internal/worker/handoff_integration_test.go
 @@ -0,0 +1,236 @@
@@ -4375,7 +4631,7 @@ index 0000000..08ae8b7
 +	raw := []byte(body)
 +	sum := sha256.Sum256(raw)
 +	id := hex.EncodeToString(sum[:])
-+	_, err := f.db.Exec(`INSERT INTO webhook_outbox(delivery_id,body_sha256,user_id,feed_id,entry_id,target_url,signature,contract,body,state,acked_at) VALUES($1,$1,1,1,1,$2,$3,'synthetic',$4,$5,CASE WHEN $6 THEN now()-interval '8 days' ELSE NULL END)`, id, target, strings.Repeat("b", 64), raw, state, old)
++	_, err := f.db.Exec(`INSERT INTO webhook_outbox(delivery_id,body_sha256,user_id,feed_id,entry_id,target_url,signature,contract,body,state,acked_at) VALUES($1,$1,1,1,(SELECT COALESCE(max(entry_id),0)+1 FROM webhook_outbox),$2,$3,'synthetic',$4,$5,CASE WHEN $6 THEN now()-interval '8 days' ELSE NULL END)`, id, target, strings.Repeat("b", 64), raw, state, old)
 +	if err != nil {
 +		t.Fatal(err)
 +	}
@@ -4569,37 +4825,56 @@ index d0c9339..72bd29b 100644
 -		queue: make(chan model.Job),
 +		queue: make(chan admittedJob), store: store,
 diff --git a/internal/worker/webhook_outbox.go b/internal/worker/webhook_outbox.go
-index 7078fc6..3bde058 100644
+index 7078fc6..cd37ea8 100644
 --- a/internal/worker/webhook_outbox.go
 +++ b/internal/worker/webhook_outbox.go
 @@ -8,0 +9 @@ import (
 +	"miniflux.app/v2/internal/handoff"
-@@ -32,0 +34,10 @@ func runWebhookOutboxPass(ctx context.Context, store *storage.Storage) {
+@@ -32,0 +34,21 @@ func runWebhookOutboxPass(ctx context.Context, store *storage.Storage) {
 +	if !outboxWorkHint(ctx, store, true) {
 +		return
 +	}
-+	lease, gateErr := store.BeginOutboxHandoff("outbox_pass")
++	reserveSender := outboxWorkHint(ctx, store, false)
++	var lease, firstSender *handoff.Lease
++	var gateErr error
++	if reserveSender {
++		lease, firstSender, gateErr = store.BeginOutboxPass()
++	} else {
++		lease, gateErr = store.BeginOutboxHandoff("outbox_pass")
++	}
 +	if gateErr != nil {
 +		return
 +	}
 +	if lease != nil {
 +		defer handoff.FinishOnReturn(lease)
 +	}
-@@ -41,12 +52 @@ func runWebhookOutboxPass(ctx context.Context, store *storage.Storage) {
++	if firstSender != nil {
++		// Also covers cleanup failure before the reserved sender is invoked.
++		defer handoff.FinishOnReturn(firstSender)
++	}
+@@ -39,0 +62,3 @@ func runWebhookOutboxPass(ctx context.Context, store *storage.Storage) {
++	if !reserveSender {
++		return
++	} // New work observed after cleanup waits for next tick.
+@@ -41,6 +66,5 @@ func runWebhookOutboxPass(ctx context.Context, store *storage.Storage) {
 -		dbCtx, cancel = context.WithTimeout(ctx, 3*time.Second)
 -		claim, err := store.ClaimWebhook(dbCtx)
 -		cancel()
 -		if err != nil {
 -			slog.Error("Webhook outbox claim failed")
 -			return
--		}
++		var sent bool
++		if i == 0 {
++			sent = runWebhookWithLease(ctx, store, firstSender, true)
++		} else {
++			sent = runAdmittedWebhook(ctx, store)
+@@ -48 +72 @@ func runWebhookOutboxPass(ctx context.Context, store *storage.Storage) {
 -		if claim == nil {
--			return
--		}
++		if !sent {
+@@ -51,10 +75,19 @@ func runWebhookOutboxPass(ctx context.Context, store *storage.Storage) {
 -		retry, sendErr := webhook.SendDurable(ctx, &claim.DurableWebhook)
 -		if ctx.Err() != nil {
-+		if !runAdmittedWebhook(ctx, store) {
-@@ -54,10 +53,0 @@ func runWebhookOutboxPass(ctx context.Context, store *storage.Storage) {
+-			return
 -		} // lease safely expires; do not acknowledge uncertainty
 -		dbCtx, cancel = context.WithTimeout(ctx, 3*time.Second)
 -		err = store.FinishWebhook(dbCtx, claim, sendErr == nil, retry)
@@ -4607,22 +4882,31 @@ index 7078fc6..3bde058 100644
 -		if err != nil {
 -			slog.Error("Webhook outbox completion not recorded; evidence retained")
 -			return
--		}
--		if sendErr != nil {
--			slog.Warn("Webhook outbox delivery retained", slog.String("delivery_id", claim.DeliveryID), slog.Bool("retry_scheduled", retry && claim.Attempts < 20))
-@@ -66,0 +57,49 @@ func runWebhookOutboxPass(ctx context.Context, store *storage.Storage) {
++	}
++}
 +
 +func runAdmittedWebhook(ctx context.Context, store *storage.Storage) bool {
++	return runWebhookWithLease(ctx, store, nil, false)
++}
++
++func runWebhookWithLease(ctx context.Context, store *storage.Storage, lease *handoff.Lease, admitted bool) bool {
++	if admitted && lease != nil {
++		defer handoff.FinishOnReturn(lease)
++	}
 +	if !outboxWorkHint(ctx, store, false) {
 +		return false
 +	}
-+	lease, gateErr := store.BeginOutboxHandoff("outbox_sender")
-+	if gateErr != nil {
-+		return false
-+	}
-+	if lease != nil {
-+		defer handoff.FinishOnReturn(lease)
-+	}
++	if !admitted {
++		var gateErr error
++		lease, gateErr = store.BeginOutboxHandoff("outbox_sender")
++		if gateErr != nil {
++			return false
+@@ -62,2 +95,2 @@ func runWebhookOutboxPass(ctx context.Context, store *storage.Storage) {
+-		if sendErr != nil {
+-			slog.Warn("Webhook outbox delivery retained", slog.String("delivery_id", claim.DeliveryID), slog.Bool("retry_scheduled", retry && claim.Attempts < 20))
++		if lease != nil {
++			defer handoff.FinishOnReturn(lease)
+@@ -65,0 +99,36 @@ func runWebhookOutboxPass(ctx context.Context, store *storage.Storage) {
 +	dbCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 +	claim, err := store.ClaimWebhook(dbCtx)
 +	cancel()
@@ -4659,7 +4943,6 @@ index 7078fc6..3bde058 100644
 +		return false
 +	}
 +	return ready
-+}
 diff --git a/internal/worker/worker.go b/internal/worker/worker.go
 index 7a8bdb8..e66a6c7 100644
 --- a/internal/worker/worker.go

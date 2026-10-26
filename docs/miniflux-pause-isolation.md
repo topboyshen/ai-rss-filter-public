@@ -64,6 +64,16 @@ lease 归零说明这些工作已结束，不代表 outbox、held、接收端 qu
 也不能证明排空。并发插入在下一 tick 再观察，真正领取、清理和网络发送仍在已准入生命周期内。
 保留容量不是无限运行承诺；正式启用前必须批准容量观察、停流与证据处置方式。
 
+有待发送候选时，pass与其首个sender的两条lease在同一metadata事务内原子登记，各自持独立PG session
+及共享生命周期锁；并发pass或producer只能看见已占用的两条记录，不能抢占“估算预留”。只剩一格时
+整对拒绝且零新增，不先耗掉最后一格再发现sender无法准入。cleanup-only仍只登记一条，本轮不转入发送；
+新候选下一tick再观察。首个候选被其他worker抢先领取时，两条lease正常结束，不补发。
+
+10000条是累计硬上限，不清理历史lease、不扩大重试预算；即使stop-new确认，剩余容量也可能不足以
+排空全部backlog。容量不足必须终止本次切换窗口、保留未送达原件及未知lease，再执行可确认的完整pause；
+不能把stop-new确认、空轮询或HTTP成功写成排空完成。第二连接/写入失败不会留半对记录；两条提交后
+进程丢失则保留active证据，最终pause继续受阻，不由连接或锁消失推断完成。
+
 ## 实际隔离 harness
 
 `scripts/verify_miniflux_pause_native.py` 默认仅输出计划；`--run` 强制 Linux/x86_64 和实际 Docker
