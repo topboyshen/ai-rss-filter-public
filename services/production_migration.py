@@ -214,7 +214,8 @@ def _step_authorizer(conn):
         if action in (sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH):
             return sqlite3.SQLITE_DENY
         if conn.controlled_step and (action == sqlite3.SQLITE_TRANSACTION or
-                (action == sqlite3.SQLITE_PRAGMA and arg2 is not None and arg1.lower() in {"synchronous", "journal_mode"})):
+                (action == sqlite3.SQLITE_PRAGMA and arg2 is not None
+                 and arg1.lower() in {"synchronous", "journal_mode", "max_page_count"})):
             return sqlite3.SQLITE_DENY
         return sqlite3.SQLITE_OK
     conn.set_authorizer(authorize)
@@ -266,15 +267,35 @@ class LockedMigration:
         self.sender.check()
         _frozen(self.permit)
         if active:
-            free = os.statvfs(self.path.parent)
-            spool_free = os.statvfs(self.permit["inventory"]["spool"])
-            gate._require(min(free.f_bavail * free.f_frsize, spool_free.f_bavail * spool_free.f_frsize)
-                          >= self.permit["minimum_free_bytes"], "migration free-space floor not met")
+            self._disk_budget()
 
-    def recheck_inventory(self):
+    def _disk_budget(self):
+        # Include retained WAL/SHM: a small main file is not a disk-size proof
+        # while a transaction is writing its new pages into WAL.
+        total = sum(path.stat().st_size for path in
+                    (self.path, Path(str(self.path) + "-wal"), Path(str(self.path) + "-shm")) if gate._present(path))
+        gate._require(total <= self.permit["max_database_bytes"], "migration database/WAL byte budget exceeded")
+        free = os.statvfs(self.path.parent)
+        spool_free = os.statvfs(self.permit["inventory"]["spool"])
+        gate._require(min(free.f_bavail * free.f_frsize, spool_free.f_bavail * spool_free.f_frsize)
+                      >= self.permit["minimum_free_bytes"], "migration free-space floor not met")
+
+    def _page_budget(self, conn, *, establish=False):
+        size = conn.execute("PRAGMA page_size").fetchone()[0]
+        pages = conn.execute("PRAGMA page_count").fetchone()[0]
+        maximum = self.permit["max_database_bytes"] // size
+        gate._require(0 < pages <= maximum, "migration logical database size exceeded")
+        if establish:
+            # SQLite enforces this during allocation, before an oversized
+            # transaction can commit. It does not authorize a larger WAL.
+            actual = conn.execute(f"PRAGMA max_page_count={maximum}").fetchone()[0]
+            gate._require(actual == maximum, "SQLite refused reviewed page limit")
+        self._disk_budget()
+
+    def recheck_inventory(self, *, active=True):
         """Re-read under this session's retained locks; never reacquire them."""
         from scripts import independent_drain_inventory as inventory
-        self.check(active=True)
+        self.check(active=active)
         spec = self.permit["inventory"]
         reader = inventory.Reader(5)
         spool, journal = Path(spec["spool"]), Path(spec["journal"])
@@ -305,6 +326,7 @@ class LockedMigration:
                       "production migration requires retained existing WAL and SHM identities")
         conn = _connection(self.path, readonly=True)
         try:
+            self._page_budget(conn)
             gate._require(database_fingerprint(conn) == self.permit["before"], "migration source schema or metadata differs")
             preflight = steps.preflight(conn)
         finally:
@@ -345,6 +367,7 @@ class LockedMigration:
         gate._write(attempt, {"operation_id": self.permit["operation_id"], "permit_sha256": gate._hash(self.permit)})
         conn = _connection(self.path)
         try:
+            self._page_budget(conn, establish=True)
             _step_authorizer(conn)
             for number, step in enumerate(steps.STEP_IDS):
                 self._execute_step(conn, number, step, authority)
@@ -355,7 +378,17 @@ class LockedMigration:
     def _execute_step(self, conn, number, step, authority):
         self._authorization(active=True)
         deadline = min(time.monotonic() + 120, time.monotonic() + self.permit["expires_at"] - time.time())
-        conn.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
+        failures = []
+        def progress():
+            try:
+                gate._require(time.monotonic() <= deadline, "migration step deadline exceeded")
+                self._disk_budget()
+            except Exception as error:
+                if not failures:
+                    failures.append(error)
+                return 1
+            return 0
+        conn.set_progress_handler(progress, 1000)
         conn.execute("BEGIN IMMEDIATE")
         try:
             before = database_fingerprint(conn)
@@ -373,14 +406,24 @@ class LockedMigration:
             record = {"permit_sha256": gate._hash(self.permit), "step_id": step,
                       "before": before, "after": after, "details": details}
             conn.execute(f"INSERT INTO {JOURNAL} VALUES(?,?,?)", (self.permit["operation_id"], number, gate._encoded(record).decode()))
+            # A lock/session/config/window failure during the business SQL
+            # must roll back this same transaction, including its marker.
+            self._authorization(active=True)
+            self._page_budget(conn)
+            gate._require(time.monotonic() <= deadline, "migration step deadline exceeded")
             conn.controlled_step = False
             conn.execute("COMMIT")
-        except BaseException:
+        except BaseException as error:
             conn.controlled_step = False
+            conn.set_progress_handler(None, 0)
             if conn.in_transaction:
                 conn.execute("ROLLBACK")
+            if failures:
+                raise failures[0] from error
             raise
-        _same_database(self.path, self.permit["database"])
+        # PG and SQLite cannot commit atomically. Loss after SQLite COMMIT
+        # leaves a real journal row and an uncertain operation; never rerun it.
+        self.check()
         isolation._confirm_database(self.path)
 
     def query_migration(self, operation_id):

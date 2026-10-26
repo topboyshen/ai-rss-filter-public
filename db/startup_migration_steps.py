@@ -69,6 +69,9 @@ def _outbox_needs_repair(conn):
 
 def preflight(conn):
     """No schema repair, PRAGMA mutation, historical import or retention here."""
+    # This forward plan knows only the existing 0..7 news migration markers.
+    # Never let _news normalize an unknown future or malformed start to 7.
+    _news_version(conn)
     db._event_core_startup_preflight(conn)
     tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     ledger_present = "backtest_signals" in tables
@@ -86,6 +89,16 @@ def preflight(conn):
             "historical_export_backfill": "already_complete" if populated else "no_historical_rows"}
 
 
+def _news_version(conn):
+    row = conn.execute("SELECT v FROM app_meta WHERE k='schema_version'").fetchone() if table_exists(conn, "app_meta") else None
+    if row is None:
+        return 0
+    value = row[0]
+    require(isinstance(value, str) and value in {str(n) for n in range(8)},
+            "unsupported news schema version; separate reviewed migration required")
+    return int(value)
+
+
 def _base(conn):
     cursor = conn.cursor()
     db._init_app_meta(cursor)
@@ -94,15 +107,14 @@ def _base(conn):
 
 
 def _news(conn, version):
+    current = _news_version(conn)
     cursor = conn.cursor()
     groups = db.startup_schema_migration_groups()
     require(len(groups) == 7, "news migration plan changed")
     for column, definition in groups[version - 1]:
         db._add_column(cursor, "news_cache", column, definition)
-    row = cursor.execute("SELECT v FROM app_meta WHERE k='schema_version'").fetchone()
-    current = int(row[0]) if row else 0
     cursor.execute("INSERT OR REPLACE INTO app_meta(k,v) VALUES('schema_version',?)",
-                   (str(max(version, min(7, current))),))
+                   (str(max(version, current)),))
     require(all(db._column_exists(cursor, "news_cache", column) for group in groups[:version]
                 for column, _ in group), "news schema postcondition failed")
 

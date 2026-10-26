@@ -5,6 +5,7 @@ import hashlib
 import os
 import sqlite3
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -234,7 +235,7 @@ def test_normal_initializer_commit_and_storage_pragma_cannot_escape_step(prepare
         conn.controlled_step = True
         with pytest.raises(gate.AdmissionError, match="independent commit"):
             conn.commit()
-        for sql in ("COMMIT", "PRAGMA synchronous=NORMAL", "PRAGMA journal_mode=DELETE"):
+        for sql in ("COMMIT", "PRAGMA synchronous=NORMAL", "PRAGMA journal_mode=DELETE", "PRAGMA max_page_count=999999999"):
             with pytest.raises(sqlite3.DatabaseError):
                 conn.execute(sql)
         assert conn.in_transaction and conn.execute("PRAGMA synchronous").fetchone()[0] == 2
@@ -346,3 +347,147 @@ def test_database_identity_supports_reviewed_multigigabyte_storage_without_readi
     path.chmod(0o600)
     assert migration.database_identity(path)["file"]["inode"] == path.stat().st_ino
     # Metadata capacity only; not a 2 GiB SQL migration or production throughput claim.
+
+
+@pytest.mark.parametrize("value", ["8", "-1", "07", " 7", "7.0", "unknown"])
+def test_unknown_news_version_refused_readonly_before_authorization(prepared, value):
+    p = prepared
+    p["anchor"].execute("UPDATE app_meta SET v=? WHERE k='schema_version'", (value,))
+    p["permit"]["before"] = migration.database_fingerprint(p["anchor"])
+    set_compatibility(p["permit"])
+    before = migration.database_fingerprint(p["anchor"])
+    with migration.locked_session(p["root"], p["permit"]) as session:
+        with pytest.raises(RuntimeError, match="unsupported news schema version"):
+            session.authorize()
+    assert migration.database_fingerprint(p["anchor"]) == before
+    assert not p["root"].exists()
+
+
+def test_binary_news_marker_is_not_treated_as_a_text_version():
+    with sqlite3.connect(":memory:") as conn:
+        conn.execute("CREATE TABLE app_meta(k TEXT PRIMARY KEY,v TEXT NOT NULL)")
+        conn.execute("INSERT INTO app_meta VALUES('schema_version',?)", (b"7",))
+        changes = conn.total_changes
+        with pytest.raises(RuntimeError, match="unsupported news schema version"):
+            steps.preflight(conn)
+        assert conn.total_changes == changes
+
+
+@pytest.mark.parametrize("value", [None, *map(str, range(8))])
+def test_supported_news_marker_preflight_is_readonly(prepared, value):
+    p = prepared
+    if value is None:
+        p["anchor"].execute("DELETE FROM app_meta WHERE k='schema_version'")
+    else:
+        p["anchor"].execute("UPDATE app_meta SET v=? WHERE k='schema_version'", (value,))
+    before = migration.database_fingerprint(p["anchor"])
+    conn = migration._connection(p["db"], readonly=True)
+    try:
+        steps.preflight(conn)
+        assert conn.total_changes == 0
+    finally:
+        conn.close()
+    assert migration.database_fingerprint(p["anchor"]) == before
+
+
+def test_pg_lock_lost_during_real_step_rolls_back_business_and_marker(prepared, monkeypatch):
+    p = prepared
+    p["anchor"].execute("UPDATE app_meta SET v='0' WHERE k='schema_version'")
+    p["permit"]["before"] = migration.database_fingerprint(p["anchor"])
+    set_compatibility(p["permit"])
+    original = steps.apply_step
+    def lose_lock(conn, name, **kwargs):
+        result = original(conn, name, **kwargs)
+        if name == "news-schema-1":
+            p["sender"].live = False
+        return result
+    monkeypatch.setattr(steps, "apply_step", lose_lock)
+    with pytest.raises(gate.AdmissionError, match="sender lock lost"):
+        with migration.locked_session(p["root"], p["permit"]) as session:
+            session.authorize()
+            session.migrate()
+    assert p["anchor"].execute("SELECT v FROM app_meta WHERE k='schema_version'").fetchone()[0] == "0"
+    assert p["anchor"].execute(f"SELECT count(*) FROM {migration.JOURNAL}").fetchone()[0] == 1
+    monkeypatch.setattr(steps, "apply_step", lambda *_a, **_k: pytest.fail("lost-lock query executed business SQL"))
+    with migration.locked_session(p["root"], p["permit"]) as recovered:
+        receipt = recovered.query_migration(p["permit"]["operation_id"])
+    assert receipt["completed_steps"] == ["base-tables"] and receipt["durable"] is False
+
+
+@pytest.mark.parametrize("commit_number", [1, len(steps.STEP_IDS)])
+def test_lock_loss_immediately_after_commit_is_unknown_and_queries_only(prepared, monkeypatch, commit_number):
+    p, commits = prepared, []
+    original = migration._Connection
+    class LostLock(original):
+        def execute(self, sql, *args, **kwargs):
+            result = super().execute(sql, *args, **kwargs)
+            if sql == "COMMIT":
+                commits.append(sql)
+                if len(commits) == commit_number:
+                    p["sender"].live = False
+            return result
+    monkeypatch.setattr(migration, "_Connection", LostLock)
+    with pytest.raises(gate.AdmissionError, match="sender lock lost"):
+        with migration.locked_session(p["root"], p["permit"]) as session:
+            session.authorize()
+            session.migrate()
+    monkeypatch.setattr(steps, "apply_step", lambda *_a, **_k: pytest.fail("committed step repeated"))
+    with migration.locked_session(p["root"], p["permit"]) as recovered:
+        result = recovered.query_migration(p["permit"]["operation_id"])
+        with pytest.raises(gate.AdmissionError, match="already attempted"):
+            recovered.migrate()
+    assert len(commits) == commit_number
+    assert len(result["completed_steps"]) == commit_number
+    assert result["durable"] is (commit_number == len(steps.STEP_IDS))
+
+
+def test_sqlite_page_limit_and_wal_budget_abort_before_oversize_commit(prepared, monkeypatch):
+    p = prepared
+    p["permit"]["max_database_bytes"] = 64 * 1024**2
+    original = steps.apply_step
+    def grow(conn, name, **kwargs):
+        result = original(conn, name, **kwargs)
+        if name == "base-tables":
+            assert conn.execute("PRAGMA max_page_count").fetchone()[0] * conn.execute("PRAGMA page_size").fetchone()[0] == 64 * 1024**2
+            conn.execute("CREATE TABLE synthetic_capacity_probe(value BLOB)")
+            for _ in range(10):
+                conn.execute("INSERT INTO synthetic_capacity_probe VALUES(zeroblob(?))", (7 * 1024**2,))
+        return result
+    monkeypatch.setattr(steps, "apply_step", grow)
+    with pytest.raises((sqlite3.DatabaseError, gate.AdmissionError), match="full|budget|size"):
+        with migration.locked_session(p["root"], p["permit"]) as session:
+            session.authorize()
+            session.migrate()
+    assert not steps.table_exists(p["anchor"], "synthetic_capacity_probe")
+    assert not steps.table_exists(p["anchor"], migration.JOURNAL)
+    assert migration.database_fingerprint(p["anchor"]) == p["permit"]["before"]
+    assert (p["root"] / "migration.intent.json").exists()
+
+
+def test_normal_migration_fits_minimum_reviewed_database_budget(prepared):
+    p = prepared
+    p["permit"]["max_database_bytes"] = 64 * 1024**2
+    with migration.locked_session(p["root"], p["permit"]) as session:
+        session.authorize()
+        assert session.migrate()["status"] == "migration_completed"
+
+
+def test_free_space_drop_during_step_rolls_back_but_does_not_block_exact_query(prepared, monkeypatch):
+    p, low = prepared, []
+    original, statvfs = steps.apply_step, migration.os.statvfs
+    def apply(conn, name, **kwargs):
+        result = original(conn, name, **kwargs)
+        low.append(True)
+        return result
+    def free(path):
+        return SimpleNamespace(f_bavail=1, f_frsize=4096) if low else statvfs(path)
+    monkeypatch.setattr(steps, "apply_step", apply)
+    monkeypatch.setattr(migration.os, "statvfs", free)
+    with pytest.raises(gate.AdmissionError, match="free-space floor"):
+        with migration.locked_session(p["root"], p["permit"]) as session:
+            session.authorize()
+            session.migrate()
+    assert migration.database_fingerprint(p["anchor"]) == p["permit"]["before"]
+    with migration.locked_session(p["root"], p["permit"]) as recovered:
+        result = recovered.query_migration(p["permit"]["operation_id"])
+    assert result["status"] == "migration_uncertain" and result["completed_steps"] == []
