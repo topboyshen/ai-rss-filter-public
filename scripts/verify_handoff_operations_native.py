@@ -20,8 +20,10 @@ IMAGE = "python:3.11.17-slim-trixie@sha256:e88e9763f943ec1834f992a4b51e0f2450048
 DOCKER = ["docker", "--host", "unix:///var/run/docker.sock"]
 MEMORY = 768 * 1024 * 1024
 PIDS = 256
-READONLY_MOUNTS = ("scripts", "tests", "services", "routes", "app.py", "docker-compose.yml", "worker_main.py")
+READONLY_MOUNTS = ("scripts", "tests", "services", "routes", "app.py", "docker-compose.yml", "worker_main.py",
+                   ".github/workflows/handoff-operations.yml")
 FILES = (
+    ".github/workflows/handoff-operations.yml",
     "scripts/verify_handoff_operations_native.py",
     "services/webhook_receipts.py",
     "scripts/plan_webhook_receipt_trial.py",
@@ -34,6 +36,13 @@ FILES = (
     "scripts/observe_handoff_capacity.py",
     "tests/test_production_handoff_adapter.py",
     "tests/test_handoff_capacity_observer.py",
+    "services/admission_fence.py",
+    "services/receiver_handoff_control.py",
+    "scripts/production_receiver_driver.py",
+    "scripts/verify_production_receiver_native.py",
+    "scripts/handoff_runtime_adapter.py",
+    "scripts/handoff_host_cron.py",
+    "tests/test_production_receiver_driver.py",
     "app.py",
     "docker-compose.yml",
     "worker_main.py",
@@ -52,7 +61,7 @@ assert platform.system() == 'Linux' and platform.machine() == 'x86_64'
 suite = unittest.TestSuite()
 for pattern in ('test_webhook_receipt_trial_plan.py', 'test_durable_handoff_cutover.py',
                 'test_handoff_operations_native.py', 'test_production_handoff_adapter.py',
-                'test_handoff_capacity_observer.py'):
+                'test_handoff_capacity_observer.py', 'test_production_receiver_driver.py'):
     suite.addTests(unittest.defaultTestLoader.discover('/work/tests', pattern=pattern))
 assert suite.countTestCases() > 0
 result = unittest.TextTestRunner(verbosity=2).run(suite)
