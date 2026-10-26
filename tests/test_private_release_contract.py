@@ -80,9 +80,18 @@ def fixture(tmp_path):
     review["existing_topology"] = private.runtime_topology(inspect_records(
         {"manifest_data": manifest, "review_data": review}, directory / "sealed"))
     review_path = save(directory / "review.json", review)
-    return {"root": repo, "config": config, "manifest": manifest_path, "environment": environment,
-            "review": review_path, "output": directory / "sealed", "secret": secret,
-            "manifest_data": manifest, "review_data": review}
+    result = {"root": repo, "config": config, "manifest": manifest_path, "environment": environment,
+              "review": review_path, "output": directory / "sealed", "secret": secret,
+              "manifest_data": manifest, "review_data": review}
+    try:
+        yield result
+    finally:
+        # Assertions exercise the real sealed permissions. Only after the test,
+        # restore directory writes in this disposable fixture so the ordinary
+        # unprivileged release-test runner can unlink its synthetic files.
+        sealed = result["output"]
+        if sealed.is_dir() and not sealed.is_symlink():
+            sealed.chmod(stat.S_IMODE(sealed.stat().st_mode) | stat.S_IWUSR)
 
 
 def seal(fixture):
@@ -556,3 +565,16 @@ def test_multiple_secret_references_have_stable_frozen_order(fixture):
     reseal_inputs(fixture)
     path = seal(fixture)
     private.load(path, fixture["root"])
+
+
+
+def test_fixture_teardown_only_restores_disposable_directory_writes(tmp_path):
+    generator = fixture.__wrapped__(tmp_path)
+    inputs = next(generator)
+    path = seal(inputs)
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o500
+    assert stat.S_IMODE(path.stat().st_mode) == 0o400
+    generator.close()
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(path.stat().st_mode) == 0o400
+    path.unlink()

@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -25,6 +26,47 @@ import private_release_contract as private  # noqa: E402
 def save(path, data):
     path.write_bytes(data if isinstance(data, bytes) else private.encoded(data))
     path.chmod(0o600)
+    with path.open("rb") as handle:
+        os.fsync(handle.fileno())
+
+
+def advance_stage(path, report, stage):
+    if report.get("stage"):
+        report["events"].append({"stage": report["stage"], "state": "completed", "at_ns": time.time_ns()})
+    report["stage"] = stage
+    report.setdefault("events", []).append({"stage": stage, "state": "started", "at_ns": time.time_ns()})
+    save(path, report)
+
+
+def failure_details(error):
+    # Frame identifiers are from these committed scripts. Exception text may
+    # contain YAML, environment, URLs or Docker output: persist only its hash.
+    allowed = {str(Path(__file__).resolve()), str(Path(private.__file__).resolve())}
+    locations = [{"file": Path(frame.filename).name, "function": frame.name, "line": frame.lineno}
+                 for frame in traceback.extract_tb(error.__traceback__) if str(Path(frame.filename).resolve()) in allowed]
+    return {"kind": "contract_refusal" if isinstance(error, private.ContractError) else "unexpected_error",
+            "message_sha256": private.sha(str(error).encode()), "locations": locations}
+
+
+def fail_stage(path, report, error):
+    report["status"] = "failed"
+    report["failure"] = failure_details(error)
+    report.setdefault("events", []).append({"stage": report.get("stage", "setup"), "state": "failed", "at_ns": time.time_ns()})
+    save(path, report)
+
+
+def cleanup(workspace, project, network, volume, image, sealed, report):
+    # Remove only this invocation's synthetic resources. Never overwrite the
+    # original failure record; the uploaded report contains no private inputs.
+    ids = subprocess.run(["docker", "ps", "-aq", "--filter", f"label=com.docker.compose.project={project}"], capture_output=True, check=False).stdout.decode().split()
+    if ids:
+        subprocess.run(["docker", "rm", "-f", *ids], capture_output=True, check=False)
+    for args in (["network", "rm", network], ["volume", "rm", volume], ["image", "rm", image]):
+        subprocess.run(["docker", *args], capture_output=True, check=False)
+    if report["status"] == "passed":
+        if sealed:
+            sealed.parent.chmod(0o700)
+        shutil.rmtree(workspace)
 
 
 def build_candidate(root, workspace, source, image, contract, contract_sha):
@@ -73,8 +115,10 @@ def execute(root, output):
     volume = project + "-volume"
     sealed = None
     try:
+        advance_stage(report_path, report, "native_architecture")
         require_arch = private.run(["docker", "info", "--format", "{{.Architecture}}"])
         private.require(require_arch.strip() in {b"x86_64", b"amd64"}, "native amd64 required")
+        advance_stage(report_path, report, "prepare_synthetic_inputs")
         project_dir = workspace / "project"
         project_dir.mkdir(mode=0o700)
         data = project_dir / "data"
@@ -101,6 +145,7 @@ def execute(root, output):
         save(manifest_path, manifest)
         # Establish a genuine existing synthetic project before the review.
         # Its old Python container only sleeps; no application/model is started.
+        advance_stage(report_path, report, "create_synthetic_resources")
         private.run(["docker", "network", "create", "--internal", network])
         private.run(["docker", "volume", "create", volume])
         previous = deepcopy(manifest)
@@ -111,8 +156,12 @@ def execute(root, output):
         previous_service["environment"]["LLM_API_KEY"] = "synthetic-never-sent-to-a-model"
         previous_path = workspace / "previous.json"
         save(previous_path, previous)
+        advance_stage(report_path, report, "pull_previous_fixed_image")
+        private.run(["docker", "pull", base_image])
+        advance_stage(report_path, report, "start_previous_synthetic_project")
         private.run(["docker", "compose", "--project-name", project, "--project-directory", str(project_dir),
-                     "-f", str(previous_path), "up", "-d"])
+                     "-f", str(previous_path), "up", "-d", "--no-build", "--pull", "never"])
+        advance_stage(report_path, report, "inspect_previous_synthetic_project")
         existing = private.runtime_topology(private.inspect_project({"review": {"project": project, "project_directory": str(project_dir)}}))
         review = {**source, "approved": True, "approved_by": "synthetic-native-workflow",
                   "approved_at": int(time.time()) - 1, "expires_at": int(time.time()) + 3600,
@@ -125,25 +174,35 @@ def execute(root, output):
                   "topology": {"ai-filter-api": {"mounts": service["volumes"], "networks": ["existing"], "ports": []}}}
         review_path = workspace / "review.json"
         save(review_path, review)
+        advance_stage(report_path, report, "seal_private_inputs")
         sealed = private.seal(root, config, manifest_path, environment, review_path, workspace / "sealed")
+        advance_stage(report_path, report, "check_private_seal")
         contract, deployment, contract_sha = private.load(sealed, root, require_fresh=True)
+        advance_stage(report_path, report, "build_and_check_candidate_image")
         digest = build_candidate(root, workspace, source, image, contract, contract_sha)
+        advance_stage(report_path, report, "probe_private_runtime_config")
         private.image_probe(contract, sealed.parent, digest)
         report["checks"].append("real_image_labels_embedded_example_and_private_loader_hash")
+        advance_stage(report_path, report, "preflight_existing_project")
         private.preflight(contract, deployment)
+        advance_stage(report_path, report, "switch_synthetic_project")
         private.compose(contract, sealed.parent, digest, ["-f", str(sealed.parent / "compose.json"), "up", "-d", "--no-build", "--pull", "never"])
+        advance_stage(report_path, report, "verify_synthetic_runtime")
         private.verify_runtime(contract, deployment, sealed.parent, digest)
         report["checks"].append("actual_project_existing_volume_network_mount_hash_strategy")
+        advance_stage(report_path, report, "prove_read_only_mount")
         container = private.inspect_project(contract)[0]["Id"]
         write = subprocess.run(["docker", "exec", container, "python", "-c", "open('/app/config.yaml','ab').write(b'changed')"], capture_output=True, check=False)
         private.require(write.returncode != 0, "runtime config unexpectedly writable")
         report["checks"].append("runtime_bind_is_read_only")
+        advance_stage(report_path, report, "reject_wrong_image")
         try:
             private.verify_runtime(contract, deployment, sealed.parent, "sha256:" + "0" * 64)
         except private.ContractError:
             report["checks"].append("wrong_image_refused")
         else:
             raise private.ContractError("wrong image accepted")
+        advance_stage(report_path, report, "reject_changed_input")
         save(config, config.read_bytes() + b"\n# mutation after gate\n")
         try:
             private.load(sealed, root, require_fresh=True)
@@ -151,24 +210,14 @@ def execute(root, output):
             report["checks"].append("post_gate_input_mutation_refused")
         else:
             raise private.ContractError("mutated private input accepted")
+        report["events"].append({"stage": report["stage"], "state": "completed", "at_ns": time.time_ns()})
         report.update(status="passed", image_id=digest, contract_sha256=contract_sha)
-    except Exception:
-        report["status"] = "failed"
+    except Exception as error:
+        fail_stage(report_path, report, error)
         raise
     finally:
         save(report_path, report)
-        # Only resources whose names were generated by this invocation are
-        # removed. Synthetic private evidence stays on failed runners until
-        # disposal; only the allowlisted public report is uploaded.
-        ids = subprocess.run(["docker", "ps", "-aq", "--filter", f"label=com.docker.compose.project={project}"], capture_output=True, check=False).stdout.decode().split()
-        if ids:
-            subprocess.run(["docker", "rm", "-f", *ids], capture_output=True, check=False)
-        for args in (["network", "rm", network], ["volume", "rm", volume], ["image", "rm", image]):
-            subprocess.run(["docker", *args], capture_output=True, check=False)
-        if report["status"] == "passed":
-            if sealed:
-                sealed.parent.chmod(0o700)
-            shutil.rmtree(workspace)
+        cleanup(workspace, project, network, volume, image, sealed, report)
 
 
 def main():

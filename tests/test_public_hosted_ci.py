@@ -15,6 +15,7 @@ EXPECTED_JOBS = {
     "miniflux-outbox.yml": {"fixed-source": "ubuntu-latest"},
     "miniflux-pause.yml": {"native-fixed-image": "ubuntu-latest"},
     "webhook-capacity.yml": {"native-amd64": "ubuntu-24.04"},
+    "private-release-config.yml": {"native-amd64": "ubuntu-24.04"},
 }
 EXPECTED_TIMEOUTS = {
     "admission-fence.yml": 8,
@@ -23,6 +24,7 @@ EXPECTED_TIMEOUTS = {
     "miniflux-outbox.yml": 15,
     "miniflux-pause.yml": 20,
     "webhook-capacity.yml": 40,
+    "private-release-config.yml": 25,
 }
 
 
@@ -33,7 +35,7 @@ def _workflow(name):
 
 def test_all_existing_workflows_and_job_names_are_preserved():
     assert {path.name for path in WORKFLOWS.glob("*.yml")} == set(EXPECTED_JOBS)
-    assert sum(len(jobs) for jobs in EXPECTED_JOBS.values()) == 8
+    assert sum(len(jobs) for jobs in EXPECTED_JOBS.values()) == 9
 
 
 @pytest.mark.parametrize("name", EXPECTED_JOBS)
