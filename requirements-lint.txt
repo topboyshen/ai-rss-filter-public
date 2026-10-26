@@ -1,2 +1,2 @@
 # Development/CI only; never installed in the production image.
-ruff==0.16.10
+ruff==0.17.2
