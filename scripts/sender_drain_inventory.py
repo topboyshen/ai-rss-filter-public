@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import math
 from pathlib import Path
 import time
 
@@ -17,6 +18,58 @@ IDENTITY_SQL = capacity.PG_IDENTITY_SQL + """, 'handoff_state'::regclass::oid::b
 ROWS_SQL = """SELECT delivery_id,body_sha256,body,target_url,signature,contract,user_id,feed_id,entry_id,state,attempts
  FROM webhook_outbox WHERE state IN ('pending','inflight') ORDER BY delivery_id LIMIT 5001"""
 
+
+
+class _TimedCursor:
+    """Every SQL command shares the original wall deadline and <=3s SQL cap."""
+    def __init__(self, cursor, deadline):
+        self.cursor, self.deadline = cursor, deadline
+
+    def remaining(self):
+        left = self.deadline - time.monotonic()
+        require(left > 0, "sender PostgreSQL overall deadline exceeded")
+        return left
+
+    def execute(self, sql, params=None):
+        milliseconds = max(1, min(3000, int(self.remaining() * 1000)))
+        self.cursor.execute("SELECT set_config('statement_timeout',%s,false)", (str(milliseconds),))
+        self.remaining()
+        result = self.cursor.execute(sql) if params is None else self.cursor.execute(sql, params)
+        self.remaining()
+        return result
+
+    def fetchone(self):
+        self.remaining()
+        value = self.cursor.fetchone()
+        self.remaining()
+        return value
+
+    def fetchall(self):
+        self.remaining()
+        value = self.cursor.fetchall()
+        self.remaining()
+        return value
+
+    def __iter__(self):
+        for value in self.cursor:
+            self.remaining()
+            yield value
+
+
+def _deadline(value=None):
+    return min(time.monotonic() + 10, value) if value is not None else time.monotonic() + 10
+
+
+def _connect(connect, dsn, deadline):
+    remaining = deadline - time.monotonic()
+    # libpq treats connect_timeout below 2s as 2s. Do not start another
+    # connection when that minimum no longer fits the shared remaining bound.
+    require(remaining >= 2, "insufficient remaining PostgreSQL connect budget")
+    connection = connect(dsn, connect_timeout=min(3, math.floor(remaining)))
+    if time.monotonic() >= deadline:
+        connection.close()
+        require(False, "PostgreSQL connection exceeded overall deadline")
+    return connection
 
 def write_blob(path, raw, maximum):
     require(len(raw) <= maximum, "private original size limit")
@@ -66,13 +119,13 @@ def freeze_bundle(connect, dsn, expected, binding, receipt, window, root):
     root = Path(root)
     require(not root.exists() and not root.is_symlink(), "bundle already attempted; preserve original")
     private_directory(root, create=True)
-    started = time.monotonic()
-    connection = connect(dsn, connect_timeout=3)
+    deadline = _deadline()
+    connection = _connect(connect, dsn, deadline)
     try:
         connection.autocommit = True
-        with connection.cursor() as cursor:
+        with connection.cursor() as raw_cursor:
+            cursor = _TimedCursor(raw_cursor, deadline)
             cursor.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            cursor.execute("SET LOCAL statement_timeout='3000ms'")
             cursor.execute("SET LOCAL lock_timeout='3000ms'")
             cursor.execute("SHOW transaction_read_only")
             require(cursor.fetchone()[0] == "on", "original snapshot not read-only")
@@ -85,7 +138,7 @@ def freeze_bundle(connect, dsn, expected, binding, receipt, window, root):
             cursor.execute(ROWS_SQL)
             entries = []
             for values in cursor:
-                require(len(entries) < capacity.SENDER_ROWS and time.monotonic() - started <= 10, "original snapshot budget")
+                require(len(entries) < capacity.SENDER_ROWS and time.monotonic() < deadline, "original snapshot budget")
                 row, raw = _row(values)
                 write_blob(root / row["body_file"], raw, MAX_BODY_BYTES)
                 entries.append(row)
@@ -95,23 +148,23 @@ def freeze_bundle(connect, dsn, expected, binding, receipt, window, root):
                  "inventory_summary": summary, "retained_lease_budget": budget, "entries": entries,
                  "legacy_original_coverage": "registered_paths_since_instrumentation_only", "queue_checked": False, "switch_authorized": False}
         validate_manifest(value)
-        require(time.monotonic() - started <= 10, "original snapshot wall budget")
+        require(time.monotonic() < deadline, "original snapshot wall budget")
         write_blob(root / "manifest.json", encoded(value), MAX_MANIFEST_BYTES)
         return value
     finally:
         connection.close()
 
 
-def observe(connect, dsn, expected):
+def observe(connect, dsn, expected, *, deadline=None):
     """Fixed read-only SQL; returns counts plus actual gate, never a permit."""
     validate_identity(expected)
-    started = time.monotonic()
-    connection = connect(dsn, connect_timeout=3)
+    deadline = _deadline(deadline)
+    connection = _connect(connect, dsn, deadline)
     try:
         connection.autocommit = True
-        with connection.cursor() as cursor:
+        with connection.cursor() as raw_cursor:
+            cursor = _TimedCursor(raw_cursor, deadline)
             cursor.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            cursor.execute("SET LOCAL statement_timeout='3000ms'")
             cursor.execute("SET LOCAL lock_timeout='3000ms'")
             cursor.execute("SHOW transaction_read_only")
             require(cursor.fetchone()[0] == "on", "sender observation not read-only")
@@ -133,7 +186,7 @@ def observe(connect, dsn, expected):
             operations = cursor.fetchone()[0]
             require(type(operations) is int and 0 <= operations <= 10000, "operation capacity invalid")
             cursor.execute("ROLLBACK")
-        require(time.monotonic() - started <= 10, "sender observation wall budget")
+        require(time.monotonic() < deadline, "sender observation wall budget")
         return {**sample, "database_identity": actual, "read_only_transaction": True, "gate": gate,
                 "retained_leases": leases, "retained_operations": operations}
     finally:
@@ -161,9 +214,9 @@ class PostgresReader:
         require(hashlib.sha256(encoded(value)).hexdigest() == self._credential_sha256, "sender database credential changed")
         return value["dsn"]
 
-    def snapshot(self):
+    def snapshot(self, *, deadline=None):
         import psycopg
-        return observe(psycopg.connect, self._dsn(), self.expected)
+        return observe(psycopg.connect, self._dsn(), self.expected, deadline=deadline)
 
     def freeze(self, binding, receipt, window, root):
         import psycopg
@@ -184,11 +237,12 @@ class FrozenPostgres:
 
     def __enter__(self):
         import psycopg
-        self.connection = psycopg.connect(self.reader._dsn(), connect_timeout=3)
+        deadline = _deadline()
+        self.connection = _connect(psycopg.connect, self.reader._dsn(), deadline)
         try:
             self.connection.autocommit = True
-            with self.connection.cursor() as cursor:
-                cursor.execute("SET statement_timeout='3000ms'")
+            with self.connection.cursor() as raw_cursor:
+                cursor = _TimedCursor(raw_cursor, deadline)
                 cursor.execute("SET lock_timeout='3000ms'")
                 cursor.execute(IDENTITY_SQL)
                 require(dict(zip(IDENTITY_KEYS, cursor.fetchone())) == self.reader.expected, "frozen PG identity differs")
@@ -200,9 +254,9 @@ class FrozenPostgres:
                 pid = cursor.fetchone()[0]
             self.lock_identity = {"backend_pid":pid,"state_table_oid":oid,"activity_namespace":20261024,"metadata_namespace":20261023,
                                   "database_identity":self.reader.expected}
-            self.snapshot = self.reader.snapshot()
+            self.snapshot = self.reader.snapshot(deadline=deadline)
             self._closed(self.snapshot)
-            self.check()
+            self.check(deadline=deadline)
             return self
         except BaseException:
             self.connection.close()
@@ -218,16 +272,18 @@ class FrozenPostgres:
                 and value["legacy"]["rows"] == 0 and value["expired_unacknowledged"] == 0,
                 "sender retained originals are not independently drained")
 
-    def check(self):
+    def check(self, *, deadline=None):
+        deadline = _deadline(deadline)
         require(self.connection is not None, "sender PG locks no longer held")
-        with self.connection.cursor() as cursor:
+        with self.connection.cursor() as raw_cursor:
+            cursor = _TimedCursor(raw_cursor, deadline)
             cursor.execute(IDENTITY_SQL)
             require(dict(zip(IDENTITY_KEYS, cursor.fetchone())) == self.reader.expected, "locked PG identity changed")
             cursor.execute("""SELECT pg_backend_pid(),count(*) FROM pg_locks WHERE pid=pg_backend_pid()
  AND locktype='advisory' AND classid IN (20261024::oid,20261023::oid) AND objid=%s::oid
  AND objsubid=2 AND mode='ExclusiveLock' AND granted""", (self.reader.expected["state_table_oid"],))
             require(cursor.fetchone() == (self.lock_identity["backend_pid"],2), "sender PG lock ownership lost")
-        current = self.reader.snapshot()
+        current = self.reader.snapshot(deadline=deadline)
         self._closed(current)
         require(current == self.snapshot, "frozen sender inventory changed under locks")
         return self.lock_identity

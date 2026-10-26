@@ -39,7 +39,7 @@ def actual(tmp_path):
     raw = os.environ.get("MINIFLUX_OUTBOX_TEST_DSN")
     if not raw:
         pytest.skip("actual isolated PostgreSQL DSN not configured; no PG proof")
-    psycopg = pytest.importorskip("psycopg")
+    import psycopg
     url = urlsplit(raw)
     assert (
         url.scheme in {"postgres", "postgresql"}
@@ -246,3 +246,17 @@ def test_actual_held_and_wrong_database_never_yield_empty_or_original_bundle(
     with pytest.raises(Exception):
         reader.snapshot()
     phase("actual_held_original_and_wrong_oid_blocked_without_repair")
+
+
+def test_actual_statement_timeout_shrinks_to_remaining_total_budget(actual):
+    import time
+    import psycopg
+    connection, _, _, _, _, _ = actual
+    phase("before_actual_remaining_statement_timeout")
+    started = time.monotonic()
+    with connection.cursor() as raw:
+        cursor = inventory._TimedCursor(raw, started + 0.15)
+        with pytest.raises(psycopg.errors.QueryCanceled):
+            cursor.execute("SELECT pg_sleep(0.6)")
+    assert time.monotonic() - started < 0.5
+    phase("actual_postgres_cancelled_using_remaining_deadline")
