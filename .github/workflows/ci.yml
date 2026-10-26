@@ -98,6 +98,40 @@ jobs:
           node-version: '24.21.0'
           package-manager-cache: false
 
+      - name: Prepare private Node executable for the isolated suite
+        id: isolated_node
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          node_source="$(command -v node)"
+          node_expected="${RUNNER_TOOL_CACHE}/node/24.21.0/x64/bin/node"
+          if [[ "$node_source" != "$node_expected" || -L "$node_source" || ! -f "$node_source" || ! -x "$node_source" ]]; then
+            echo "Expected the ordinary Node executable installed by setup-node" >&2
+            exit 2
+          fi
+          test "$(realpath -- "$node_source")" = "$node_expected"
+          case "$RUNNER_TEMP" in
+            /*) ;;
+            *) exit 2 ;;
+          esac
+          case "$RUNNER_TEMP" in
+            *:*|*$'\n'*|*$'\r'*) exit 2 ;;
+          esac
+          node_mode="$(stat -c '%a' "$node_source" 2>/dev/null || stat -f '%Lp' "$node_source")"
+          node_hash="$(sha256sum "$node_source" | awk '{print $1}')"
+          node_private_dir="$(mktemp -d "${RUNNER_TEMP}/ai-filter-node.XXXXXX")"
+          node_private="${node_private_dir}/node"
+          install -m 0700 -- "$node_source" "$node_private"
+          test "$(sha256sum "$node_source" | awk '{print $1}')" = "$node_hash"
+          test "$(sha256sum "$node_private" | awk '{print $1}')" = "$node_hash"
+          node_private_mode="$(stat -c '%a' "$node_private" 2>/dev/null || stat -f '%Lp' "$node_private")"
+          test "$node_private_mode" = 700
+          node_version="$(env -i PATH=/usr/bin:/bin "$node_private" --version)"
+          test "$node_version" = v24.21.0
+          printf 'Node %s: setup-node mode=%s, private mode=%s, sha256=%s\n' "$node_version" "$node_mode" "$node_private_mode" "$node_hash"
+          printf 'path=%s\n' "$node_private" >> "$GITHUB_OUTPUT"
+
       - name: Cache pip dependencies
         uses: actions/cache@v6
         with:
@@ -124,7 +158,7 @@ jobs:
           # statement/branch coverage. Keep a small platform/version margin.
           install -d -m 0700 "${RUNNER_TEMP}/ai-filter-synthetic-cutover-evidence"
           AI_FILTER_TEST_PYTHON="$(command -v python)" \
-            AI_FILTER_TEST_NODE="$(command -v node)" \
+            AI_FILTER_TEST_NODE="${{ steps.isolated_node.outputs.path }}" \
             AI_FILTER_TEST_COVERAGE_OUTPUT="${RUNNER_TEMP}/ai-filter-coverage.xml" \
             AI_FILTER_CUTOVER_EVIDENCE_DIR="${RUNNER_TEMP}/ai-filter-synthetic-cutover-evidence" \
             ./scripts/run-release-tests.sh full
