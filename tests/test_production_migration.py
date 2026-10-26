@@ -126,12 +126,20 @@ def prepared(tmp_path, monkeypatch):
               "before": migration.database_fingerprint(conn), "target_schema_sha256": expected_schema,
               "step_ids": list(steps.STEP_IDS), "sender": sender_contract,
               "sender_contract_sha256": gate._hash(sender_contract), "inventory": spec,
-              "inventory_sha256": inventory_hash, "compatibility_sha256": "9" * 64, "minimum_free_bytes": 64 * 1024**2}
+              "inventory_sha256": inventory_hash, "minimum_free_bytes": 64 * 1024**2, "max_database_bytes": 4 * 1024**3}
+    set_compatibility(permit)
     try:
         yield {"directory": directory, "root": directory / "migration", "permit": permit,
                "anchor": conn, "sender": sender, "db": db, "fence": fence, "store": store}
     finally:
         conn.close()
+
+
+def set_compatibility(permit):
+    permit["compatibility"] = {"old_binding": deepcopy(permit["freeze"]["binding"]), "candidate_source": deepcopy(permit["source"]),
+        "from_schema_sha256": permit["before"]["schema_sha256"], "to_schema_sha256": permit["target_schema_sha256"],
+        "sqlite_policy": "fixed-current-event-core-forward-only", "old_image_execution": "not-proven-no-fallback"}
+    permit["compatibility_sha256"] = gate._hash(permit["compatibility"])
 
 
 def test_real_steps_are_atomic_journaled_and_never_reinitialize(prepared, monkeypatch):
@@ -277,6 +285,7 @@ def test_legacy_event_rows_without_backfill_marker_are_refused_before_any_step(p
     # Existing outbox plus the schema marker is sufficient to make this an
     # unsupported legacy start, even when the visible queue has no work.
     p["permit"]["before"] = migration.database_fingerprint(p["anchor"])
+    set_compatibility(p["permit"])
     with migration.locked_session(p["root"], p["permit"]) as session:
         with pytest.raises(database.EventCoreSchemaError, match="missing"):
             session.authorize()
@@ -292,3 +301,48 @@ def test_a_different_process_cannot_use_the_inherited_lock_capability(prepared, 
             with pytest.raises(gate.AdmissionError, match="session is not live"):
                 session.authorize()
     assert not p["root"].exists()
+
+
+def test_old_frozen_image_and_new_candidate_are_distinct_reviewed_endpoints(prepared):
+    p = prepared
+    p["permit"]["source"]["revision"] = "6" * 40
+    p["permit"]["source"]["image_id"] = "sha256:" + "7" * 64
+    set_compatibility(p["permit"])
+    with migration.locked_session(p["root"], p["permit"]) as session:
+        session.authorize()
+        assert session.migrate()["status"] == "migration_completed"
+
+
+def test_arbitrary_compatibility_hash_or_swapped_endpoints_refused(prepared):
+    permit = deepcopy(prepared["permit"])
+    permit["compatibility"]["old_binding"]["image_id"] = "sha256:" + "0" * 64
+    permit["compatibility_sha256"] = gate._hash(permit["compatibility"])
+    with pytest.raises(gate.AdmissionError, match="compatibility endpoints"):
+        with migration.locked_session(prepared["root"], permit):
+            pytest.fail("swapped endpoints admitted")
+    assert not prepared["root"].exists()
+
+
+@pytest.mark.parametrize("field,value", [("score", 9.0), ("mapping_confidence", 0.2), ("domain_event_id", "changed")])
+def test_retained_outbox_full_rows_detect_same_identity_payload_change(field, value):
+    with sqlite3.connect(":memory:") as conn:
+        conn.execute("CREATE TABLE integration_signal_outbox(seq INTEGER,ledger_signal_id INTEGER,event_id TEXT,"
+                     "score REAL,mapping_confidence REAL,domain_event_id TEXT)")
+        conn.execute("INSERT INTO integration_signal_outbox VALUES(1,2,'same-signal',5.0,0.8,'same-domain')")
+        before = steps.retained_outbox(conn)
+        conn.execute(f"UPDATE integration_signal_outbox SET {field}=?", (value,))
+        after = steps.retained_outbox(conn)
+        assert before["rows"] == after["rows"] == 1
+        assert before["columns"] == after["columns"]
+        assert before["content_sha256"] != after["content_sha256"]
+
+
+def test_database_identity_supports_reviewed_multigigabyte_storage_without_reading_or_copying(tmp_path):
+    tmp_path = tmp_path.resolve()
+    tmp_path.chmod(0o700)
+    path = tmp_path / "synthetic-sparse.db"
+    with path.open("xb") as handle:
+        handle.truncate(2 * 1024**3)
+    path.chmod(0o600)
+    assert migration.database_identity(path)["file"]["inode"] == path.stat().st_ino
+    # Metadata capacity only; not a 2 GiB SQL migration or production throughput claim.

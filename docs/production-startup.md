@@ -40,7 +40,11 @@ boundary, or are empty pristine schemas accepted by the existing read-only
 preflight. A populated compatibility/event database with missing or incompatible
 markers is refused before authorization. Historical outbox import must already
 be recorded when any ledger row exists. The new plan explicitly uses
-`backfill=False, trim=False`, preserves retained outbox identities/counts, and
+`backfill=False, trim=False`; this disables historical import and retention,
+but the existing helper can still fill mapping dimensions and event references.
+Nonempty rows requiring either repair are therefore refused before any step.
+Every retained column/value is streamed into a bounded full-row fingerprint;
+the same IDs with changed scores, mappings or references cannot pass. The plan
 does not manufacture missing historical exports. Missing historical migration
 proof needs a separately reviewed migration; it is not treated as compatibility.
 The target schema fingerprint is a reviewed input and is checked after all
@@ -57,6 +61,17 @@ DB directory/file/WAL/SHM identities, source/target schema, critical app-meta,
 retained outbox, a frozen admission operation, finite operation/window, fixed
 steps, the sender contract and an independently read inventory fingerprint.
 Full source hashes and clean-source private seal validation remain mandatory.
+The old frozen binding and candidate source/image are distinct endpoints in a
+complete reviewed compatibility structure whose hash is checked. The SQLite
+policy proves only the supported forward transition. Old-image execution and
+backward compatibility remain explicitly unproven, with no fallback branch;
+a random compatibility hash is not accepted as evidence.
+
+The permit sets an explicit DB file-size limit up to a 16 GiB hard ceiling;
+this is a disk bound, not permission to copy or load the whole file. SQLite's
+cache is 16 MiB and maximum row/scalar length is 8 MiB. Schema/meta inventories,
+outbox rows/bytes and SQL/step durations are separately bounded. A synthetic
+sparse-file test covers a 2 GiB identity, not production-size SQL performance.
 
 Lock order is release, refresh, receiver controller, receiver activity, actual
 spool/journal and journal identity locks, then the sender's actual PostgreSQL

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 
 from db import database as db
 from db import event_migration, integration_outbox
@@ -29,13 +30,41 @@ def table_exists(conn, name):
 
 def retained_outbox(conn):
     digest = hashlib.sha256()
-    count = 0
+    count, inspected_bytes, columns = 0, 0, []
+    deadline = time.monotonic() + 10
     if table_exists(conn, "integration_signal_outbox"):
-        for row in conn.execute("SELECT seq,ledger_signal_id,event_id FROM integration_signal_outbox ORDER BY seq"):
+        cursor = conn.execute("SELECT * FROM integration_signal_outbox ORDER BY seq")
+        names = [item[0] for item in cursor.description]
+        for row in cursor:
             count += 1
-            require(count <= MAX_ROWS, "retained outbox exceeds migration inspection bound")
-            digest.update(json.dumps(list(row), separators=(",", ":")).encode() + b"\n")
-    return {"rows": count, "identity_sha256": digest.hexdigest()}
+            require(count <= MAX_ROWS and time.monotonic() <= deadline, "retained outbox exceeds migration inspection bound")
+            if not columns:
+                columns = names
+                digest.update(json.dumps(columns, separators=(",", ":")).encode() + b"\n")
+            for value in row:
+                scalar = event_migration._digest_value(value)
+                inspected_bytes += len(scalar)
+                require(inspected_bytes <= 256 * 1024**2, "retained outbox byte inspection bound")
+                digest.update(scalar)
+            digest.update(b"\n")
+    return {"rows": count, "columns": columns, "content_sha256": digest.hexdigest()}
+
+
+def _outbox_needs_repair(conn):
+    if not table_exists(conn, "integration_signal_outbox"):
+        return False
+    if conn.execute("SELECT 1 FROM integration_signal_outbox LIMIT 1").fetchone() is None:
+        return False
+    if not event_migration._outbox_dimensions_current(conn):
+        return True
+    score_marker = conn.execute("SELECT v FROM app_meta WHERE k=?", (event_migration.SCORE_DIMENSIONS_META_KEY,)).fetchone()
+    if score_marker is None or not str(score_marker[0]).isascii() or not str(score_marker[0]).isdigit() or int(score_marker[0]) <= 0:
+        return True
+    return conn.execute(
+        "SELECT 1 FROM integration_signal_outbox AS o LEFT JOIN backtest_signals AS b ON b.id=o.ledger_signal_id "
+        "WHERE COALESCE(o.domain_event_id,'')='' OR o.event_version IS NULL OR o.event_version=0 "
+        "OR (COALESCE(o.event_mapping_id,'')='' AND COALESCE(b.event_mapping_id,'')<>'') LIMIT 1"
+    ).fetchone() is not None
 
 
 def preflight(conn):
@@ -49,6 +78,7 @@ def preflight(conn):
         marker = conn.execute("SELECT v FROM app_meta WHERE k=?", (integration_outbox.BACKFILL_META,)).fetchone()
     require(not populated or (marker is not None and marker[0] == "1" and "integration_signal_outbox" in tables),
             "historical export backfill requires separate reviewed migration")
+    require(not _outbox_needs_repair(conn), "retained outbox mapping/reference repair requires separate reviewed migration")
     # Missing backfill markers with existing event/compatibility data and
     # incompatible event schemas are refused by the read-only preflight above.
     # They need a separately reviewed legacy migration, not this startup plan.

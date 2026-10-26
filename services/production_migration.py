@@ -23,7 +23,7 @@ SCHEMA = "production-migration-v1"
 JOURNAL = "production_startup_migration_steps"
 LOCK_ORDER = ("release", "refresh", "controller", "activity", "spool", "journal")
 MAX_SECONDS = 1800
-MAX_DB_BYTES = 512 * 1024**2
+MAX_DB_BYTES = 16 * 1024**3
 
 
 def file_identity(path, *, directory=False):
@@ -116,7 +116,8 @@ def validate_permit(permit, *, active=False):
     keys = {"schema", "operation_id", "parent_operation_id", "approved_by", "not_before", "expires_at",
             "runtime_sources_sha256", "migration_code_sha256", "source", "config", "database", "freeze",
             "locks", "before", "target_schema_sha256", "step_ids", "sender_contract_sha256",
-            "inventory_sha256", "compatibility_sha256", "sender", "inventory", "minimum_free_bytes"}
+            "inventory_sha256", "compatibility_sha256", "compatibility", "sender", "inventory",
+            "minimum_free_bytes", "max_database_bytes"}
     gate._require(isinstance(permit, dict) and set(permit) == keys and permit["schema"] == SCHEMA,
                   "invalid production migration permit")
     for key in ("operation_id", "parent_operation_id", "runtime_sources_sha256", "migration_code_sha256",
@@ -142,6 +143,13 @@ def validate_permit(permit, *, active=False):
     gate._require(gate._hash(permit["sender"]) == permit["sender_contract_sha256"], "sender migration contract differs")
     gate._require(type(permit["minimum_free_bytes"]) is int and 64 * 1024**2 <= permit["minimum_free_bytes"] < 2**63,
                   "finite migration free-space floor required")
+    gate._require(type(permit["max_database_bytes"]) is int and 64 * 1024**2 <= permit["max_database_bytes"] <= MAX_DB_BYTES,
+                  "reviewed migration database size limit required")
+    expected_compatibility = {"old_binding": permit["freeze"]["binding"], "candidate_source": source,
+        "from_schema_sha256": permit["before"]["schema_sha256"], "to_schema_sha256": permit["target_schema_sha256"],
+        "sqlite_policy": "fixed-current-event-core-forward-only", "old_image_execution": "not-proven-no-fallback"}
+    gate._require(permit["compatibility"] == expected_compatibility
+                  and gate._hash(expected_compatibility) == permit["compatibility_sha256"], "reviewed compatibility endpoints differ")
     _configuration(permit)
     _release_contract(permit, active=active)
     return permit
@@ -166,8 +174,8 @@ def _frozen(permit):
                       and gate._hash(fence._manifest()) == record["manifest_sha256"]
                       and set(leases) == set(finishes) and all(row["outcome"] == "finished" for row in finishes.values()),
                       "frozen migration evidence changed or activity remains")
-    gate._require(permit["source"]["revision"] == fence.binding["revision"]
-                  and permit["source"]["image_id"] == fence.binding["image_id"], "migration source differs from frozen binding")
+    gate._require(permit["compatibility"]["old_binding"] == fence.binding,
+                  "old frozen runtime differs from reviewed compatibility endpoint")
     return fence
 
 
@@ -188,6 +196,8 @@ def _connection(path, *, readonly=False):
     conn = sqlite3.connect("file:" + quote(str(path), safe="/") + suffix, uri=True,
                            timeout=0.1, isolation_level=None, cached_statements=0, factory=_Connection)
     conn.row_factory = sqlite3.Row
+    conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 8 * 1024**2)
+    conn.execute("PRAGMA cache_size=-16384")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA recursive_triggers=ON")
     conn.execute("PRAGMA busy_timeout=100")
@@ -249,6 +259,7 @@ class LockedMigration:
             gate._require(actual == expected and (info.st_dev, info.st_ino) == (actual["device"], actual["inode"]),
                           "migration lock identity changed")
         _same_database(self.path, self.permit["database"])
+        gate._require(self.path.stat().st_size <= self.permit["max_database_bytes"], "reviewed migration database size exceeded")
         for path, expected in self.inventory["lock_identities"].items():
             actual = file_identity(path)
             gate._require(all(actual[key] == value for key, value in expected.items()), "inventory lock identity changed")
