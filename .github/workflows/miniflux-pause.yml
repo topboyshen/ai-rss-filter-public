@@ -9,6 +9,13 @@ on:
       - 'ops/miniflux/**'
       - 'scripts/*miniflux*pause*.py'
       - 'scripts/miniflux_handoff_adapter.py'
+      - 'scripts/production_sender_driver.py'
+      - 'scripts/sender_drain_inventory.py'
+      - 'services/sender_drain_contract.py'
+      - 'tests/test_production_sender_driver.py'
+      - 'tests/test_sender_drain_contract.py'
+      - 'tests/test_sender_postgres_native.py'
+      - 'requirements-ops.txt'
       - 'scripts/miniflux_host_joint_native.py'
       - 'scripts/miniflux_dump_selection.py'
       - 'scripts/apply_miniflux_outbox.py'
@@ -33,6 +40,13 @@ on:
       - 'ops/miniflux/**'
       - 'scripts/*miniflux*pause*.py'
       - 'scripts/miniflux_handoff_adapter.py'
+      - 'scripts/production_sender_driver.py'
+      - 'scripts/sender_drain_inventory.py'
+      - 'services/sender_drain_contract.py'
+      - 'tests/test_production_sender_driver.py'
+      - 'tests/test_sender_drain_contract.py'
+      - 'tests/test_sender_postgres_native.py'
+      - 'requirements-ops.txt'
       - 'scripts/miniflux_host_joint_native.py'
       - 'scripts/miniflux_dump_selection.py'
       - 'scripts/apply_miniflux_outbox.py'
@@ -81,6 +95,12 @@ jobs:
         with:
           go-version: '1.26.4'
           cache: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Fixed host PostgreSQL inventory dependencies
+        run: |
+          python -m pip install --only-binary=:all: -r requirements.txt -r requirements-ops.txt
       - name: Fixed upstream plus two separately verified patches
         run: |
           set -euo pipefail
@@ -97,11 +117,19 @@ jobs:
           cd "$RUNNER_TEMP/miniflux-pause"
           test -z "$(gofmt -l $(git ls-files --modified --others --exclude-standard -- '*.go'))"
           go test -p 1 -count=1 -v ./... 2>&1 | tee "$RUNNER_TEMP/pause-source-evidence/FULL_TEST.log"
-          go test -race -p 1 -count=1 -v ./internal/handoff ./internal/http/request ./internal/integration ./internal/worker ./internal/storage ./internal/http/server 2>&1 | tee "$RUNNER_TEMP/pause-source-evidence/RACE_TEST.log"
+          go test -race -p 1 -count=1 -v ./internal/handoff ./internal/database ./internal/http/request ./internal/integration ./internal/worker ./internal/storage ./internal/http/server 2>&1 | tee "$RUNNER_TEMP/pause-source-evidence/RACE_TEST.log"
           go vet ./...
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-X miniflux.app/v2/internal/version.Version=2.3.2 -X miniflux.app/v2/internal/version.Commit=${GITHUB_SHA}" -o "$RUNNER_TEMP/pause-build/miniflux" .
           go version -m "$RUNNER_TEMP/pause-build/miniflux" > "$RUNNER_TEMP/pause-source-evidence/BINARY_INFO.txt"
           sha256sum "$RUNNER_TEMP/pause-build/miniflux" > "$RUNNER_TEMP/pause-source-evidence/BINARY.sha256"
+      - name: Actual PostgreSQL host inventory and continuously held locks
+        env:
+          MINIFLUX_OUTBOX_TEST_DSN: 'postgres://postgres:synthetic-ci-only@127.0.0.1:5432/synthetic_outbox?sslmode=disable'
+        run: |
+          set -euo pipefail
+          export MINIFLUX_PATCHED_SOURCE="$RUNNER_TEMP/miniflux-pause"
+          python -m pytest -v -s -o addopts= tests/test_sender_postgres_native.py \
+            2>&1 | tee "$RUNNER_TEMP/pause-source-evidence/HOST_PG_TEST.log"
       - name: Actual legacy-original permissions and shared capacity
         env:
           PG_ID: '${{ job.services.postgres.id }}'
