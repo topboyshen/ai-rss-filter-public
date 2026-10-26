@@ -587,16 +587,9 @@ def init_db() -> None:
             logger.info("Database initialized: %s", DB_PATH)
 
 
-def _run_migrations(conn: sqlite3.Connection, cursor) -> None:
-    """按语义版本执行 schema 迁移；每个版本可包含多条幂等步骤。"""
-    try:
-        cursor.execute("SELECT v FROM app_meta WHERE k = 'schema_version'")
-        row = cursor.fetchone()
-        stored_version = int(row[0]) if row else 0
-    except Exception:
-        stored_version = 0
-
-    migration_groups = [
+def startup_schema_migration_groups():
+    """Fixed ordered news schema migrations, shared with controlled transactions."""
+    return [
         # version 1: 添加 feed_url 字段
         [("feed_url", "TEXT")],
         # version 2: 评分 metadata 字段
@@ -626,6 +619,18 @@ def _run_migrations(conn: sqlite3.Connection, cursor) -> None:
         # version 7: nullable explanation snapshots; historical values stay unknown.
         SCHEMA_COLUMNS,
     ]
+
+
+def _run_migrations(conn: sqlite3.Connection, cursor) -> None:
+    """按语义版本执行 schema 迁移；每个版本可包含多条幂等步骤。"""
+    try:
+        cursor.execute("SELECT v FROM app_meta WHERE k = 'schema_version'")
+        row = cursor.fetchone()
+        stored_version = int(row[0]) if row else 0
+    except Exception:
+        stored_version = 0
+
+    migration_groups = startup_schema_migration_groups()
     target_version = len(migration_groups)
 
     # 兼容旧实现：旧 schema_version 按每条 SQL 递增，最高可能为 7。
