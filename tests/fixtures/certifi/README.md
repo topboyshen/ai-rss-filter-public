@@ -22,3 +22,11 @@ release restores the three unaffected emSign roots. Tests preserve those
 roots and ordinary ISRG/DigiCert trust. They make no remote TLS requests and
 do not claim that every production endpoint uses certifi rather than another
 trust store. The separately frozen historical capacity baseline is unchanged.
+
+The offline CLI check uses `openssl verify -trusted`, which explicitly limits
+trust anchors to the selected bundle. Supplying `-CAfile` plus an empty
+`-CApath` alone leaves OpenSSL 3's default CAstore enabled. The tests also
+inject an unsafe default certificate-file environment and keep the required
+failure specific to verification error 18, not arbitrary command failure.
+The image checker uses an initially empty Python `SSLContext` and never loads
+system defaults.

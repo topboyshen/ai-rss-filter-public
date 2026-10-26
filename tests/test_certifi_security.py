@@ -7,6 +7,7 @@ import re
 import shutil
 import ssl
 import subprocess
+from types import SimpleNamespace
 
 import certifi
 import pytest
@@ -105,8 +106,47 @@ def test_missing_actual_bundle_fails_closed(tmp_path):
     assert checker.certifi_bundle_report("2026.10.19", tmp_path / "absent")["errors"]
 
 
+def _verify_root(executable, bundle, root):
+    # OpenSSL 3: -trusted disables default CAfile, CApath AND CAstore. An
+    # explicit -CAfile plus an empty -CApath does not disable default CAstore.
+    # LibreSSL also supports -trusted, without OpenSSL-3-only option probing.
+    return subprocess.run(
+        [executable, "verify", "-trusted", str(bundle), str(root)],
+        capture_output=True, text=True, timeout=3, check=False,
+    )
+
+
+def test_verify_command_uses_only_explicit_trust_anchors(monkeypatch, tmp_path):
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return SimpleNamespace(returncode=0, stdout="root.pem: OK", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    bundle, root = tmp_path / "bundle.pem", tmp_path / "root.pem"
+    assert _verify_root("/openssl", bundle, root).returncode == 0
+    assert calls == [(
+        ["/openssl", "verify", "-trusted", str(bundle), str(root)],
+        {"capture_output": True, "text": True, "timeout": 3, "check": False},
+    )]
+
+
+def test_image_checker_ignores_environment_default_trust_store(monkeypatch, tmp_path):
+    clean = _write_bundle(tmp_path, _clean_trust_fixture())
+    unsafe = tmp_path / "ambient-ca.pem"
+    unsafe.write_text(DISTRUSTED.read_text(encoding="ascii"), encoding="ascii")
+    monkeypatch.setenv("SSL_CERT_FILE", str(unsafe))
+    monkeypatch.setenv("SSL_CERT_DIR", str(tmp_path))
+    report = checker.certifi_bundle_report("2026.10.19", clean)
+    assert report["errors"] == []
+    assert report["distrusted_root_present"] is False
+
+
 @pytest.mark.parametrize("case,accepted", [("distrusted", False), ("old_trust", True), ("unaffected", True)])
-def test_openssl_verifies_normal_trust_but_rejects_removed_root(tmp_path, case, accepted):
+def test_openssl_verifies_normal_trust_but_rejects_removed_root(
+    tmp_path, monkeypatch, case, accepted,
+):
     # A self-signed public root verifies only if the chosen trust store trusts it.
     executable = shutil.which("openssl")
     assert executable, "OpenSSL is required for the offline trust regression"
@@ -119,12 +159,11 @@ def test_openssl_verifies_normal_trust_but_rejects_removed_root(tmp_path, case, 
     ca = _write_bundle(tmp_path, bundle)
     root = tmp_path / "root.pem"
     root.write_text(pem, encoding="ascii")
-    empty_ca_dir = tmp_path / "empty-ca-dir"
-    empty_ca_dir.mkdir()
-    result = subprocess.run(
-        [executable, "verify", "-CAfile", str(ca), "-CApath", str(empty_ca_dir), str(root)],
-        capture_output=True, text=True, timeout=3, check=False,
-    )
+    ambient = tmp_path / "ambient-ca.pem"
+    ambient.write_text(DISTRUSTED.read_text(encoding="ascii"), encoding="ascii")
+    monkeypatch.setenv("SSL_CERT_FILE", str(ambient))
+    monkeypatch.setenv("SSL_CERT_DIR", str(tmp_path))
+    result = _verify_root(executable, ca, root)
     if accepted:
         assert result.returncode == 0, result.stdout + result.stderr
         assert ": OK" in result.stdout
