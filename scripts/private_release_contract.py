@@ -8,6 +8,7 @@ loader probe, and never creates production volumes or networks.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -20,6 +21,7 @@ from decimal import Decimal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 
 
@@ -245,6 +247,103 @@ def validate_attachments(service, manifest, app):
     require(len(targets) == len(set(targets)), "duplicate service mount target")
 
 
+def numeric_user(value):
+    require(isinstance(value, str) and re.fullmatch(r"[0-9]+:[0-9]+", value),
+            "application launch identity requires numeric UID:GID")
+    uid, gid = (int(part) for part in value.split(":"))
+    require(max(uid, gid) < 2**32 - 1, "invalid numeric launch identity")
+    return uid, gid
+
+
+def supplementary_groups(service):
+    groups = service.get("group_add", [])
+    require(isinstance(groups, list) and all(type(group) in (str, int) and re.fullmatch(r"[0-9]+", str(group))
+                                          and int(group) < 2**32 - 1 for group in groups),
+            "supplementary groups must be explicit numeric GIDs")
+    normalized = sorted(str(int(group)) for group in groups)
+    require(len(normalized) == len(set(normalized)), "duplicate supplementary group")
+    return normalized
+
+
+def security_options(values):
+    require(isinstance(values, list) and all(value in {"no-new-privileges", "no-new-privileges:true"} for value in values)
+            and len(values) <= 1, "unsupported runtime security option")
+    return ["no-new-privileges:true"] if values else []
+
+
+def validate_permissions(service):
+    if "user" in service:
+        numeric_user(service["user"])
+    supplementary_groups(service)
+    require(service.get("cap_add", []) == [] and service.get("cap_drop", []) in ([], ["ALL"]),
+            "added or unsupported runtime capabilities forbidden")
+    security_options(service.get("security_opt", []))
+
+
+def working_directory(service, defaults):
+    value = service.get("working_dir", defaults.get("WorkingDir") or "")
+    require(isinstance(value, str) and (not value or (value.startswith("/")
+            and not value.startswith("//") and os.path.normpath(value) == value
+            and not any(char in value for char in "\r\n\x00"))), "invalid runtime working directory")
+    require(service.get("image") != IMAGE or value == "/app", "application working directory must be /app")
+    return value
+
+
+def health_duration(value):
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)(ns|us|ms|s|m|h)", str(value))
+    require(match is not None, "health duration requires a single explicit time unit")
+    amount = Decimal(match[1]) * {"ns": 1, "us": 1000, "ms": 10**6, "s": 10**9,
+                                  "m": 60 * 10**9, "h": 3600 * 10**9}[match[2]]
+    require(amount == int(amount) and 0 <= amount < 2**63, "invalid health duration")
+    return int(amount)
+
+
+def configured_healthcheck(service):
+    check = service.get("healthcheck", {})
+    require(isinstance(check, dict) and set(check) <= {
+        "test", "interval", "timeout", "start_period", "start_interval", "retries", "disable"},
+        "unsupported healthcheck configuration")
+    require(type(check.get("disable", False)) is bool and not (check.get("disable") and "test" in check),
+            "ambiguous healthcheck disable configuration")
+    test = ["NONE"] if check.get("disable") else check.get("test", [])
+    require(isinstance(test, list) and all(isinstance(item, str) and "\x00" not in item for item in test)
+            and (not test or (test[0] == "CMD" and len(test) > 1)
+                 or (test[0] == "CMD-SHELL" and len(test) == 2) or test == ["NONE"]),
+            "healthcheck test requires explicit command syntax")
+    result = {"Test": test}
+    for field, key in (("interval", "Interval"), ("timeout", "Timeout"),
+                       ("start_period", "StartPeriod"), ("start_interval", "StartInterval")):
+        result[key] = health_duration(check[field]) if field in check else 0
+    require("start_interval" not in check or "start_period" in check,
+            "health start interval requires explicit start period")
+    retries = check.get("retries", 0)
+    require(type(retries) is int and 0 <= retries < 2**31, "invalid health retry count")
+    result["Retries"] = retries
+    return result
+
+
+def normalized_healthcheck(value):
+    value = value or {}
+    require(isinstance(value, dict) and set(value) <= {
+        "Test", "Interval", "Timeout", "StartPeriod", "StartInterval", "Retries"},
+        "unsupported image or runtime healthcheck")
+    result = {"Test": value.get("Test") or []}
+    require(isinstance(result["Test"], list) and all(isinstance(item, str) for item in result["Test"]),
+            "invalid image or runtime healthcheck command")
+    for key in ("Interval", "Timeout", "StartPeriod", "StartInterval", "Retries"):
+        result[key] = value.get(key, 0)
+        require(type(result[key]) is int and result[key] >= 0, "invalid image or runtime healthcheck duration")
+    return result
+
+
+def expected_healthcheck(service, defaults):
+    # Moby merge inherits each empty/zero field independently, including when
+    # Compose disables the test. Compare stored configuration, not only status.
+    base = normalized_healthcheck(defaults.get("Healthcheck"))
+    supplied = configured_healthcheck(service)
+    return {key: supplied[key] or value for key, value in base.items()}
+
+
 def validate_manifest(manifest, review, env_values, runtime_path):
     require(isinstance(manifest, dict) and set(manifest) <= {
         "name", "services", "volumes", "networks", "secrets", "configs"}, "unsupported manifest field")
@@ -286,6 +385,7 @@ def validate_manifest(manifest, review, env_values, runtime_path):
         require(not set(service) & {"build", "env_file", "extends", "volumes_from", "devices",
                                     "privileged", "pid", "ipc", "uts", "container_name"},
                 "unsupported private service indirection")
+        validate_permissions(service)
         require(set(service.get("deploy", {})) <= {"replicas"}
                 and not set(service) & {"cpu_count", "cpu_percent", "cpu_period", "cpu_quota", "cpu_rt_runtime", "cpu_rt_period"},
                 "unsupported deployment resource indirection")
@@ -298,6 +398,10 @@ def validate_manifest(manifest, review, env_values, runtime_path):
         app = image == IMAGE
         require(app or re.fullmatch(r"[A-Za-z0-9._:/-]+@sha256:[0-9a-f]{64}", image),
                 "all service images must be immutable")
+        if "working_dir" in service:
+            require(service["working_dir"], "explicit working directory cannot be empty")
+            working_directory(service, {})
+        configured_healthcheck(service)
         environment = service.get("environment", {})
         require(isinstance(environment, dict), "environment must be a mapping")
         for key, value in environment.items():
@@ -491,20 +595,61 @@ def compose(contract, directory, image, args):
                env=docker_environment(directory, image))
 
 
+def role_environment(service, defaults, values):
+    result = runtime_environment(defaults.get("Env"))
+    for key, expected in service.get("environment", {}).items():
+        match = REFERENCE.fullmatch(str(expected))
+        result[key] = values[match[1]] if match else str(expected)
+    require(all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) for key in result)
+            and all(not any(char in value for char in "\r\n\x00") for value in result.values()),
+            "role environment cannot be represented without record injection")
+    return result
+
+
+@contextmanager
+def probe_environment_file(directory, environment):
+    # Docker's env-file contains the resolved role names, not interpolation
+    # aliases. Values never enter host environment or process arguments.
+    descriptor, name = tempfile.mkstemp(prefix=".private-role-probe-", dir=directory.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write("".join(f"{key}={value}\n" for key, value in sorted(environment.items())).encode())
+            handle.flush()
+            os.fsync(handle.fileno())
+        yield name
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
 def image_probe(contract, directory, digest):
     require(re.fullmatch(r"sha256:[0-9a-f]{64}", digest), "invalid image digest")
     manifest = json.loads(private_file(directory / "compose.json", sealed=True)[0])
-    mounts = []
-    for name, reference in manifest.get("secrets", {}).items():
-        require(re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name), "invalid secret reference name")
-        mounts += ["--mount", f"type=bind,src={reference['file']},dst=/run/secrets/{name},readonly"]
-    probe = json.loads(run(["docker", "run", "--rm", "--network", "none", "--read-only", "--cap-drop", "ALL",
-                           "--security-opt", "no-new-privileges", "--memory", "768m", "--pids-limit", "256",
-                           "--env-file", str(directory / "environment"), "-e", "AI_FILTER_CONFIG_PATH=/app/config.yaml",
-                           "--mount", f"type=bind,src={directory / 'runtime.yaml'},dst=/app/config.yaml,readonly", *mounts,
-                           "--entrypoint", "python", digest, "-c", PROBE]))
-    require(probe == {"config_sha256": contract["files"]["runtime.yaml"], "strategy": contract["review"]["strategy"]},
-            "image runtime config or strategy mismatch")
+    info = json.loads(run(["docker", "image", "inspect", digest]))
+    require(len(info) == 1 and info[0]["Id"] == digest, "image probe identity mismatch")
+    defaults = info[0]["Config"]
+    values = environment_values(private_file(directory / "environment", sealed=True)[0])
+    for service_name in contract["app_services"]:
+        service = manifest["services"][service_name]
+        user = service.get("user", defaults.get("User") or "0:0")
+        uid, _gid = numeric_user(user)
+        _config, metadata = private_file(directory / "runtime.yaml", sealed=True)
+        require(uid == metadata["uid"], "runtime UID does not own the private config")
+        mounts = []
+        for name in service.get("secrets", []):
+            reference = manifest["secrets"][name]
+            _secret, metadata = private_file(reference["file"])
+            require(uid == metadata["uid"], "runtime UID does not own its private secret")
+            mounts += ["--mount", f"type=bind,src={reference['file']},dst=/run/secrets/{name},readonly"]
+        groups = [item for group in supplementary_groups(service) for item in ("--group-add", group)]
+        workdir = working_directory(service, defaults)
+        with probe_environment_file(directory, role_environment(service, defaults, values)) as environment:
+            probe = json.loads(run(["docker", "run", "--rm", "--network", "none", "--read-only", "--cap-drop", "ALL",
+                                   "--user", user, *groups, "--workdir", workdir, "--security-opt", "no-new-privileges",
+                                   "--memory", "768m", "--pids-limit", "256", "--env-file", environment,
+                                   "--mount", f"type=bind,src={directory / 'runtime.yaml'},dst=/app/config.yaml,readonly", *mounts,
+                                   "--entrypoint", "python", digest, "-c", PROBE]))
+        require(probe == {"config_sha256": contract["files"]["runtime.yaml"], "strategy": contract["review"]["strategy"]},
+                "image runtime config or strategy mismatch")
 
 
 def expected_topology(manifest):
@@ -559,6 +704,8 @@ def runtime_topology(containers):
         result.setdefault(name, []).append({"id": container["Id"], "image": container["Image"],
                                              "mounts": sorted(mounts, key=lambda item: item["target"]),
                                              "networks": sorted(container["NetworkSettings"]["Networks"]),
+                                             "user": container["Config"].get("User") or "",
+                                             "group_add": sorted(container["HostConfig"].get("GroupAdd") or []),
                                              "ports": sorted(ports, key=lambda item: encoded(item))})
     return {name: sorted(items, key=lambda item: item["id"]) for name, items in result.items()}
 
@@ -619,16 +766,25 @@ def verify_execution(service, container, image_info, values):
     require(container["Image"] == image_info["Id"] and container["State"]["Running"], "runtime image identity mismatch")
     actual = container["Config"]
     defaults = image_info["Config"]
+    require((actual.get("WorkingDir") or "") == working_directory(service, defaults),
+            "runtime working directory mismatch")
+    require(normalized_healthcheck(actual.get("Healthcheck")) == expected_healthcheck(service, defaults),
+            "runtime healthcheck configuration mismatch")
     for field, key in (("command", "Cmd"), ("entrypoint", "Entrypoint")):
         wanted = service.get(field) if service.get(field) is not None else defaults.get(key)
         require(command_vector(actual.get(key)) == command_vector(wanted), "runtime command or entrypoint mismatch")
-    expected_env = runtime_environment(defaults.get("Env"))
-    for key, expected in service.get("environment", {}).items():
-        match = REFERENCE.fullmatch(str(expected))
-        expected_env[key] = values[match[1]] if match else str(expected)
-    require(runtime_environment(actual.get("Env")) == expected_env,
+    require(runtime_environment(actual.get("Env")) == role_environment(service, defaults, values),
             "runtime environment or role differs from frozen references")
     resources = container["HostConfig"]
+    expected_user = service.get("user", defaults.get("User") or "")
+    numeric_user(expected_user or "0:0")
+    require((actual.get("User") or "") == expected_user
+            and sorted(resources.get("GroupAdd") or []) == supplementary_groups(service),
+            "runtime user or supplementary groups mismatch")
+    require(resources.get("Privileged", False) is False and not resources.get("CapAdd")
+            and (resources.get("CapDrop") or []) == service.get("cap_drop", [])
+            and security_options(resources.get("SecurityOpt") or []) == security_options(service.get("security_opt", [])),
+            "runtime privileges differ from frozen manifest")
     for field, key in (("mem_limit", "Memory"), ("mem_reservation", "MemoryReservation"), ("memswap_limit", "MemorySwap")):
         if field == "memswap_limit" and field not in service:
             # Docker's ordinary default permits swap equal to the memory limit.
@@ -660,8 +816,7 @@ def verify_service_execution(contract, manifest, containers, directory, digest):
         verify_execution(service, container, inspected[image_ref], values)
 
 
-def verify_runtime(contract, manifest, directory, digest):
-    containers = inspect_project(contract)
+def verify_app_loaders(contract, manifest, containers, directory, digest):
     by_service = {}
     for container in containers:
         labels = container["Config"]["Labels"]
@@ -690,6 +845,10 @@ def verify_runtime(contract, manifest, directory, digest):
             probe = json.loads(run(["docker", "exec", container["Id"], "python", "-c", PROBE]))
             require(probe == {"config_sha256": contract["files"]["runtime.yaml"], "strategy": contract["review"]["strategy"]},
                     "runtime config or strategy mismatch")
+
+
+def verify_runtime(contract, manifest, directory, digest):
+    containers = inspect_project(contract)
     verify_service_execution(contract, manifest, containers, directory, digest)
     actual_topology = runtime_topology(containers)
     expected_names = {name for name, service in manifest["services"].items() if not service.get("profiles")}
@@ -724,6 +883,9 @@ def verify_runtime(contract, manifest, directory, digest):
             require(sorted(observed, key=lambda item: item["target"]) == sorted(expected_mounts, key=lambda item: item["target"])
                     and actual["networks"] == networks and actual["ports"] == ports,
                     "runtime service mount, network, or port mismatch")
+    # Verify imports' execution context and all actual mounts before invoking
+    # the config loader, so an unreviewed writable directory cannot supply it.
+    verify_app_loaders(contract, manifest, containers, directory, digest)
 
 
 def main():

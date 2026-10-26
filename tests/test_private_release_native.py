@@ -75,3 +75,22 @@ def test_fixed_image_pull_failure_is_separate_from_start_and_preserved(tmp_path,
                for event in saved["events"])
     assert not any(args[:2] == ["docker", "compose"] for args in calls)
     assert saved["failure"]["locations"][0]["file"] == Path(native.__file__).name
+
+
+
+def test_reader_identity_proof_keeps_capabilities_dropped_and_file_private(tmp_path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_bytes(b"synthetic: true\n")
+    config.chmod(0o400)
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append(args)
+        return b"" if len(calls) == 1 else native.private.sha(config.read_bytes()).encode() + b"\n"
+
+    monkeypatch.setattr(native.private, "run", run)
+    native.verify_config_reader_identity("python@sha256:" + "a" * 64, config, "1001:1001")
+    assert [args[args.index("--user") + 1] for args in calls] == ["0:0", "1001:1001"]
+    assert all(args[args.index("--cap-drop") + 1] == "ALL" and "--cap-add" not in args for args in calls)
+    assert "except PermissionError" in calls[0][-1]
+    assert config.stat().st_mode & 0o777 == 0o400

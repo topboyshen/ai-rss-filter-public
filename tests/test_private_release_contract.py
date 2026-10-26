@@ -47,6 +47,7 @@ def fixture(tmp_path):
         "services": {
             "ai-filter-api": {
                 "image": private.IMAGE, "mem_limit": "768m", "pids_limit": 256,
+                "user": f"{os.geteuid()}:{os.getegid()}",
                 "command": ["python", "app.py"],
                 "environment": {"AI_FILTER_CONFIG_PATH": "/app/config.yaml", "LLM_API_KEY": "${LLM_API_KEY:?}"},
                 "volumes": [
@@ -121,7 +122,8 @@ def inspect_records(fixture, directory, *, image=DIGEST):
                                               "com.docker.compose.service": name},
                                    "Env": [key + "=" + (SECRET if value == "${LLM_API_KEY:?}" else str(value))
                                            for key, value in service.get("environment", {}).items()],
-                                   "Cmd": service.get("command", []), "Entrypoint": None},
+                                   "Cmd": service.get("command", []), "Entrypoint": None, "User": service.get("user", ""),
+                                   "WorkingDir": service.get("working_dir", "/app")},
                         "Mounts": mounts, "NetworkSettings": {"Networks": {"existing-project_ai-net": {}}},
                         "HostConfig": {"Memory": private.memory_bytes(service["mem_limit"]),
                                        "MemorySwap": 2 * private.memory_bytes(service["mem_limit"]),
@@ -130,7 +132,7 @@ def inspect_records(fixture, directory, *, image=DIGEST):
     return records
 
 
-def fake_docker(monkeypatch, contract, records, *, probe=None):
+def fake_docker(monkeypatch, contract, records, *, probe=None, image_defaults=None):
     calls = []
 
     def run(args, **kwargs):
@@ -140,7 +142,8 @@ def fake_docker(monkeypatch, contract, records, *, probe=None):
         if args[:2] == ["docker", "inspect"]:
             return private.encoded(records)
         if args[:3] == ["docker", "image", "inspect"]:
-            return private.encoded([{"Id": DIGEST, "Config": {"Cmd": [], "Entrypoint": None, "Env": []}}])
+            defaults = {"Cmd": [], "Entrypoint": None, "Env": [], "WorkingDir": "/app"}
+            return private.encoded([{"Id": DIGEST, "Config": {**defaults, **(image_defaults or {})}}])
         if args[:2] in (["docker", "volume"], ["docker", "network"]):
             return private.encoded([{"Name": args[-1]}])
         if args[:2] in (["docker", "exec"], ["docker", "run"]):
@@ -303,7 +306,8 @@ def test_image_and_runtime_probe_exact_agreement(fixture, monkeypatch):
     private.preflight(contract, manifest)
     private.verify_runtime(contract, manifest, path.parent, DIGEST)
     assert any(args[:2] == ["docker", "exec"] for args, _ in calls)
-    command = calls[0][0]
+    command = next(args for args, _ in calls if args[:2] == ["docker", "run"])
+    assert command[command.index("--user") + 1] == f"{os.geteuid()}:{os.getegid()}"
     assert command[command.index("--network") + 1] == "none"
     assert "--read-only" in command and SECRET not in " ".join(command)
 
@@ -578,3 +582,179 @@ def test_fixture_teardown_only_restores_disposable_directory_writes(tmp_path):
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
     assert stat.S_IMODE(path.stat().st_mode) == 0o400
     path.unlink()
+
+
+
+def test_image_probe_uses_role_identity_env_aliases_and_scoped_secrets(fixture, monkeypatch):
+    manifest = fixture["manifest_data"]
+    service = manifest["services"]["ai-filter-api"]
+    service["environment"].pop("LLM_API_KEY")
+    service["environment"]["AI_FILTER_API_KEY"] = "${SECRET_REF:?}"
+    service["secrets"] = ["session"]
+    service["group_add"] = ["44"]
+    worker = deepcopy(service)
+    worker["ports"] = []
+    worker["secrets"] = ["worker-only"]
+    manifest["services"]["ai-filter-worker"] = worker
+    second_secret = save(fixture["secret"].parent / "worker-secret", b"worker-only-synthetic-secret-123456789")
+    manifest["secrets"]["worker-only"] = {"file": str(second_secret)}
+    save(fixture["environment"], ("SECRET_REF=" + SECRET + "\n").encode())
+    review = fixture["review_data"]
+    review["environment_sha256"] = private.sha(fixture["environment"].read_bytes())
+    review["service_mapping"]["ai-filter-worker"] = ["ai-filter-worker"]
+    review["existing_topology"] = private.runtime_topology(inspect_records(fixture, fixture["output"]))
+    review["topology"]["ai-filter-worker"] = {"mounts": worker["volumes"], "networks": worker["networks"], "ports": []}
+    reseal_inputs(fixture)
+    path = seal(fixture)
+    contract, _, _ = private.load(path, fixture["root"])
+    seen = []
+
+    def run(args, **kwargs):
+        if args[:3] == ["docker", "image", "inspect"]:
+            return private.encoded([{"Id": DIGEST, "Config": {"Env": ["IMAGE_DEFAULT=kept"], "User": "", "WorkingDir": "/app"}}])
+        assert args[:2] == ["docker", "run"]
+        env_file = Path(args[args.index("--env-file") + 1])
+        content = env_file.read_text()
+        assert "AI_FILTER_API_KEY=" + SECRET in content
+        assert "IMAGE_DEFAULT=kept" in content
+        assert "SECRET_REF=" not in content
+        assert SECRET not in " ".join(args)
+        assert env_file.stat().st_mode & 0o777 == 0o600
+        assert args[args.index("--user") + 1] == service["user"]
+        assert args[args.index("--workdir") + 1] == "/app"
+        assert args[args.index("--group-add") + 1] == "44"
+        seen.append((env_file, [args[index + 1] for index, value in enumerate(args) if value == "--mount"]))
+        return private.encoded({"config_sha256": contract["files"]["runtime.yaml"], "strategy": review["strategy"]})
+
+    monkeypatch.setattr(private, "run", run)
+    private.image_probe(contract, path.parent, DIGEST)
+    assert len(seen) == 2 and all(not file.exists() for file, _ in seen)
+    assert any("/run/secrets/session" in mount for mount in seen[0][1])
+    assert not any("worker-only" in mount for mount in seen[0][1])
+    assert any("/run/secrets/worker-only" in mount for mount in seen[1][1])
+    assert not any("/run/secrets/session" in mount for mount in seen[1][1])
+
+
+@pytest.mark.parametrize("user", ["node", "1001", "root", "1:-1", "4294967295:1"])
+def test_ambiguous_or_invalid_user_identity_is_rejected(fixture, user):
+    fixture["manifest_data"]["services"]["ai-filter-api"]["user"] = user
+    reseal_inputs(fixture)
+    with pytest.raises(private.ContractError, match="identity"):
+        seal(fixture)
+
+
+def test_probe_refuses_different_owner_without_widening_permissions(fixture, monkeypatch):
+    service = fixture["manifest_data"]["services"]["ai-filter-api"]
+    service["user"] = f"{os.geteuid() + 1}:{os.getegid()}"
+    reseal_inputs(fixture)
+    path = seal(fixture)
+    contract, _, _ = private.load(path, fixture["root"])
+    calls = fake_docker(monkeypatch, contract, inspect_records(fixture, path.parent))
+    with pytest.raises(private.ContractError, match="runtime UID does not own"):
+        private.image_probe(contract, path.parent, DIGEST)
+    assert not any(args[:2] == ["docker", "run"] for args, _ in calls)
+    assert stat.S_IMODE((path.parent / "runtime.yaml").stat().st_mode) == 0o400
+
+
+@pytest.mark.parametrize("change", ["user", "groups", "privileged", "cap_add", "cap_drop", "security_opt"])
+def test_runtime_launch_identity_and_privilege_drift_rejected(fixture, monkeypatch, change):
+    path = seal(fixture)
+    contract, manifest, _ = private.load(path, fixture["root"])
+    records = inspect_records(fixture, path.parent)
+    if change == "user":
+        records[0]["Config"]["User"] = f"{os.geteuid() + 1}:0"
+    else:
+        key, value = {"groups": ("GroupAdd", ["77"]), "privileged": ("Privileged", True),
+                      "cap_add": ("CapAdd", ["SYS_ADMIN"]), "cap_drop": ("CapDrop", ["ALL"]),
+                      "security_opt": ("SecurityOpt", ["seccomp=unconfined"])}[change]
+        records[0]["HostConfig"][key] = value
+    fake_docker(monkeypatch, contract, records)
+    with pytest.raises(private.ContractError):
+        private.verify_runtime(contract, manifest, path.parent, DIGEST)
+
+
+def test_manifest_cannot_request_added_capabilities(fixture):
+    fixture["manifest_data"]["services"]["ai-filter-api"]["cap_add"] = ["DAC_OVERRIDE"]
+    reseal_inputs(fixture)
+    with pytest.raises(private.ContractError, match="capabilities forbidden"):
+        seal(fixture)
+
+
+@pytest.mark.parametrize("field", ["WorkingDir", "Test", "disable", "Interval", "Timeout",
+                                    "StartPeriod", "StartInterval", "Retries", "missing"])
+def test_actual_execution_context_drift_rejected_before_loader(fixture, monkeypatch, field):
+    health = {"Test": ["CMD", "curl", "--fail", "http://127.0.0.1:5000/health"],
+              "Interval": 30_000_000_000, "Timeout": 3_000_000_000, "StartPeriod": 20_000_000_000,
+              "StartInterval": 1_000_000_000, "Retries": 3}
+    path = seal(fixture)
+    contract, manifest, _ = private.load(path, fixture["root"])
+    records = inspect_records(fixture, path.parent)
+    for record in records:
+        record["Config"]["Healthcheck"] = deepcopy(health)
+    calls = fake_docker(monkeypatch, contract, records, image_defaults={"Healthcheck": health})
+    private.verify_runtime(contract, manifest, path.parent, DIGEST)
+    config = records[0]["Config"]
+    if field == "WorkingDir":
+        config[field] = "/app/data"
+    elif field == "missing":
+        config.pop("Healthcheck")
+    elif field in {"Test", "disable"}:
+        config["Healthcheck"]["Test"] = ["CMD", "true"] if field == "Test" else ["NONE"]
+    else:
+        config["Healthcheck"][field] += 1
+    calls.clear()
+    with pytest.raises(private.ContractError, match="working directory|healthcheck configuration"):
+        private.verify_runtime(contract, manifest, path.parent, DIGEST)
+    assert not any(args[:2] == ["docker", "exec"] for args, _ in calls)
+
+
+@pytest.mark.parametrize("disabled", [False, True])
+def test_explicit_healthcheck_merges_image_defaults_and_verifies_exactly(fixture, monkeypatch, disabled):
+    service = fixture["manifest_data"]["services"]["ai-filter-api"]
+    service["working_dir"] = "/app"
+    service["healthcheck"] = {"interval": "0s", "timeout": "1.5s", "start_period": "20s",
+                              "start_interval": "100ms", "retries": 4, "disable": disabled}
+    if not disabled:
+        service["healthcheck"]["test"] = ["CMD-SHELL", "curl --fail http://127.0.0.1:5000/health"]
+    reseal_inputs(fixture)
+    path = seal(fixture)
+    contract, manifest, _ = private.load(path, fixture["root"])
+    health = {"Test": ["CMD", "image-health"], "Interval": 30_000_000_000, "Timeout": 3_000_000_000, "Retries": 3}
+    records = inspect_records(fixture, path.parent)
+    for record in records:
+        record["Config"]["Healthcheck"] = deepcopy(health)
+    records[0]["Config"]["Healthcheck"] = {
+        "Test": ["NONE"] if disabled else service["healthcheck"]["test"],
+        "Interval": 30_000_000_000, "Timeout": 1_500_000_000, "StartPeriod": 20_000_000_000,
+        "StartInterval": 100_000_000, "Retries": 4}
+    fake_docker(monkeypatch, contract, records, image_defaults={"Healthcheck": health})
+    private.verify_runtime(contract, manifest, path.parent, DIGEST)
+    records[0]["Config"]["Healthcheck"]["Retries"] = 3
+    with pytest.raises(private.ContractError, match="healthcheck configuration"):
+        private.verify_runtime(contract, manifest, path.parent, DIGEST)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("working_dir", "/app/data"), ("working_dir", "app"), ("working_dir", "/app/../app"), ("working_dir", ""),
+    ("healthcheck", {"test": "true"}), ("healthcheck", {"test": ["UNREVIEWED", "true"]}),
+    ("healthcheck", {"disable": True, "test": ["CMD", "true"]}),
+    ("healthcheck", {"interval": "1s500ms"}), ("healthcheck", {"interval": -1}),
+    ("healthcheck", {"start_interval": "1s"}), ("healthcheck", {"retries": True}),
+    ("healthcheck", {"unknown": "ignored"}),
+])
+def test_unsupported_execution_context_refused_at_seal(fixture, field, value):
+    fixture["manifest_data"]["services"]["ai-filter-api"][field] = value
+    reseal_inputs(fixture)
+    with pytest.raises(private.ContractError):
+        seal(fixture)
+
+
+def test_actual_code_mount_drift_rejected_before_loader(fixture, monkeypatch):
+    path = seal(fixture)
+    contract, manifest, _ = private.load(path, fixture["root"])
+    records = inspect_records(fixture, path.parent)
+    records[0]["Mounts"].append({"Type": "bind", "Source": "/synthetic/unreviewed", "Destination": "/app/core", "RW": True})
+    calls = fake_docker(monkeypatch, contract, records)
+    with pytest.raises(private.ContractError, match="mount, network, or port"):
+        private.verify_runtime(contract, manifest, path.parent, DIGEST)
+    assert not any(args[:2] == ["docker", "exec"] for args, _ in calls)

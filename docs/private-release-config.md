@@ -76,7 +76,7 @@ An independently reviewed, private JSON receipt must contain:
 - `existing_topology`, independently captured under the controller's locks from
   actual old `docker inspect` records. `runtime_topology()` supplies the canonical
   representation: each service maps to a sorted list of `{id, image, mounts,
-  networks, ports}`. It is not inferred from the candidate or current entries.
+  networks, user, group_add, ports}`. It is not inferred from the candidate or current entries.
 - `service_mapping`, mapping every candidate role to an explicit list of old
   roles whose writable data mounts it may reuse. This supports a reviewed
   old-web → new-api role split without permitting a cross-role data-path swap.
@@ -126,13 +126,42 @@ Build and deploy probe the actual image by immutable ID, network disabled,
 read-only root, all capabilities dropped, no-new-privileges, 768 MiB/256 PID
 limits, and the frozen YAML plus required private secret references. The probe
 imports only the config loader; it makes no model call or database connection.
+Each role's probe uses its reviewed numeric `user: UID:GID`, or the actual
+candidate image's default identity (empty Docker User means `0:0`). Named users
+and UID-only declarations/defaults are unsupported and refused; no identity is
+guessed. The role UID must own the sealed mode-0400 YAML and its scoped secret
+files. A mismatch stops release instead of changing ownership/permissions or
+adding DAC capabilities. A root-based production role therefore requires a
+root-owned private seal; this helper performs no host data ownership migration.
+
+The probe receives image defaults plus that role's resolved environment through
+a private mode-0600 temporary env file. Interpolation aliases are resolved to
+actual role variable names, and only the role's declared secret files are mounted.
+Its UID/GID and supplementary groups match the role contract while all probe
+capabilities remain dropped. Temporary env files are removed after each probe;
+values never enter host subprocess environment, Docker argv, or diagnostics.
+Application roles and their loader probes must use `/app` as their working
+directory, inherited from the image or explicitly frozen in the manifest. This
+prevents a writable data directory from supplying the loader's Python imports.
+
 After startup, verification checks actual app container image IDs, config mount
 source/read-only status, effective environment, config bytes, and the strategy
 computed by the loader inside each running role. It also checks each service's
 mounts, networks, ports, replicas and embedded gateway-config bytes. Every
 running service, including infrastructure, must use its exact immutable image,
-reviewed Cmd/Entrypoint, image-plus-manifest environment (including role), and
-memory/swap/PID/CPU limits. Each manifest service requires explicit finite memory
+reviewed Cmd/Entrypoint, image-plus-manifest environment (including role),
+configured WorkingDir, Healthcheck, User/GroupAdd, and memory/swap/PID/CPU limits.
+Execution context and actual mounts are checked before invoking the loader.
+Healthcheck verification merges image defaults with the frozen manifest using
+Docker's per-field inheritance; a healthy status cannot substitute for the
+reviewed command. Supported fields are explicit list-form `test`, `disable`,
+`interval`, `timeout`, `start_period`, `start_interval`, and `retries`. Durations
+use one `ns`, `us`, `ms`, `s`, `m`, or `h` unit, optionally fractional;
+`start_interval` requires an explicit `start_period`. Other forms are refused.
+Privileged mode and added
+capabilities are rejected; CapDrop and SecurityOpt must match the frozen manifest.
+Supported capability drops are empty or ALL; supported extra security options are
+empty or no-new-privileges. No new permission is granted to make a probe pass. Each manifest service requires explicit finite memory
 (no more than 768 MiB) and PID limits (no more than 256). Omitted or implicit
 new networks are rejected before mutation. This proves
 the container's loader result; it is not independent proof that every long-lived
@@ -149,7 +178,8 @@ embedded-config checks.
 
 The `Private release config native` workflow builds the real production Dockerfile
 from a Git archive on native amd64, creates a synthetic old Compose project,
-reuses its volume/network/data paths, and verifies real labels, read-only mounts,
+reuses its volume/network/data paths, independently proves an incorrect UID
+cannot read the mode-0400 seal while the reviewed role UID can, and verifies real labels, read-only mounts,
 config hashes and strategy, plus the explicitly reviewed fixture command and
 resource limits. Its sleeping fixture containers do not run the app,
 producers, or models. It tests refusal after input mutation and wrong-image

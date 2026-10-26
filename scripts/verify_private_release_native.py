@@ -69,6 +69,20 @@ def cleanup(workspace, project, network, volume, image, sealed, report):
         shutil.rmtree(workspace)
 
 
+def verify_config_reader_identity(image, config_path, user):
+    uid, _gid = private.numeric_user(user)
+    other_user = "65534:65534" if uid == 0 else "0:0"
+    base = ["docker", "run", "--rm", "--network", "none", "--read-only", "--cap-drop", "ALL",
+            "--security-opt", "no-new-privileges", "--memory", "384m", "--pids-limit", "64",
+            "--mount", f"type=bind,src={config_path},dst=/app/config.yaml,readonly", "--entrypoint", "python"]
+    negative = "try:\n open('/app/config.yaml','rb').read()\nexcept PermissionError:\n pass\nelse:\n raise SystemExit(23)"
+    private.run([*base, "--user", other_user, image, "-c", negative])
+    actual = private.run([*base, "--user", user, image, "-c",
+                          "import hashlib; print(hashlib.sha256(open('/app/config.yaml','rb').read()).hexdigest())"])
+    private.require(actual.decode().strip() == private.sha(config_path.read_bytes()),
+                    "reviewed UID cannot read its sealed config")
+
+
 def build_candidate(root, workspace, source, image, contract, contract_sha):
     context = workspace / "context"
     context.mkdir(mode=0o700)
@@ -132,7 +146,7 @@ def execute(root, output):
                                 + "; print(config.load_config()['scoring_strategy_version'])"],
                                env={"PATH": os.environ["PATH"], "PYTHONPATH": str(root)}).decode().strip()
         service = {"image": private.IMAGE, "command": ["python", "-c", "import time; time.sleep(600)"],
-                   "mem_limit": "384m", "pids_limit": 64,
+                   "mem_limit": "384m", "pids_limit": 64, "user": f"{os.geteuid()}:{os.getegid()}",
                    "environment": {"AI_FILTER_CONFIG_PATH": "/app/config.yaml", "LLM_API_KEY": "${LLM_API_KEY:?}"},
                    "volumes": [{"type": "bind", "source": str(data), "target": "/app/data", "bind": {"create_host_path": False}},
                                {"type": "bind", "source": private.RUNTIME, "target": "/app/config.yaml", "read_only": True},
@@ -178,6 +192,9 @@ def execute(root, output):
         sealed = private.seal(root, config, manifest_path, environment, review_path, workspace / "sealed")
         advance_stage(report_path, report, "check_private_seal")
         contract, deployment, contract_sha = private.load(sealed, root, require_fresh=True)
+        advance_stage(report_path, report, "prove_config_reader_identity")
+        verify_config_reader_identity(base_image, sealed.parent / "runtime.yaml", service["user"])
+        report["checks"].append("mismatched_uid_denied_reviewed_uid_reads_private_config")
         advance_stage(report_path, report, "build_and_check_candidate_image")
         digest = build_candidate(root, workspace, source, image, contract, contract_sha)
         advance_stage(report_path, report, "probe_private_runtime_config")
