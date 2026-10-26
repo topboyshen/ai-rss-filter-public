@@ -30,11 +30,15 @@ TESTS = ("tests/test_independent_drain_inventory.py", "tests/test_frozen_cutover
          "tests/test_handoff_runtime_adapter.py", "tests/test_controlled_startup.py",
          "tests/test_frozen_cutover_actual_startup.py", "tests/test_miniflux_handoff_adapter.py",
          "tests/test_miniflux_host_joint_native.py", "tests/test_durable_handoff_crash_diagnostics.py",
-         "tests/test_durable_handoff_cutover.py")
+         "tests/test_durable_handoff_cutover.py", "tests/test_production_migration.py",
+         "tests/test_production_sender_driver.py", "tests/test_sender_drain_contract.py",
+         "tests/test_sender_pg_deadlines.py", "tests/test_production_startup_pg_fixture.py",
+         "tests/test_receiver_drain_transfer.py", "tests/test_receiver_drain_driver.py",
+         "tests/test_takeover_readonly_preflight.py")
 MOUNTS = ("scripts", "tests", "services", "routes", "core", "db", "utils", "workers", "modules",
           "templates", "app.py", "worker_main.py", "sse_engine.py", "logging_bootstrap.py",
           "scoring_provenance.py", "scoring_explanation.py", "config.yaml", "docker-compose.yml",
-          "ops/isolation")
+          "ops/isolation", "ops/miniflux", ".github/workflows", "gunicorn.conf.py")
 CONTAINER_TEST = r'''
 import json, os, pathlib, platform, shutil, sys, tempfile, pytest
 assert platform.system() == 'Linux' and platform.machine() == 'x86_64'
@@ -54,7 +58,11 @@ try:
         'tests/test_handoff_runtime_adapter.py', 'tests/test_controlled_startup.py',
         'tests/test_frozen_cutover_actual_startup.py', 'tests/test_miniflux_handoff_adapter.py',
         'tests/test_miniflux_host_joint_native.py', 'tests/test_durable_handoff_crash_diagnostics.py',
-        'tests/test_durable_handoff_cutover.py'], plugins=[summary])
+        'tests/test_durable_handoff_cutover.py', 'tests/test_production_migration.py',
+        'tests/test_production_sender_driver.py', 'tests/test_sender_drain_contract.py',
+        'tests/test_sender_pg_deadlines.py', 'tests/test_production_startup_pg_fixture.py',
+        'tests/test_receiver_drain_transfer.py', 'tests/test_receiver_drain_driver.py',
+        'tests/test_takeover_readonly_preflight.py'], plugins=[summary])
 finally:
     # Preserve only this process's own private synthetic fixtures on all exits.
     # The startup runner continues refusing non-temporary database paths.
@@ -82,7 +90,9 @@ def run(repo, output):
         raise ValueError("clean source required")
     files = sorted({str(path.relative_to(repo)) for name in MOUNTS for path in
                     ([repo / name] if (repo / name).is_file() else (repo / name).rglob("*.py"))}
-                   | set(TESTS) | {"Dockerfile", "requirements.txt", "requirements-prod.txt",
+                   | {str(path.relative_to(repo)) for path in (repo / "ops/miniflux").iterdir()
+                      if path.is_file() and path.suffix in {".json", ".patch"}}
+                   | set(TESTS) | {"Dockerfile", "requirements.txt", "requirements-prod.txt", "requirements-ops.txt",
                                   "ops/isolation/Dockerfile.cutover-completion", ".github/workflows/cutover-completion.yml"})
     hashes = {name: hashlib.sha256((repo / name).read_bytes()).hexdigest() for name in files}
     base.save(output / "SOURCE.json", {"source_sha256": hashes, "production_access": False,

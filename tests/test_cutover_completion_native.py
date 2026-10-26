@@ -23,13 +23,18 @@ class CompletionNativeGuards(unittest.TestCase):
                     "tests/test_handoff_runtime_adapter.py", "tests/test_controlled_startup.py",
                     "tests/test_frozen_cutover_actual_startup.py", "tests/test_miniflux_handoff_adapter.py",
                     "tests/test_miniflux_host_joint_native.py", "tests/test_durable_handoff_crash_diagnostics.py",
-                    "tests/test_durable_handoff_cutover.py"}
+                    "tests/test_durable_handoff_cutover.py", "tests/test_production_migration.py",
+                    "tests/test_production_sender_driver.py", "tests/test_sender_drain_contract.py",
+                    "tests/test_sender_pg_deadlines.py", "tests/test_production_startup_pg_fixture.py",
+                    "tests/test_receiver_drain_transfer.py", "tests/test_receiver_drain_driver.py",
+                    "tests/test_takeover_readonly_preflight.py"}
         actual = {node.value for node in ast.walk(ast.parse(runner.CONTAINER_TEST))
                   if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.startswith("tests/")}
         self.assertEqual(set(runner.TESTS), expected)
         self.assertEqual(len(runner.TESTS), len(expected))
         self.assertEqual(actual, expected)
-        for name in ("app.py", "worker_main.py", "core", "db", "services", "config.yaml", "modules"):
+        for name in ("app.py", "worker_main.py", "core", "db", "services", "config.yaml", "modules",
+                     "ops/miniflux", ".github/workflows", "gunicorn.conf.py"):
             self.assertIn(name, runner.MOUNTS)
         self.assertIn("memory.peak", runner.CONTAINER_TEST)
         self.assertIn("memory.events", runner.CONTAINER_TEST)
