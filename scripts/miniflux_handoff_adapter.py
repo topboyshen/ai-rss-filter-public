@@ -34,11 +34,11 @@ def source_sha256():
     return sha({name: hashlib.sha256((directory / name).read_bytes()).hexdigest() for name in names})
 
 
-def checked_binding(value):
+def checked_binding(value, *, scope="isolation"):
     keys = {"schema", "scope", "run_id", "control_id", "component_name", "component", "manifest",
             "application_source_sha256", "source_sha256", "generation", "initial_operation_id", "entrances"}
     require(isinstance(value, dict) and set(value) == keys and type(value["schema"]) is int
-            and value["schema"] == 1 and value["scope"] == "isolation", "isolation Miniflux binding required")
+            and value["schema"] == 1 and value["scope"] == scope, "exact Miniflux binding scope required")
     require(re.fullmatch(r"[0-9a-f]{32}", value["run_id"])
             and re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", value["control_id"]), "invalid bridge identity")
     for name in ("manifest", "application_source_sha256", "initial_operation_id"):
@@ -89,8 +89,10 @@ class MinifluxPauseControl:
     component each time. Injected rows in unit tests are explicitly not Docker
     evidence. The fixed native harness uses fresh inspect on every call.
     """
+    _scope = "isolation"
+
     def __init__(self, binding, client, inspect_current, evidence_root):
-        self.binding = checked_binding(binding)
+        self.binding = checked_binding(binding, scope=self._scope)
         self.client, self.inspect_current = client, inspect_current
         self.root = Path(evidence_root)
         private_directory(self.root, create=True)
@@ -104,7 +106,7 @@ class MinifluxPauseControl:
                 os.close(fd)
 
     def _identity(self):
-        checked_binding(self.binding)
+        checked_binding(self.binding, scope=self._scope)
         require(sha(self.binding) == self.binding_sha256, "frozen binding mutated")
         inspect_binding(self.inspect_current(), {self.binding["component_name"]: self.binding["component"]})
 
