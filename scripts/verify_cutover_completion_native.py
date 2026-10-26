@@ -34,7 +34,8 @@ TESTS = ("tests/test_independent_drain_inventory.py", "tests/test_frozen_cutover
          "tests/test_production_sender_driver.py", "tests/test_sender_drain_contract.py",
          "tests/test_sender_pg_deadlines.py", "tests/test_production_startup_pg_fixture.py",
          "tests/test_receiver_drain_transfer.py", "tests/test_receiver_drain_driver.py",
-         "tests/test_takeover_readonly_preflight.py")
+         "tests/test_takeover_readonly_preflight.py", "tests/test_joint_drain_controller.py",
+         "tests/test_receiver_drain_fixture_runtime.py", "tests/test_sender_receiver_joint_native.py")
 MOUNTS = ("scripts", "tests", "services", "routes", "core", "db", "utils", "workers", "modules",
           "templates", "app.py", "worker_main.py", "sse_engine.py", "logging_bootstrap.py",
           "scoring_provenance.py", "scoring_explanation.py", "config.yaml", "docker-compose.yml",
@@ -62,7 +63,8 @@ try:
         'tests/test_production_sender_driver.py', 'tests/test_sender_drain_contract.py',
         'tests/test_sender_pg_deadlines.py', 'tests/test_production_startup_pg_fixture.py',
         'tests/test_receiver_drain_transfer.py', 'tests/test_receiver_drain_driver.py',
-        'tests/test_takeover_readonly_preflight.py'], plugins=[summary])
+        'tests/test_takeover_readonly_preflight.py', 'tests/test_joint_drain_controller.py',
+        'tests/test_receiver_drain_fixture_runtime.py', 'tests/test_sender_receiver_joint_native.py'], plugins=[summary])
 finally:
     # Preserve only this process's own private synthetic fixtures on all exits.
     # The startup runner continues refusing non-temporary database paths.
