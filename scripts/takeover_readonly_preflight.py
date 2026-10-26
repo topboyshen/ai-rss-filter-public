@@ -213,7 +213,7 @@ def collect(manifest, emit, run=capture, clock=time.monotonic, bind=executable_i
     start, completed = clock(), []
     emit({"event": "start", "utc": utc(), "read_only": True,
           "database_queries": 0, "http_requests": 0, "budget_seconds": TOTAL_SECONDS,
-          "manifest_sha256": digest(json.dumps(manifest, sort_keys=True).encode())})
+          "manifest_binding_sha256": digest(json.dumps(manifest, sort_keys=True).encode())})
     docker = [manifest["docker_binary"], "--host", "unix:///var/run/docker.sock"]
     phases = [("executable", lambda: bind(manifest["docker_binary"], manifest["docker_sha256"])),
               ("containers", lambda: container_rows(run(docker + ["container", "inspect"]
@@ -252,9 +252,10 @@ def main():
         raw = private_read(args.manifest)
         value = parse_manifest(raw)
         if not args.collect:
-            print(json.dumps({"status": "plan_only", "manifest_sha256": digest(raw),
+            print(json.dumps({"status": "plan_only", "manifest_file_sha256": digest(raw),
                               "production_queries": 0, "release_authorized": False}))
             return 0
+        print(json.dumps({"event": "input_binding", "manifest_file_sha256": digest(raw)}), flush=True)
         return collect(value, lambda row: print(json.dumps(row), flush=True))
     except Exception as error:
         reason = str(error) if isinstance(error, EvidenceFailure) else "evidence_unavailable"

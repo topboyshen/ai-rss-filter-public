@@ -92,7 +92,7 @@ def test_manifest_dry_run_never_executes_or_creates_files(tmp_path):
     result = subprocess.run([sys.executable, "-I", "-B", str(PATH), "--manifest", str(path)],
                             capture_output=True, text=True, timeout=5, check=False)
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout) == {"status": "plan_only", "manifest_sha256": probe.digest(raw),
+    assert json.loads(result.stdout) == {"status": "plan_only", "manifest_file_sha256": probe.digest(raw),
                                         "production_queries": 0, "release_authorized": False}
     assert sorted(p.name for p in tmp_path.iterdir()) == before
 
@@ -208,3 +208,18 @@ def test_actual_client_output_limit_counts_stderr_without_relaying_it():
     command = [sys.executable, "-I", "-c", "import sys;sys.stderr.buffer.write(b'x'*1100000)"]
     with pytest.raises(probe.EvidenceFailure, match="command_output_limit"):
         probe.capture(command, 2)
+
+
+def test_parsed_binding_digest_is_not_mislabeled_as_original_file_digest():
+    compact = json.dumps(manifest(), separators=(",", ":")).encode()
+    pretty = json.dumps(manifest(), indent=2).encode()
+    assert probe.digest(compact) != probe.digest(pretty)
+    observed = []
+    for raw in (compact, pretty):
+        rows = []
+        assert probe.collect(probe.parse_manifest(raw), rows.append, run=valid_run,
+                             bind=lambda *args: None) == 0
+        assert "manifest_sha256" not in rows[0]
+        assert "manifest_file_sha256" not in rows[0]
+        observed.append(rows[0]["manifest_binding_sha256"])
+    assert observed[0] == observed[1]

@@ -10,6 +10,9 @@ hash without invoking Docker. `--collect` is reserved for a separately
 authorized host observation. Preparing or testing this script does not
 authorize that observation.
 
+`manifest_file_sha256` hashes the exact input bytes; `manifest_binding_sha256`
+hashes the parsed canonical binding. They are deliberately distinct fields.
+
 The manifest contains exactly `schema`, `docker_binary`, `docker_sha256`,
 `containers`, `images`, and `files`. The schema is
 `takeover-readonly-preflight-v1`. Container names are explicit (maximum eight),
