@@ -95,9 +95,10 @@ class NativeTransport:
         return gate._parsed(_capture(["/usr/bin/docker", "--host", "unix:///var/run/docker.sock", "inspect", *ids]))
 
     def request(self, method, path, value=None):
-        require((method == "GET" and (path in {"/registration", "/snapshot"}
-                or (path.startswith("/operations/") and gate.HEX64.fullmatch(path[12:]))))
-                or (method == "POST" and path in {"/stop-new", "/freeze"}), "unsupported control request")
+        require((method == "GET" and (path in {"/registration", "/snapshot", "/drain/registration"}
+                or (path.startswith("/operations/") and gate.HEX64.fullmatch(path[12:]))
+                or (path.startswith("/drain/operations/") and gate.HEX64.fullmatch(path[18:]))))
+                or (method == "POST" and path in {"/stop-new", "/freeze", "/drain/transfer"}), "unsupported control request")
         token = self._token()
         require(sha(token) == self.token_sha256, "control credential changed")
         body = b"" if value is None else encoded(value)
