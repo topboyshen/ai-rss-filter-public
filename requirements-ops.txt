@@ -1,0 +1,4 @@
+# Host-side isolated cutover controller only; never part of the application image.
+# Actual PostgreSQL locks and read-only inventory use this reviewed driver pair.
+psycopg==3.3.6
+psycopg-binary==3.3.6

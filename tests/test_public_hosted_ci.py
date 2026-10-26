@@ -85,7 +85,7 @@ def test_native_job_timeouts_are_not_relaxed(name, minutes):
     assert next(iter(workflow["jobs"].values()))["timeout-minutes"] == minutes
 
 
-@pytest.mark.parametrize("name", ["miniflux-outbox.yml", "miniflux-pause.yml"])
+@pytest.mark.parametrize("name", ["miniflux-outbox.yml", "miniflux-pause.yml", "cutover-completion.yml"])
 def test_postgres_remains_digest_locked_and_bounded(name):
     _, workflow = _workflow(name)
     job = next(iter(workflow["jobs"].values()))
@@ -119,3 +119,48 @@ def test_private_release_workflow_covers_its_tests_without_unrelated_paths(event
     _, workflow = _workflow("private-release-config.yml")
     triggers = workflow.get("on", workflow.get(True))
     assert any(fnmatchcase(changed_path, pattern) for pattern in triggers[event]["paths"]) is expected
+
+
+@pytest.mark.parametrize("workflow,changed_path,expected", [
+    ("cutover-completion.yml", "services/production_startup.py", True),
+    ("cutover-completion.yml", "db/startup_migration_steps.py", True),
+    ("cutover-completion.yml", "db/database.py", True),
+    ("cutover-completion.yml", "gunicorn.conf.py", True),
+    ("cutover-completion.yml", "services/receiver_drain_transfer.py", True),
+    ("cutover-completion.yml", "services/sender_drain_contract.py", True),
+    ("cutover-completion.yml", "services/admission_http.py", True),
+    ("cutover-completion.yml", "routes/webhook_routes.py", True),
+    ("cutover-completion.yml", "requirements-ops.txt", True),
+    ("cutover-completion.yml", "scripts/verify_production_startup_native.py", True),
+    ("cutover-completion.yml", "tests/test_joint_drain_controller.py", True),
+    ("cutover-completion.yml", "tests/test_takeover_readonly_preflight.py", True),
+    ("cutover-completion.yml", "docs/release-notes.md", False),
+    ("cutover-completion.yml", "tests/test_numeric_facts.py", False),
+    ("miniflux-pause.yml", "scripts/production_sender_driver.py", True),
+    ("miniflux-pause.yml", "scripts/sender_drain_inventory.py", True),
+    ("miniflux-pause.yml", "services/sender_drain_contract.py", True),
+    ("miniflux-pause.yml", "tests/test_production_sender_driver.py", True),
+    ("miniflux-pause.yml", "tests/test_sender_drain_contract.py", True),
+    ("miniflux-pause.yml", "tests/test_sender_postgres_native.py", True),
+    ("miniflux-pause.yml", "requirements-ops.txt", True),
+    ("miniflux-pause.yml", "docs/release-notes.md", False),
+    ("miniflux-pause.yml", "tests/test_numeric_facts.py", False),
+])
+def test_combined_cutover_regressions_trigger_the_relevant_native_gate(workflow, changed_path, expected):
+    _, value = _workflow(workflow)
+    triggers = value.get("on", value.get(True))
+    for event in ["pull_request"] + (["push"] if workflow == "miniflux-pause.yml" else []):
+        assert any(fnmatchcase(changed_path, pattern) for pattern in triggers[event]["paths"]) is expected
+
+
+def test_host_postgres_driver_is_pinned_without_changing_application_dependencies():
+    root = WORKFLOWS.parents[1]
+    pins = {line for line in (root / "requirements-ops.txt").read_text().splitlines()
+            if line and not line.startswith("#")}
+    assert pins == {"psycopg==3.3.6", "psycopg-binary==3.3.6"}
+    for name in ("requirements-prod.txt", "requirements.txt", "Dockerfile"):
+        text = (root / name).read_text()
+        assert "requirements-ops" not in text and "psycopg" not in text
+    for name in ("cutover-completion.yml", "miniflux-pause.yml"):
+        source, _ = _workflow(name)
+        assert "--only-binary=:all: -r requirements.txt -r requirements-ops.txt" in source
