@@ -6,11 +6,10 @@ import os
 from pathlib import Path
 import time
 
-from durable_handoff_cutover import encoded, private_directory, require, sync_directory
-from miniflux_handoff_adapter import checked_binding
-import observe_handoff_capacity as capacity
+from scripts.durable_handoff_cutover import encoded, private_directory, require, sync_directory
+from scripts import observe_handoff_capacity as capacity
 from services.sender_drain_contract import (IDENTITY_KEYS, MAX_BODY_BYTES, MAX_MANIFEST_BYTES,
-    source_sha256, validate_identity, validate_stop_receipt, validate_entry, validate_manifest)
+    source_sha256, validate_identity, validate_stop_receipt, validate_entry, validate_manifest, validate_binding)
 
 IDENTITY_SQL = capacity.PG_IDENTITY_SQL + """, 'handoff_state'::regclass::oid::bigint,
  'handoff_operations'::regclass::oid::bigint, 'handoff_leases'::regclass::oid::bigint,
@@ -62,7 +61,7 @@ def _row(value):
 def freeze_bundle(connect, dsn, expected, binding, receipt, window, root):
     """Actual bounded read-only PG snapshot. Never resample a partially written bundle."""
     validate_identity(expected)
-    checked_binding(binding, scope="instrumented_sender_only")
+    validate_binding(binding)
     validate_stop_receipt(receipt, binding)
     root = Path(root)
     require(not root.exists() and not root.is_symlink(), "bundle already attempted; preserve original")
@@ -144,7 +143,7 @@ def observe(connect, dsn, expected):
 class PostgresReader:
     """Explicit private DSN with fixed psycopg read-only queries; no zero callback."""
     def __init__(self, dsn_file, expected_identity):
-        from durable_handoff_cutover import read_private
+        from scripts.durable_handoff_cutover import read_private
         self.path = Path(dsn_file)
         require(self.path.is_absolute(), "absolute private sender DSN reference required")
         self.expected = validate_identity(dict(expected_identity))
@@ -177,7 +176,7 @@ class PostgresReader:
 class FrozenPostgres:
     """Live session locks, not a serializable authorization receipt."""
     def __init__(self, reader, operation, manifest):
-        from miniflux_handoff_adapter import HEX64
+        from services.sender_drain_contract import HEX64
         require(all(isinstance(v, str) and HEX64.fullmatch(v) for v in (operation, manifest)), "exact closed gate identity required")
         self.reader, self.operation, self.manifest = reader, operation, manifest
         self.connection = None

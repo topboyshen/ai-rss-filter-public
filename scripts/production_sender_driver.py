@@ -25,7 +25,8 @@ MAX_SAMPLES = 32
 
 def sources():
     names = ("production_sender_driver.py", "sender_drain_inventory.py", "miniflux_handoff_adapter.py",
-             "handoff_runtime_adapter.py", "handoff_host_cron.py", "durable_handoff_cutover.py", "observe_handoff_capacity.py")
+             "handoff_runtime_adapter.py", "handoff_host_cron.py", "durable_handoff_cutover.py", "observe_handoff_capacity.py",
+             "production_receiver_driver.py")
     return {**{name: hashlib.sha256((Path(__file__).parent/name).read_bytes()).hexdigest() for name in names},
             "sender_drain_contract": contract.source_sha256()}
 
@@ -141,26 +142,33 @@ class SenderDriver:
         return value
 
     def query_stop_new(self, operation):
-        self._window()
+        # Recovery is separately bounded by original intent, 32 retained query
+        # slots and per-I/O deadlines. It never grants another POST/window.
         self.bind()
         value = self.control.query_stop_new(operation)
         self.bind()
         return value
 
     def seal_originals(self, stop_operation):
+        self._window()
+        receipt = self.query_stop_new(stop_operation)
         with locked(self.control.root/"control.lock", True):
             self._window()
-            # The precise query is outside the outer lock; the control owns it.
-        receipt = self.query_stop_new(stop_operation)
-        bundle = self.root/"originals"
-        value = self.postgres.freeze(self.plan["binding"], receipt, self.plan["window"], bundle)
-        self.bind()
-        checked, digest = contract.load_bundle(bundle)
-        require(checked == value, "sealed original bundle differs")
-        return {"manifest_sha256":digest,"bundle":str(bundle),"queue_checked":False,"switch_authorized":False}
+            self.bind()
+            bundle = self.root/"originals"
+            value = self.postgres.freeze(self.plan["binding"], receipt, self.plan["window"], bundle)
+            self.bind()
+            checked, digest = contract.load_bundle(bundle)
+            require(checked == value, "sealed original bundle differs")
+            return {"manifest_sha256":digest,"bundle":str(bundle),"queue_checked":False,"switch_authorized":False}
 
-    def _sample(self, operation, phase):
-        self._window()
+    def _sample(self, operation, phase, *, recovery=False):
+        with locked(self.control.root/"control.lock", True):
+            return self._sample_locked(operation, phase, recovery=recovery)
+
+    def _sample_locked(self, operation, phase, *, recovery=False):
+        if not recovery:
+            self._window()
         paths = list(self.root.glob("inventory-*.json*"))
         require(len(paths) < MAX_SAMPLES, "sender inventory evidence budget exhausted")
         sample = self.bind()
@@ -184,8 +192,7 @@ class SenderDriver:
         return evidence
 
     def inventory(self, stop_operation):
-        with locked(self.control.root/"control.lock", True):
-            return self._sample(stop_operation, "draining")
+        return self._sample(stop_operation, "draining")
 
     def freeze(self, operation, stop_operation, reason):
         inventory = self.inventory(stop_operation)
@@ -196,10 +203,10 @@ class SenderDriver:
         return {"receipt":value,"inventory":final,"switch_authorized":False}
 
     def query_freeze(self, operation):
-        self._window()
+        # Exact recovery may finish the retained receipt after the write window.
         self.bind()
         value = self.control.query_freeze(operation)
-        final = self._sample(operation, "closed")
+        final = self._sample(operation, "closed", recovery=True)
         require(not final["blockers"], "sender closed but final inventory blocked")
         return {"receipt":value,"inventory":final,"switch_authorized":False}
 

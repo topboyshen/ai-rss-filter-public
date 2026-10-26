@@ -270,3 +270,94 @@ def test_staged_interface_cannot_call_legacy_full_stop_or_resume(setup):
         with pytest.raises(CutoverError):
             getattr(d.control, name)(None)
     assert read_private(d.root / "plan.json") == d.plan
+
+
+@pytest.mark.parametrize("stage", ["stop", "pause"])
+def test_expired_mutation_window_still_allows_exact_original_recovery(
+    setup, monkeypatch, stage
+):
+    d, t, r = setup
+    if stage == "pause":
+        d.stop_new("b" * 64, "stop")
+        clear(r)
+    t.lost = True
+    with pytest.raises(TimeoutError):
+        d.stop_new("b" * 64, "stop") if stage == "stop" else d.freeze(
+            "c" * 64, "b" * 64, "freeze"
+        )
+    monkeypatch.setattr(sender.time, "time", lambda: d.plan["window"]["expires_at"] + 1)
+    restored = sender.SenderDriver(d.plan, t, r, d.root)
+    result = (
+        restored.query_stop_new("b" * 64)
+        if stage == "stop"
+        else restored.query_freeze("c" * 64)["receipt"]
+    )
+    assert result["confirmed"] is True
+    before = list(posts(t))
+    with pytest.raises(CutoverError):
+        restored.stop_new("d" * 64, "expired write")
+    with pytest.raises(CutoverError):
+        restored.seal_originals("b" * 64)
+    assert posts(t) == before
+
+
+def test_original_query_budget_does_not_reset_on_reconstruction(setup):
+    d, t, r = setup
+    d.stop_new("b" * 64, "stop")
+    for _ in range(32):
+        d.query_stop_new("b" * 64)
+    restored = sender.SenderDriver(d.plan, t, r, d.root)
+    with pytest.raises(CutoverError, match="query evidence budget"):
+        restored.query_stop_new("b" * 64)
+    # Existing bridge policy retains 32 total slots; it was not widened.
+    assert len(list(d.control.root.glob("query-*.json"))) == 32
+    assert len(posts(t)) == 1
+
+
+def test_duplicate_concurrent_inventory_never_overwrites_original(setup, monkeypatch):
+    import threading
+
+    d, t, r = setup
+    d.stop_new("b" * 64, "stop")
+    entered, release = threading.Event(), threading.Event()
+    original = sender.durable_write
+    errors = []
+
+    def delayed(path, value):
+        if path.name.startswith("inventory-"):
+            entered.set()
+            assert release.wait(2)
+        return original(path, value)
+
+    def first():
+        try:
+            d._sample("b" * 64, "draining")
+        except BaseException as error:
+            errors.append(error)
+
+    monkeypatch.setattr(sender, "durable_write", delayed)
+    thread = threading.Thread(target=first)
+    thread.start()
+    assert entered.wait(2)
+    try:
+        with pytest.raises((CutoverError, BlockingIOError, TimeoutError)):
+            d._sample("b" * 64, "draining")
+    finally:
+        release.set()
+        thread.join(2)
+    assert not errors and not thread.is_alive()
+    assert len(list(d.root.glob("inventory-*.json"))) == 1
+    assert read_private(d.root / "inventory-00.json")["blockers"] == ["outbox_pending"]
+
+
+def test_full_inventory_evidence_budget_preserves_all_originals(setup):
+    d, _, _ = setup
+    d.stop_new("b" * 64, "stop")
+    for _ in range(sender.MAX_SAMPLES):
+        d.inventory("b" * 64)
+    originals = {p.name: p.read_bytes() for p in d.root.glob("inventory-*.json")}
+    with pytest.raises(CutoverError, match="inventory evidence budget"):
+        d.inventory("b" * 64)
+    assert originals == {
+        p.name: p.read_bytes() for p in d.root.glob("inventory-*.json")
+    }
