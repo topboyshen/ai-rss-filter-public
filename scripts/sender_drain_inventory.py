@@ -37,6 +37,10 @@ def _read_gate(cursor, receipt):
     cursor.execute("SELECT manifest,generation,phase,current_operation FROM handoff_state WHERE id=1")
     require(cursor.fetchone() == (receipt["manifest"], receipt["generation"], "draining", receipt["operation_id"]),
             "actual PostgreSQL gate differs from confirmed stop-new")
+    cursor.execute("""SELECT manifest,action,previous_generation,generation,status FROM handoff_operations
+ WHERE operation_id=%s""", (receipt["operation_id"],))
+    require(cursor.fetchone() == (receipt["manifest"], "stop_new", receipt["previous_generation"], receipt["generation"], "confirmed"),
+            "actual PostgreSQL producer-stop marker differs")
     cursor.execute("""SELECT count(*),count(*) FILTER(WHERE status='active' AND source NOT IN ('outbox_pass','outbox_sender')),
  count(*) FILTER(WHERE status='uncertain' AND source NOT IN ('outbox_pass','outbox_sender')) FROM handoff_leases""")
     records, active, uncertain = cursor.fetchone()
@@ -97,3 +101,144 @@ def freeze_bundle(connect, dsn, expected, binding, receipt, window, root):
         return value
     finally:
         connection.close()
+
+
+def observe(connect, dsn, expected):
+    """Fixed read-only SQL; returns counts plus actual gate, never a permit."""
+    validate_identity(expected)
+    started = time.monotonic()
+    connection = connect(dsn, connect_timeout=3)
+    try:
+        connection.autocommit = True
+        with connection.cursor() as cursor:
+            cursor.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            cursor.execute("SET LOCAL statement_timeout='3000ms'")
+            cursor.execute("SET LOCAL lock_timeout='3000ms'")
+            cursor.execute("SHOW transaction_read_only")
+            require(cursor.fetchone()[0] == "on", "sender observation not read-only")
+            cursor.execute(IDENTITY_SQL)
+            actual = dict(zip(IDENTITY_KEYS, cursor.fetchone()))
+            require(actual == expected, "sender PostgreSQL identity changed")
+            cursor.execute(capacity.PG_SAMPLE_SQL)
+            sample = capacity._postgres_counts(cursor.fetchall())
+            cursor.execute("SELECT manifest,generation,phase,current_operation FROM handoff_state WHERE id=1")
+            row = cursor.fetchone()
+            require(row is not None and len(row) == 4, "actual sender gate missing")
+            gate = dict(zip(("manifest", "generation", "phase", "current_operation"), row))
+            cursor.execute("""SELECT count(*),count(*) FILTER(WHERE status='active'),count(*) FILTER(WHERE status='uncertain'),
+ count(*) FILTER(WHERE status='active' AND source NOT IN ('outbox_pass','outbox_sender')),
+ count(*) FILTER(WHERE status='uncertain' AND source NOT IN ('outbox_pass','outbox_sender')) FROM handoff_leases""")
+            leases = dict(zip(("records", "active", "uncertain", "active_producers", "uncertain_producers"), cursor.fetchone()))
+            require(all(type(v) is int and 0 <= v <= 10000 for v in leases.values()), "invalid retained lease state")
+            cursor.execute("SELECT count(*) FROM handoff_operations")
+            operations = cursor.fetchone()[0]
+            require(type(operations) is int and 0 <= operations <= 10000, "operation capacity invalid")
+            cursor.execute("ROLLBACK")
+        require(time.monotonic() - started <= 10, "sender observation wall budget")
+        return {**sample, "database_identity": actual, "read_only_transaction": True, "gate": gate,
+                "retained_leases": leases, "retained_operations": operations}
+    finally:
+        connection.close()
+
+
+class PostgresReader:
+    """Explicit private DSN with fixed psycopg read-only queries; no zero callback."""
+    def __init__(self, dsn_file, expected_identity):
+        from durable_handoff_cutover import read_private
+        self.path = Path(dsn_file)
+        require(self.path.is_absolute(), "absolute private sender DSN reference required")
+        self.expected = validate_identity(dict(expected_identity))
+        self._read_private = read_private
+        self._credential_sha256 = hashlib.sha256(encoded(self._credential())).hexdigest()
+
+    def _credential(self):
+        value = self._read_private(self.path)
+        require(isinstance(value, dict) and set(value) == {"dsn"} and isinstance(value["dsn"], str)
+                and 0 < len(value["dsn"]) <= 8192, "explicit sender DSN required")
+        return value
+
+    def _dsn(self):
+        value = self._credential()
+        require(hashlib.sha256(encoded(value)).hexdigest() == self._credential_sha256, "sender database credential changed")
+        return value["dsn"]
+
+    def snapshot(self):
+        import psycopg
+        return observe(psycopg.connect, self._dsn(), self.expected)
+
+    def freeze(self, binding, receipt, window, root):
+        import psycopg
+        return freeze_bundle(psycopg.connect, self._dsn(), self.expected, binding, receipt, window, root)
+
+    def locked(self, closed_operation_id, manifest):
+        return FrozenPostgres(self, closed_operation_id, manifest)
+
+
+class FrozenPostgres:
+    """Live session locks, not a serializable authorization receipt."""
+    def __init__(self, reader, operation, manifest):
+        from miniflux_handoff_adapter import HEX64
+        require(all(isinstance(v, str) and HEX64.fullmatch(v) for v in (operation, manifest)), "exact closed gate identity required")
+        self.reader, self.operation, self.manifest = reader, operation, manifest
+        self.connection = None
+        self.snapshot = self.lock_identity = None
+
+    def __enter__(self):
+        import psycopg
+        self.connection = psycopg.connect(self.reader._dsn(), connect_timeout=3)
+        try:
+            self.connection.autocommit = True
+            with self.connection.cursor() as cursor:
+                cursor.execute("SET statement_timeout='3000ms'")
+                cursor.execute("SET lock_timeout='3000ms'")
+                cursor.execute(IDENTITY_SQL)
+                require(dict(zip(IDENTITY_KEYS, cursor.fetchone())) == self.reader.expected, "frozen PG identity differs")
+                oid = self.reader.expected["state_table_oid"]
+                for namespace in (20261024, 20261023):
+                    cursor.execute("SELECT pg_try_advisory_lock(%s,%s)", (namespace, oid))
+                    require(cursor.fetchone()[0] is True, "sender activity/control lock busy")
+                cursor.execute("SELECT pg_backend_pid()")
+                pid = cursor.fetchone()[0]
+            self.lock_identity = {"backend_pid":pid,"state_table_oid":oid,"activity_namespace":20261024,"metadata_namespace":20261023,
+                                  "database_identity":self.reader.expected}
+            self.snapshot = self.reader.snapshot()
+            self._closed(self.snapshot)
+            self.check()
+            return self
+        except BaseException:
+            self.connection.close()
+            self.connection = None
+            raise
+
+    def _closed(self, value):
+        require(value["gate"] == {"manifest":self.manifest,"phase":"closed","generation":value["gate"]["generation"],
+                                  "current_operation":self.operation}, "exact sender full pause not current")
+        leases = value["retained_leases"]
+        require(leases["active"] == leases["uncertain"] == 0, "sender active/unknown lease retained")
+        require(not any(value["states"][k] for k in ("pending","inflight","held"))
+                and value["legacy"]["rows"] == 0 and value["expired_unacknowledged"] == 0,
+                "sender retained originals are not independently drained")
+
+    def check(self):
+        require(self.connection is not None, "sender PG locks no longer held")
+        with self.connection.cursor() as cursor:
+            cursor.execute(IDENTITY_SQL)
+            require(dict(zip(IDENTITY_KEYS, cursor.fetchone())) == self.reader.expected, "locked PG identity changed")
+            cursor.execute("""SELECT pg_backend_pid(),count(*) FROM pg_locks WHERE pid=pg_backend_pid()
+ AND locktype='advisory' AND classid IN (20261024::oid,20261023::oid) AND objid=%s::oid
+ AND objsubid=2 AND mode='ExclusiveLock' AND granted""", (self.reader.expected["state_table_oid"],))
+            require(cursor.fetchone() == (self.lock_identity["backend_pid"],2), "sender PG lock ownership lost")
+        current = self.reader.snapshot()
+        self._closed(current)
+        require(current == self.snapshot, "frozen sender inventory changed under locks")
+        return self.lock_identity
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type is None:
+                self.check()
+        finally:
+            self.connection.close()
+            self.connection = None
+
+

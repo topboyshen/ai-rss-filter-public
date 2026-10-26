@@ -267,3 +267,129 @@ def _query_slot(root):
         name = f"query-{count:02d}"
         yield name
     return slot()
+
+
+class StopNewPending(CutoverError):
+    """Exact durable producer stop exists; existing producers remain active/unknown."""
+
+
+def checked_stop_new(raw, manifest, operation, generation, *, confirmed=True):
+    keys = {"schema", "manifest", "operation_id", "action", "previous_generation", "generation",
+            "state", "durable", "confirmed", "active_leases", "uncertain_leases",
+            "active_producer_leases", "uncertain_producer_leases"}
+    require(isinstance(raw, dict) and set(raw) == keys, "exact stop-new PostgreSQL receipt required")
+    expected = {"schema": 1, "manifest": manifest, "operation_id": operation, "action": "stop_new",
+                "previous_generation": generation - 1, "generation": generation, "state": "draining",
+                "durable": True, "confirmed": confirmed}
+    require(isinstance(operation, str) and HEX64.fullmatch(operation)
+            and all(type(raw[k]) is type(v) and raw[k] == v for k, v in expected.items()), "stop-new identity/state differs")
+    for key in ("active_leases", "uncertain_leases", "active_producer_leases", "uncertain_producer_leases"):
+        require(type(raw[key]) is int and 0 <= raw[key] <= 10000, "invalid producer/consumer count")
+    require(raw["active_producer_leases"] <= raw["active_leases"]
+            and raw["uncertain_producer_leases"] <= raw["uncertain_leases"], "producer counts exceed total work")
+    if confirmed:
+        require(raw["active_producer_leases"] == raw["uncertain_producer_leases"] == 0, "producer completion unconfirmed")
+    return raw
+
+
+class MinifluxDrainControl(MinifluxPauseControl):
+    """Instrumented sender stop-new, exact query, then full pause; never reopen.
+
+    The host driver must bind PG and independently inventory originals. A
+    confirmed producer stop explicitly allows durable consumers and says
+    nothing about old unregistered work, receiver completion or switching.
+    """
+    _scope = "instrumented_sender_only"
+
+    def stop(self, *args, **kwargs):
+        raise CutoverError("staged sender requires stop_new then freeze")
+
+    def resume(self, *args, **kwargs):
+        raise CutoverError("staged sender has no reopen capability")
+
+    def query_resume(self, *args, **kwargs):
+        raise CutoverError("staged sender has no reopen capability")
+
+    def _stage_intent(self, action, operation, generation, reason, prior):
+        require(action in {"stop_new", "pause"} and isinstance(operation, str) and HEX64.fullmatch(operation)
+                and operation != prior and isinstance(prior, str) and HEX64.fullmatch(prior)
+                and type(generation) is int and generation == self.binding["generation"] + (action == "pause")
+                and isinstance(reason, str) and 0 < len(reason) <= 256, "exact staged operation required")
+        return {"schema": 1, "action": action, "operation_id": operation, "prior_operation_id": prior,
+                "binding_sha256": self.binding_sha256, "generation": generation, "reason": reason}
+
+    def _read_stage(self, action, operation):
+        path = self.root / (action + ".intent.json")
+        require(not present(Path(str(path) + ".pending")), "staged intent sync uncertain; preserve")
+        intent = read_private(path)
+        expected = self._stage_intent(action, operation, intent["generation"], intent["reason"], intent["prior_operation_id"])
+        require(intent == expected, "staged intent differs")
+        durable_write(path, intent)
+        return intent
+
+    def _stage_response(self, intent, status, raw):
+        action, operation, generation = intent["action"], intent["operation_id"], intent["generation"] + 1
+        if action == "stop_new":
+            require(status in (200, 409) and set(raw) == {"result", "confirmed"}
+                    and type(raw["confirmed"]) is bool and (status == 200) == raw["confirmed"], "stop-new result unknown")
+            receipt = checked_stop_new(raw["result"], self.binding["manifest"], operation, generation, confirmed=raw["confirmed"])
+            if not raw["confirmed"]:
+                raise StopNewPending("registered producers remain; preserve original and query exact operation")
+        else:
+            receipt = self._confirmed(status, raw, operation, generation, "pause", "closed")
+        path = self.root / (action + ".confirmed.json")
+        evidence = {"intent_sha256": sha(intent), "pg_receipt": receipt, "queue_checked": False,
+                    "legacy_originals_proven": False, "switch_authorized": False}
+        if present(path):
+            # Consumer counters can decrease after a confirmed producer stop.
+            # Keep the first exact original, but compare immutable identity.
+            old = read_private(path)
+            expected = {k: v for k, v in old["pg_receipt"].items() if k not in {"active_leases", "uncertain_leases"}}
+            require({k: v for k, v in receipt.items() if k in expected} == expected
+                    and old["intent_sha256"] == evidence["intent_sha256"], "confirmed stage identity changed")
+        else:
+            durable_write(path, evidence)
+        return receipt
+
+    def stop_new(self, operation, generation, reason):
+        with locked(self.root / "control.lock", True):
+            intent = self._stage_intent("stop_new", operation, generation, reason, self.binding["initial_operation_id"])
+            path = self.root / "stop_new.intent.json"
+            require(not present(path) and not present(Path(str(path) + ".pending")), "stop-new attempted; exact query only")
+            self.registration()
+            durable_write(self.root / "initial-open.json", self._initial_open())
+            durable_write(path, intent)
+            status, raw = self._exchange("POST", "/stop-new", {"operation_id": operation})
+            self._save_exchange("stop_new-response", status, raw)
+            return self._stage_response(intent, status, raw)
+
+    def query_stop_new(self, operation):
+        return self._query_stage("stop_new", operation)
+
+    def _query_stage(self, action, operation):
+        with locked(self.root / "control.lock", True):
+            intent = self._read_stage(action, operation)
+            self.registration()
+            with _query_slot(self.root) as name:
+                status, raw = self._exchange("GET", "/operations/" + operation)
+                self._save_exchange(name, status, raw)
+            return self._stage_response(intent, status, raw)
+
+    def freeze(self, operation, stop_operation, reason):
+        with locked(self.root / "control.lock", True):
+            prior = self._read_stage("stop_new", stop_operation)
+            intent = self._stage_intent("pause", operation, prior["generation"] + 1, reason, stop_operation)
+            path = self.root / "pause.intent.json"
+            require(not present(path) and not present(Path(str(path) + ".pending")), "full pause attempted; exact query only")
+            self.registration()
+            with _query_slot(self.root) as name:
+                status, raw = self._exchange("GET", "/operations/" + stop_operation)
+                self._save_exchange(name, status, raw)
+            self._stage_response(prior, status, raw)
+            durable_write(path, intent)
+            status, raw = self._exchange("POST", "/pause", {"operation_id": operation})
+            self._save_exchange("pause-response", status, raw)
+            return self._stage_response(intent, status, raw)
+
+    def query_freeze(self, operation):
+        return self._query_stage("pause", operation)
