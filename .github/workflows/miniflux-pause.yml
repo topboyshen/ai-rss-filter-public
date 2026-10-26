@@ -1,0 +1,173 @@
+name: Miniflux unified pause
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    paths:
+      - 'ops/miniflux/**'
+      - 'scripts/*miniflux*pause*.py'
+      - 'scripts/miniflux_handoff_adapter.py'
+      - 'scripts/miniflux_host_joint_native.py'
+      - 'scripts/miniflux_dump_selection.py'
+      - 'scripts/apply_miniflux_outbox.py'
+      - 'scripts/durable_handoff_cutover.py'
+      - 'scripts/observe_handoff_capacity.py'
+      - 'scripts/independent_drain_inventory.py'
+      - 'services/webhook_receipts.py'
+      - 'services/natural_score_continuations.py'
+      - 'scripts/handoff_*.py'
+      - 'scripts/verify_handoff_operations_native.py'
+      - 'tests/test_miniflux_pause*.py'
+      - 'tests/test_miniflux_handoff_adapter.py'
+      - 'tests/test_miniflux_host_joint_native.py'
+      - 'tests/test_miniflux_dump_selection.py'
+      - 'tests/test_miniflux_legacy_access.py'
+      - 'tests/test_handoff_capacity_observer.py'
+      - 'tests/test_independent_drain_inventory.py'
+      - '.github/workflows/miniflux-pause.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'ops/miniflux/**'
+      - 'scripts/*miniflux*pause*.py'
+      - 'scripts/miniflux_handoff_adapter.py'
+      - 'scripts/miniflux_host_joint_native.py'
+      - 'scripts/miniflux_dump_selection.py'
+      - 'scripts/apply_miniflux_outbox.py'
+      - 'scripts/durable_handoff_cutover.py'
+      - 'scripts/observe_handoff_capacity.py'
+      - 'scripts/independent_drain_inventory.py'
+      - 'services/webhook_receipts.py'
+      - 'services/natural_score_continuations.py'
+      - 'scripts/handoff_*.py'
+      - 'scripts/verify_handoff_operations_native.py'
+      - 'tests/test_miniflux_pause*.py'
+      - 'tests/test_miniflux_handoff_adapter.py'
+      - 'tests/test_miniflux_host_joint_native.py'
+      - 'tests/test_miniflux_dump_selection.py'
+      - 'tests/test_miniflux_legacy_access.py'
+      - 'tests/test_handoff_capacity_observer.py'
+      - 'tests/test_independent_drain_inventory.py'
+      - '.github/workflows/miniflux-pause.yml'
+
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  native-fixed-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+        env:
+          POSTGRES_DB: synthetic_outbox
+          POSTGRES_PASSWORD: synthetic-ci-only
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres -d synthetic_outbox"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+          --memory 384m --memory-swap 384m --cpus 1 --pids-limit 64
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.4'
+          cache: false
+      - name: Fixed upstream plus two separately verified patches
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          mkdir -p "$RUNNER_TEMP/pause-build" "$RUNNER_TEMP/pause-source-evidence"
+          git clone --depth 1 --branch 2.3.2 https://github.com/miniflux/v2.git "$RUNNER_TEMP/miniflux-pause"
+          python scripts/apply_miniflux_pause.py --source "$RUNNER_TEMP/miniflux-pause" --apply | tee "$RUNNER_TEMP/pause-source-evidence/APPLY.json"
+          sha256sum ops/miniflux/*lock.json ops/miniflux/*.patch scripts/*miniflux*pause*.py > "$RUNNER_TEMP/pause-source-evidence/SOURCES.sha256"
+      - name: Full Go tests and actual PostgreSQL pause regressions
+        env:
+          MINIFLUX_OUTBOX_TEST_DSN: 'postgres://postgres:synthetic-ci-only@127.0.0.1:5432/synthetic_outbox?sslmode=disable'
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/miniflux-pause"
+          test -z "$(gofmt -l $(git ls-files --modified --others --exclude-standard -- '*.go'))"
+          go test -p 1 -count=1 -v ./... 2>&1 | tee "$RUNNER_TEMP/pause-source-evidence/FULL_TEST.log"
+          go test -race -p 1 -count=1 -v ./internal/handoff ./internal/http/request ./internal/integration ./internal/worker ./internal/storage ./internal/http/server 2>&1 | tee "$RUNNER_TEMP/pause-source-evidence/RACE_TEST.log"
+          go vet ./...
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-X miniflux.app/v2/internal/version.Version=2.3.2 -X miniflux.app/v2/internal/version.Commit=${GITHUB_SHA}" -o "$RUNNER_TEMP/pause-build/miniflux" .
+          go version -m "$RUNNER_TEMP/pause-build/miniflux" > "$RUNNER_TEMP/pause-source-evidence/BINARY_INFO.txt"
+          sha256sum "$RUNNER_TEMP/pause-build/miniflux" > "$RUNNER_TEMP/pause-source-evidence/BINARY.sha256"
+      - name: Actual legacy-original permissions and shared capacity
+        env:
+          PG_ID: '${{ job.services.postgres.id }}'
+        run: |
+          set -euo pipefail
+          python -I -B ops/miniflux/held-access/verify_legacy.py \
+            --container "$PG_ID" --source "$RUNNER_TEMP/miniflux-pause" \
+            --output "$RUNNER_TEMP/legacy-held-evidence" --run
+      - name: Build new isolated sender image only
+        run: |
+          set -euo pipefail
+          docker --host unix:///var/run/docker.sock build --platform=linux/amd64 --pull=false \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            -f ops/miniflux/Dockerfile -t "miniflux-pause-isolation:${GITHUB_SHA}" "$RUNNER_TEMP/pause-build" \
+            2>&1 | tee "$RUNNER_TEMP/pause-source-evidence/IMAGE_BUILD.log"
+          docker --host unix:///var/run/docker.sock image inspect "miniflux-pause-isolation:${GITHUB_SHA}" > "$RUNNER_TEMP/pause-source-evidence/IMAGE.json"
+          docker --host unix:///var/run/docker.sock pull --platform=linux/amd64 python:3.11.17-slim-trixie@sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e5767af9ea65f6ce
+          docker --host unix:///var/run/docker.sock pull --platform=linux/amd64 postgres@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+      - name: Actual fixed-image scheduler manual legacy async restart and PG pause
+        run: |
+          set -euo pipefail
+          image_id=$(docker --host unix:///var/run/docker.sock image inspect "miniflux-pause-isolation:${GITHUB_SHA}" --format '{{.Id}}')
+          python scripts/verify_miniflux_pause_native.py --source "$RUNNER_TEMP/miniflux-pause" \
+            --sender-image "$image_id" --binary "$RUNNER_TEMP/pause-build/miniflux" \
+            --output "$RUNNER_TEMP/pause-native-evidence" --run
+      - name: Preserve actual unit-test PostgreSQL state and identity
+        if: always()
+        env:
+          PG_ID: '${{ job.services.postgres.id }}'
+        run: |
+          set -uo pipefail
+          umask 077
+          evidence="$RUNNER_TEMP/pause-source-evidence"
+          mkdir -p "$evidence"
+          [[ "$PG_ID" =~ ^[0-9a-f]{64}$ ]] || exit 2
+          failed=0
+          preserve() {
+            local name="$1" rc=0
+            shift
+            "$@" > "$evidence/$name" 2> "$evidence/$name.stderr" || rc=$?
+            printf '%s\n' "$rc" > "$evidence/$name.exit_code"
+            if [ "$rc" -ne 0 ]; then failed=1; fi
+          }
+          preserve PG_INSPECT.json docker --host unix:///var/run/docker.sock inspect "$PG_ID" --format '{{json .}}'
+          preserve PG_MEMORY_PEAK.txt docker --host unix:///var/run/docker.sock exec "$PG_ID" cat /sys/fs/cgroup/memory.peak
+          preserve PG_MEMORY_EVENTS.txt docker --host unix:///var/run/docker.sock exec "$PG_ID" cat /sys/fs/cgroup/memory.events
+          preserve PG_SCHEMAS.json docker --host unix:///var/run/docker.sock exec "$PG_ID" psql -X -A -t -v ON_ERROR_STOP=1 -U postgres -d synthetic_outbox -c "SELECT COALESCE(json_agg(nspname ORDER BY nspname),'[]') FROM pg_namespace WHERE nspname NOT LIKE 'pg_%' AND nspname <> 'information_schema';"
+          # All schemas and smaller fixtures stay full. Only the exact legacy
+          # byte-boundary two tables may omit data, after their hash/length and
+          # independent bounded export are confirmed. Missing proof fails.
+          preserve PG_DUMP_EXCLUSIONS.txt python3 -I -B scripts/miniflux_dump_selection.py --evidence "$RUNNER_TEMP/legacy-held-evidence"
+          if [ "$(< "$evidence/PG_DUMP_EXCLUSIONS.txt.exit_code")" = 0 ]; then
+            dump=(docker --host unix:///var/run/docker.sock exec "$PG_ID" pg_dump)
+            while IFS= read -r value; do dump+=("$value"); done < "$evidence/PG_DUMP_EXCLUSIONS.txt"
+            preserve SYNTHETIC_TEST_DATABASE.sql "${dump[@]}" -U postgres -d synthetic_outbox
+          else
+            printf '%s\n' 'dump selection unconfirmed; existing partial exports retained' > "$evidence/SYNTHETIC_TEST_DATABASE.sql.stderr"
+            printf '1\n' > "$evidence/SYNTHETIC_TEST_DATABASE.sql.exit_code"
+          fi
+          exit "$failed"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: miniflux-pause-native-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/pause-source-evidence/
+            ${{ runner.temp }}/pause-native-evidence/
+            ${{ runner.temp }}/legacy-held-evidence/
+          if-no-files-found: error

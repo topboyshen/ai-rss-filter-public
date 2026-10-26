@@ -1,0 +1,57 @@
+name: Frozen cutover completion isolation
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches: [master, 'codex/**']
+    paths:
+      - 'services/controlled_startup.py'
+      - 'services/admission_fence.py'
+      - 'scripts/*cutover*.py'
+      - 'scripts/handoff_*.py'
+      - 'scripts/miniflux_handoff_adapter.py'
+      - 'scripts/miniflux_host_joint_native.py'
+      - 'scripts/independent_drain_inventory.py'
+      - 'scripts/run_controlled_startup.py'
+      - 'tests/test_*cutover*.py'
+      - 'tests/test_handoff_runtime_adapter.py'
+      - 'tests/test_miniflux_handoff_adapter.py'
+      - 'tests/test_miniflux_host_joint_native.py'
+      - 'tests/test_durable_handoff_crash_diagnostics.py'
+      - 'tests/test_controlled_startup.py'
+      - 'tests/test_independent_drain_inventory.py'
+      - 'ops/isolation/Dockerfile.cutover-completion'
+      - '.github/workflows/cutover-completion.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  native-amd64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Real synthetic storage and frozen lifecycle at 768 MiB / 256 PID
+        run: |
+          python -I -B scripts/verify_cutover_completion_native.py \
+            --repo . --output "${RUNNER_TEMP}/cutover-completion"
+      - name: Preserve original evidence including failures
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cutover-completion-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cutover-completion/**
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14

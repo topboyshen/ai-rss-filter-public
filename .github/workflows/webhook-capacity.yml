@@ -1,0 +1,83 @@
+name: Webhook native capacity
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - 'routes/webhook_routes.py'
+      - 'services/webhook*.py'
+      - 'core/config.py'
+      - 'db/**'
+      - 'app.py'
+      - 'config.yaml'
+      - 'Dockerfile'
+      - 'requirements*.txt'
+      - 'tests/test_webhook*'
+      - 'scripts/webhook_capacity_probe.py'
+      - 'scripts/verify_webhook_capacity_native.py'
+      - '.github/workflows/webhook-capacity.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'routes/webhook_routes.py'
+      - 'services/webhook*.py'
+      - 'core/config.py'
+      - 'db/**'
+      - 'app.py'
+      - 'config.yaml'
+      - 'Dockerfile'
+      - 'requirements*.txt'
+      - 'tests/test_webhook*'
+      - 'scripts/webhook_capacity_probe.py'
+      - 'scripts/verify_webhook_capacity_native.py'
+      - '.github/workflows/webhook-capacity.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  native-amd64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Native AMD64 exact-image baseline and candidate comparison
+        run: |
+          set -euo pipefail
+          python scripts/verify_webhook_capacity_native.py \
+            --repo . --output "${RUNNER_TEMP}/webhook-native-capacity"
+      - name: Preserve all safe raw evidence, including failures
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: webhook-native-capacity-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/webhook-native-capacity/RESULT.json
+            ${{ runner.temp }}/webhook-native-capacity/HOST.json
+            ${{ runner.temp }}/webhook-native-capacity/docker-info/**
+            ${{ runner.temp }}/webhook-native-capacity/*/IMAGE.json
+            ${{ runner.temp }}/webhook-native-capacity/*/build/**
+            ${{ runner.temp }}/webhook-native-capacity/*/inspect/**
+            ${{ runner.temp }}/webhook-native-capacity/*/volume/**
+            ${{ runner.temp }}/webhook-native-capacity/*/allocation/**
+            ${{ runner.temp }}/webhook-native-capacity/*/gradient/**
+            ${{ runner.temp }}/webhook-native-capacity/*/bytes/**
+            ${{ runner.temp }}/webhook-native-capacity/*/maxbody/**
+            ${{ runner.temp }}/webhook-native-capacity/*/partial/**
+            ${{ runner.temp }}/webhook-native-capacity/*/restart/**
+            ${{ runner.temp }}/webhook-native-capacity/*/enospc/**
+            ${{ runner.temp }}/webhook-native-capacity/*/alias*/**
+          if-no-files-found: error
+          retention-days: 14

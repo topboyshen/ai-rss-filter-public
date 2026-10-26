@@ -51,6 +51,9 @@ data/.last-refresh-trigger
 data/.event-mapping-migration-required
 data/releases/
 *.patch
+# Reviewed, digest-locked source inputs are required to build Miniflux in CI.
+!/ops/miniflux/0001-durable-webhook-outbox.patch
+!/ops/miniflux/0002-unified-pause-and-held-originals.patch
 
 # Private local review/transport evidence must never enter the public repository.
 /data/diagnostics/

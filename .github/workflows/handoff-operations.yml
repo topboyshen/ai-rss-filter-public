@@ -1,0 +1,67 @@
+name: Handoff operations isolation
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - 'services/webhook_receipts.py'
+      - 'scripts/durable_handoff_cutover*.py'
+      - 'scripts/plan_webhook_receipt_trial.py'
+      - 'scripts/verify_handoff_operations_native.py'
+      - 'scripts/production_handoff_adapter.py'
+      - 'scripts/observe_handoff_capacity.py'
+      - 'tests/test_production_handoff_adapter.py'
+      - 'tests/test_handoff_capacity_observer.py'
+      - 'tests/test_durable_handoff_cutover.py'
+      - 'tests/test_webhook_receipt_trial_plan.py'
+      - 'tests/test_handoff_operations_native.py'
+      - '.github/workflows/handoff-operations.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'services/webhook_receipts.py'
+      - 'scripts/durable_handoff_cutover*.py'
+      - 'scripts/plan_webhook_receipt_trial.py'
+      - 'scripts/verify_handoff_operations_native.py'
+      - 'scripts/production_handoff_adapter.py'
+      - 'scripts/observe_handoff_capacity.py'
+      - 'tests/test_production_handoff_adapter.py'
+      - 'tests/test_handoff_capacity_observer.py'
+      - 'tests/test_durable_handoff_cutover.py'
+      - 'tests/test_webhook_receipt_trial_plan.py'
+      - 'tests/test_handoff_operations_native.py'
+      - '.github/workflows/handoff-operations.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  native-amd64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Native offline capacity and real subprocess cutover isolation
+        run: |
+          python -I -B scripts/verify_handoff_operations_native.py \
+            --repo . --output "${RUNNER_TEMP}/handoff-operations"
+      - name: Preserve raw evidence including failures
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: handoff-operations-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/handoff-operations/**
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
