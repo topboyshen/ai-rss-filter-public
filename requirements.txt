@@ -2,7 +2,7 @@
 # 复用生产依赖版本，仅在此增加测试依赖
 -r requirements-prod.txt
 iniconfig==2.3.0
-pluggy==1.6.0
+pluggy==1.7.0
 Pygments==2.21.0
 pytest==9.1.1
 pytest-cov==7.1.0
