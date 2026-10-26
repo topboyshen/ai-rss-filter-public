@@ -462,6 +462,311 @@ index 0000000..2704180
 +}
 +
 +func handoffDrainMigration(tx *sql.Tx) error { return handoff.MigrateDrain(tx) }
+diff --git a/internal/database/handoff_upgrade_integration_test.go b/internal/database/handoff_upgrade_integration_test.go
+new file mode 100644
+index 0000000..672dbb1
+--- /dev/null
++++ b/internal/database/handoff_upgrade_integration_test.go
+@@ -0,0 +1,299 @@
++// SPDX-License-Identifier: Apache-2.0
++package database
++
++import (
++	"context"
++	"crypto/rand"
++	"database/sql"
++	"database/sql/driver"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"net/url"
++	"os"
++	"strings"
++	"sync/atomic"
++	"testing"
++
++	"github.com/lib/pq"
++	"miniflux.app/v2/internal/handoff"
++)
++
++// Every phase logs before the next potentially failing operation. CI retains
++// the full log and schema, including failures; no original rows are deleted.
++func upgradeFixture(t *testing.T, version int) (*sql.DB, string) {
++	t.Helper()
++	raw := os.Getenv("MINIFLUX_OUTBOX_TEST_DSN")
++	if raw == "" {
++		t.Skip("actual synthetic PostgreSQL not configured")
++	}
++	u, err := url.Parse(raw)
++	if err != nil || u.Scheme != "postgres" || (u.Hostname() != "127.0.0.1" && u.Hostname() != "localhost") || u.Path != "/synthetic_outbox" {
++		t.Fatal("refuse non-isolated migration database")
++	}
++	admin, err := sql.Open("postgres", raw)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer admin.Close()
++	var entropy [12]byte
++	if _, err = rand.Read(entropy[:]); err != nil {
++		t.Fatal(err)
++	}
++	schema := "handoff_upgrade_" + hex.EncodeToString(entropy[:])
++	if _, err = admin.Exec("CREATE SCHEMA " + schema); err != nil {
++		t.Fatal(err)
++	}
++	t.Logf("phase=allocated retained_schema=%s target_start=%d", schema, version)
++	q := u.Query()
++	q.Set("search_path", schema)
++	u.RawQuery = q.Encode()
++	db, err := sql.Open("postgres", u.String())
++	if err != nil {
++		t.Fatal(err)
++	}
++	db.SetMaxOpenConns(4)
++	t.Cleanup(func() { db.Close() })
++	for current := 0; current < version; current++ {
++		tx, e := db.Begin()
++		if e != nil {
++			t.Fatal(e)
++		}
++		if e = migrations[current](tx); e == nil {
++			_, e = tx.Exec("TRUNCATE schema_version")
++			if e == nil {
++				_, e = tx.Exec("INSERT INTO schema_version(version) VALUES($1)", current+1)
++			}
++		}
++		if e != nil {
++			tx.Rollback()
++			t.Fatal(current+1, e)
++		}
++		if e = tx.Commit(); e != nil {
++			t.Fatal(current+1, e)
++		}
++	}
++	t.Logf("phase=actual_prior_schema_committed version=%d", version)
++	return db, u.String()
++}
++
++func upgradeSeed(t *testing.T, db *sql.DB, legacy bool) string {
++	t.Helper()
++	_, err := db.Exec(`INSERT INTO webhook_outbox(delivery_id,body_sha256,user_id,feed_id,entry_id,target_url,signature,contract,body,state)
++ SELECT encode(sha256('old-held'::bytea),'hex'),encode(sha256('old-held'::bytea),'hex'),1,1,1,'https://synthetic.invalid',repeat('a',64),'synthetic','old-held'::bytea,'held'`)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if legacy {
++		_, err = db.Exec(`INSERT INTO webhook_legacy_originals(delivery_id,body_sha256,event_type,user_id,feed_id,entry_id,target_url,signature,contract,body)
++ SELECT encode(sha256('legacy-held'::bytea),'hex'),encode(sha256('legacy-held'::bytea),'hex'),'save_entry',1,1,1,'https://synthetic.invalid',repeat('a',64),'synthetic','legacy-held'::bytea`)
++		if err != nil {
++			t.Fatal(err)
++		}
++		r, e := handoff.Initialize(context.Background(), db, strings.Repeat("a", 64), strings.Repeat("b", 64))
++		if e != nil || !r.Confirmed {
++			t.Fatal(r, e)
++		}
++	}
++	return upgradeEvidence(t, db, legacy)
++}
++
++func upgradeEvidence(t *testing.T, db *sql.DB, legacy bool) string {
++	t.Helper()
++	query := `SELECT jsonb_build_object('outbox',(SELECT jsonb_agg(to_jsonb(o) ORDER BY delivery_id) FROM webhook_outbox o))::text`
++	if legacy {
++		query = `SELECT jsonb_build_object('outbox',(SELECT jsonb_agg(to_jsonb(o) ORDER BY delivery_id) FROM webhook_outbox o),
++         'legacy',(SELECT jsonb_agg(to_jsonb(l) ORDER BY delivery_id) FROM webhook_legacy_originals l),
++         'operations',(SELECT jsonb_agg(to_jsonb(o) ORDER BY operation_id) FROM handoff_operations o))::text`
++	}
++	var value string
++	if err := db.QueryRow(query).Scan(&value); err != nil {
++		t.Fatal(err)
++	}
++	return value
++}
++
++func upgradeVersion(t *testing.T, db *sql.DB, want int) {
++	t.Helper()
++	var version int
++	if err := db.QueryRow(`SELECT version FROM schema_version`).Scan(&version); err != nil || version != want {
++		t.Fatal(version, want, err)
++	}
++}
++
++func TestPGActual132And133Migrate134RetainOriginalsAndOldEvidence(t *testing.T) {
++	for _, prior := range []int{132, 133} {
++		t.Run(fmt.Sprint(prior), func(t *testing.T) {
++			db, _ := upgradeFixture(t, prior)
++			before := upgradeSeed(t, db, prior == 133)
++			t.Log("phase=before_actual_Migrate held_originals_and_prior_marker_retained")
++			if err := Migrate(db); err != nil {
++				t.Fatal(err)
++			}
++			upgradeVersion(t, db, 134)
++			if upgradeEvidence(t, db, prior == 133) != before {
++				t.Fatal("original or prior operation rewritten")
++			}
++			var constraint string
++			if err := db.QueryRow(`SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid='handoff_state'::regclass AND conname='handoff_state_phase_check'`).Scan(&constraint); err != nil || !strings.Contains(constraint, "draining") {
++				t.Fatal(constraint, err)
++			}
++			t.Log("phase=committed schema_marker134_and_draining_constraint_match retained_originals_unchanged")
++			// A restart seeing the committed marker must execute no migration again.
++			if err := Migrate(db); err != nil {
++				t.Fatal(err)
++			}
++			if upgradeEvidence(t, db, prior == 133) != before {
++				t.Fatal("restart rewrote evidence")
++			}
++			if _, err := db.Exec(`DELETE FROM webhook_outbox`); err == nil {
++				t.Fatal("upgrade weakened held protection")
++			}
++			t.Log("phase=restart_query_and_held_guard_verified")
++		})
++	}
++}
++
++func TestPG134MarkerWriteFailureRollsBackDDLAndPreserves133(t *testing.T) {
++	db, _ := upgradeFixture(t, 133)
++	before := upgradeSeed(t, db, true)
++	_, err := db.Exec(`CREATE FUNCTION fail_upgrade_marker() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.version=134 THEN RAISE EXCEPTION 'synthetic marker write failed'; END IF; RETURN NEW; END $$;
++      CREATE TRIGGER fail_upgrade_marker BEFORE INSERT ON schema_version FOR EACH ROW EXECUTE FUNCTION fail_upgrade_marker()`)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Log("phase=before_actual_migration injected_marker_failure134")
++	if err = Migrate(db); err == nil {
++		t.Fatal("marker failure accepted")
++	}
++	upgradeVersion(t, db, 133)
++	if upgradeEvidence(t, db, true) != before {
++		t.Fatal("failed transaction altered originals")
++	}
++	var constraint string
++	if err = db.QueryRow(`SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid='handoff_state'::regclass AND conname='handoff_state_phase_check'`).Scan(&constraint); err != nil || strings.Contains(constraint, "draining") {
++		t.Fatal(constraint, err)
++	}
++	t.Log("phase=known_rollback marker133_old_constraint_and_evidence_preserved no_retry_performed")
++}
++
++type lostUpgradeConnector struct {
++	original driver.Connector
++	commits  atomic.Int32
++	lose     int32
++}
++
++func (c *lostUpgradeConnector) Connect(ctx context.Context) (driver.Conn, error) {
++	conn, err := c.original.Connect(ctx)
++	if err != nil {
++		return nil, err
++	}
++	return &lostUpgradeConn{Conn: conn, owner: c}, nil
++}
++func (c *lostUpgradeConnector) Driver() driver.Driver { return c.original.Driver() }
++
++type lostUpgradeConn struct {
++	driver.Conn
++	owner *lostUpgradeConnector
++}
++
++func (c *lostUpgradeConn) Begin() (driver.Tx, error) {
++	tx, err := c.Conn.Begin()
++	if err != nil {
++		return nil, err
++	}
++	return &lostUpgradeTx{Tx: tx, owner: c.owner}, nil
++}
++
++type lostUpgradeTx struct {
++	driver.Tx
++	owner *lostUpgradeConnector
++}
++
++func (t *lostUpgradeTx) Commit() error {
++	if err := t.Tx.Commit(); err != nil {
++		return err
++	}
++	if t.owner.commits.Add(1) == t.owner.lose {
++		return errors.New("synthetic ACK lost after actual PG commit")
++	}
++	return nil
++}
++
++func TestPGActualUpgradeLostCommitACKOnlyQueriesExactMarker(t *testing.T) {
++	for _, lose := range []int32{1, 2} {
++		t.Run(fmt.Sprint(lose), func(t *testing.T) {
++			db, dsn := upgradeFixture(t, 132)
++			before := upgradeSeed(t, db, false)
++			connector, err := pq.NewConnector(dsn)
++			if err != nil {
++				t.Fatal(err)
++			}
++			wrapped := &lostUpgradeConnector{original: connector, lose: lose}
++			lost := sql.OpenDB(wrapped)
++			t.Logf("phase=before_actual_Migrate simulate_ACK_loss_after_commit=%d", lose)
++			err = Migrate(lost)
++			lost.Close()
++			if err == nil || !strings.Contains(err.Error(), "ACK lost") {
++				t.Fatal(err)
++			}
++			want := 132 + int(lose)
++			upgradeVersion(t, db, want)
++			if upgradeEvidence(t, db, false) != before {
++				t.Fatal("unknown ACK damaged original")
++			}
++			if wrapped.commits.Load() != lose {
++				t.Fatal("automatic commit replay")
++			}
++			t.Logf("phase=recovery_read_only marker=%d committed_steps=%d no_replay_or_downgrade=true", want, lose)
++		})
++	}
++}
++
++func (c *lostUpgradeConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
++	if executor, ok := c.Conn.(driver.ExecerContext); ok {
++		return executor.ExecContext(ctx, query, args)
++	}
++	return nil, driver.ErrSkip
++}
++func (c *lostUpgradeConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
++	if executor, ok := c.Conn.(driver.QueryerContext); ok {
++		return executor.QueryContext(ctx, query, args)
++	}
++	return nil, driver.ErrSkip
++}
++
++func TestPG134OldReaderCannotCertifyNewStateOrLegacyCoverage(t *testing.T) {
++	db, _ := upgradeFixture(t, 133)
++	upgradeSeed(t, db, true)
++	if err := Migrate(db); err != nil {
++		t.Fatal(err)
++	}
++	r, err := handoff.StopNew(context.Background(), db, strings.Repeat("a", 64), strings.Repeat("c", 64))
++	if err != nil || !r.Confirmed || r.State != "draining" {
++		t.Fatal(r, err)
++	}
++	// The old schema-startup inequality accepts a newer version. Reproduce
++	// that exact limitation, not a claim that an old executable was run.
++	var version int
++	if err = db.QueryRow(`SELECT version FROM schema_version`).Scan(&version); err != nil || version < 133 {
++		t.Fatal(version, err)
++	}
++	var raw []byte
++	if err = db.QueryRow(`SELECT jsonb_build_object('action',action,'state',(SELECT phase FROM handoff_state WHERE id=1)) FROM handoff_operations WHERE operation_id=$1`, strings.Repeat("c", 64)).Scan(&raw); err != nil {
++		t.Fatal(err)
++	}
++	var old map[string]string
++	if err = json.Unmarshal(raw, &old); err != nil {
++		t.Fatal(err)
++	}
++	if old["action"] != "stop_new" || old["state"] != "draining" {
++		t.Fatal(old)
++	}
++	var legacy int
++	if err = db.QueryRow(`SELECT count(*) FROM webhook_legacy_originals WHERE state='held'`).Scan(&legacy); err != nil || legacy != 1 {
++		t.Fatal(legacy, err)
++	}
++	t.Log("phase=legacy_boundary version>=133_is_not_compatibility new_action_stop_new_requires_new_reader legacy_held_remains old_executable_not_run")
++}
 diff --git a/internal/database/legacy_handoff.go b/internal/database/legacy_handoff.go
 new file mode 100644
 index 0000000..9c25c89

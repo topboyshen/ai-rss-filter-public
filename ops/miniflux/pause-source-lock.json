@@ -4,7 +4,7 @@
   "revision": "51f2e0d8199ea8fa305081f6e175bba64b0ef94b",
   "patch": "0002-unified-pause-and-held-originals.patch",
   "base_patch_sha256": "0bf94e8fcb31dc902088122221c459f92a00854976f5a34200b21a37c40102f6",
-  "patch_sha256": "c5d1b1af495e44b2cfa1c03e89b6bf57c00d25a5c0ba7c4ef29c75ebc8bb12fc",
+  "patch_sha256": "40de3d46bb866ffc415e4551ea21337dcde629ba961183c719f24bd606205fa2",
   "patched_files_sha256": {
     "internal/api/category_handlers.go": "42cb763ac647be311710920f097eb02691c75f4c63e577ceba8dbacb5ec3b594",
     "internal/api/entry_handlers.go": "95b9bd05f94a4dc495ebe095d4b996861efa1ca9a3744946766f495fedc2dfc4",
@@ -24,6 +24,7 @@
     "internal/config/webhook_outbox.go": "9d28395d057d1567e7fe50ba03c894e7f4fe96929f2b88239712ebacd3ff3c3d",
     "internal/config/webhook_outbox_test.go": "cc75ee1c1ac7ecd80b6955ff43fcc7d797de0bb083bda5809644a40570e47ce6",
     "internal/database/handoff.go": "306f9b01aafde021bc2665cbb1390dea4fa23c4732d831955c31fa2e5759e1fa",
+    "internal/database/handoff_upgrade_integration_test.go": "2032eb7f53fc73c3d9365ce22108ce60bd80f881e9fcec765e32293826f2d0f7",
     "internal/database/legacy_handoff.go": "23a383bb5a462ed49a14d7339ebe12585d7ced1e65bd7ce4028931e011e996f2",
     "internal/database/migrations.go": "1ae2bead273bd5e3dee3b325fdc250d366a68a10b46e411b23d70a8c29e2a697",
     "internal/database/webhook_outbox.go": "42ee96b4a961887d5387f8a0261ec6f8e9132f78eb362760451c172341640dad",
