@@ -1,0 +1,211 @@
+name: CI
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches:
+      - master
+      - 'remediation/**'
+      - 'codex/**'
+  schedule:
+    - cron: '0 0 * * 1'
+  workflow_dispatch:
+
+# Only superseded PR runs share a group. Each master/scheduled run remains
+# independent, so a newer push cannot cancel the post-merge full gate.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.scope.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Classify pull request scope using the base revision
+        id: scope
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          # Never let a PR's modified classifier exempt itself from full CI.
+          # The initial introduction of this helper therefore runs full CI.
+          scope_script="${RUNNER_TEMP}/ci-change-scope-trusted.py"
+          scope_output="${RUNNER_TEMP}/ci-change-scope-output"
+          docs_only=false
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]] \
+            && [[ "$PR_BASE_SHA" =~ ^[0-9a-f]{40}$ ]] \
+            && git show "${PR_BASE_SHA}:scripts/ci_change_scope.py" > "$scope_script"; then
+            if python "$scope_script" classify \
+              --event-name "$GITHUB_EVENT_NAME" --event-path "$GITHUB_EVENT_PATH" \
+              --repo . --output "$scope_output"; then
+              if [[ "$(cat "$scope_output")" == "docs_only=true" ]]; then
+                docs_only=true
+              fi
+            fi
+          fi
+          printf 'docs_only=%s\n' "$docs_only" >> "$GITHUB_OUTPUT"
+          printf 'PR documentation-only exemption: %s\n' "$docs_only"
+      - name: Check documentation and CI scope regressions
+        if: steps.scope.outputs.docs_only == 'true'
+        run: |
+          set -euo pipefail
+          python "${RUNNER_TEMP}/ci-change-scope-trusted.py" check \
+            --event-name "$GITHUB_EVENT_NAME" --event-path "$GITHUB_EVENT_PATH" --repo .
+          python -m unittest discover -s tests -p test_ci_change_scope.py -v
+          printf '%s\n' 'Documentation checks passed. Full tests and image build intentionally skipped for this PR; master still runs the full gate.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Install pinned lint tool
+        if: steps.scope.outputs.docs_only != 'true'
+        run: python -m pip install -r requirements-lint.txt
+      - name: Check existing lint baseline without new findings
+        if: steps.scope.outputs.docs_only != 'true'
+        run: python scripts/check_lint.py
+
+  test:
+    # The previous matrix had only 3.11. Keep one explicit job so GitHub does
+    # not append "(3.11)" again or change the name when docs skip this job.
+    name: test (3.11)
+    needs: lint
+    # Only a successful complete docs check grants an exemption. A failed lint
+    # or classifier must not make the required test check implicitly skip.
+    if: ${{ !cancelled() && (needs.lint.result != 'success' || needs.lint.outputs.docs_only != 'true') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Set up fixed Node for isolated JavaScript tests
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24.21.0'
+          package-manager-cache: false
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt', 'requirements-prod.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Validate shell and release contracts
+        run: |
+          bash scripts/check-shell-syntax.sh
+
+      - name: Function length gate
+        run: python3 scripts/check_function_length.py --max 120 --allowlist ops/function_length_allowlist.json
+
+      - name: Run isolated full test suite with coverage
+        run: |
+          # LF-native Linux baseline on 2026-08-04: 75.81% combined
+          # statement/branch coverage. Keep a small platform/version margin.
+          install -d -m 0700 "${RUNNER_TEMP}/ai-filter-synthetic-cutover-evidence"
+          AI_FILTER_TEST_PYTHON="$(command -v python)" \
+            AI_FILTER_TEST_NODE="$(command -v node)" \
+            AI_FILTER_TEST_COVERAGE_OUTPUT="${RUNNER_TEMP}/ai-filter-coverage.xml" \
+            AI_FILTER_CUTOVER_EVIDENCE_DIR="${RUNNER_TEMP}/ai-filter-synthetic-cutover-evidence" \
+            ./scripts/run-release-tests.sh full
+
+      - name: Preserve isolated synthetic cutover evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: synthetic-cutover-python-3.11-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ai-filter-synthetic-cutover-evidence/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Validate Compose and build the production image
+        run: |
+          set -euo pipefail
+          cleanup_ci_material() {
+            rm -f -- .env \
+              secrets/dashboard_session_secret \
+              secrets/ai_filter_integration_token \
+              secrets/quant_market_context_token
+            rmdir -- secrets 2>/dev/null || true
+          }
+          trap cleanup_ci_material EXIT
+
+          cp .env.example .env
+          install -d -m 0700 secrets
+          for secret in dashboard_session_secret ai_filter_integration_token quant_market_context_token; do
+            (umask 077; printf 'ci-only-placeholder-0123456789abcdef\n' > "secrets/${secret}")
+          done
+          image_ref="my-ai-filter:ci"
+          build_version="my-ai-filter:ci"
+          manifest_sha="$(sha256sum docker-compose.yml | awk '{print $1}')"
+          config_sha="$(sha256sum config.yaml | awk '{print $1}')"
+          source_identity="${GITHUB_SHA}:clean"
+          mapping_generation="event-mapping-store-v5-provider-attribution-v1"
+          IMAGE_REF="${image_ref}" docker compose config --quiet
+          docker build --tag "${image_ref}" \
+            --build-arg AI_FILTER_BUILD_VERSION="${build_version}" \
+            --build-arg AI_FILTER_BUILD_GIT_SHA="${GITHUB_SHA}" \
+            --build-arg AI_FILTER_BUILD_MANIFEST_SHA="${manifest_sha}" \
+            --build-arg AI_FILTER_BUILD_CONFIG_SHA="${config_sha}" \
+            --build-arg AI_FILTER_BUILD_SOURCE_ID="${source_identity}" \
+            --build-arg AI_FILTER_MAPPING_MIGRATION_GENERATION="${mapping_generation}" .
+
+          assert_image_label() {
+            local label_name="$1" expected="$2" actual
+            actual="$(docker image inspect "${image_ref}" \
+              --format "{{ index .Config.Labels \"${label_name}\" }}")"
+            if [[ "${actual}" != "${expected}" ]]; then
+              printf 'Image label %s did not match the expected CI provenance.\n' \
+                "${label_name}" >&2
+              return 1
+            fi
+          }
+          assert_image_label org.opencontainers.image.version "${build_version}"
+          assert_image_label org.opencontainers.image.revision "${GITHUB_SHA}"
+          assert_image_label io.ai-filter.compose-manifest.sha256 "${manifest_sha}"
+          assert_image_label io.ai-filter.config.sha256 "${config_sha}"
+          assert_image_label io.ai-filter.source.identity "${source_identity}"
+          assert_image_label io.ai-filter.event-mapping-generation "${mapping_generation}"
+
+          embedded_config_sha="$(docker run --rm --entrypoint sha256sum \
+            "${image_ref}" /app/config.yaml | awk '{print $1}')"
+          if [[ "${embedded_config_sha}" != "${config_sha}" ]]; then
+            printf 'Embedded /app/config.yaml did not match the source digest.\n' >&2
+            exit 1
+          fi
+
+          # Inspect the installed final filesystem, not the host test environment.
+          # No production volumes, secrets, network, model calls or database writes.
+          docker run --rm -i --network none --read-only \
+            --cap-drop ALL --security-opt no-new-privileges \
+            --env PYTHONDONTWRITEBYTECODE=1 \
+            --env AI_FILTER_ROLE=web --env AI_FILTER_CONFIG_PATH=/app/config.yaml \
+            --entrypoint python "${image_ref}" -B - < scripts/check_runtime_image.py
+
+      - name: Preserve coverage report
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-python-3.11
+          path: ${{ runner.temp }}/ai-filter-coverage.xml
+          if-no-files-found: error
+          retention-days: 14
