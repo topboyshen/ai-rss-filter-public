@@ -550,6 +550,43 @@ class Harness:
             "full_pause": closed, "stop_new_is_queue_empty_proof": False})
         return freeze
 
+    def staged_host_bridge_case(self):
+        from miniflux_handoff_adapter import MinifluxDrainControl, source_sha256 as bridge_source
+        from miniflux_host_joint_native import component
+
+        prior = self.gate_snapshot()["state"]
+        if len(prior) != 1 or prior[0]["phase"] != "closed":
+            raise ValueError("staged host bridge requires the actual prior closed operation")
+        resume = hashlib.sha256(b"native:staged-host:resume").hexdigest()
+        resumed = self.resume(prior[0]["current_operation"], resume)
+        def inspect():
+            return json.loads(self.command(["inspect", self.names["sender"]]))
+        row = inspect()[0]
+        binding = {"schema": 1, "scope": "instrumented_sender_only", "run_id": self.owner,
+                   "control_id": "miniflux", "component_name": row["Name"].lstrip("/"), "component": component(row),
+                   "manifest": self.manifest, "application_source_sha256": sha(self.repo / "ops/miniflux/pause-source-lock.json"),
+                   "source_sha256": bridge_source(), "generation": resumed["generation"],
+                   "initial_operation_id": resume, "entrances": ["miniflux_scheduler", "miniflux_manual", "legacy_async_sender"]}
+        harness = self
+        class Client:
+            def request(self, method, path, payload):
+                return harness.private_exchange(path, method, payload)
+        control = MinifluxDrainControl(binding, Client(), inspect, self.output / "staged-host-bridge")
+        operation = hashlib.sha256(b"native:staged-host:stop-new").hexdigest()
+        stop = control.stop_new(operation, resumed["generation"], "actual synthetic host producer stop")
+        queried_stop = control.query_stop_new(operation)
+        self.refresh(expected=503)
+        stopped_snapshot = self.gate_snapshot()
+        freeze = hashlib.sha256(b"native:staged-host:freeze").hexdigest()
+        paused = control.freeze(freeze, operation, "actual synthetic host full pause")
+        queried_pause = control.query_freeze(freeze)
+        closed = self.query_closed(freeze)
+        self.case("ACTUAL_STAGED_HOST_BRIDGE", {"binding": binding, "producer_stop": stop,
+            "queried_stop": queried_stop, "draining_postgres": stopped_snapshot,
+            "pause": paused, "queried_pause": queried_pause, "closed": closed,
+            "queue_checked": False, "legacy_originals_proven": False, "switch_authorized": False,
+            "scope": "actual host bridge phases only; independent inventory and receiver transfer tested separately"})
+
     def postgres_restart_case(self, closed):
         before = self.gate_snapshot()
         self.sample_memory("pg", "before_restart")
@@ -662,6 +699,7 @@ def run(repo, source, image_id, binary, output):
         harness.closed_scheduler_case()
         from miniflux_host_joint_native import run as joint_run
         joint_run(harness, closed)
+        harness.staged_host_bridge_case()
     except Exception as failure:
         error = {"type": type(failure).__name__, "message": harness.redacted(str(failure))}
         save(output / "FAILURE.json", error)
@@ -676,7 +714,7 @@ def run(repo, source, image_id, binary, output):
         if error is None and evidence_errors:
             error = {"type": "EvidencePreservationIncomplete", "message": str(evidence_errors)}
     cases = sorted(path.name for path in output.glob("CASE_*.json"))
-    result = {"status": "passed" if error is None and len(cases) == 9 else "failed_or_evidence_insufficient",
+    result = {"status": "passed" if error is None and len(cases) == 10 else "failed_or_evidence_insufficient",
               "cases": cases, "error": error, "evidence_errors": evidence_errors, "elapsed_seconds": time.monotonic() - harness.started,
               "native_amd64": True, "resource_limits": {"sender_memory_bytes": MEMORY, "sender_pids": PIDS},
               "retained_network": harness.network, "retained_containers": list(harness.names.values()),

@@ -1,0 +1,248 @@
+"""Opt-in actual fixed-source PostgreSQL reader/lock evidence, synthetic only."""
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import sys
+from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
+
+import pytest
+
+from services import sender_drain_contract as contract
+from scripts import sender_drain_inventory as inventory
+from test_sender_drain_contract import synthetic_manifest
+
+SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+sys.path.insert(0, str(SCRIPTS))
+
+
+def phase(value):
+    print("sender_pg_phase=" + value, flush=True)
+
+
+def source_sql(source, relative, pattern):
+    lock = json.loads(
+        (SCRIPTS.parent / "ops/miniflux/pause-source-lock.json").read_text()
+    )
+    raw = (source / relative).read_bytes()
+    assert hashlib.sha256(raw).hexdigest() == lock["patched_files_sha256"][relative]
+    found = re.findall(pattern, raw.decode(), re.S)
+    assert len(found) == 1
+    return found[0]
+
+
+@pytest.fixture
+def actual(tmp_path):
+    raw = os.environ.get("MINIFLUX_OUTBOX_TEST_DSN")
+    if not raw:
+        pytest.skip("actual isolated PostgreSQL DSN not configured; no PG proof")
+    psycopg = pytest.importorskip("psycopg")
+    url = urlsplit(raw)
+    assert (
+        url.scheme in {"postgres", "postgresql"}
+        and url.hostname in {"127.0.0.1", "localhost"}
+        and url.path == "/synthetic_outbox"
+    )
+    source = Path(os.environ["MINIFLUX_PATCHED_SOURCE"])
+    assert source.is_absolute()
+    schema = "sender_reader_" + secrets.token_hex(12)
+    phase("before_schema_create_" + schema)
+    with psycopg.connect(raw, autocommit=True) as admin:
+        admin.execute("CREATE SCHEMA " + schema)
+    query = parse_qs(url.query)
+    query.pop("search_path", None)
+    query["options"] = ["-c search_path=" + schema]
+    dsn = urlunsplit(
+        (url.scheme, url.netloc, url.path, urlencode(query, doseq=True), url.fragment)
+    )
+    connection = psycopg.connect(dsn, autocommit=True)
+    # Exact locked SQL fixture; migration transaction/marker behavior is tested
+    # by actual Go database.Migrate, not inferred from this fixture seed.
+    statements = [
+        source_sql(
+            source, "internal/database/webhook_outbox.go", r"tx.Exec\(`(.*?)`\)"
+        ),
+        source_sql(source, "internal/handoff/handoff.go", r"const SchemaSQL = `(.*?)`"),
+        source_sql(
+            source, "internal/database/legacy_handoff.go", r"tx.Exec\(`(.*?)`\)"
+        ),
+        source_sql(
+            source, "internal/handoff/drain.go", r"const DrainSchemaSQL = `(.*?)`"
+        ),
+    ]
+    for statement in statements:
+        connection.execute(statement)
+    connection.execute(
+        "CREATE TABLE schema_version(version integer); INSERT INTO schema_version VALUES(134)"
+    )
+    value, body = synthetic_manifest(tmp_path)
+    binding = value["sender_binding"]
+    receipt = value["control_receipt"]
+    connection.execute(
+        "INSERT INTO handoff_state VALUES(1,%s,%s,'draining',%s)",
+        (binding["manifest"], receipt["generation"], receipt["operation_id"]),
+    )
+    connection.execute(
+        """INSERT INTO handoff_operations(operation_id,manifest,action,previous_generation,generation,prior_operation,status,confirmed_at)
+ VALUES(%s,%s,'stop_new',%s,%s,%s,'confirmed',clock_timestamp())""",
+        (
+            receipt["operation_id"],
+            binding["manifest"],
+            binding["generation"],
+            receipt["generation"],
+            binding["initial_operation_id"],
+        ),
+    )
+    row = value["entries"][0]
+    connection.execute(
+        """INSERT INTO webhook_outbox(delivery_id,body_sha256,user_id,feed_id,entry_id,target_url,signature,contract,body)
+ VALUES(%s,%s,1,1,1,%s,%s,%s,%s)""",
+        (
+            row["delivery_id"],
+            row["body_sha256"],
+            row["target_url"],
+            row["signature"],
+            row["contract"],
+            body,
+        ),
+    )
+    actual = dict(
+        zip(
+            inventory.IDENTITY_KEYS,
+            connection.execute(inventory.IDENTITY_SQL).fetchone(),
+        )
+    )
+    path = tmp_path / "dsn.json"
+    path.write_text(json.dumps({"dsn": dsn}))
+    path.chmod(0o600)
+    reader = inventory.PostgresReader(path, actual)
+    phase("source_bound_fixture_ready_" + schema)
+    yield connection, reader, binding, receipt, value, body
+    phase("retaining_schema_" + schema)
+    connection.close()
+
+
+def test_actual_readonly_bundle_preserves_exact_body_and_pg_identity(actual, tmp_path):
+    connection, reader, binding, receipt, _, body = actual
+    phase("before_actual_readonly_original_snapshot")
+    sample = reader.snapshot()
+    assert (
+        sample["states"]["pending"] == 1
+        and sample["retained_leases"]["active_producers"] == 0
+    )
+    bundle = tmp_path / "originals"
+    import time
+
+    now = int(time.time())
+    value = reader.freeze(
+        binding, receipt, {"not_before": now - 1, "expires_at": now + 300}, bundle
+    )
+    loaded, sha = contract.load_bundle(bundle)
+    assert value == loaded and sha == contract.digest(value)
+    assert contract.read_original(bundle, loaded["entries"][0]) == body
+    assert (
+        bytes(connection.execute("SELECT body FROM webhook_outbox").fetchone()[0])
+        == body
+    )
+    phase("original_bundle_sealed_exact_bytes_no_database_mutation")
+    before = {p.name: p.read_bytes() for p in bundle.iterdir()}
+    with pytest.raises(Exception):
+        reader.freeze(binding, receipt, value["window"], bundle)
+    assert before == {p.name: p.read_bytes() for p in bundle.iterdir()}
+
+
+def close_fixture(connection, binding):
+    operation = "d" * 64
+    connection.execute(
+        "UPDATE webhook_outbox SET state='acked',acked_at=clock_timestamp()"
+    )
+    connection.execute(
+        "UPDATE handoff_state SET phase='closed',generation=generation+1,current_operation=%s",
+        (operation,),
+    )
+    connection.execute(
+        """INSERT INTO handoff_operations(operation_id,manifest,action,previous_generation,generation,prior_operation,status,confirmed_at)
+ VALUES(%s,%s,'pause',3,4,%s,'confirmed',clock_timestamp())""",
+        (operation, binding["manifest"], "9" * 64),
+    )
+    return operation
+
+
+def test_actual_frozen_session_locks_block_control_and_release_only_on_exit(actual):
+    connection, reader, binding, _, _, _ = actual
+    operation = close_fixture(connection, binding)
+    phase("before_actual_frozen_pg_lock_acquire")
+    with reader.locked(operation, binding["manifest"]) as held:
+        assert held.check() == held.lock_identity
+        for namespace in (20261024, 20261023):
+            assert (
+                connection.execute(
+                    "SELECT pg_try_advisory_lock(%s,%s)",
+                    (namespace, reader.expected["state_table_oid"]),
+                ).fetchone()[0]
+                is False
+            )
+        assert held.snapshot["states"]["acked"] == 1
+        phase("same_real_pg_activity_and_metadata_locks_retained")
+    for namespace in (20261024, 20261023):
+        assert (
+            connection.execute(
+                "SELECT pg_try_advisory_lock(%s,%s)",
+                (namespace, reader.expected["state_table_oid"]),
+            ).fetchone()[0]
+            is True
+        )
+        connection.execute(
+            "SELECT pg_advisory_unlock(%s,%s)",
+            (namespace, reader.expected["state_table_oid"]),
+        )
+    phase("actual_pg_locks_released_after_context")
+
+
+def test_actual_lost_lock_session_cannot_reconnect_or_confirm(actual):
+    connection, reader, binding, _, _, _ = actual
+    operation = close_fixture(connection, binding)
+    phase("before_actual_lost_pg_backend")
+    with pytest.raises(Exception):
+        with reader.locked(operation, binding["manifest"]) as held:
+            pid = held.lock_identity["backend_pid"]
+            assert (
+                connection.execute(
+                    "SELECT pg_terminate_backend(%s)", (pid,)
+                ).fetchone()[0]
+                is True
+            )
+            held.check()
+    assert (
+        connection.execute("SELECT phase FROM handoff_state").fetchone()[0] == "closed"
+    )
+    phase("backend_loss_retained_closed_no_reconnect_no_reopen")
+
+
+def test_actual_held_and_wrong_database_never_yield_empty_or_original_bundle(
+    actual, tmp_path
+):
+    connection, reader, binding, receipt, _, body = actual
+    connection.execute("UPDATE webhook_outbox SET state='held'")
+    import time
+
+    now = int(time.time())
+    with pytest.raises(Exception):
+        reader.freeze(
+            binding,
+            receipt,
+            {"not_before": now - 1, "expires_at": now + 300},
+            tmp_path / "blocked",
+        )
+    assert not (tmp_path / "blocked/manifest.json").exists()
+    assert (
+        bytes(connection.execute("SELECT body FROM webhook_outbox").fetchone()[0])
+        == body
+    )
+    reader.expected = {**reader.expected, "table_oid": reader.expected["table_oid"] + 1}
+    with pytest.raises(Exception):
+        reader.snapshot()
+    phase("actual_held_original_and_wrong_oid_blocked_without_repair")
