@@ -1,0 +1,4246 @@
+diff --git a/internal/api/category_handlers.go b/internal/api/category_handlers.go
+index ffa037b..0637476 100644
+--- a/internal/api/category_handlers.go
++++ b/internal/api/category_handlers.go
+@@ -191 +191,4 @@ func (h *handler) refreshCategoryHandler(w http.ResponseWriter, r *http.Request)
+-	go h.pool.Push(jobs)
++	if err := h.pool.PushAsync(jobs); err != nil {
++		response.JSONServerError(w, r, err)
++		return
++	}
+diff --git a/internal/api/entry_handlers.go b/internal/api/entry_handlers.go
+index 7733688..1c8577d 100644
+--- a/internal/api/entry_handlers.go
++++ b/internal/api/entry_handlers.go
+@@ -273 +273,4 @@ func (h *handler) saveEntryHandler(w http.ResponseWriter, r *http.Request) {
+-	go integration.SendEntry(entry, settings)
++	if err := integration.StartSaveEntry(h.store, entry, settings); err != nil {
++		response.JSONServerError(w, r, err)
++		return
++	}
+@@ -556 +559,9 @@ func (h *handler) flushHistoryHandler(w http.ResponseWriter, r *http.Request) {
+-	go h.store.FlushHistory(loggedUserID)
++	if config.Opts.HasHandoff() {
++		// The public HTTP lease must cover the write until it actually returns.
++		if err := h.store.FlushHistory(loggedUserID); err != nil {
++			response.JSONServerError(w, r, err)
++			return
++		}
++	} else {
++		go h.store.FlushHistory(loggedUserID)
++	}
+diff --git a/internal/api/feed_handlers.go b/internal/api/feed_handlers.go
+index f589e6d..bd731fe 100644
+--- a/internal/api/feed_handlers.go
++++ b/internal/api/feed_handlers.go
+@@ -97 +97,4 @@ func (h *handler) refreshAllFeedsHandler(w http.ResponseWriter, r *http.Request)
+-	go h.pool.Push(jobs)
++	if err := h.pool.PushAsync(jobs); err != nil {
++		response.JSONServerError(w, r, err)
++		return
++	}
+diff --git a/internal/api/middleware.go b/internal/api/middleware.go
+index 789428e..cbf1006 100644
+--- a/internal/api/middleware.go
++++ b/internal/api/middleware.go
+@@ -76,0 +77,3 @@ func (m *middleware) validateAPIKeyAuth(next http.Handler) http.Handler {
++		if !request.AcquireAuthenticatedHandoff(w, r) {
++			return
++		}
+@@ -160,0 +164,3 @@ func (m *middleware) validateBasicAuth(next http.Handler) http.Handler {
++		if !request.AcquireAuthenticatedHandoff(w, r) {
++			return
++		}
+diff --git a/internal/api/user_handlers.go b/internal/api/user_handlers.go
+index f7a6fe7..8c58af0 100644
+--- a/internal/api/user_handlers.go
++++ b/internal/api/user_handlers.go
+@@ -11,0 +12 @@ import (
++	"miniflux.app/v2/internal/config"
+@@ -263 +264,2 @@ func (h *handler) removeUserHandler(w http.ResponseWriter, r *http.Request) {
+-	go func() {
++	if config.Opts.HasHandoff() {
++		// Keep the existing HTTP lease until cascading database work completes.
+@@ -265,4 +267,2 @@ func (h *handler) removeUserHandler(w http.ResponseWriter, r *http.Request) {
+-			slog.Error("Unable to delete user",
+-				slog.Int64("user_id", user.ID),
+-				slog.Any("error", err),
+-			)
++			response.JSONServerError(w, r, err)
++			return
+@@ -270 +270,10 @@ func (h *handler) removeUserHandler(w http.ResponseWriter, r *http.Request) {
+-	}()
++	} else {
++		go func() {
++			if err := h.store.RemoveUser(user.ID); err != nil {
++				slog.Error("Unable to delete user",
++					slog.Int64("user_id", user.ID),
++					slog.Any("error", err),
++				)
++			}
++		}()
++	}
+diff --git a/internal/cli/cleanup_tasks.go b/internal/cli/cleanup_tasks.go
+index f7b0c37..74ec5c2 100644
+--- a/internal/cli/cleanup_tasks.go
++++ b/internal/cli/cleanup_tasks.go
+@@ -10,0 +11 @@ import (
++	"miniflux.app/v2/internal/handoff"
+@@ -16,0 +18,8 @@ func runCleanupTasks(store *storage.Storage) {
++	lease, gateErr := store.BeginHandoff("cleanup")
++	if gateErr != nil {
++		slog.Warn("Handoff cleanup admission refused")
++		return
++	}
++	if lease != nil {
++		defer handoff.FinishOnReturn(lease)
++	}
+diff --git a/internal/cli/cli.go b/internal/cli/cli.go
+index 00b39fa..1ca12a0 100644
+--- a/internal/cli/cli.go
++++ b/internal/cli/cli.go
+@@ -168,0 +169,8 @@ func Parse() {
++	if config.Opts.HasHandoff() {
++		leaseDB, leaseErr := database.NewConnectionPool(config.Opts.DatabaseURL(), 0, 32, config.Opts.DatabaseConnectionLifetime())
++		if leaseErr != nil {
++			printErrorAndExit(leaseErr)
++		}
++		defer leaseDB.Close()
++		store.ConfigureHandoff(leaseDB)
++	}
+diff --git a/internal/cli/daemon.go b/internal/cli/daemon.go
+index 28687c6..d52ca6d 100644
+--- a/internal/cli/daemon.go
++++ b/internal/cli/daemon.go
+@@ -28,0 +29,4 @@ func startDaemon(store *storage.Storage) {
++	control, controlErr := startHandoffControl(store)
++	if controlErr != nil {
++		printErrorAndExit(controlErr)
++	}
+@@ -41,0 +46,3 @@ func startDaemon(store *storage.Storage) {
++	if control != nil {
++		httpServers = append(httpServers, control)
++	}
+@@ -43 +50 @@ func startDaemon(store *storage.Storage) {
+-		httpServers = server.StartWebServer(store, pool)
++		httpServers = append(httpServers, server.StartWebServer(store, pool)...)
+diff --git a/internal/cli/handoff_control.go b/internal/cli/handoff_control.go
+new file mode 100644
+index 0000000..b84fb39
+--- /dev/null
++++ b/internal/cli/handoff_control.go
+@@ -0,0 +1,114 @@
++// SPDX-License-Identifier: Apache-2.0
++package cli
++
++import (
++	"context"
++	"crypto/subtle"
++	"encoding/json"
++	"errors"
++	"io"
++	"net"
++	"net/http"
++	"strings"
++	"time"
++
++	"miniflux.app/v2/internal/config"
++	"miniflux.app/v2/internal/handoff"
++	"miniflux.app/v2/internal/storage"
++)
++
++func handoffFields(r *http.Request) (map[string]string, error) {
++	defer r.Body.Close()
++	decoder := json.NewDecoder(io.LimitReader(r.Body, 1025))
++	token, err := decoder.Token()
++	if err != nil || token != json.Delim('{') {
++		return nil, errors.New("object required")
++	}
++	values := map[string]string{}
++	for decoder.More() {
++		key, err := decoder.Token()
++		name, ok := key.(string)
++		if err != nil || !ok || (name != "operation_id" && name != "closed_operation_id") {
++			return nil, errors.New("invalid field")
++		}
++		if _, exists := values[name]; exists {
++			return nil, errors.New("duplicate field")
++		}
++		var value string
++		if decoder.Decode(&value) != nil {
++			return nil, errors.New("string required")
++		}
++		values[name] = value
++	}
++	if _, err := decoder.Token(); err != nil {
++		return nil, err
++	}
++	if _, err := decoder.Token(); err != io.EOF {
++		return nil, errors.New("trailing data")
++	}
++	if values["operation_id"] == "" {
++		return nil, errors.New("operation required")
++	}
++	return values, nil
++}
++
++func handoffControlHandler(store *storage.Storage) http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		want := "Bearer " + config.Opts.HandoffControlToken()
++		if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte(want)) != 1 {
++			http.Error(w, "unauthorized", http.StatusUnauthorized)
++			return
++		}
++		if r.Method == "GET" && r.URL.Path == "/registration" {
++			json.NewEncoder(w).Encode(map[string]any{"schema": 1, "manifest": config.Opts.HandoffManifest(), "protocol": "miniflux-pg-handoff-v1", "business_open_not_assumed": true})
++			return
++		}
++		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
++		defer cancel()
++		var result any
++		var err error
++		if r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/operations/") {
++			result, err = store.QueryHandoff(ctx, strings.TrimPrefix(r.URL.Path, "/operations/"))
++		} else if r.Method == "POST" {
++			var fields map[string]string
++			fields, err = handoffFields(r)
++			if err == nil {
++				switch r.URL.Path {
++				case "/initialize":
++					result, err = store.InitializeHandoff(ctx, fields["operation_id"])
++				case "/pause":
++					result, err = store.PauseHandoff(ctx, fields["operation_id"])
++				case "/resume":
++					result, err = store.ResumeHandoff(ctx, fields["closed_operation_id"], fields["operation_id"])
++				default:
++					http.NotFound(w, r)
++					return
++				}
++			}
++		} else {
++			http.NotFound(w, r)
++			return
++		}
++		receipt, ok := result.(handoff.Receipt)
++		confirmed := err == nil && ok && receipt.Durable && receipt.Confirmed
++		if !confirmed {
++			w.WriteHeader(http.StatusConflict)
++		}
++		json.NewEncoder(w).Encode(map[string]any{"result": result, "confirmed": confirmed})
++	})
++}
++
++func startHandoffControl(store *storage.Storage) (*http.Server, error) {
++	if !config.Opts.HasHandoff() {
++		return nil, nil
++	}
++	listener, err := net.Listen("tcp", config.Opts.HandoffControlAddr())
++	if err != nil {
++		return nil, err
++	}
++	server := &http.Server{Handler: handoffControlHandler(store), ReadHeaderTimeout: time.Second,
++		ReadTimeout: 4 * time.Second, WriteTimeout: 4 * time.Second, IdleTimeout: time.Second}
++	go server.Serve(listener)
++	return server, nil
++}
+diff --git a/internal/cli/handoff_control_test.go b/internal/cli/handoff_control_test.go
+new file mode 100644
+index 0000000..8e43a12
+--- /dev/null
++++ b/internal/cli/handoff_control_test.go
+@@ -0,0 +1,20 @@
++// SPDX-License-Identifier: Apache-2.0
++package cli
++
++import (
++	"net/http/httptest"
++	"strings"
++	"testing"
++)
++
++func TestHandoffControlStrictCommandBody(t *testing.T) {
++	for _, body := range []string{`{}`, `{"operation_id":"a","operation_id":"b"}`, `{"operation_id":true}`, `{"operation_id":"a","unknown":"b"}`, `{"operation_id":"a"} {}`, "{\"operation_id\":\"" + strings.Repeat("a", 1100) + "\"}"} {
++		if _, err := handoffFields(httptest.NewRequest("POST", "/pause", strings.NewReader(body))); err == nil {
++			t.Fatal("accepted malformed command")
++		}
++	}
++	fields, err := handoffFields(httptest.NewRequest("POST", "/pause", strings.NewReader(`{"operation_id":"exact"}`)))
++	if err != nil || fields["operation_id"] != "exact" {
++		t.Fatal("valid command rejected")
++	}
++}
+diff --git a/internal/cli/scheduler.go b/internal/cli/scheduler.go
+index 1cfad36..2f1425a 100644
+--- a/internal/cli/scheduler.go
++++ b/internal/cli/scheduler.go
+@@ -10,0 +11 @@ import (
++	"miniflux.app/v2/internal/handoff"
+@@ -35,14 +36,26 @@ func feedScheduler(store *storage.Storage, pool *worker.Pool, frequency time.Dur
+-		// Generate a batch of feeds for any user that has feeds to refresh.
+-		jobs, err := store.NewBatchBuilder().
+-			WithBatchSize(batchSize).
+-			WithErrorLimit(errorLimit).
+-			WithoutDisabledFeeds().
+-			WithNextCheckExpired().
+-			WithLimitPerHost(limitPerHost).
+-			FetchJobs()
+-
+-		if err != nil {
+-			slog.Error("Unable to fetch jobs from database", slog.Any("error", err))
+-		} else if len(jobs) > 0 {
+-			slog.Debug("Feed URLs in this batch", slog.Any("feed_urls", jobs.FeedURLs()))
+-			pool.Push(jobs)
++		scheduleFeedBatch(store, pool, batchSize, errorLimit, limitPerHost)
++	}
++}
++
++func scheduleFeedBatch(store *storage.Storage, pool *worker.Pool, batchSize, errorLimit, limitPerHost int) {
++	lease, gateErr := store.BeginHandoff("scheduler")
++	if gateErr != nil {
++		slog.Warn("Handoff scheduler admission refused")
++		return
++	}
++	defer handoff.FinishOnReturn(lease)
++	// Generate a batch of feeds for any user that has feeds to refresh.
++	jobs, err := store.NewBatchBuilder().
++		WithBatchSize(batchSize).
++		WithErrorLimit(errorLimit).
++		WithoutDisabledFeeds().
++		WithNextCheckExpired().
++		WithLimitPerHost(limitPerHost).
++		FetchJobs()
++
++	if err != nil {
++		slog.Error("Unable to fetch jobs from database", slog.Any("error", err))
++	} else if len(jobs) > 0 {
++		slog.Debug("Feed URLs in this batch", slog.Any("feed_urls", jobs.FeedURLs()))
++		if err := pool.Push(jobs); err != nil {
++			slog.Warn("Handoff scheduler enqueue incomplete")
+diff --git a/internal/config/handoff.go b/internal/config/handoff.go
+new file mode 100644
+index 0000000..a562e10
+--- /dev/null
++++ b/internal/config/handoff.go
+@@ -0,0 +1,47 @@
++// SPDX-License-Identifier: Apache-2.0
++package config
++
++import (
++	"encoding/hex"
++	"errors"
++	"net"
++	"strconv"
++	"strings"
++)
++
++func (c *configOptions) HasHandoff() bool {
++	return c != nil && c.options["HANDOFF_ENABLED"].parsedBoolValue
++}
++func (c *configOptions) HandoffManifest() string {
++	return c.options["HANDOFF_MANIFEST"].parsedStringValue
++}
++func (c *configOptions) HandoffControlAddr() string {
++	return c.options["HANDOFF_CONTROL_ADDR"].parsedStringValue
++}
++func (c *configOptions) HandoffControlToken() string {
++	return c.options["HANDOFF_CONTROL_TOKEN"].parsedStringValue
++}
++
++func (c *configOptions) validateHandoff() error {
++	if !c.HasHandoff() {
++		return nil
++	}
++	if !c.HasWebhookOutbox() {
++		return errors.New("HANDOFF_ENABLED requires transactional WEBHOOK_OUTBOX; unpreserved legacy refresh is refused")
++	}
++	if strings.TrimSpace(c.WebhookOutboxContract()) == "" {
++		return errors.New("handoff requires a nonempty webhook outbox contract")
++	}
++	for _, value := range []string{c.HandoffManifest(), c.HandoffControlToken()} {
++		decoded, err := hex.DecodeString(value)
++		if err != nil || len(decoded) != 32 || value != strings.ToLower(value) {
++			return errors.New("handoff manifest and token require 64 hex characters")
++		}
++	}
++	host, port, err := net.SplitHostPort(c.HandoffControlAddr())
++	number, portErr := strconv.Atoi(port)
++	if err != nil || portErr != nil || number < 1 || number > 65535 || (host != "127.0.0.1" && host != "::1") {
++		return errors.New("handoff control must bind an explicit loopback port")
++	}
++	return nil
++}
+diff --git a/internal/config/handoff_test.go b/internal/config/handoff_test.go
+new file mode 100644
+index 0000000..193ab89
+--- /dev/null
++++ b/internal/config/handoff_test.go
+@@ -0,0 +1,45 @@
++// SPDX-License-Identifier: Apache-2.0
++package config
++
++import (
++	"strings"
++	"testing"
++)
++
++func TestHandoffConfigurationFailClosedAndDefaultOff(t *testing.T) {
++	var unset *configOptions
++	if unset.HasHandoff() {
++		t.Fatal("uninitialized options must preserve default-off behavior")
++	}
++	if NewConfigOptions().HasHandoff() {
++		t.Fatal("default open control")
++	}
++	valid := []string{"HANDOFF_ENABLED=1", "WEBHOOK_OUTBOX=1", "WEBHOOK_OUTBOX_CONTRACT=synthetic",
++		"HANDOFF_MANIFEST=" + strings.Repeat("a", 64), "HANDOFF_CONTROL_TOKEN=" + strings.Repeat("b", 64),
++		"HANDOFF_CONTROL_ADDR=127.0.0.1:19002"}
++	cp := NewConfigParser()
++	if err := cp.parseLines(valid); err != nil {
++		t.Fatal(err)
++	}
++	if err := cp.options.Validate(); err != nil {
++		t.Fatal(err)
++	}
++	for _, invalid := range []string{"WEBHOOK_OUTBOX=0", "WEBHOOK_OUTBOX_CONTRACT=", "WEBHOOK_OUTBOX_CONTRACT=   ", "HANDOFF_MANIFEST=bad", "HANDOFF_MANIFEST=" + strings.Repeat("A", 64), "HANDOFF_CONTROL_TOKEN=bad", "HANDOFF_CONTROL_TOKEN=" + strings.Repeat("B", 64), "HANDOFF_CONTROL_ADDR=:19002", "HANDOFF_CONTROL_ADDR=localhost:19002", "HANDOFF_CONTROL_ADDR=127.0.0.1:0", "HANDOFF_CONTROL_ADDR=127.0.0.1:banana", "HANDOFF_CONTROL_ADDR=192.0.2.1:19002"} {
++		t.Run(invalid, func(t *testing.T) {
++			cp := NewConfigParser()
++			key := strings.SplitN(invalid, "=", 2)[0] + "="
++			lines := []string{}
++			for _, line := range valid {
++				if !strings.HasPrefix(line, key) {
++					lines = append(lines, line)
++				}
++			}
++			if err := cp.parseLines(append(lines, invalid)); err != nil {
++				return
++			}
++			if cp.options.Validate() == nil {
++				t.Fatal("invalid handoff configuration accepted")
++			}
++		})
++	}
++}
+diff --git a/internal/config/options.go b/internal/config/options.go
+index 5ba94d4..0524ac9 100644
+--- a/internal/config/options.go
++++ b/internal/config/options.go
+@@ -68,0 +69,4 @@ func NewConfigOptions() *configOptions {
++			"HANDOFF_ENABLED":       {rawValue: "0", valueType: boolType},
++			"HANDOFF_MANIFEST":      {valueType: stringType},
++			"HANDOFF_CONTROL_ADDR":  {valueType: stringType},
++			"HANDOFF_CONTROL_TOKEN": {valueType: stringType, secret: true},
+diff --git a/internal/config/parser.go b/internal/config/parser.go
+index 9859e41..0d5122e 100644
+--- a/internal/config/parser.go
++++ b/internal/config/parser.go
+@@ -54,0 +55,3 @@ func (c *configOptions) Validate() error {
++	if err := c.validateHandoff(); err != nil {
++		return err
++	}
+diff --git a/internal/database/handoff.go b/internal/database/handoff.go
+new file mode 100644
+index 0000000..eda55ec
+--- /dev/null
++++ b/internal/database/handoff.go
+@@ -0,0 +1,14 @@
++// SPDX-License-Identifier: Apache-2.0
++package database
++
++import (
++	"database/sql"
++	"miniflux.app/v2/internal/handoff"
++)
++
++func handoffMigration(tx *sql.Tx) error {
++	if err := handoff.Migrate(tx); err != nil {
++		return err
++	}
++	return legacyHandoffMigration(tx)
++}
+diff --git a/internal/database/legacy_handoff.go b/internal/database/legacy_handoff.go
+new file mode 100644
+index 0000000..9c25c89
+--- /dev/null
++++ b/internal/database/legacy_handoff.go
+@@ -0,0 +1,26 @@
++// SPDX-License-Identifier: Apache-2.0
++package database
++
++import "database/sql"
++
++// legacyHandoffMigration is part of reviewed migration 133, not an independent
++// automatic migration. These originals are held evidence, never delivery jobs.
++func legacyHandoffMigration(tx *sql.Tx) error {
++	_, err := tx.Exec(`CREATE TABLE webhook_legacy_originals (
++ delivery_id text PRIMARY KEY CHECK(delivery_id ~ '^[a-f0-9]{64}$'),
++ body_sha256 text NOT NULL CHECK(body_sha256=delivery_id),
++ event_type text NOT NULL CHECK(event_type='save_entry'),
++ user_id bigint NOT NULL CHECK(user_id>0), feed_id bigint NOT NULL CHECK(feed_id>0), entry_id bigint NOT NULL CHECK(entry_id>0),
++ target_url text NOT NULL, signature text NOT NULL CHECK(signature ~ '^[a-f0-9]{64}$'),
++ contract text NOT NULL CHECK(contract<>''), body bytea NOT NULL,
++ state text NOT NULL DEFAULT 'held' CHECK(state='held'),
++ reason text NOT NULL DEFAULT 'unsupported_save_entry_requires_manual_review',
++ created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
++ CHECK(octet_length(body) BETWEEN 1 AND 1048576), CHECK(encode(sha256(body),'hex')=body_sha256)
++ );
++ CREATE FUNCTION protect_legacy_handoff_original() RETURNS trigger LANGUAGE plpgsql AS $$
++ BEGIN RAISE EXCEPTION 'legacy original is immutable retained evidence'; END $$;
++ CREATE TRIGGER legacy_handoff_original_guard BEFORE UPDATE OR DELETE ON webhook_legacy_originals
++ FOR EACH ROW EXECUTE FUNCTION protect_legacy_handoff_original();`)
++	return err
++}
+diff --git a/internal/database/migrations.go b/internal/database/migrations.go
+index 84cbe03..348ab1c 100644
+--- a/internal/database/migrations.go
++++ b/internal/database/migrations.go
+@@ -1548,0 +1549 @@ var migrations = [...]func(tx *sql.Tx) error{
++	handoffMigration,
+diff --git a/internal/fever/handler.go b/internal/fever/handler.go
+index 3945e42..162b371 100644
+--- a/internal/fever/handler.go
++++ b/internal/fever/handler.go
+@@ -458,3 +458,4 @@ func (h *feverHandler) handleWriteItems(w http.ResponseWriter, r *http.Request)
+-		go func() {
+-			integration.SendEntry(entry, settings)
+-		}()
++		if err := integration.StartSaveEntry(h.store, entry, settings); err != nil {
++			response.JSONServerError(w, r, err)
++			return
++		}
+diff --git a/internal/fever/middleware.go b/internal/fever/middleware.go
+index 357c8d9..5c371b7 100644
+--- a/internal/fever/middleware.go
++++ b/internal/fever/middleware.go
+@@ -61,0 +62,3 @@ func Middleware(store *storage.Storage) func(http.Handler) http.Handler {
++			if !request.AcquireAuthenticatedHandoff(w, r) {
++				return
++			}
+diff --git a/internal/googlereader/handler.go b/internal/googlereader/handler.go
+index 82b35ef..6dc3e35 100644
+--- a/internal/googlereader/handler.go
++++ b/internal/googlereader/handler.go
+@@ -130,0 +131,3 @@ func (h *greaderHandler) clientLoginHandler(w http.ResponseWriter, r *http.Reque
++	if !request.AcquireAuthenticatedHandoff(w, r) {
++		return
++	}
+@@ -312,4 +315,4 @@ func (h *greaderHandler) editTagHandler(w http.ResponseWriter, r *http.Request)
+-			e := entry
+-			go func() {
+-				integration.SendEntry(e, settings)
+-			}()
++			if err := integration.StartSaveEntry(h.store, entry, settings); err != nil {
++				response.JSONServerError(w, r, err)
++				return
++			}
+diff --git a/internal/googlereader/middleware.go b/internal/googlereader/middleware.go
+index 9450ed0..c0aba63 100644
+--- a/internal/googlereader/middleware.go
++++ b/internal/googlereader/middleware.go
+@@ -168,0 +169,3 @@ func (m *authMiddleware) serveValidated(w http.ResponseWriter, r *http.Request,
++	if !request.AcquireAuthenticatedHandoff(w, r) {
++		return
++	}
+diff --git a/internal/handoff/handoff.go b/internal/handoff/handoff.go
+new file mode 100644
+index 0000000..b4db6f2
+--- /dev/null
++++ b/internal/handoff/handoff.go
+@@ -0,0 +1,695 @@
++// SPDX-License-Identifier: Apache-2.0
++// Package handoff implements a durable admission gate, not a delivery ACK.
++// A retained active/uncertain lease blocks closing even after its backend dies.
++package handoff
++
++import (
++	"context"
++	"crypto/rand"
++	"database/sql"
++	"database/sql/driver"
++	"encoding/hex"
++	"errors"
++	"fmt"
++	"log/slog"
++	"regexp"
++	"sync"
++	"time"
++)
++
++var (
++	ErrClosed    = errors.New("handoff admission is closed or uninitialized")
++	ErrConflict  = errors.New("handoff identity or operation conflict")
++	ErrUncertain = errors.New("handoff work completion is uncertain")
++	identifier   = regexp.MustCompile(`^[a-f0-9]{64}$`)
++	sourceName   = regexp.MustCompile(`^[a-zA-Z0-9_.:-]{1,96}$`)
++)
++
++const metadataNamespace = 20261023
++const activityNamespace = 20261024
++
++// Records are retained rather than silently garbage collected. At this bound
++// admission/control refuse further records; an operator must review retention.
++const MaxRetainedRecords = 10000
++
++// SchemaSQL is installed only by migration 133. There is deliberately no OPEN
++// seed row: enabling the feature requires an explicit Initialize operation.
++const SchemaSQL = `
++CREATE TABLE handoff_state (
++ id integer PRIMARY KEY CHECK(id=1),
++ manifest text NOT NULL CHECK(manifest ~ '^[a-f0-9]{64}$'),
++ generation bigint NOT NULL CHECK(generation>=0),
++ phase text NOT NULL CHECK(phase IN ('open','closing','closed')),
++ current_operation text NOT NULL CHECK(current_operation ~ '^[a-f0-9]{64}$')
++);
++CREATE TABLE handoff_operations (
++ operation_id text PRIMARY KEY CHECK(operation_id ~ '^[a-f0-9]{64}$'),
++ manifest text NOT NULL CHECK(manifest ~ '^[a-f0-9]{64}$'),
++ action text NOT NULL CHECK(action IN ('initialize','pause','resume')),
++ previous_generation bigint NOT NULL CHECK(previous_generation>=-1),
++ generation bigint NOT NULL CHECK(generation=previous_generation+1),
++ prior_operation text NOT NULL,
++ status text NOT NULL CHECK(status IN ('pending','confirmed')),
++ created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
++ confirmed_at timestamptz
++);
++CREATE TABLE handoff_leases (
++ lease_id text PRIMARY KEY CHECK(lease_id ~ '^[a-f0-9]{32}$'),
++ manifest text NOT NULL CHECK(manifest ~ '^[a-f0-9]{64}$'),
++ source text NOT NULL CHECK(length(source) BETWEEN 1 AND 96),
++ status text NOT NULL CHECK(status IN ('active','finished','uncertain')),
++ backend_pid integer NOT NULL,
++ created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
++ finished_at timestamptz
++);
++CREATE INDEX handoff_unfinished_leases ON handoff_leases(status) WHERE status <> 'finished';
++CREATE FUNCTION handoff_preserve_evidence() RETURNS trigger LANGUAGE plpgsql AS $$
++BEGIN
++ IF TG_OP='DELETE' THEN RAISE EXCEPTION 'handoff evidence cannot be deleted'; END IF;
++ IF TG_TABLE_NAME='handoff_operations' THEN
++  IF NEW.operation_id<>OLD.operation_id OR NEW.manifest<>OLD.manifest OR NEW.action<>OLD.action
++   OR NEW.previous_generation<>OLD.previous_generation OR NEW.generation<>OLD.generation
++   OR NEW.prior_operation<>OLD.prior_operation OR NEW.created_at<>OLD.created_at
++   OR OLD.status<>'pending' OR NEW.status<>'confirmed' OR NEW.confirmed_at IS NULL
++  THEN RAISE EXCEPTION 'handoff operation identity is immutable'; END IF;
++ ELSE
++  IF NEW.lease_id<>OLD.lease_id OR NEW.manifest<>OLD.manifest OR NEW.source<>OLD.source
++   OR NEW.backend_pid<>OLD.backend_pid OR NEW.created_at<>OLD.created_at
++   OR OLD.status<>'active' OR NEW.status NOT IN ('finished','uncertain') OR NEW.finished_at IS NULL
++  THEN RAISE EXCEPTION 'handoff lease identity is immutable'; END IF;
++ END IF;
++ RETURN NEW;
++END $$;
++CREATE TRIGGER handoff_operations_guard BEFORE UPDATE OR DELETE ON handoff_operations
++ FOR EACH ROW EXECUTE FUNCTION handoff_preserve_evidence();
++CREATE TRIGGER handoff_leases_guard BEFORE UPDATE OR DELETE ON handoff_leases
++ FOR EACH ROW EXECUTE FUNCTION handoff_preserve_evidence();
++`
++
++func Migrate(tx *sql.Tx) error { _, err := tx.Exec(SchemaSQL); return err }
++
++type Receipt struct {
++	Schema             int    `json:"schema"`
++	Manifest           string `json:"manifest"`
++	OperationID        string `json:"operation_id"`
++	Action             string `json:"action"`
++	State              string `json:"state"`
++	PreviousGeneration int64  `json:"previous_generation"`
++	Generation         int64  `json:"generation"`
++	Durable            bool   `json:"durable"`
++	Confirmed          bool   `json:"confirmed"`
++	ActiveLeases       int64  `json:"active_leases"`
++	UncertainLeases    int64  `json:"uncertain_leases"`
++}
++
++type state struct {
++	manifest, phase, operation string
++	generation                 int64
++}
++
++func validate(manifest, operation string) error {
++	if !identifier.MatchString(manifest) || !identifier.MatchString(operation) {
++		return ErrConflict
++	}
++	return nil
++}
++
++func beginTx(ctx context.Context, conn *sql.Conn) (*sql.Tx, error) {
++	tx, err := conn.BeginTx(ctx, nil)
++	if err != nil {
++		return nil, err
++	}
++	if _, err = tx.ExecContext(ctx, `SET LOCAL synchronous_commit=on`); err != nil {
++		tx.Rollback()
++		return nil, err
++	}
++	var durable bool
++	err = tx.QueryRowContext(ctx, `SELECT current_setting('fsync')='on' AND current_setting('full_page_writes')='on'`).Scan(&durable)
++	if err != nil || !durable {
++		tx.Rollback()
++		if err == nil {
++			err = errors.New("handoff requires fsync and full_page_writes")
++		}
++		return nil, err
++	}
++	if _, err = tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1, 'handoff_state'::regclass::oid::integer)`, metadataNamespace); err != nil {
++		tx.Rollback()
++		return nil, err
++	}
++	return tx, nil
++}
++
++func readState(ctx context.Context, tx *sql.Tx) (state, error) {
++	var s state
++	err := tx.QueryRowContext(ctx, `SELECT manifest,generation,phase,current_operation FROM handoff_state WHERE id=1 FOR UPDATE`).Scan(&s.manifest, &s.generation, &s.phase, &s.operation)
++	return s, err
++}
++
++// discard never returns a session advisory lock to the pool, including after
++// uncertain network failures. A lost backend leaves its durable lease active.
++func discard(conn *sql.Conn) {
++	if conn != nil {
++		_ = conn.Raw(func(any) error { return driver.ErrBadConn })
++		_ = conn.Close()
++	}
++}
++
++func activity(ctx context.Context, conn *sql.Conn, shared bool) (bool, error) {
++	query := `SELECT pg_try_advisory_lock($1, 'handoff_state'::regclass::oid::integer)`
++	if shared {
++		query = `SELECT pg_try_advisory_lock_shared($1, 'handoff_state'::regclass::oid::integer)`
++	}
++	var got bool
++	err := conn.QueryRowContext(ctx, query, activityNamespace).Scan(&got)
++	return got, err
++}
++
++// Lease owns a dedicated physical session until Finish or Abort. The supplied
++// pool MUST be separate from the business SQL pool to avoid pool starvation.
++type Lease struct {
++	mu           sync.Mutex
++	db           *sql.DB
++	conn         *sql.Conn
++	manifest, id string
++	done         string
++}
++
++func Begin(ctx context.Context, db *sql.DB, manifest, source string) (*Lease, error) {
++	if db == nil || !identifier.MatchString(manifest) || !sourceName.MatchString(source) {
++		return nil, ErrConflict
++	}
++	conn, err := db.Conn(ctx)
++	if err != nil {
++		return nil, err
++	}
++	keep := false
++	defer func() {
++		if !keep {
++			discard(conn)
++		}
++	}()
++	got, err := activity(ctx, conn, true)
++	if err != nil {
++		return nil, err
++	}
++	if !got {
++		return nil, ErrClosed
++	}
++	tx, err := beginTx(ctx, conn)
++	if err != nil {
++		return nil, err
++	}
++	defer tx.Rollback()
++	s, err := readState(ctx, tx)
++	if errors.Is(err, sql.ErrNoRows) {
++		return nil, ErrClosed
++	}
++	if err != nil {
++		return nil, err
++	}
++	if s.manifest != manifest {
++		return nil, ErrConflict
++	}
++	if s.phase != "open" {
++		return nil, ErrClosed
++	}
++	var count int
++	if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM handoff_leases`).Scan(&count); err != nil {
++		return nil, err
++	}
++	if count >= MaxRetainedRecords {
++		return nil, errors.New("handoff retained lease capacity reached")
++	}
++	if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM handoff_operations`).Scan(&count); err != nil {
++		return nil, err
++	}
++	if count >= MaxRetainedRecords {
++		return nil, errors.New("handoff retained operation capacity reached")
++	}
++	var random [16]byte
++	if _, err = rand.Read(random[:]); err != nil {
++		return nil, err
++	}
++	id := hex.EncodeToString(random[:])
++	_, err = tx.ExecContext(ctx, `INSERT INTO handoff_leases(lease_id,manifest,source,status,backend_pid) VALUES($1,$2,$3,'active',pg_backend_pid())`, id, manifest, source)
++	if err != nil {
++		return nil, err
++	}
++	if err = tx.Commit(); err != nil {
++		return nil, err
++	}
++	keep = true
++	return &Lease{db: db, conn: conn, manifest: manifest, id: id}, nil
++}
++
++func (l *Lease) check(ctx context.Context) error {
++	if l == nil || l.conn == nil || l.done != "" {
++		return ErrUncertain
++	}
++	var valid bool
++	err := l.conn.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM handoff_leases WHERE lease_id=$1 AND manifest=$2 AND status='active' AND backend_pid=pg_backend_pid()) AND EXISTS(SELECT 1 FROM pg_locks WHERE pid=pg_backend_pid() AND locktype='advisory' AND classid=$3::oid AND objid='handoff_state'::regclass::oid AND objsubid=2 AND mode='ShareLock' AND granted)`, l.id, l.manifest, activityNamespace).Scan(&valid)
++	if err != nil {
++		return err
++	}
++	if !valid {
++		return ErrUncertain
++	}
++	return nil
++}
++
++func (l *Lease) Check(ctx context.Context) error {
++	if l == nil {
++		return ErrConflict
++	}
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	err := l.check(ctx)
++	if err != nil {
++		discard(l.conn)
++		l.conn = nil
++	}
++	return err
++}
++
++func (l *Lease) Matches(db *sql.DB, manifest string) error {
++	if l == nil {
++		return ErrConflict
++	}
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	if l.db != db || l.manifest != manifest {
++		return ErrConflict
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
++	defer cancel()
++	err := l.check(ctx)
++	if err != nil {
++		discard(l.conn)
++		l.conn = nil
++	}
++	return err
++}
++
++func (l *Lease) finish(outcome string) error {
++	if l == nil {
++		return ErrConflict
++	}
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	if l.done != "" {
++		if l.done == outcome {
++			return nil
++		}
++		return ErrConflict
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
++	defer cancel()
++	if err := l.check(ctx); err != nil {
++		discard(l.conn)
++		l.conn = nil
++		return err
++	}
++	tx, err := beginTx(ctx, l.conn)
++	if err != nil {
++		discard(l.conn)
++		l.conn = nil
++		return err
++	}
++	defer tx.Rollback()
++	res, err := tx.ExecContext(ctx, `UPDATE handoff_leases SET status=$1,finished_at=clock_timestamp() WHERE lease_id=$2 AND manifest=$3 AND status='active' AND backend_pid=pg_backend_pid()`, outcome, l.id, l.manifest)
++	if err == nil {
++		var n int64
++		n, err = res.RowsAffected()
++		if err == nil && n != 1 {
++			err = ErrConflict
++		}
++	}
++	if err == nil {
++		err = tx.Commit()
++	}
++	discard(l.conn)
++	l.conn = nil
++	if err == nil {
++		l.done = outcome
++	}
++	return err
++}
++
++func (l *Lease) Finish() error { return l.finish("finished") }
++func (l *Lease) Abort() error  { return l.finish("uncertain") }
++
++// FinishOnReturn must itself be directly deferred by the work owner. A panic
++// never turns the original active work into a successful completion marker.
++// SQL failure retains active/uncertain evidence and blocks drain confirmation.
++func FinishOnReturn(lease *Lease) {
++	if recovered := recover(); recovered != nil {
++		if lease != nil {
++			if err := lease.Abort(); err != nil {
++				slog.Error("handoff panic completion remains unconfirmed", "error", err)
++			}
++		}
++		panic(recovered)
++	}
++	if lease != nil {
++		if err := lease.Finish(); err != nil {
++			slog.Error("handoff work completion remains unconfirmed", "error", err)
++		}
++	}
++}
++
++func insertOperation(ctx context.Context, tx *sql.Tx, manifest, op, action, prior string, prev int64, confirmed bool) error {
++	var count int
++	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM handoff_operations`).Scan(&count); err != nil {
++		return err
++	}
++	limit := MaxRetainedRecords
++	if action == "resume" {
++		// Reopening must retain one slot for the next durable pause operation.
++		limit--
++	}
++	if count >= limit {
++		return errors.New("handoff retained operation capacity reached")
++	}
++	status := "pending"
++	if confirmed {
++		status = "confirmed"
++	}
++	_, err := tx.ExecContext(ctx, `INSERT INTO handoff_operations(operation_id,manifest,action,previous_generation,generation,prior_operation,status,confirmed_at) VALUES($1,$2,$3,$4::bigint,$4::bigint+1,$5,$6,CASE WHEN $6='confirmed' THEN clock_timestamp() ELSE NULL END)`, op, manifest, action, prev, prior, status)
++	return err
++}
++
++func readReceipt(ctx context.Context, tx *sql.Tx, manifest, op string) (Receipt, error) {
++	r := Receipt{Schema: 1, Manifest: manifest, OperationID: op}
++	var stored, status string
++	err := tx.QueryRowContext(ctx, `SELECT manifest,action,previous_generation,generation,status FROM handoff_operations WHERE operation_id=$1`, op).Scan(&stored, &r.Action, &r.PreviousGeneration, &r.Generation, &status)
++	if err != nil {
++		return r, err
++	}
++	if stored != manifest {
++		return r, ErrConflict
++	}
++	r.Confirmed = status == "confirmed"
++	r.State = "open"
++	if r.Action == "pause" {
++		r.State = "closing"
++		if r.Confirmed {
++			r.State = "closed"
++		}
++	}
++	err = tx.QueryRowContext(ctx, `SELECT count(*) FILTER(WHERE status='active'),count(*) FILTER(WHERE status='uncertain') FROM handoff_leases WHERE status<>'finished'`).Scan(&r.ActiveLeases, &r.UncertainLeases)
++	return r, err
++}
++
++// Initialize is explicit, empty-state-only, and idempotent only for its exact
++// operation. Application startup must never call it automatically.
++func Initialize(ctx context.Context, db *sql.DB, manifest, op string) (Receipt, error) {
++	var empty Receipt
++	if db == nil {
++		return empty, ErrConflict
++	}
++	if err := validate(manifest, op); err != nil {
++		return empty, err
++	}
++	conn, err := db.Conn(ctx)
++	if err != nil {
++		return empty, err
++	}
++	defer discard(conn)
++	tx, err := beginTx(ctx, conn)
++	if err != nil {
++		return empty, err
++	}
++	defer tx.Rollback()
++	s, err := readState(ctx, tx)
++	if err == nil {
++		if s.manifest != manifest || s.operation != op {
++			return empty, ErrConflict
++		}
++		r, e := readReceipt(ctx, tx, manifest, op)
++		if e != nil || r.Action != "initialize" {
++			return empty, ErrConflict
++		}
++		if e = tx.Commit(); e != nil {
++			return empty, e
++		}
++		r.Durable = true
++		return r, nil
++	}
++	if !errors.Is(err, sql.ErrNoRows) {
++		return empty, err
++	}
++	var rows int
++	err = tx.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM handoff_operations)+(SELECT count(*) FROM handoff_leases)`).Scan(&rows)
++	if err != nil {
++		return empty, err
++	}
++	if rows != 0 {
++		return empty, ErrConflict
++	}
++	if err = insertOperation(ctx, tx, manifest, op, "initialize", "", -1, true); err != nil {
++		return empty, err
++	}
++	_, err = tx.ExecContext(ctx, `INSERT INTO handoff_state VALUES(1,$1,0,'open',$2)`, manifest, op)
++	if err != nil {
++		return empty, err
++	}
++	r, err := readReceipt(ctx, tx, manifest, op)
++	if err != nil {
++		return empty, err
++	}
++	if err = tx.Commit(); err != nil {
++		return empty, err
++	}
++	r.Durable = true
++	return r, nil
++}
++
++// Pause first durably closes admission. If work remains, the returned receipt
++// is durable but NOT confirmed. Query the SAME operation later; never reset it.
++func Pause(ctx context.Context, db *sql.DB, manifest, op string) (Receipt, error) {
++	var empty Receipt
++	if db == nil {
++		return empty, ErrConflict
++	}
++	if err := validate(manifest, op); err != nil {
++		return empty, err
++	}
++	conn, err := db.Conn(ctx)
++	if err != nil {
++		return empty, err
++	}
++	defer discard(conn)
++	tx, err := beginTx(ctx, conn)
++	if err != nil {
++		return empty, err
++	}
++	defer tx.Rollback()
++	s, err := readState(ctx, tx)
++	if errors.Is(err, sql.ErrNoRows) {
++		return empty, ErrClosed
++	}
++	if err != nil {
++		return empty, err
++	}
++	if s.manifest != manifest {
++		return empty, ErrConflict
++	}
++	if s.operation == op {
++		r, e := readReceipt(ctx, tx, manifest, op)
++		if e != nil || r.Action != "pause" {
++			return empty, ErrConflict
++		}
++		if e = tx.Commit(); e != nil {
++			return empty, e
++		}
++		return confirmPause(ctx, conn, manifest, op)
++	}
++	if s.phase != "open" {
++		return empty, ErrClosed
++	}
++	if err = insertOperation(ctx, tx, manifest, op, "pause", s.operation, s.generation, false); err != nil {
++		return empty, err
++	}
++	_, err = tx.ExecContext(ctx, `UPDATE handoff_state SET phase='closing',generation=generation+1,current_operation=$1 WHERE id=1`, op)
++	if err != nil {
++		return empty, err
++	}
++	if err = tx.Commit(); err != nil {
++		return empty, err
++	}
++	return confirmPause(ctx, conn, manifest, op)
++}
++
++func confirmPause(ctx context.Context, conn *sql.Conn, manifest, op string) (Receipt, error) {
++	got, err := activity(ctx, conn, false)
++	if err != nil {
++		return Receipt{}, err
++	}
++	tx, err := beginTx(ctx, conn)
++	if err != nil {
++		return Receipt{}, err
++	}
++	defer tx.Rollback()
++	s, err := readState(ctx, tx)
++	if err != nil {
++		return Receipt{}, err
++	}
++	if s.manifest != manifest || s.operation != op || s.phase == "open" {
++		return Receipt{}, ErrConflict
++	}
++	r, err := readReceipt(ctx, tx, manifest, op)
++	if err != nil {
++		return r, err
++	}
++	if r.Action != "pause" || r.Generation != s.generation {
++		return r, ErrConflict
++	}
++	if got && r.ActiveLeases == 0 && r.UncertainLeases == 0 && !r.Confirmed {
++		_, err = tx.ExecContext(ctx, `UPDATE handoff_operations SET status='confirmed',confirmed_at=clock_timestamp() WHERE operation_id=$1 AND status='pending'`, op)
++		if err != nil {
++			return r, err
++		}
++		_, err = tx.ExecContext(ctx, `UPDATE handoff_state SET phase='closed' WHERE id=1`)
++		if err != nil {
++			return r, err
++		}
++		r.Confirmed = true
++		r.State = "closed"
++	}
++	if r.Confirmed && (!got || r.ActiveLeases != 0 || r.UncertainLeases != 0 || s.phase != "closed" && r.State != "closed") {
++		return r, ErrConflict
++	}
++	if err = tx.Commit(); err != nil {
++		return Receipt{}, err
++	}
++	r.Durable = true
++	return r, nil
++}
++
++// Query may finish a previously recorded closing operation; it is not a
++// read-only endpoint. Historical operations cannot certify the current state.
++func Query(ctx context.Context, db *sql.DB, manifest, op string) (Receipt, error) {
++	var empty Receipt
++	if db == nil {
++		return empty, ErrConflict
++	}
++	if err := validate(manifest, op); err != nil {
++		return empty, err
++	}
++	conn, err := db.Conn(ctx)
++	if err != nil {
++		return empty, err
++	}
++	defer discard(conn)
++	tx, err := beginTx(ctx, conn)
++	if err != nil {
++		return empty, err
++	}
++	defer tx.Rollback()
++	s, err := readState(ctx, tx)
++	if err != nil {
++		return empty, err
++	}
++	if s.manifest != manifest || s.operation != op {
++		return empty, ErrConflict
++	}
++	r, err := readReceipt(ctx, tx, manifest, op)
++	if err != nil {
++		return empty, err
++	}
++	if r.Generation != s.generation {
++		return empty, ErrConflict
++	}
++	if err = tx.Commit(); err != nil {
++		return empty, err
++	}
++	if r.Action == "pause" {
++		return confirmPause(ctx, conn, manifest, op)
++	}
++	r.Durable = true
++	return r, nil
++}
++
++// Resume is an explicit CAS from one confirmed closed operation. It cannot
++// erase uncertain work, change the manifest, or reopen automatically on restart.
++func Resume(ctx context.Context, db *sql.DB, manifest, closedOp, newOp string) (Receipt, error) {
++	var empty Receipt
++	if db == nil {
++		return empty, ErrConflict
++	}
++	if err := validate(manifest, newOp); err != nil {
++		return empty, err
++	}
++	if !identifier.MatchString(closedOp) || closedOp == newOp {
++		return empty, ErrConflict
++	}
++	conn, err := db.Conn(ctx)
++	if err != nil {
++		return empty, err
++	}
++	defer discard(conn)
++	got, err := activity(ctx, conn, false)
++	if err != nil {
++		return empty, err
++	}
++	if !got {
++		return empty, ErrUncertain
++	}
++	tx, err := beginTx(ctx, conn)
++	if err != nil {
++		return empty, err
++	}
++	defer tx.Rollback()
++	s, err := readState(ctx, tx)
++	if err != nil {
++		return empty, err
++	}
++	if s.manifest != manifest {
++		return empty, ErrConflict
++	}
++	if s.operation == newOp {
++		r, e := readReceipt(ctx, tx, manifest, newOp)
++		var prior string
++		if e == nil {
++			e = tx.QueryRowContext(ctx, `SELECT prior_operation FROM handoff_operations WHERE operation_id=$1`, newOp).Scan(&prior)
++		}
++		if e != nil || r.Action != "resume" || prior != closedOp {
++			return empty, ErrConflict
++		}
++		if e = tx.Commit(); e != nil {
++			return empty, e
++		}
++		r.Durable = true
++		return r, nil
++	}
++	if s.phase != "closed" || s.operation != closedOp {
++		return empty, ErrClosed
++	}
++	prior, err := readReceipt(ctx, tx, manifest, closedOp)
++	if err != nil {
++		return empty, err
++	}
++	if !prior.Confirmed || prior.Action != "pause" || prior.ActiveLeases != 0 || prior.UncertainLeases != 0 {
++		return empty, ErrUncertain
++	}
++	if err = insertOperation(ctx, tx, manifest, newOp, "resume", closedOp, s.generation, true); err != nil {
++		return empty, err
++	}
++	_, err = tx.ExecContext(ctx, `UPDATE handoff_state SET phase='open',generation=generation+1,current_operation=$1 WHERE id=1`, newOp)
++	if err != nil {
++		return empty, err
++	}
++	r, err := readReceipt(ctx, tx, manifest, newOp)
++	if err != nil {
++		return empty, err
++	}
++	if err = tx.Commit(); err != nil {
++		return empty, err
++	}
++	r.Durable = true
++	return r, nil
++}
++
++func (r Receipt) String() string {
++	return fmt.Sprintf("handoff %s generation=%d confirmed=%t", r.State, r.Generation, r.Confirmed)
++}
+diff --git a/internal/handoff/handoff_integration_test.go b/internal/handoff/handoff_integration_test.go
+new file mode 100644
+index 0000000..5b86b43
+--- /dev/null
++++ b/internal/handoff/handoff_integration_test.go
+@@ -0,0 +1,482 @@
++// SPDX-License-Identifier: Apache-2.0
++package handoff
++
++import (
++	"context"
++	"crypto/rand"
++	"database/sql"
++	"encoding/hex"
++	"errors"
++	"net/url"
++	"os"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	_ "github.com/lib/pq"
++)
++
++const testManifest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
++const initializeOp = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
++const pauseOp = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
++const resumeOp = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
++
++type fixture struct {
++	db, pool *sql.DB
++	dsn      string
++}
++
++func realGate(t *testing.T) fixture {
++	t.Helper()
++	raw := os.Getenv("MINIFLUX_OUTBOX_TEST_DSN")
++	if raw == "" {
++		t.Skip("actual PostgreSQL not configured; no persistence claim")
++	}
++	u, err := url.Parse(raw)
++	if err != nil || u.Scheme != "postgres" || (u.Hostname() != "127.0.0.1" && u.Hostname() != "localhost") || u.Path != "/synthetic_outbox" {
++		t.Fatal("refuse non-isolated PostgreSQL DSN")
++	}
++	admin, err := sql.Open("postgres", raw)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer admin.Close()
++	var random [12]byte
++	if _, err = rand.Read(random[:]); err != nil {
++		t.Fatal(err)
++	}
++	schema := "handoff_test_" + hex.EncodeToString(random[:])
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++	if _, err = admin.ExecContext(ctx, `CREATE SCHEMA `+schema); err != nil {
++		t.Fatal(err)
++	}
++	q := u.Query()
++	q.Set("search_path", schema)
++	u.RawQuery = q.Encode()
++	db, err := sql.Open("postgres", u.String())
++	if err != nil {
++		t.Fatal(err)
++	}
++	db.SetMaxOpenConns(8)
++	pool, err := sql.Open("postgres", u.String())
++	if err != nil {
++		t.Fatal(err)
++	}
++	pool.SetMaxOpenConns(16)
++	t.Cleanup(func() { pool.Close(); db.Close() })
++	tx, err := db.BeginTx(ctx, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = Migrate(tx); err != nil {
++		tx.Rollback()
++		t.Fatal(err)
++	}
++	if err = tx.Commit(); err != nil {
++		t.Fatal(err)
++	}
++	t.Logf("retained isolated schema=%s", schema)
++	return fixture{db, pool, u.String()}
++}
++
++func startGate(t *testing.T) fixture {
++	t.Helper()
++	f := realGate(t)
++	r, e := Initialize(context.Background(), f.db, testManifest, initializeOp)
++	if e != nil || !r.Confirmed || !r.Durable || r.State != "open" || r.Generation != 0 {
++		t.Fatalf("initialize %#v %v", r, e)
++	}
++	return f
++}
++
++func TestPGMissingInitializationAndExplicitIdempotence(t *testing.T) {
++	f := realGate(t)
++	ctx := context.Background()
++	if _, e := Begin(ctx, f.pool, testManifest, "scheduler"); !errors.Is(e, ErrClosed) {
++		t.Fatalf("missing row admitted %v", e)
++	}
++	for range 2 {
++		r, e := Initialize(ctx, f.db, testManifest, initializeOp)
++		if e != nil || !r.Confirmed || r.Generation != 0 {
++			t.Fatalf("init %#v %v", r, e)
++		}
++	}
++	if _, e := Initialize(ctx, f.db, testManifest, pauseOp); !errors.Is(e, ErrConflict) {
++		t.Fatal(e)
++	}
++	var n int
++	if e := f.db.QueryRow(`SELECT count(*) FROM handoff_operations`).Scan(&n); e != nil || n != 1 {
++		t.Fatal(n, e)
++	}
++}
++
++func TestPGOperationGenerationsRemainBigintAcrossControlActions(t *testing.T) {
++	f := startGate(t)
++	ctx := context.Background()
++	const previous int64 = 1 << 33
++	if _, err := f.db.Exec(`UPDATE handoff_state SET generation=$1`, previous); err != nil {
++		t.Fatal(err)
++	}
++	paused, err := Pause(ctx, f.db, testManifest, pauseOp)
++	if err != nil || !paused.Confirmed || paused.PreviousGeneration != previous || paused.Generation != previous+1 {
++		t.Fatalf("bigint pause: %#v %v", paused, err)
++	}
++	resumed, err := Resume(ctx, f.db, testManifest, pauseOp, resumeOp)
++	if err != nil || !resumed.Confirmed || resumed.PreviousGeneration != previous+1 || resumed.Generation != previous+2 {
++		t.Fatalf("bigint resume: %#v %v", resumed, err)
++	}
++	var stored int64
++	if err = f.db.QueryRow(`SELECT generation FROM handoff_operations WHERE operation_id=$1`, resumeOp).Scan(&stored); err != nil || stored != previous+2 {
++		t.Fatalf("stored bigint: %d %v", stored, err)
++	}
++}
++
++func TestPGPauseClosesNewWorkButDrainsOriginalLease(t *testing.T) {
++	f := startGate(t)
++	ctx := context.Background()
++	lease, e := Begin(ctx, f.pool, testManifest, "scheduler.refresh")
++	if e != nil {
++		t.Fatal(e)
++	}
++	r, e := Pause(ctx, f.db, testManifest, pauseOp)
++	if e != nil || r.Confirmed || !r.Durable || r.State != "closing" || r.ActiveLeases != 1 {
++		t.Fatalf("pause %#v %v", r, e)
++	}
++	if _, e = Begin(ctx, f.pool, testManifest, "manual.refresh"); !errors.Is(e, ErrClosed) {
++		t.Fatalf("admitted while closing: %v", e)
++	}
++	if e = lease.Matches(f.pool, testManifest); e != nil {
++		t.Fatal("original admitted work cannot drain", e)
++	}
++	if e = lease.Finish(); e != nil {
++		t.Fatal(e)
++	}
++	r, e = Query(ctx, f.db, testManifest, pauseOp)
++	if e != nil || !r.Confirmed || r.State != "closed" || r.ActiveLeases != 0 {
++		t.Fatalf("query %#v %v", r, e)
++	}
++	if _, e = Begin(ctx, f.pool, testManifest, "scheduler"); !errors.Is(e, ErrClosed) {
++		t.Fatal(e)
++	}
++	for range 2 {
++		r, e = Query(ctx, f.db, testManifest, pauseOp)
++		if e != nil || !r.Confirmed {
++			t.Fatalf("repeat query %#v %v", r, e)
++		}
++	}
++}
++
++func TestPGAbortRetainedAndCannotResume(t *testing.T) {
++	f := startGate(t)
++	ctx := context.Background()
++	lease, e := Begin(ctx, f.pool, testManifest, "save_entry")
++	if e != nil {
++		t.Fatal(e)
++	}
++	if e = lease.Abort(); e != nil {
++		t.Fatal(e)
++	}
++	r, e := Pause(ctx, f.db, testManifest, pauseOp)
++	if e != nil || r.Confirmed || r.UncertainLeases != 1 {
++		t.Fatalf("abort %#v %v", r, e)
++	}
++	if _, e = Resume(ctx, f.db, testManifest, pauseOp, resumeOp); e == nil {
++		t.Fatal("resumed uncertain work")
++	}
++	if _, e = f.db.Exec(`DELETE FROM handoff_leases`); e == nil {
++		t.Fatal("deleted uncertainty")
++	}
++	if e = lease.Finish(); !errors.Is(e, ErrConflict) {
++		t.Fatal(e)
++	}
++}
++
++func TestPGBackendDeathIsNotCompletion(t *testing.T) {
++	f := startGate(t)
++	ctx := context.Background()
++	lease, e := Begin(ctx, f.pool, testManifest, "outbox.send")
++	if e != nil {
++		t.Fatal(e)
++	}
++	var pid int
++	if e = lease.conn.QueryRowContext(ctx, `SELECT pg_backend_pid()`).Scan(&pid); e != nil {
++		t.Fatal(e)
++	}
++	if _, e = f.db.ExecContext(ctx, `SELECT pg_terminate_backend($1)`, pid); e != nil {
++		t.Fatal(e)
++	}
++	if e = lease.Check(ctx); e == nil {
++		t.Fatal("dead backend still valid")
++	}
++	r, e := Pause(ctx, f.db, testManifest, pauseOp)
++	if e != nil || r.Confirmed || r.ActiveLeases != 1 {
++		t.Fatalf("death falsely drained %#v %v", r, e)
++	}
++	if e = lease.Finish(); e == nil {
++		t.Fatal("unknown death finished")
++	}
++	if _, e = Resume(ctx, f.db, testManifest, pauseOp, resumeOp); e == nil {
++		t.Fatal("resumed unknown work")
++	}
++}
++
++func TestPGResumeExactCASAndOldReceiptCannotProveCurrentState(t *testing.T) {
++	f := startGate(t)
++	ctx := context.Background()
++	r, e := Pause(ctx, f.db, testManifest, pauseOp)
++	if e != nil || !r.Confirmed {
++		t.Fatal(r, e)
++	}
++	if _, e = Resume(ctx, f.db, testManifest, initializeOp, resumeOp); e == nil {
++		t.Fatal("wrong closed op resumed")
++	}
++	for range 2 {
++		r, e = Resume(ctx, f.db, testManifest, pauseOp, resumeOp)
++		if e != nil || !r.Confirmed || r.State != "open" || r.Generation != 2 {
++			t.Fatal(r, e)
++		}
++	}
++	if _, e = Query(ctx, f.db, testManifest, pauseOp); !errors.Is(e, ErrConflict) {
++		t.Fatalf("old close proof current: %v", e)
++	}
++	lease, e := Begin(ctx, f.pool, testManifest, "new.refresh")
++	if e != nil {
++		t.Fatal(e)
++	}
++	if e = lease.Finish(); e != nil {
++		t.Fatal(e)
++	}
++}
++
++func TestPGRestartKeepsClosedAndExactOperationQuery(t *testing.T) {
++	f := startGate(t)
++	ctx := context.Background()
++	r, e := Pause(ctx, f.db, testManifest, pauseOp)
++	if e != nil || !r.Confirmed {
++		t.Fatal(r, e)
++	}
++	restarted, e := sql.Open("postgres", f.dsn)
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer restarted.Close()
++	r, e = Query(ctx, restarted, testManifest, pauseOp)
++	if e != nil || !r.Confirmed {
++		t.Fatal(r, e)
++	}
++	if _, e = Begin(ctx, restarted, testManifest, "restart.scheduler"); !errors.Is(e, ErrClosed) {
++		t.Fatal(e)
++	}
++	if _, e = Initialize(ctx, restarted, testManifest, initializeOp); !errors.Is(e, ErrConflict) {
++		t.Fatalf("startup reopened: %v", e)
++	}
++}
++
++func TestPGForeignLeaseAndManifestFailClosed(t *testing.T) {
++	f := startGate(t)
++	ctx := context.Background()
++	l, e := Begin(ctx, f.pool, testManifest, "refresh")
++	if e != nil {
++		t.Fatal(e)
++	}
++	if e = l.Matches(f.db, testManifest); !errors.Is(e, ErrConflict) {
++		t.Fatal("foreign pool", e)
++	}
++	if e = l.Matches(f.pool, strings.Repeat("e", 64)); !errors.Is(e, ErrConflict) {
++		t.Fatal("foreign manifest", e)
++	}
++	if e = l.Matches(f.pool, testManifest); e != nil {
++		t.Fatal("valid lease damaged by foreign lookup", e)
++	}
++	if e = l.Finish(); e != nil {
++		t.Fatal(e)
++	}
++	if _, e = Pause(ctx, f.db, strings.Repeat("e", 64), pauseOp); !errors.Is(e, ErrConflict) {
++		t.Fatal(e)
++	}
++}
++
++func TestPGConcurrentPauseAndAdmitNoPostCloseEscape(t *testing.T) {
++	f := startGate(t)
++	ctx := context.Background()
++	var wg sync.WaitGroup
++	var mu sync.Mutex
++	var accepted []*Lease
++	var errs []error
++	ready := make(chan struct{})
++	for range 12 {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			<-ready
++			l, e := Begin(ctx, f.pool, testManifest, "concurrent")
++			mu.Lock()
++			defer mu.Unlock()
++			if e == nil {
++				accepted = append(accepted, l)
++			} else if !errors.Is(e, ErrClosed) {
++				errs = append(errs, e)
++			}
++		}()
++	}
++	close(ready)
++	_, e := Pause(ctx, f.db, testManifest, pauseOp)
++	if e != nil {
++		t.Fatal(e)
++	}
++	wg.Wait()
++	if len(errs) > 0 {
++		t.Fatal(errs)
++	}
++	for _, l := range accepted {
++		if e = l.Finish(); e != nil {
++			t.Fatal(e)
++		}
++	}
++	r, e := Query(ctx, f.db, testManifest, pauseOp)
++	if e != nil || !r.Confirmed {
++		t.Fatal(r, e)
++	}
++	for range 3 {
++		if _, e = Begin(ctx, f.pool, testManifest, "after.close"); !errors.Is(e, ErrClosed) {
++			t.Fatal(e)
++		}
++	}
++}
++
++func TestPGConcurrentFinishDoesNotLeakOrChangeOutcome(t *testing.T) {
++	f := startGate(t)
++	ctx := context.Background()
++	l, e := Begin(ctx, f.pool, testManifest, "concurrent.finish")
++	if e != nil {
++		t.Fatal(e)
++	}
++	var wg sync.WaitGroup
++	errch := make(chan error, 8)
++	for range 8 {
++		wg.Add(1)
++		go func() { defer wg.Done(); errch <- l.Finish() }()
++	}
++	wg.Wait()
++	close(errch)
++	for e = range errch {
++		if e != nil {
++			t.Fatal(e)
++		}
++	}
++	if e = l.Abort(); !errors.Is(e, ErrConflict) {
++		t.Fatal(e)
++	}
++	r, e := Pause(ctx, f.db, testManifest, pauseOp)
++	if e != nil || !r.Confirmed {
++		t.Fatal("session leaked", r, e)
++	}
++}
++
++func TestPGLeaseCapacityRefusesNewWorkButFinishAndPauseStillWork(t *testing.T) {
++	f := startGate(t)
++	ctx := context.Background()
++	l, e := Begin(ctx, f.pool, testManifest, "last.admission")
++	if e != nil {
++		t.Fatal(e)
++	}
++	_, e = f.db.Exec(`INSERT INTO handoff_leases(lease_id,manifest,source,status,backend_pid,finished_at) SELECT lpad(to_hex(i),32,'0'),$1,'capacity.fixture','finished',1,clock_timestamp() FROM generate_series(1,$2) i`, testManifest, MaxRetainedRecords-1)
++	if e != nil {
++		t.Fatal(e)
++	}
++	if _, e = Begin(ctx, f.pool, testManifest, "full"); e == nil || !strings.Contains(e.Error(), "capacity") {
++		t.Fatal("capacity bypass", e)
++	}
++	if e = l.Finish(); e != nil {
++		t.Fatal(e)
++	}
++	r, e := Pause(ctx, f.db, testManifest, pauseOp)
++	if e != nil || !r.Confirmed {
++		t.Fatal(r, e)
++	}
++	var count int
++	if e = f.db.QueryRow(`SELECT count(*) FROM handoff_leases`).Scan(&count); e != nil || count != MaxRetainedRecords {
++		t.Fatal(count, e)
++	}
++}
++
++func TestPGOperationEvidenceCannotBeRewrittenOrDeleted(t *testing.T) {
++	f := startGate(t)
++	ctx := context.Background()
++	r, e := Pause(ctx, f.db, testManifest, pauseOp)
++	if e != nil || !r.Confirmed {
++		t.Fatal(r, e)
++	}
++	for _, q := range []string{`DELETE FROM handoff_operations`, `UPDATE handoff_operations SET manifest=repeat('e',64)`, `UPDATE handoff_operations SET status='pending'`} {
++		if _, e = f.db.Exec(q); e == nil {
++			t.Fatal("evidence mutation allowed", q)
++		}
++	}
++	if _, e = Pause(ctx, f.db, testManifest, initializeOp); e == nil {
++		t.Fatal("operation id reused with different action")
++	}
++}
++
++func TestPGDeferredPanicLeavesUncertainAndPreservesOriginal(t *testing.T) {
++	f := startGate(t)
++	lease, err := Begin(context.Background(), f.pool, testManifest, "panicking.actual.work")
++	if err != nil {
++		t.Fatal(err)
++	}
++	func() {
++		defer func() {
++			if recover() != "synthetic work panic" {
++				t.Error("original panic lost")
++			}
++		}()
++		defer FinishOnReturn(lease)
++		panic("synthetic work panic")
++	}()
++	r, err := Pause(context.Background(), f.db, testManifest, pauseOp)
++	if err != nil || r.Confirmed || r.UncertainLeases != 1 || r.ActiveLeases != 0 {
++		t.Fatal(r, err)
++	}
++}
++
++func TestPGOperationCapacityCannotSilentlyContinueAdmitting(t *testing.T) {
++	f := startGate(t)
++	_, err := f.db.Exec(`INSERT INTO handoff_operations(operation_id,manifest,action,previous_generation,generation,prior_operation,status,confirmed_at) SELECT lpad(to_hex(i),64,'0'),$1,'initialize',-1,0,'','confirmed',clock_timestamp() FROM generate_series(1,$2) i`, testManifest, MaxRetainedRecords-2)
++	if err != nil {
++		t.Fatal(err)
++	}
++	r, err := Pause(context.Background(), f.db, testManifest, pauseOp)
++	if err != nil || !r.Confirmed {
++		t.Fatal(r, err)
++	}
++	if _, err = Resume(context.Background(), f.db, testManifest, pauseOp, resumeOp); err == nil || !strings.Contains(err.Error(), "capacity") {
++		t.Fatal("capacity reopened", err)
++	}
++	if _, err = Begin(context.Background(), f.pool, testManifest, "full.registry"); err == nil {
++		t.Fatal("capacity admitted")
++	}
++}
++
++func TestPGResumeReservesCapacityForTheNextPause(t *testing.T) {
++	f := startGate(t)
++	_, err := f.db.Exec(`INSERT INTO handoff_operations(operation_id,manifest,action,previous_generation,generation,prior_operation,status,confirmed_at) SELECT lpad(to_hex(i),64,'0'),$1,'initialize',-1,0,'','confirmed',clock_timestamp() FROM generate_series(1,$2) i`, testManifest, MaxRetainedRecords-3)
++	if err != nil {
++		t.Fatal(err)
++	}
++	paused, err := Pause(context.Background(), f.db, testManifest, pauseOp)
++	if err != nil || !paused.Confirmed {
++		t.Fatal(paused, err)
++	}
++	if _, err = Resume(context.Background(), f.db, testManifest, pauseOp, resumeOp); err == nil || !strings.Contains(err.Error(), "capacity") {
++		t.Fatal("resumed without a future pause slot", err)
++	}
++	receipt, err := Query(context.Background(), f.db, testManifest, pauseOp)
++	if err != nil || !receipt.Confirmed || receipt.State != "closed" {
++		t.Fatal("capacity rejection changed prior close proof", receipt, err)
++	}
++	var count int
++	if err = f.db.QueryRow(`SELECT count(*) FROM handoff_operations`).Scan(&count); err != nil || count != MaxRetainedRecords-1 {
++		t.Fatal("rejected resume changed retained evidence", count, err)
++	}
++}
+diff --git a/internal/handoff/handoff_test.go b/internal/handoff/handoff_test.go
+new file mode 100644
+index 0000000..30e809e
+--- /dev/null
++++ b/internal/handoff/handoff_test.go
+@@ -0,0 +1,105 @@
++// SPDX-License-Identifier: Apache-2.0
++package handoff
++
++import (
++	"context"
++	"errors"
++	"strings"
++	"testing"
++)
++
++func TestRejectMalformedIdentityWithoutDatabase(t *testing.T) {
++	for _, value := range []string{"", strings.Repeat("a", 63), strings.Repeat("A", 64), "../" + strings.Repeat("a", 61)} {
++		if validate(value, strings.Repeat("b", 64)) == nil {
++			t.Fatalf("accepted invalid manifest %q", value)
++		}
++		if validate(strings.Repeat("a", 64), value) == nil {
++			t.Fatalf("accepted invalid operation %q", value)
++		}
++	}
++	if err := validate(strings.Repeat("a", 64), strings.Repeat("b", 64)); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestNilAndFabricatedLeaseFailClosed(t *testing.T) {
++	ctx := context.Background()
++	manifest := strings.Repeat("a", 64)
++	op := strings.Repeat("b", 64)
++	if _, e := Begin(ctx, nil, manifest, "scheduler"); e == nil {
++		t.Fatal("nil DB admitted")
++	}
++	if _, e := Initialize(ctx, nil, manifest, op); e == nil {
++		t.Fatal("nil DB initialized")
++	}
++	if _, e := Pause(ctx, nil, manifest, op); e == nil {
++		t.Fatal("nil DB paused")
++	}
++	if _, e := Query(ctx, nil, manifest, op); e == nil {
++		t.Fatal("nil DB queried")
++	}
++	if _, e := Resume(ctx, nil, manifest, op, strings.Repeat("c", 64)); e == nil {
++		t.Fatal("nil DB resumed")
++	}
++	for _, lease := range []*Lease{nil, {}} {
++		if e := lease.Check(ctx); e == nil {
++			t.Fatal("fabricated lease checked")
++		}
++		if e := lease.Matches(nil, manifest); e == nil {
++			t.Fatal("fabricated lease matched")
++		}
++		if e := lease.Finish(); e == nil {
++			t.Fatal("fabricated lease finished")
++		}
++		if e := lease.Abort(); e == nil {
++			t.Fatal("fabricated lease aborted")
++		}
++	}
++}
++
++func TestLeaseOutcomesAreNotInterchangeable(t *testing.T) {
++	l := &Lease{done: "finished"}
++	if e := l.Finish(); e != nil {
++		t.Fatal(e)
++	}
++	if e := l.Abort(); !errors.Is(e, ErrConflict) {
++		t.Fatalf("finished changed: %v", e)
++	}
++	l = &Lease{done: "uncertain"}
++	if e := l.Abort(); e != nil {
++		t.Fatal(e)
++	}
++	if e := l.Finish(); !errors.Is(e, ErrConflict) {
++		t.Fatalf("uncertain changed: %v", e)
++	}
++}
++
++func TestSchemaHasNoImplicitOpenAndRetainsEvidence(t *testing.T) {
++	if strings.Contains(SchemaSQL, "INSERT INTO") {
++		t.Fatal("migration opens gate")
++	}
++	for _, piece := range []string{"handoff_operations_guard", "handoff_leases_guard", "BEFORE UPDATE OR DELETE", "status IN ('active','finished','uncertain')"} {
++		if !strings.Contains(SchemaSQL, piece) {
++			t.Fatal(piece)
++		}
++	}
++	if MaxRetainedRecords != 10000 {
++		t.Fatal("retention bound changed")
++	}
++}
++
++func TestDeferredCompletionPreservesPanicIncludingDisabledGate(t *testing.T) {
++	for _, lease := range []*Lease{nil, {done: "uncertain"}} {
++		func() {
++			defer func() {
++				if recover() != "original panic" {
++					t.Error("panic changed or swallowed")
++				}
++			}()
++			defer FinishOnReturn(lease)
++			panic("original panic")
++		}()
++	}
++	func() { defer FinishOnReturn(nil) }()
++	func() { defer FinishOnReturn(&Lease{done: "finished"}) }()
++}
+diff --git a/internal/http/request/handoff.go b/internal/http/request/handoff.go
+new file mode 100644
+index 0000000..3f7b10a
+--- /dev/null
++++ b/internal/http/request/handoff.go
+@@ -0,0 +1,91 @@
++// SPDX-License-Identifier: Apache-2.0
++package request
++
++import (
++	"context"
++	"log/slog"
++	"net/http"
++	"sync"
++
++	"miniflux.app/v2/internal/config"
++	"miniflux.app/v2/internal/handoff"
++)
++
++type handoffScopeKey struct{}
++
++// HandoffScope owns a lazily acquired lease for the WHOLE request, including
++// authentication bookkeeping and response/session persistence. It does not
++// authenticate credentials. Only existing successful auth paths may Acquire.
++type HandoffScope struct {
++	mu                  sync.Mutex
++	acquire             func() (*handoff.Lease, error)
++	lease               *handoff.Lease
++	attempted, finished bool
++	err                 error
++}
++
++func WithHandoffScope(r *http.Request, acquire func() (*handoff.Lease, error)) (*http.Request, *HandoffScope) {
++	scope := &HandoffScope{acquire: acquire}
++	return r.WithContext(context.WithValue(r.Context(), handoffScopeKey{}, scope)), scope
++}
++
++// AcquireAuthenticatedHandoff must be called AFTER actual credential/session
++// validation and BEFORE the first auth timestamp, session or business write.
++// Missing outer request ownership fails closed when the feature is enabled.
++func AcquireAuthenticatedHandoff(w http.ResponseWriter, r *http.Request) bool {
++	if !config.Opts.HasHandoff() {
++		return true
++	}
++	scope, ok := r.Context().Value(handoffScopeKey{}).(*HandoffScope)
++	if !ok || scope == nil {
++		http.Error(w, "handoff request ownership missing", http.StatusServiceUnavailable)
++		return false
++	}
++	scope.mu.Lock()
++	defer scope.mu.Unlock()
++	if scope.finished {
++		http.Error(w, "handoff request already finished", http.StatusServiceUnavailable)
++		return false
++	}
++	if !scope.attempted {
++		scope.attempted = true
++		if scope.acquire == nil {
++			scope.err = handoff.ErrConflict
++		} else {
++			scope.lease, scope.err = scope.acquire()
++		}
++		if scope.err == nil && scope.lease == nil {
++			scope.err = handoff.ErrUncertain
++		}
++	}
++	if scope.err != nil {
++		http.Error(w, "handoff closed or unconfirmed", http.StatusServiceUnavailable)
++		return false
++	}
++	return true
++}
++
++// FinishOnReturn is directly deferred by the outer HTTP wrapper. A panic is
++// retained as uncertain and rethrown, not converted to a finished lease.
++func (s *HandoffScope) FinishOnReturn() {
++	recovered := recover()
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if !s.finished {
++		s.finished = true
++		if s.lease != nil {
++			var err error
++			if recovered != nil {
++				err = s.lease.Abort()
++			} else {
++				err = s.lease.Finish()
++			}
++			if err != nil {
++				slog.Error("handoff HTTP completion remains unconfirmed", "error", err)
++			}
++		}
++	}
++	if recovered != nil {
++		panic(recovered)
++	}
++}
+diff --git a/internal/http/request/handoff_test.go b/internal/http/request/handoff_test.go
+new file mode 100644
+index 0000000..2e12848
+--- /dev/null
++++ b/internal/http/request/handoff_test.go
+@@ -0,0 +1,100 @@
++// SPDX-License-Identifier: Apache-2.0
++package request
++
++import (
++	"errors"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"miniflux.app/v2/internal/config"
++	"miniflux.app/v2/internal/handoff"
++)
++
++func handoffConfig(t *testing.T, enabled bool) {
++	t.Helper()
++	prior := config.Opts
++	t.Cleanup(func() { config.Opts = prior })
++	flag := "0"
++	if enabled {
++		flag = "1"
++	}
++	for k, v := range map[string]string{"HANDOFF_ENABLED": flag, "HANDOFF_MANIFEST": strings.Repeat("a", 64), "HANDOFF_CONTROL_TOKEN": strings.Repeat("b", 64), "HANDOFF_CONTROL_ADDR": "127.0.0.1:19002", "WEBHOOK_OUTBOX": "1", "WEBHOOK_OUTBOX_CONTRACT": "synthetic"} {
++		t.Setenv(k, v)
++	}
++	var err error
++	config.Opts, err = config.NewConfigParser().ParseEnvironmentVariables()
++	if err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestHandoffScopeDisabledIsNoopWithoutOwner(t *testing.T) {
++	handoffConfig(t, false)
++	w := httptest.NewRecorder()
++	r := httptest.NewRequest("GET", "/unmatched", nil)
++	if !AcquireAuthenticatedHandoff(w, r) {
++		t.Fatal("disabled behavior changed")
++	}
++	r, _ = WithHandoffScope(r, func() (*handoff.Lease, error) { t.Fatal("disabled touched gate"); return nil, nil })
++	if !AcquireAuthenticatedHandoff(w, r) {
++		t.Fatal("disabled scope changed behavior")
++	}
++}
++
++func TestHandoffScopeEnabledMissingOwnerFailsClosed(t *testing.T) {
++	handoffConfig(t, true)
++	w := httptest.NewRecorder()
++	if AcquireAuthenticatedHandoff(w, httptest.NewRequest("GET", "/v1/me", nil)) || w.Code != 503 {
++		t.Fatal("unowned request passed")
++	}
++}
++
++func TestHandoffScopeFailedAcquireIsNeverRetriedInsideSameRequest(t *testing.T) {
++	handoffConfig(t, true)
++	calls := 0
++	r, scope := WithHandoffScope(httptest.NewRequest("GET", "/v1/me", nil), func() (*handoff.Lease, error) { calls++; return nil, errors.New("synthetic closed") })
++	for range 3 {
++		w := httptest.NewRecorder()
++		if AcquireAuthenticatedHandoff(w, r) || w.Code != 503 {
++			t.Fatal("failed acquisition passed")
++		}
++	}
++	scope.FinishOnReturn()
++	if calls != 1 {
++		t.Fatal("retried original uncertain acquisition", calls)
++	}
++}
++
++func TestHandoffScopeNilLeaseAndFinishedOwnerFailClosed(t *testing.T) {
++	handoffConfig(t, true)
++	calls := 0
++	r, scope := WithHandoffScope(httptest.NewRequest("GET", "/v1/me", nil), func() (*handoff.Lease, error) { calls++; return nil, nil })
++	if AcquireAuthenticatedHandoff(httptest.NewRecorder(), r) {
++		t.Fatal("nil lease passed")
++	}
++	scope.FinishOnReturn()
++	if AcquireAuthenticatedHandoff(httptest.NewRecorder(), r) {
++		t.Fatal("finished request passed")
++	}
++	if calls != 1 {
++		t.Fatal(calls)
++	}
++}
++
++func TestHandoffScopeAnonymousDoesNotAcquireAndPanicIsPreserved(t *testing.T) {
++	handoffConfig(t, true)
++	_, scope := WithHandoffScope(httptest.NewRequest("GET", "/unknown", nil), func() (*handoff.Lease, error) { t.Fatal("unauthenticated acquired"); return nil, nil })
++	func() {
++		defer func() {
++			if recover() != "original" {
++				t.Error("original panic changed")
++			}
++		}()
++		defer scope.FinishOnReturn()
++		panic("original")
++	}()
++	if !scope.finished {
++		t.Fatal("owner not finished")
++	}
++}
+diff --git a/internal/http/server/handoff.go b/internal/http/server/handoff.go
+new file mode 100644
+index 0000000..00256a0
+--- /dev/null
++++ b/internal/http/server/handoff.go
+@@ -0,0 +1,31 @@
++// SPDX-License-Identifier: Apache-2.0
++package server
++
++import (
++	"net/http"
++
++	"miniflux.app/v2/internal/config"
++	"miniflux.app/v2/internal/handoff"
++	"miniflux.app/v2/internal/http/request"
++	"miniflux.app/v2/internal/storage"
++)
++
++// Existing successful authentication paths acquire this request-owned lease
++// before their first write. Anonymous/static/OPTIONS failures do not fill the
++// retained lease registry. Health never proves business admission.
++func handoffAdmission(store *storage.Storage, next http.Handler) http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if !config.Opts.HasHandoff() {
++			next.ServeHTTP(w, r)
++			return
++		}
++		switch r.URL.Path {
++		case "/liveness", "/healthz", "/readiness", "/readyz", "/healthcheck":
++			next.ServeHTTP(w, r)
++			return
++		}
++		r, scope := request.WithHandoffScope(r, func() (*handoff.Lease, error) { return store.BeginHandoff("authenticated_http") })
++		defer scope.FinishOnReturn()
++		next.ServeHTTP(w, r)
++	})
++}
+diff --git a/internal/http/server/handoff_auth_integration_test.go b/internal/http/server/handoff_auth_integration_test.go
+new file mode 100644
+index 0000000..a320c11
+--- /dev/null
++++ b/internal/http/server/handoff_auth_integration_test.go
+@@ -0,0 +1,361 @@
++// SPDX-License-Identifier: Apache-2.0
++package server
++
++import (
++	"context"
++	"database/sql"
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"os"
++	"strings"
++	"testing"
++	"time"
++
++	"miniflux.app/v2/internal/config"
++	"miniflux.app/v2/internal/database"
++	"miniflux.app/v2/internal/handoff"
++	requestctx "miniflux.app/v2/internal/http/request"
++	"miniflux.app/v2/internal/model"
++	"miniflux.app/v2/internal/storage"
++)
++
++type authFixture struct {
++	db     *sql.DB
++	store  *storage.Storage
++	router http.Handler
++	key    string
++	cookie *http.Cookie
++}
++
++func actualAuthFixture(t *testing.T) authFixture {
++	t.Helper()
++	raw := os.Getenv("MINIFLUX_OUTBOX_TEST_DSN")
++	if raw == "" {
++		t.Skip("requires explicit isolated PostgreSQL")
++	}
++	u, e := url.Parse(raw)
++	if e != nil || u.Scheme != "postgres" || u.Hostname() != "127.0.0.1" || u.Path != "/synthetic_outbox" {
++		t.Fatal("synthetic loopback PostgreSQL only")
++	}
++	admin, e := sql.Open("postgres", raw)
++	if e != nil {
++		t.Fatal(e)
++	}
++	schema := fmt.Sprintf("pause_auth_%d", time.Now().UnixNano())
++	if _, e = admin.Exec("CREATE SCHEMA " + schema); e != nil {
++		t.Fatal(e)
++	}
++	admin.Close()
++	q := u.Query()
++	q.Set("search_path", schema)
++	u.RawQuery = q.Encode()
++	db, e := sql.Open("postgres", u.String())
++	if e != nil {
++		t.Fatal(e)
++	}
++	db.SetMaxOpenConns(8)
++	leaseDB, e := sql.Open("postgres", u.String())
++	if e != nil {
++		t.Fatal(e)
++	}
++	leaseDB.SetMaxOpenConns(8)
++	t.Cleanup(func() { leaseDB.Close(); db.Close() })
++	if e = database.Migrate(db); e != nil {
++		t.Fatal(e)
++	}
++	prior := config.Opts
++	t.Cleanup(func() { config.Opts = prior })
++	for k, v := range map[string]string{"HANDOFF_ENABLED": "1", "HANDOFF_MANIFEST": strings.Repeat("a", 64), "HANDOFF_CONTROL_TOKEN": strings.Repeat("b", 64), "HANDOFF_CONTROL_ADDR": "127.0.0.1:19002", "WEBHOOK_OUTBOX": "1", "WEBHOOK_OUTBOX_CONTRACT": "synthetic", "DISABLE_API": "0"} {
++		t.Setenv(k, v)
++	}
++	config.Opts, e = config.NewConfigParser().ParseEnvironmentVariables()
++	if e != nil {
++		t.Fatal(e)
++	}
++	store := storage.NewStorage(db)
++	store.ConfigureHandoff(leaseDB)
++	user, e := store.CreateUser(&model.UserCreationRequest{Username: "synthetic", Password: "only-isolated-password"})
++	if e != nil {
++		t.Fatal(e)
++	}
++	key, e := store.CreateAPIKey(user.ID, "synthetic-auth-boundary")
++	if e != nil {
++		t.Fatal(e)
++	}
++	_, e = db.Exec(`UPDATE integrations SET fever_enabled=true,fever_token='synthetic-fever',googlereader_enabled=true,googlereader_username='synthetic-gr',googlereader_password=(SELECT password FROM users WHERE id=$1) WHERE user_id=$1`, user.ID)
++	if e != nil {
++		t.Fatal(e)
++	}
++	session, secret := model.NewWebSession("synthetic", "127.0.0.1")
++	session.SetUser(user)
++	if e = store.CreateWebSession(session); e != nil {
++		t.Fatal(e)
++	}
++	if e = store.UpdateWebSession(session); e != nil {
++		t.Fatal(e)
++	}
++	if _, e = handoff.Initialize(context.Background(), db, strings.Repeat("a", 64), strings.Repeat("c", 64)); e != nil {
++		t.Fatal(e)
++	}
++	t.Log("retained real authentication schema", schema)
++	return authFixture{db: db, store: store, router: newRouter(store, nil), key: key.Token, cookie: &http.Cookie{Name: "MinifluxSessionID", Value: session.ID + "." + secret}}
++}
++
++func (f authFixture) count(t *testing.T) int {
++	t.Helper()
++	var n int
++	if e := f.db.QueryRow(`SELECT count(*) FROM handoff_leases`).Scan(&n); e != nil {
++		t.Fatal(e)
++	}
++	return n
++}
++func (f authFixture) serve(method, path, body string, prepare func(*http.Request)) *httptest.ResponseRecorder {
++	r := httptest.NewRequest(method, path, strings.NewReader(body))
++	if body != "" {
++		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
++	}
++	if prepare != nil {
++		prepare(r)
++	}
++	w := httptest.NewRecorder()
++	f.router.ServeHTTP(w, r)
++	return w
++}
++func (f authFixture) pause(t *testing.T) {
++	t.Helper()
++	r, e := handoff.Pause(context.Background(), f.db, strings.Repeat("a", 64), strings.Repeat("d", 64))
++	if e != nil || !r.Confirmed {
++		t.Fatal(r, e)
++	}
++}
++
++func TestPostgresHandoffAnonymousFailuresStaticAndUnknownDoNotCreateLeases(t *testing.T) {
++	f := actualAuthFixture(t)
++	before := f.count(t)
++	var sessions int
++	if e := f.db.QueryRow(`SELECT count(*) FROM web_sessions`).Scan(&sessions); e != nil {
++		t.Fatal(e)
++	}
++	for range 3 {
++		for _, c := range []struct {
++			method, path, body string
++			status             int
++		}{{"OPTIONS", "/v1/feeds", "", 204}, {"GET", "/v1/me", "", 401}, {"GET", "/robots.txt", "", 200}, {"GET", "/stylesheets/absent/absent.css", "", 404}, {"GET", "/does-not-exist", "", 503}, {"POST", "/login", "username=bad&password=bad", 503}, {"GET", "/oauth2/unknown/redirect", "", 503}, {"GET", "/reader/api/0/token", "", 401}} {
++			w := f.serve(c.method, c.path, c.body, nil)
++			if w.Code != c.status {
++				t.Fatalf("%s %s status=%d want=%d body=%s", c.method, c.path, w.Code, c.status, w.Body.String())
++			}
++		}
++	}
++	if w := f.serve("GET", "/v1/me", "", func(r *http.Request) { r.Header.Set("X-Auth-Token", "invalid") }); w.Code != 401 {
++		t.Fatal(w.Code)
++	}
++	if w := f.serve("GET", "/v1/me", "", func(r *http.Request) { r.SetBasicAuth("synthetic", "wrong") }); w.Code != 401 {
++		t.Fatal(w.Code)
++	}
++	if w := f.serve("POST", "/fever/", "api_key=invalid", nil); w.Code != 200 || !strings.Contains(w.Body.String(), `"auth":0`) {
++		t.Fatal(w.Code, w.Body.String())
++	}
++	if w := f.serve("POST", "/accounts/ClientLogin", "Email=synthetic-gr&Passwd=wrong", nil); w.Code != 401 {
++		t.Fatal(w.Code)
++	}
++	var afterSessions int
++	if e := f.db.QueryRow(`SELECT count(*) FROM web_sessions`).Scan(&afterSessions); e != nil {
++		t.Fatal(e)
++	}
++	if f.count(t) != before || afterSessions != sessions {
++		t.Fatal("anonymous traffic consumed persistent records")
++	}
++}
++
++func TestPostgresHandoffPauseWinningCredentialReadRacePreventsAuthWrites(t *testing.T) {
++	f := actualAuthFixture(t)
++	blocker, e := f.db.Begin()
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer blocker.Rollback()
++	if _, e = blocker.Exec(`LOCK TABLE api_keys IN ACCESS EXCLUSIVE MODE`); e != nil {
++		t.Fatal(e)
++	}
++	result := make(chan int, 1)
++	go func() {
++		result <- f.serve("GET", "/v1/me", "", func(r *http.Request) { r.Header.Set("X-Auth-Token", f.key) }).Code
++	}()
++	defer func() { _ = blocker.Rollback() }()
++	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
++	defer cancel()
++	for {
++		var waiting bool
++		if e = f.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE relation='api_keys'::regclass AND mode='AccessShareLock' AND NOT granted)`).Scan(&waiting); e != nil {
++			t.Fatal(e)
++		}
++		if waiting {
++			break
++		}
++		select {
++		case <-ctx.Done():
++			t.Fatal("actual credential lookup did not block")
++		case <-time.After(5 * time.Millisecond):
++		}
++	}
++	f.pause(t)
++	if e = blocker.Rollback(); e != nil {
++		t.Fatal(e)
++	}
++	select {
++	case status := <-result:
++		if status != 503 {
++			t.Fatal("authentication raced past closed gate", status)
++		}
++	case <-time.After(4 * time.Second):
++		t.Fatal("credential request did not finish")
++	}
++	var wrote bool
++	if e = f.db.QueryRow(`SELECT (SELECT last_login_at IS NOT NULL FROM users WHERE username='synthetic') OR (SELECT last_used_at IS NOT NULL FROM api_keys WHERE token=$1)`, f.key).Scan(&wrote); e != nil {
++		t.Fatal(e)
++	}
++	if wrote || f.count(t) != 0 {
++		t.Fatal("auth metadata changed despite pause winning race")
++	}
++}
++
++func TestPostgresHandoffRequestPanicRetainsUncertainLease(t *testing.T) {
++	f := actualAuthFixture(t)
++	wrapped := handoffAdmission(f.store, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if !requestctx.AcquireAuthenticatedHandoff(w, r) {
++			return
++		}
++		panic("synthetic authenticated work panic")
++	}))
++	func() {
++		defer func() {
++			if recover() != "synthetic authenticated work panic" {
++				t.Error("panic swallowed")
++			}
++		}()
++		wrapped.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/synthetic-authenticated", nil))
++	}()
++	r, e := handoff.Pause(context.Background(), f.db, strings.Repeat("a", 64), strings.Repeat("d", 64))
++	if e != nil || r.Confirmed || r.UncertainLeases != 1 {
++		t.Fatal("panic incorrectly finished", r, e)
++	}
++}
++
++func TestPostgresHandoffDisabledPreservesAnonymousSessionAndAuthenticatedBehavior(t *testing.T) {
++	f := actualAuthFixture(t)
++	t.Setenv("HANDOFF_ENABLED", "0")
++	var e error
++	config.Opts, e = config.NewConfigParser().ParseEnvironmentVariables()
++	if e != nil {
++		t.Fatal(e)
++	}
++	if w := f.serve("GET", "/", "", nil); w.Code != 200 {
++		t.Fatal("disabled anonymous login changed", w.Code, w.Body.String())
++	}
++	if w := f.serve("GET", "/v1/me", "", func(r *http.Request) { r.Header.Set("X-Auth-Token", f.key) }); w.Code != 200 {
++		t.Fatal(w.Code)
++	}
++	var sessions int
++	if e = f.db.QueryRow(`SELECT count(*) FROM web_sessions`).Scan(&sessions); e != nil {
++		t.Fatal(e)
++	}
++	if sessions != 2 || f.count(t) != 0 {
++		t.Fatal("disabled session or lease behavior changed", sessions)
++	}
++}
++
++func TestPostgresHandoffRealCredentialPathsAcquireBeforeAuthWrites(t *testing.T) {
++	f := actualAuthFixture(t)
++	api := func(r *http.Request) { r.Header.Set("X-Auth-Token", f.key) }
++	basic := func(r *http.Request) { r.SetBasicAuth("synthetic", "only-isolated-password") }
++	ui := func(r *http.Request) { r.AddCookie(f.cookie) }
++	for _, prepare := range []func(*http.Request){api, basic} {
++		if w := f.serve("GET", "/v1/me", "", prepare); w.Code != 200 {
++			t.Fatal(w.Code, w.Body.String())
++		}
++	}
++	if w := f.serve("POST", "/fever/", "api_key=synthetic-fever", nil); w.Code != 200 || !strings.Contains(w.Body.String(), `"auth":1`) {
++		t.Fatal(w.Code, w.Body.String())
++	}
++	login := f.serve("POST", "/accounts/ClientLogin", "Email=synthetic-gr&Passwd=only-isolated-password&output=json", nil)
++	if login.Code != 200 {
++		t.Fatal(login.Code, login.Body.String())
++	}
++	var token map[string]string
++	if e := json.Unmarshal(login.Body.Bytes(), &token); e != nil {
++		t.Fatal(e)
++	}
++	gr := func(r *http.Request) { r.Header.Set("Authorization", "GoogleLogin auth="+token["Auth"]) }
++	if w := f.serve("GET", "/reader/api/0/token", "", gr); w.Code != 200 {
++		t.Fatal(w.Code, w.Body.String())
++	}
++	if w := f.serve("GET", "/manifest.json", "", ui); w.Code != 200 {
++		t.Fatal(w.Code, w.Body.String())
++	}
++	if f.count(t) != 6 {
++		t.Fatal("actual credential paths not each owned", f.count(t))
++	}
++	f.pause(t)
++	var loginBefore, keyBefore string
++	if e := f.db.QueryRow(`SELECT last_login_at::text FROM users WHERE username='synthetic'`).Scan(&loginBefore); e != nil {
++		t.Fatal(e)
++	}
++	if e := f.db.QueryRow(`SELECT last_used_at::text FROM api_keys WHERE token=$1`, f.key).Scan(&keyBefore); e != nil {
++		t.Fatal(e)
++	}
++	for _, c := range []struct {
++		method, path, body string
++		prepare            func(*http.Request)
++	}{{"GET", "/v1/me", "", api}, {"GET", "/v1/me", "", basic}, {"POST", "/fever/", "api_key=synthetic-fever", nil}, {"POST", "/accounts/ClientLogin", "Email=synthetic-gr&Passwd=only-isolated-password", nil}, {"GET", "/reader/api/0/token", "", gr}, {"GET", "/manifest.json", "", ui}} {
++		if w := f.serve(c.method, c.path, c.body, c.prepare); w.Code != 503 {
++			t.Fatal("authenticated request crossed pause", c.path, w.Code)
++		}
++	}
++	var loginAfter, keyAfter string
++	_ = f.db.QueryRow(`SELECT last_login_at::text FROM users WHERE username='synthetic'`).Scan(&loginAfter)
++	_ = f.db.QueryRow(`SELECT last_used_at::text FROM api_keys WHERE token=$1`, f.key).Scan(&keyAfter)
++	if f.count(t) != 6 || loginBefore != loginAfter || keyBefore != keyAfter {
++		t.Fatal("paused credential path wrote before gate")
++	}
++}
++
++func TestPostgresHandoffAuthenticatedRequestScopeHoldsLeaseUntilHandlerReturns(t *testing.T) {
++	f := actualAuthFixture(t)
++	entered, finish := make(chan struct{}), make(chan struct{})
++	done := make(chan struct{})
++	wrapped := handoffAdmission(f.store, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		// Real credential verification is tested above; this handshake fixes the
++		// exact scheduling boundary after successful acquisition, before return.
++		if !requestctx.AcquireAuthenticatedHandoff(w, r) {
++			return
++		}
++		close(entered)
++		<-finish
++		w.WriteHeader(204)
++	}))
++	go func() {
++		defer close(done)
++		wrapped.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/synthetic-authenticated", nil))
++	}()
++	select {
++	case <-entered:
++	case <-time.After(3 * time.Second):
++		t.Fatal("handler did not acquire")
++	}
++	r, e := handoff.Pause(context.Background(), f.db, strings.Repeat("a", 64), strings.Repeat("d", 64))
++	if e != nil || r.Confirmed || r.ActiveLeases != 1 {
++		close(finish)
++		<-done
++		t.Fatal("request not counted in flight", r, e)
++	}
++	close(finish)
++	<-done
++	r, e = handoff.Query(context.Background(), f.db, strings.Repeat("a", 64), strings.Repeat("d", 64))
++	if e != nil || !r.Confirmed {
++		t.Fatal(r, e)
++	}
++}
+diff --git a/internal/http/server/handoff_background_writes_test.go b/internal/http/server/handoff_background_writes_test.go
+new file mode 100644
+index 0000000..aab8d22
+--- /dev/null
++++ b/internal/http/server/handoff_background_writes_test.go
+@@ -0,0 +1,260 @@
++// SPDX-License-Identifier: Apache-2.0
++package server
++
++import (
++	"context"
++	"database/sql"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"os"
++	"strings"
++	"testing"
++	"time"
++
++	"miniflux.app/v2/internal/api"
++	"miniflux.app/v2/internal/config"
++	"miniflux.app/v2/internal/crypto"
++	"miniflux.app/v2/internal/database"
++	"miniflux.app/v2/internal/handoff"
++	"miniflux.app/v2/internal/storage"
++)
++
++type backgroundWriteFixture struct {
++	db      *sql.DB
++	handler http.Handler
++}
++
++func newBackgroundWriteFixture(t *testing.T, enabled bool) backgroundWriteFixture {
++	t.Helper()
++	raw := os.Getenv("MINIFLUX_OUTBOX_TEST_DSN")
++	if raw == "" {
++		t.Skip("explicit isolated PostgreSQL required")
++	}
++	u, err := url.Parse(raw)
++	if err != nil || u.Scheme != "postgres" || (u.Hostname() != "127.0.0.1" && u.Hostname() != "localhost") || u.Path != "/synthetic_outbox" {
++		t.Fatal("synthetic loopback PostgreSQL only")
++	}
++	admin, err := sql.Open("postgres", raw)
++	if err != nil {
++		t.Fatal(err)
++	}
++	schema := fmt.Sprintf("pause_background_%d", time.Now().UnixNano())
++	if _, err = admin.Exec(`CREATE SCHEMA ` + schema); err != nil {
++		admin.Close()
++		t.Fatal(err)
++	}
++	admin.Close()
++	query := u.Query()
++	query.Set("search_path", schema)
++	u.RawQuery = query.Encode()
++	db, err := sql.Open("postgres", u.String())
++	if err != nil {
++		t.Fatal(err)
++	}
++	db.SetMaxOpenConns(8)
++	t.Cleanup(func() { db.Close() })
++	leaseDB, err := sql.Open("postgres", u.String())
++	if err != nil {
++		t.Fatal(err)
++	}
++	leaseDB.SetMaxOpenConns(8)
++	t.Cleanup(func() { leaseDB.Close() })
++	if err = database.Migrate(db); err != nil {
++		t.Fatal(err)
++	}
++	hash, err := crypto.HashPassword("synthetic-only-password")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err = db.Exec(`INSERT INTO users(id,username,password,is_admin) VALUES(1,'synthetic-admin',$1,true),(2,'synthetic-target',$1,false)`, hash); err != nil {
++		t.Fatal(err)
++	}
++	if _, err = db.Exec(`INSERT INTO categories(id,user_id,title) VALUES(1,1,'synthetic');
++ INSERT INTO feeds(id,user_id,category_id,title,feed_url,site_url) VALUES(1,1,1,'synthetic','https://synthetic.invalid/feed','https://synthetic.invalid');
++ INSERT INTO entries(id,user_id,feed_id,hash,title,url,content,status,starred,share_code,published_at,created_at,changed_at) VALUES(1,1,1,'retained-before-flush','synthetic','https://synthetic.invalid/entry','','read',false,'',clock_timestamp(),clock_timestamp(),clock_timestamp());`); err != nil {
++		t.Fatal(err)
++	}
++	prior := config.Opts
++	t.Cleanup(func() { config.Opts = prior })
++	mode := "0"
++	if enabled {
++		mode = "1"
++	}
++	for key, value := range map[string]string{"HANDOFF_ENABLED": mode, "WEBHOOK_OUTBOX": "1", "WEBHOOK_OUTBOX_CONTRACT": "synthetic", "HANDOFF_MANIFEST": strings.Repeat("a", 64), "HANDOFF_CONTROL_TOKEN": strings.Repeat("b", 64), "HANDOFF_CONTROL_ADDR": "127.0.0.1:19002"} {
++		t.Setenv(key, value)
++	}
++	config.Opts, err = config.NewConfigParser().ParseEnvironmentVariables()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = config.Opts.Validate(); err != nil {
++		t.Fatal(err)
++	}
++	store := storage.NewStorage(db)
++	store.ConfigureHandoff(leaseDB)
++	if _, err = handoff.Initialize(context.Background(), db, strings.Repeat("a", 64), strings.Repeat("1", 64)); err != nil {
++		t.Fatal(err)
++	}
++	t.Log("retained schema", schema)
++	return backgroundWriteFixture{db, handoffAdmission(store, api.NewHandler(store, nil))}
++}
++
++func (f backgroundWriteFixture) request(method, path string) <-chan int {
++	done := make(chan int, 1)
++	go func() {
++		request := httptest.NewRequest(method, path, nil)
++		request.SetBasicAuth("synthetic-admin", "synthetic-only-password")
++		response := httptest.NewRecorder()
++		f.handler.ServeHTTP(response, request)
++		done <- response.Code
++	}()
++	return done
++}
++
++func waitBackgroundDBCondition(t *testing.T, db *sql.DB, query string, args ...any) {
++	t.Helper()
++	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
++	defer cancel()
++	for {
++		var ready bool
++		if err := db.QueryRowContext(ctx, query, args...).Scan(&ready); err != nil {
++			t.Fatal("database handshake failed", err)
++		}
++		if ready {
++			return
++		}
++		select {
++		case <-ctx.Done():
++			t.Fatal("database handshake absent")
++		case <-time.After(5 * time.Millisecond):
++		}
++	}
++}
++
++func TestPostgresHandoffBackgroundWritesKeepRealRouteLeaseUntilDBReturns(t *testing.T) {
++	for _, operation := range []struct {
++		name, table, method, path string
++		status                    int
++	}{
++		{"flush_history", "entries", "PUT", "/v1/flush-history", 202},
++		{"remove_user", "users", "DELETE", "/v1/users/2", 204},
++	} {
++		for _, enabled := range []bool{true, false} {
++			t.Run(fmt.Sprintf("%s/enforced=%t", operation.name, enabled), func(t *testing.T) {
++				fixture := newBackgroundWriteFixture(t, enabled)
++				key := time.Now().UnixNano()%1000000000 + 1000000000
++				blocker, err := fixture.db.Begin()
++				if err != nil {
++					t.Fatal(err)
++				}
++				defer blocker.Rollback()
++				if _, err = blocker.Exec(`SELECT pg_advisory_xact_lock($1)`, key); err != nil {
++					t.Fatal(err)
++				}
++				trigger := fmt.Sprintf(`CREATE FUNCTION synthetic_background_block() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(%d::bigint); RETURN OLD; END $$;
++ CREATE TRIGGER synthetic_background_block BEFORE DELETE ON %s FOR EACH ROW EXECUTE FUNCTION synthetic_background_block();`, key, operation.table)
++				if _, err = fixture.db.Exec(trigger); err != nil {
++					t.Fatal(err)
++				}
++				result := fixture.request(operation.method, operation.path)
++				received := false
++				defer func() {
++					_ = blocker.Rollback()
++					if !received {
++						select {
++						case <-result:
++						case <-time.After(4 * time.Second):
++							t.Error("request did not exit after synthetic lock release")
++						}
++					}
++				}()
++				// Prove the actual DELETE reached a blocked PostgreSQL advisory lock; no
++				// arbitrary sleep is used to infer that background work has begun.
++				waitBackgroundDBCondition(t, fixture.db, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND classid=0 AND objid=$1::oid AND NOT granted)`, key)
++				if enabled {
++					select {
++					case status := <-result:
++						received = true
++						t.Fatalf("enforced route responded %d before its database write finished", status)
++					default:
++					}
++				} else {
++					select {
++					case status := <-result:
++						received = true
++						if status != operation.status {
++							t.Fatal("disabled async behavior changed", status)
++						}
++					case <-time.After(4 * time.Second):
++						t.Fatal("disabled old asynchronous response blocked")
++					}
++				}
++				pause, err := handoff.Pause(context.Background(), fixture.db, strings.Repeat("a", 64), strings.Repeat("2", 64))
++				if err != nil {
++					t.Fatal(err)
++				}
++				if enabled && (pause.Confirmed || pause.ActiveLeases != 1) {
++					t.Fatal("pause falsely drained an in-flight database write", pause)
++				}
++				if !enabled && (!pause.Confirmed || pause.ActiveLeases != 0) {
++					t.Fatal("disabled behavior unexpectedly registered work", pause)
++				}
++				if err = blocker.Rollback(); err != nil {
++					t.Fatal(err)
++				}
++				if !received {
++					select {
++					case status := <-result:
++						received = true
++						if status != operation.status {
++							t.Fatal("actual route completion failed", status)
++						}
++					case <-time.After(4 * time.Second):
++						t.Fatal("route did not finish after database release")
++					}
++				}
++				absence := `SELECT NOT EXISTS(SELECT 1 FROM entries WHERE id=1)`
++				if operation.table == "users" {
++					absence = `SELECT NOT EXISTS(SELECT 1 FROM users WHERE id=2)`
++				}
++				waitBackgroundDBCondition(t, fixture.db, absence)
++				closed, err := handoff.Query(context.Background(), fixture.db, strings.Repeat("a", 64), strings.Repeat("2", 64))
++				if err != nil || !closed.Confirmed || closed.ActiveLeases != 0 || closed.UncertainLeases != 0 {
++					t.Fatal("finished write did not permit exact pause confirmation", closed, err)
++				}
++			})
++		}
++	}
++}
++
++func TestPostgresHandoffBackgroundWriteFailureDoesNotReturnAcceptance(t *testing.T) {
++	for _, operation := range []struct{ table, method, path string }{{"entries", "DELETE", "/v1/flush-history"}, {"users", "DELETE", "/v1/users/2"}} {
++		t.Run(operation.table, func(t *testing.T) {
++			fixture := newBackgroundWriteFixture(t, true)
++			if _, err := fixture.db.Exec(`CREATE FUNCTION synthetic_background_reject() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic database failure'; END $$;
++ CREATE TRIGGER synthetic_background_reject BEFORE DELETE ON ` + operation.table + ` FOR EACH ROW EXECUTE FUNCTION synthetic_background_reject();`); err != nil {
++				t.Fatal(err)
++			}
++			result := fixture.request(operation.method, operation.path)
++			select {
++			case status := <-result:
++				if status != 500 {
++					t.Fatal("failed DB write falsely accepted", status)
++				}
++			case <-time.After(4 * time.Second):
++				t.Fatal("rejected route did not finish")
++			}
++			retained := `SELECT EXISTS(SELECT 1 FROM entries WHERE id=1)`
++			if operation.table == "users" {
++				retained = `SELECT EXISTS(SELECT 1 FROM users WHERE id=2)`
++			}
++			waitBackgroundDBCondition(t, fixture.db, retained)
++			closed, err := handoff.Pause(context.Background(), fixture.db, strings.Repeat("a", 64), strings.Repeat("2", 64))
++			if err != nil || !closed.Confirmed {
++				t.Fatal("completed failure is not in-flight work", closed, err)
++			}
++		})
++	}
++}
+diff --git a/internal/http/server/handoff_integration_test.go b/internal/http/server/handoff_integration_test.go
+new file mode 100644
+index 0000000..e5241a4
+--- /dev/null
++++ b/internal/http/server/handoff_integration_test.go
+@@ -0,0 +1,106 @@
++// SPDX-License-Identifier: Apache-2.0
++package server
++
++import (
++	"context"
++	"database/sql"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"os"
++	"strings"
++	"testing"
++	"time"
++
++	"miniflux.app/v2/internal/config"
++	"miniflux.app/v2/internal/database"
++	"miniflux.app/v2/internal/handoff"
++	requestctx "miniflux.app/v2/internal/http/request"
++	"miniflux.app/v2/internal/storage"
++)
++
++func TestPostgresHandoffHTTPAllEntrancesRemainClosedAfterPause(t *testing.T) {
++	dsn := os.Getenv("MINIFLUX_OUTBOX_TEST_DSN")
++	if dsn == "" {
++		t.Skip("requires explicit isolated PostgreSQL")
++	}
++	u, err := url.Parse(dsn)
++	if err != nil || u.Hostname() != "127.0.0.1" || u.Path != "/synthetic_outbox" {
++		t.Fatal("synthetic loopback DB required")
++	}
++	db, err := sql.Open("postgres", dsn)
++	if err != nil {
++		t.Fatal(err)
++	}
++	schema := fmt.Sprintf("pause_http_%d", time.Now().UnixNano())
++	if _, err = db.Exec("CREATE SCHEMA " + schema); err != nil {
++		t.Fatal(err)
++	}
++	db.Close()
++	q := u.Query()
++	q.Set("search_path", schema)
++	u.RawQuery = q.Encode()
++	db, err = sql.Open("postgres", u.String())
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer db.Close()
++	leaseDB, err := sql.Open("postgres", u.String())
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer leaseDB.Close()
++	if err = database.Migrate(db); err != nil {
++		t.Fatal(err)
++	}
++	prior := config.Opts
++	t.Cleanup(func() { config.Opts = prior })
++	for key, value := range map[string]string{"HANDOFF_ENABLED": "1", "HANDOFF_MANIFEST": strings.Repeat("a", 64), "HANDOFF_CONTROL_TOKEN": strings.Repeat("b", 64), "HANDOFF_CONTROL_ADDR": "127.0.0.1:19002", "WEBHOOK_OUTBOX": "1", "WEBHOOK_OUTBOX_CONTRACT": "synthetic"} {
++		t.Setenv(key, value)
++	}
++	config.Opts, err = config.NewConfigParser().ParseEnvironmentVariables()
++	if err != nil {
++		t.Fatal(err)
++	}
++	store := storage.NewStorage(db)
++	store.ConfigureHandoff(leaseDB)
++	called := 0
++	// This protocol-only handler represents a successful credential check.
++	// The actual REST/Fever/Google/UI authentication paths are covered separately.
++	handler := handoffAdmission(store, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.URL.Path != "/healthz" && !requestctx.AcquireAuthenticatedHandoff(w, r) {
++			return
++		}
++		called++
++		w.WriteHeader(204)
++	}))
++	request := func(path string) int {
++		w := httptest.NewRecorder()
++		handler.ServeHTTP(w, httptest.NewRequest("POST", path, nil))
++		return w.Code
++	}
++	if request("/v1/feeds/1/refresh") != 503 || called != 0 {
++		t.Fatal("missing initialize bypassed")
++	}
++	if _, err = handoff.Initialize(context.Background(), db, strings.Repeat("a", 64), strings.Repeat("c", 64)); err != nil {
++		t.Fatal(err)
++	}
++	if request("/v1/feeds/1/refresh") != 204 || called != 1 {
++		t.Fatal("initialized request rejected")
++	}
++	if _, err = handoff.Pause(context.Background(), db, strings.Repeat("a", 64), strings.Repeat("d", 64)); err != nil {
++		t.Fatal(err)
++	}
++	for _, path := range []string{"/v1/feeds/1/refresh", "/feeds/refresh", "/feed/1/refresh", "/v1/entries/1/save", "/entry/1/save", "/fever/", "/reader/api/0/"} {
++		if request(path) != 503 {
++			t.Fatal("closed route bypassed", path)
++		}
++	}
++	if called != 1 {
++		t.Fatal("paused handler executed")
++	}
++	if request("/healthz") != 204 {
++		t.Fatal("health should not claim business open")
++	}
++}
+diff --git a/internal/http/server/routes.go b/internal/http/server/routes.go
+index 4ce7e43..b9e88a2 100644
+--- a/internal/http/server/routes.go
++++ b/internal/http/server/routes.go
+@@ -73 +73 @@ func newRouter(store *storage.Storage, pool *worker.Pool) http.Handler {
+-	return rootMux
++	return handoffAdmission(store, rootMux)
+diff --git a/internal/integration/handoff.go b/internal/integration/handoff.go
+new file mode 100644
+index 0000000..73d5293
+--- /dev/null
++++ b/internal/integration/handoff.go
+@@ -0,0 +1,103 @@
++// SPDX-License-Identifier: Apache-2.0
++package integration
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"log/slog"
++
++	"miniflux.app/v2/internal/config"
++	"miniflux.app/v2/internal/crypto"
++	"miniflux.app/v2/internal/integration/webhook"
++	"miniflux.app/v2/internal/model"
++	"miniflux.app/v2/internal/storage"
++)
++
++func prepareLegacySave(entry *model.Entry, settings *model.Integration) (*model.DurableWebhook, error) {
++	if entry == nil || entry.ID <= 0 || entry.Feed == nil || entry.Feed.Category == nil || entry.FeedID != entry.Feed.ID || entry.UserID != entry.Feed.UserID || settings == nil || settings.UserID != entry.UserID || settings.WebhookSecret == "" {
++		return nil, errors.New("legacy save original identity incomplete")
++	}
++	target := settings.WebhookURL
++	if entry.Feed.WebhookURL != "" {
++		target = entry.Feed.WebhookURL
++	}
++	body, err := json.Marshal(webhook.SaveEntryPayload(entry))
++	if err != nil {
++		return nil, err
++	}
++	if len(body) > webhook.MaxDurableBody {
++		return nil, errors.New("legacy save original exceeds bound")
++	}
++	hash := sha256.Sum256(body)
++	id := hex.EncodeToString(hash[:])
++	return &model.DurableWebhook{DeliveryID: id, BodySHA256: id, Body: body, URL: target, Signature: crypto.GenerateSHA256Hmac(settings.WebhookSecret, body), Contract: config.Opts.WebhookOutboxContract()}, nil
++}
++
++// StartSaveEntry preserves the exact unsupported save_entry webhook as held;
++// it NEVER sends that webhook. Only other providers run asynchronously. The
++// successful caller response means preservation, not receiver/scoring success.
++func StartSaveEntry(store *storage.Storage, entry *model.Entry, settings *model.Integration) error {
++	if !config.Opts.HasHandoff() {
++		go SendEntry(entry, settings)
++		return nil
++	}
++	lease, err := store.BeginHandoff("manual_save")
++	if err != nil {
++		return err
++	}
++	if settings == nil {
++		return errors.Join(errors.New("missing integration settings"), lease.Finish())
++	}
++	copySettings := *settings
++	if settings.WebhookEnabled {
++		original, err := prepareLegacySave(entry, settings)
++		if err == nil {
++			err = store.PreserveLegacyWebhook(original, entry.UserID, entry.FeedID, entry.ID)
++		}
++		if err != nil {
++			return errors.Join(err, lease.Finish())
++		}
++		copySettings.WebhookEnabled = false
++	}
++	go func() {
++		// Panic/crash leaves the durable lease unresolved, never a false paused
++		// marker. A provider error is already logged by its existing integration.
++		completed := false
++		defer func() {
++			if recover() != nil {
++				if err := lease.Abort(); err != nil {
++					slog.Error("Legacy integration abort unconfirmed")
++				}
++				slog.Error("Legacy integration panicked; handoff remains uncertain")
++				return
++			}
++			if completed {
++				if err := lease.Finish(); err != nil {
++					slog.Error("Legacy integration lease completion unconfirmed")
++				}
++			}
++		}()
++		sendEntry(entry, &copySettings)
++		completed = true
++	}()
++	return nil
++}
++
++// The enforced refresh caller retains its parent lease through this synchronous
++// work and subsequent feed updates. Disabled mode keeps the old async behavior.
++func StartPushEntries(feed *model.Feed, entries model.Entries, settings *model.Integration, finish func() error) error {
++	if !config.Opts.HasHandoff() {
++		go PushEntries(feed, entries, settings)
++		return nil
++	}
++	if settings == nil || settings.WebhookEnabled || !config.Opts.HasWebhookOutbox() {
++		return errors.New("unpreserved legacy refresh webhook refused")
++	}
++	pushEntries(feed, entries, settings)
++	if finish != nil {
++		return finish()
++	}
++	return nil
++}
+diff --git a/internal/integration/handoff_integration_test.go b/internal/integration/handoff_integration_test.go
+new file mode 100644
+index 0000000..02a5a9b
+--- /dev/null
++++ b/internal/integration/handoff_integration_test.go
+@@ -0,0 +1,166 @@
++// SPDX-License-Identifier: Apache-2.0
++package integration
++
++import (
++	"context"
++	"database/sql"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"os"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"miniflux.app/v2/internal/database"
++	"miniflux.app/v2/internal/handoff"
++	"miniflux.app/v2/internal/model"
++	"miniflux.app/v2/internal/storage"
++)
++
++func legacyPGStore(t *testing.T) (*storage.Storage, *sql.DB) {
++	t.Helper()
++	dsn := os.Getenv("MINIFLUX_OUTBOX_TEST_DSN")
++	if dsn == "" {
++		t.Skip("explicit isolated PostgreSQL DSN not configured")
++	}
++	u, err := url.Parse(dsn)
++	if err != nil || (u.Hostname() != "127.0.0.1" && u.Hostname() != "localhost") || u.Path != "/synthetic_outbox" {
++		t.Fatal("only explicit local synthetic_outbox database is allowed")
++	}
++	db, err := sql.Open("postgres", dsn)
++	if err != nil {
++		t.Fatal(err)
++	}
++	schema := fmt.Sprintf("legacy_integration_%d", time.Now().UnixNano())
++	if _, err = db.Exec(`CREATE SCHEMA ` + schema); err != nil {
++		db.Close()
++		t.Fatal(err)
++	}
++	db.Close()
++	q := u.Query()
++	q.Set("search_path", schema)
++	u.RawQuery = q.Encode()
++	db, err = sql.Open("postgres", u.String())
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { db.Close() })
++	if err = database.Migrate(db); err != nil {
++		t.Fatal(err)
++	}
++	leaseDB, err := sql.Open("postgres", u.String())
++	if err != nil {
++		t.Fatal(err)
++	}
++	leaseDB.SetMaxOpenConns(8)
++	t.Cleanup(func() { leaseDB.Close() })
++	store := storage.NewStorage(db)
++	store.ConfigureHandoff(leaseDB)
++	if _, err = handoff.Initialize(context.Background(), db, strings.Repeat("a", 64), strings.Repeat("1", 64)); err != nil {
++		t.Fatal(err)
++	}
++	t.Log("retained schema", schema)
++	return store, db
++}
++
++func TestPostgresLegacySavePreservedBeforeAsyncAndPauseWaitsForProvider(t *testing.T) {
++	configureLegacyTest(t, true)
++	store, db := legacyPGStore(t)
++	entered := make(chan struct{})
++	release := make(chan struct{})
++	var once sync.Once
++	defer once.Do(func() { close(release) })
++	var webhookHits atomic.Int32
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.URL.Path == "/webhook" {
++			webhookHits.Add(1)
++			w.WriteHeader(http.StatusAccepted)
++			return
++		}
++		close(entered)
++		<-release
++		w.WriteHeader(http.StatusOK)
++	}))
++	defer server.Close()
++	// Release before server.Close even on an assertion failure.
++	defer once.Do(func() { close(release) })
++	entry := legacyEntry()
++	settings := &model.Integration{UserID: 1, WebhookEnabled: true, WebhookURL: server.URL + "/webhook", WebhookSecret: "synthetic-key", BetulaEnabled: true, BetulaURL: server.URL, BetulaToken: "synthetic-token"}
++	original, err := prepareLegacySave(entry, settings)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = StartSaveEntry(store, entry, settings); err != nil {
++		t.Fatal(err)
++	}
++	var body []byte
++	var state, signature string
++	if err = db.QueryRow(`SELECT body,state,signature FROM webhook_legacy_originals WHERE delivery_id=$1`, original.DeliveryID).Scan(&body, &state, &signature); err != nil || string(body) != string(original.Body) || state != "held" || signature != original.Signature {
++		t.Fatal("accepted before exact original committed", err)
++	}
++	select {
++	case <-entered:
++	case <-time.After(2 * time.Second):
++		t.Fatal("tracked provider did not start")
++	}
++	pauseOp := strings.Repeat("2", 64)
++	receipt, err := handoff.Pause(context.Background(), db, strings.Repeat("a", 64), pauseOp)
++	if err != nil || receipt.Confirmed || receipt.ActiveLeases != 1 {
++		t.Fatal("inflight provider incorrectly declared drained", receipt, err)
++	}
++	changed := legacyEntry()
++	changed.ID = 8
++	if err = StartSaveEntry(store, changed, settings); err == nil {
++		t.Fatal("closing gate admitted another legacy save")
++	}
++	once.Do(func() { close(release) })
++	deadline := time.Now().Add(3 * time.Second)
++	for {
++		receipt, err = handoff.Query(context.Background(), db, strings.Repeat("a", 64), pauseOp)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if receipt.Confirmed {
++			break
++		}
++		if time.Now().After(deadline) {
++			t.Fatal("completed provider lease did not finish", receipt)
++		}
++		time.Sleep(5 * time.Millisecond)
++	}
++	if receipt.ActiveLeases != 0 || receipt.UncertainLeases != 0 || webhookHits.Load() != 0 {
++		t.Fatal("held event dispatched or wrong drain", receipt)
++	}
++	var count int
++	if err = db.QueryRow(`SELECT count(*) FROM webhook_legacy_originals`).Scan(&count); err != nil || count != 1 {
++		t.Fatal("rejected save was preserved/accepted", err)
++	}
++}
++
++func TestPostgresLegacySaveWriteFailureCannotLaunchProviders(t *testing.T) {
++	configureLegacyTest(t, true)
++	store, db := legacyPGStore(t)
++	var hits atomic.Int32
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits.Add(1); w.WriteHeader(http.StatusOK) }))
++	defer server.Close()
++	if _, err := db.Exec(`CREATE FUNCTION synthetic_legacy_no_space() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic disk full'; END $$;
++ CREATE TRIGGER synthetic_no_space BEFORE INSERT ON webhook_legacy_originals FOR EACH ROW EXECUTE FUNCTION synthetic_legacy_no_space();`); err != nil {
++		t.Fatal(err)
++	}
++	settings := &model.Integration{UserID: 1, WebhookEnabled: true, WebhookURL: server.URL + "/webhook", WebhookSecret: "synthetic", BetulaEnabled: true, BetulaURL: server.URL, BetulaToken: "synthetic"}
++	if StartSaveEntry(store, legacyEntry(), settings) == nil {
++		t.Fatal("failed preservation falsely accepted")
++	}
++	var count int
++	if err := db.QueryRow(`SELECT count(*) FROM webhook_legacy_originals`).Scan(&count); err != nil || count != 0 {
++		t.Fatal("failed row survived", err)
++	}
++	receipt, err := handoff.Pause(context.Background(), db, strings.Repeat("a", 64), strings.Repeat("3", 64))
++	if err != nil || !receipt.Confirmed || hits.Load() != 0 {
++		t.Fatal("failed preservation started provider or lost lease", receipt, err)
++	}
++}
+diff --git a/internal/integration/handoff_test.go b/internal/integration/handoff_test.go
+new file mode 100644
+index 0000000..6eb8648
+--- /dev/null
++++ b/internal/integration/handoff_test.go
+@@ -0,0 +1,166 @@
++// SPDX-License-Identifier: Apache-2.0
++package integration
++
++import (
++	"bytes"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"miniflux.app/v2/internal/config"
++	"miniflux.app/v2/internal/crypto"
++	"miniflux.app/v2/internal/integration/webhook"
++	"miniflux.app/v2/internal/model"
++	"miniflux.app/v2/internal/storage"
++)
++
++func configureLegacyTest(t *testing.T, enabled bool) {
++	t.Helper()
++	previous := config.Opts
++	t.Cleanup(func() { config.Opts = previous })
++	value := "0"
++	if enabled {
++		value = "1"
++	}
++	t.Setenv("HANDOFF_ENABLED", value)
++	t.Setenv("WEBHOOK_OUTBOX", "1")
++	t.Setenv("WEBHOOK_OUTBOX_CONTRACT", "synthetic-contract")
++	t.Setenv("HANDOFF_MANIFEST", strings.Repeat("a", 64))
++	t.Setenv("HANDOFF_CONTROL_TOKEN", strings.Repeat("b", 64))
++	t.Setenv("HANDOFF_CONTROL_ADDR", "127.0.0.1:19002")
++	t.Setenv("INTEGRATION_ALLOW_PRIVATE_NETWORKS", "1")
++	opts, err := config.NewConfigParser().ParseEnvironmentVariables()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = opts.Validate(); err != nil {
++		t.Fatal(err)
++	}
++	config.Opts = opts
++}
++
++func legacyEntry() *model.Entry {
++	return &model.Entry{ID: 7, UserID: 1, FeedID: 3, Hash: "original-hash", Title: "Synthetic α & <value>", URL: "https://synthetic.invalid/article?q=1", Content: "original\ncontent", Date: time.Unix(1700000000, 0).UTC(), Feed: &model.Feed{ID: 3, UserID: 1, Category: &model.Category{ID: 2, Title: "Synthetic"}, FeedURL: "https://synthetic.invalid/feed"}}
++}
++
++func TestLegacyPreservedPayloadIsExactOriginalSerializationAndSignature(t *testing.T) {
++	configureLegacyTest(t, false)
++	entry := legacyEntry()
++	var received []byte
++	var signature string
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		received, _ = io.ReadAll(r.Body)
++		signature = r.Header.Get("X-Miniflux-Signature")
++		w.WriteHeader(http.StatusAccepted)
++	}))
++	defer server.Close()
++	settings := &model.Integration{UserID: 1, WebhookEnabled: true, WebhookURL: server.URL, WebhookSecret: "synthetic-key"}
++	if err := webhook.NewClient(server.URL, settings.WebhookSecret).SendSaveEntryWebhookEvent(entry); err != nil {
++		t.Fatal(err)
++	}
++	preserved, err := prepareLegacySave(entry, settings)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !bytes.Equal(received, preserved.Body) || signature != preserved.Signature || preserved.Signature != crypto.GenerateSHA256Hmac(settings.WebhookSecret, preserved.Body) {
++		t.Fatal("preserved body/signature differs from actual legacy sender")
++	}
++	hash := sha256.Sum256(received)
++	if preserved.DeliveryID != hex.EncodeToString(hash[:]) || preserved.BodySHA256 != preserved.DeliveryID || preserved.Contract != "synthetic-contract" {
++		t.Fatal("wrong exact-body identity")
++	}
++	var decoded map[string]any
++	if err = json.Unmarshal(preserved.Body, &decoded); err != nil || decoded["event_type"] != "save_entry" {
++		t.Fatal("not save-entry payload", err)
++	}
++	entry.Feed.WebhookURL = "https://override.invalid/webhook"
++	override, err := prepareLegacySave(entry, settings)
++	if err != nil || override.URL != entry.Feed.WebhookURL {
++		t.Fatal("feed endpoint override lost", err)
++	}
++}
++
++func TestLegacyPreparationRejectsMissingIdentityAndOversize(t *testing.T) {
++	configureLegacyTest(t, true)
++	settings := &model.Integration{UserID: 1, WebhookEnabled: true, WebhookURL: "https://synthetic.invalid/webhook", WebhookSecret: "synthetic"}
++	for _, mutate := range []func(*model.Entry){func(e *model.Entry) { e.ID = 0 }, func(e *model.Entry) { e.Feed = nil }, func(e *model.Entry) { e.Feed.Category = nil }, func(e *model.Entry) { e.FeedID = 9 }, func(e *model.Entry) { e.UserID = 2 }, func(e *model.Entry) { e.Content = strings.Repeat("x", webhook.MaxDurableBody) }} {
++		entry := legacyEntry()
++		mutate(entry)
++		if _, err := prepareLegacySave(entry, settings); err == nil {
++			t.Fatal("invalid original accepted")
++		}
++	}
++	if _, err := prepareLegacySave(nil, settings); err == nil {
++		t.Fatal("nil entry accepted")
++	}
++	if _, err := prepareLegacySave(legacyEntry(), nil); err == nil {
++		t.Fatal("nil settings accepted")
++	}
++	settings.WebhookSecret = ""
++	if _, err := prepareLegacySave(legacyEntry(), settings); err == nil {
++		t.Fatal("unsigned original accepted")
++	}
++}
++
++func TestEnforcedDirectLegacyPathsCannotDispatchAndUnboundSaveRejects(t *testing.T) {
++	configureLegacyTest(t, true)
++	var hits atomic.Int32
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits.Add(1); w.WriteHeader(http.StatusAccepted) }))
++	defer server.Close()
++	entry := legacyEntry()
++	settings := &model.Integration{UserID: 1, WebhookEnabled: true, WebhookURL: server.URL, WebhookSecret: "synthetic"}
++	SendEntry(entry, settings)
++	PushEntries(entry.Feed, model.Entries{entry}, settings)
++	if err := webhook.NewClient(server.URL, "synthetic").SendSaveEntryWebhookEvent(entry); err == nil {
++		t.Fatal("direct webhook bypass allowed")
++	}
++	if err := webhook.NewClient(server.URL, "synthetic").SendNewEntriesWebhookEvent(entry.Feed, model.Entries{entry}); err == nil {
++		t.Fatal("direct new entries bypass allowed")
++	}
++	if err := StartSaveEntry(storage.NewStorage(nil), entry, settings); err == nil {
++		t.Fatal("unbound lease admitted")
++	}
++	if err := StartPushEntries(entry.Feed, model.Entries{entry}, settings, nil); err == nil {
++		t.Fatal("unpreserved refresh webhook admitted")
++	}
++	if hits.Load() != 0 {
++		t.Fatal("enforced legacy path emitted HTTP")
++	}
++	settings.WebhookEnabled = false
++	finished := false
++	if err := StartPushEntries(entry.Feed, model.Entries{entry}, settings, func() error { finished = true; return nil }); err != nil || !finished {
++		t.Fatal("safe nonwebhook synchronous completion failed", err)
++	}
++}
++
++func TestDisabledSaveKeepsLegacyAsyncDelivery(t *testing.T) {
++	configureLegacyTest(t, false)
++	received := make(chan []byte, 1)
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		body, _ := io.ReadAll(r.Body)
++		received <- body
++		w.WriteHeader(http.StatusAccepted)
++	}))
++	defer server.Close()
++	entry := legacyEntry()
++	settings := &model.Integration{UserID: 1, WebhookEnabled: true, WebhookURL: server.URL, WebhookSecret: "synthetic"}
++	if err := StartSaveEntry(nil, entry, settings); err != nil {
++		t.Fatal(err)
++	}
++	select {
++	case body := <-received:
++		var payload map[string]any
++		if json.Unmarshal(body, &payload) != nil || payload["event_type"] != "save_entry" {
++			t.Fatal("legacy body changed")
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("disabled legacy async delivery absent")
++	}
++}
+diff --git a/internal/integration/integration.go b/internal/integration/integration.go
+index 5606aab..c92b918 100644
+--- a/internal/integration/integration.go
++++ b/internal/integration/integration.go
+@@ -8,0 +9 @@ import (
++	"miniflux.app/v2/internal/config"
+@@ -41,0 +43,8 @@ func SendEntry(entry *model.Entry, userIntegrations *model.Integration) {
++	if config.Opts.HasHandoff() {
++		slog.Error("Direct untracked legacy save refused; use held-preservation entrypoint")
++		return
++	}
++	sendEntry(entry, userIntegrations)
++}
++
++func sendEntry(entry *model.Entry, userIntegrations *model.Integration) {
+@@ -511,0 +521,8 @@ func PushEntries(feed *model.Feed, entries model.Entries, userIntegrations *mode
++	if config.Opts.HasHandoff() {
++		slog.Error("Direct untracked legacy push refused; use tracked entrypoint")
++		return
++	}
++	pushEntries(feed, entries, userIntegrations)
++}
++
++func pushEntries(feed *model.Feed, entries model.Entries, userIntegrations *model.Integration) {
+diff --git a/internal/integration/webhook/webhook.go b/internal/integration/webhook/webhook.go
+index 873994a..514668b 100644
+--- a/internal/integration/webhook/webhook.go
++++ b/internal/integration/webhook/webhook.go
+@@ -38 +38,7 @@ func (c *Client) SendSaveEntryWebhookEvent(entry *model.Entry) error {
+-	return c.makeRequest(SaveEntryEventType, &WebhookSaveEntryEvent{
++	return c.makeRequest(SaveEntryEventType, SaveEntryPayload(entry))
++}
++
++// SaveEntryPayload is shared unchanged by the legacy sender and the held
++// original-preservation path. Callers validate feed/category before using it.
++func SaveEntryPayload(entry *model.Entry) *WebhookSaveEntryEvent {
++	return &WebhookSaveEntryEvent{
+@@ -70 +76 @@ func (c *Client) SendSaveEntryWebhookEvent(entry *model.Entry) error {
+-	})
++	}
+@@ -122,0 +129,3 @@ func (c *Client) makeRequest(eventType string, payload any) error {
++	if config.Opts.HasHandoff() {
++		return errors.New("untracked legacy webhook refused while durable handoff is enabled")
++	}
+diff --git a/internal/reader/handler/handler.go b/internal/reader/handler/handler.go
+index 09ae115..c942514 100644
+--- a/internal/reader/handler/handler.go
++++ b/internal/reader/handler/handler.go
+@@ -12,0 +13 @@ import (
++	"miniflux.app/v2/internal/handoff"
+@@ -41,0 +43,7 @@ func CreateFeedFromSubscriptionDiscovery(store *storage.Storage, userID int64, f
++	lease, err := store.BeginHandoff("create_feed_discovery")
++	if err != nil {
++		return nil, locale.NewLocalizedErrorWrapper(err, "error.database_error", err)
++	}
++	if lease != nil {
++		defer handoff.FinishOnReturn(lease)
++	}
+@@ -105,0 +114,7 @@ func CreateFeed(store *storage.Storage, userID int64, feedCreationRequest *model
++	lease, err := store.BeginHandoff("create_feed")
++	if err != nil {
++		return nil, locale.NewLocalizedErrorWrapper(err, "error.database_error", err)
++	}
++	if lease != nil {
++		defer handoff.FinishOnReturn(lease)
++	}
+@@ -196,0 +212,23 @@ func RefreshFeed(store *storage.Storage, userID, feedID int64, forceRefresh bool
++	lease, err := store.BeginHandoff("direct_refresh")
++	if err != nil {
++		return locale.NewLocalizedErrorWrapper(err, "error.database_error", err)
++	}
++	return RefreshFeedAdmitted(store, userID, feedID, forceRefresh, lease)
++}
++
++// RefreshFeedAdmitted consumes the exact pre-queued lease, not a fresh grant after closure.
++func RefreshFeedAdmitted(store *storage.Storage, userID, feedID int64, forceRefresh bool, lease *handoff.Lease) (result *locale.LocalizedErrorWrapper) {
++	if err := store.ValidateHandoffLease(lease); err != nil {
++		return locale.NewLocalizedErrorWrapper(err, "error.database_error", err)
++	}
++	if lease != nil {
++		defer func() {
++			if value := recover(); value != nil {
++				_ = lease.Abort()
++				panic(value)
++			}
++			if err := lease.Finish(); err != nil {
++				result = locale.NewLocalizedErrorWrapper(err, "error.database_error", err)
++			}
++		}()
++	}
+@@ -359 +397,3 @@ func RefreshFeed(store *storage.Storage, userID, feedID int64, forceRefresh bool
+-			go integration.PushEntries(originalFeed, newEntries, userIntegrations)
++			if err := integration.StartPushEntries(originalFeed, newEntries, userIntegrations, nil); err != nil {
++				return locale.NewLocalizedErrorWrapper(err, "error.database_error", err)
++			}
+diff --git a/internal/storage/handoff.go b/internal/storage/handoff.go
+new file mode 100644
+index 0000000..cf71841
+--- /dev/null
++++ b/internal/storage/handoff.go
+@@ -0,0 +1,54 @@
++// SPDX-License-Identifier: Apache-2.0
++package storage
++
++import (
++	"context"
++	"database/sql"
++	"errors"
++	"time"
++
++	"miniflux.app/v2/internal/config"
++	"miniflux.app/v2/internal/handoff"
++)
++
++// ConfigureHandoff must receive a separate bounded connection pool using the
++// same exact DSN. Held session locks must not starve ordinary business SQL.
++func (s *Storage) ConfigureHandoff(db *sql.DB) { s.handoffDB = db }
++
++func (s *Storage) BeginHandoff(source string) (*handoff.Lease, error) {
++	if !config.Opts.HasHandoff() {
++		return nil, nil
++	}
++	if s.handoffDB == nil {
++		return nil, errors.New("handoff lease pool not configured")
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
++	defer cancel()
++	return handoff.Begin(ctx, s.handoffDB, config.Opts.HandoffManifest(), source)
++}
++
++func (s *Storage) ValidateHandoffLease(lease *handoff.Lease) error {
++	if !config.Opts.HasHandoff() {
++		if lease != nil {
++			return errors.New("foreign lease while handoff disabled")
++		}
++		return nil
++	}
++	if lease == nil || s.handoffDB == nil {
++		return errors.New("missing admitted lease")
++	}
++	return lease.Matches(s.handoffDB, config.Opts.HandoffManifest())
++}
++
++func (s *Storage) InitializeHandoff(ctx context.Context, op string) (handoff.Receipt, error) {
++	return handoff.Initialize(ctx, s.db, config.Opts.HandoffManifest(), op)
++}
++func (s *Storage) PauseHandoff(ctx context.Context, op string) (handoff.Receipt, error) {
++	return handoff.Pause(ctx, s.db, config.Opts.HandoffManifest(), op)
++}
++func (s *Storage) QueryHandoff(ctx context.Context, op string) (handoff.Receipt, error) {
++	return handoff.Query(ctx, s.db, config.Opts.HandoffManifest(), op)
++}
++func (s *Storage) ResumeHandoff(ctx context.Context, closed, op string) (handoff.Receipt, error) {
++	return handoff.Resume(ctx, s.db, config.Opts.HandoffManifest(), closed, op)
++}
+diff --git a/internal/storage/legacy_handoff.go b/internal/storage/legacy_handoff.go
+new file mode 100644
+index 0000000..ca7853b
+--- /dev/null
++++ b/internal/storage/legacy_handoff.go
+@@ -0,0 +1,84 @@
++// SPDX-License-Identifier: Apache-2.0
++package storage
++
++import (
++	"bytes"
++	"crypto/sha256"
++	"database/sql"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"net/url"
++	"regexp"
++
++	"miniflux.app/v2/internal/model"
++)
++
++var legacySignature = regexp.MustCompile(`^[a-f0-9]{64}$`)
++
++// PreserveLegacyWebhook freezes existing-entry save events BEFORE async work
++// or HTTP acceptance. It does not assert delivery, enqueue a send, or retry.
++func (s *Storage) PreserveLegacyWebhook(item *model.DurableWebhook, userID, feedID, entryID int64) error {
++	if item == nil || userID <= 0 || feedID <= 0 || entryID <= 0 || item.Contract == "" || !legacySignature.MatchString(item.Signature) || len(item.Body) == 0 || len(item.Body) > 1048576 {
++		return errors.New("legacy preservation: invalid original")
++	}
++	hash := sha256.Sum256(item.Body)
++	u, err := url.Parse(item.URL)
++	if item.DeliveryID != hex.EncodeToString(hash[:]) || item.BodySHA256 != item.DeliveryID || err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.Fragment != "" {
++		return errors.New("legacy preservation: original identity invalid")
++	}
++	var payload struct {
++		EventType string `json:"event_type"`
++		Entry     struct {
++			ID     int64 `json:"id"`
++			UserID int64 `json:"user_id"`
++			FeedID int64 `json:"feed_id"`
++		} `json:"entry"`
++	}
++	if err = json.Unmarshal(item.Body, &payload); err != nil || payload.EventType != "save_entry" || payload.Entry.ID != entryID || payload.Entry.UserID != userID || payload.Entry.FeedID != feedID {
++		return errors.New("legacy preservation: save payload identity mismatch")
++	}
++	tx, err := s.beginEntryTransaction(true)
++	if err != nil {
++		return err
++	}
++	defer tx.Rollback()
++	if _, err = tx.Exec(`SET LOCAL synchronous_commit=on; SET LOCAL statement_timeout='3s'; SET LOCAL lock_timeout='3s'`); err != nil {
++		return err
++	}
++	var durable, locked bool
++	if err = tx.QueryRow(`SELECT current_setting('fsync')='on' AND current_setting('full_page_writes')='on',pg_try_advisory_xact_lock(19500622)`).Scan(&durable, &locked); err != nil {
++		return err
++	}
++	if !durable || !locked {
++		return errors.New("legacy preservation: durability or shared capacity lock unavailable")
++	}
++	var raw []byte
++	var target, signature, contract string
++	var user, feed, entry int64
++	err = tx.QueryRow(`SELECT body,target_url,signature,contract,user_id,feed_id,entry_id FROM webhook_legacy_originals WHERE delivery_id=$1`, item.DeliveryID).Scan(&raw, &target, &signature, &contract, &user, &feed, &entry)
++	if err == nil {
++		if !bytes.Equal(raw, item.Body) || target != item.URL || signature != item.Signature || contract != item.Contract || user != userID || feed != feedID || entry != entryID {
++			return errors.New("legacy preservation: conflicting duplicate")
++		}
++		return tx.Commit()
++	}
++	if !errors.Is(err, sql.ErrNoRows) {
++		return err
++	}
++	var count, size int64
++	err = tx.QueryRow(`SELECT count(*),COALESCE(sum(octet_length(body)+octet_length(target_url)+octet_length(contract)+1024),0)
++ FROM (SELECT body,target_url,contract FROM webhook_outbox UNION ALL SELECT body,target_url,contract FROM webhook_legacy_originals) originals`).Scan(&count, &size)
++	if err != nil {
++		return err
++	}
++	if count >= WebhookOutboxMaxRows || size+int64(len(item.Body)+len(item.URL)+len(item.Contract)+1024) > WebhookOutboxMaxBytes {
++		return errors.New("legacy preservation: shared capacity exhausted")
++	}
++	_, err = tx.Exec(`INSERT INTO webhook_legacy_originals(delivery_id,body_sha256,event_type,user_id,feed_id,entry_id,target_url,signature,contract,body)
++ VALUES($1,$2,'save_entry',$3,$4,$5,$6,$7,$8,$9)`, item.DeliveryID, item.BodySHA256, userID, feedID, entryID, item.URL, item.Signature, item.Contract, item.Body)
++	if err != nil {
++		return err
++	}
++	return tx.Commit()
++}
+diff --git a/internal/storage/legacy_handoff_test.go b/internal/storage/legacy_handoff_test.go
+new file mode 100644
+index 0000000..c13ddac
+--- /dev/null
++++ b/internal/storage/legacy_handoff_test.go
+@@ -0,0 +1,212 @@
++// SPDX-License-Identifier: Apache-2.0
++package storage
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"fmt"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"miniflux.app/v2/internal/crypto"
++	"miniflux.app/v2/internal/model"
++)
++
++func legacyOriginal(id int64) *model.DurableWebhook {
++	body := []byte(fmt.Sprintf(`{"event_type":"save_entry","entry":{"id":%d,"user_id":1,"feed_id":1,"title":"synthetic original"}}`, id))
++	hash := sha256.Sum256(body)
++	key := hex.EncodeToString(hash[:])
++	return &model.DurableWebhook{DeliveryID: key, BodySHA256: key, Body: body, URL: "https://receiver.invalid/webhook", Signature: crypto.GenerateSHA256Hmac("synthetic", body), Contract: "synthetic-contract"}
++}
++
++func legacyCount(t *testing.T, store *Storage) int {
++	t.Helper()
++	var n int
++	if err := store.db.QueryRow(`SELECT count(*) FROM webhook_legacy_originals`).Scan(&n); err != nil {
++		t.Fatal(err)
++	}
++	return n
++}
++
++func TestLegacyOriginalInvalidIdentityRejectedBeforeDB(t *testing.T) {
++	store := NewStorage(nil)
++	for _, mutate := range []func(*model.DurableWebhook){
++		func(m *model.DurableWebhook) { m.Body = []byte("changed") }, func(m *model.DurableWebhook) { m.BodySHA256 = strings.Repeat("0", 64) },
++		func(m *model.DurableWebhook) { m.URL = "https://account@receiver.invalid/webhook" }, func(m *model.DurableWebhook) { m.URL = "file:///tmp/endpoint" },
++		func(m *model.DurableWebhook) { m.Signature = "not-an-hmac" }, func(m *model.DurableWebhook) { m.Contract = "" },
++		func(m *model.DurableWebhook) { m.Body = make([]byte, 1048577) },
++	} {
++		item := legacyOriginal(7)
++		mutate(item)
++		if store.PreserveLegacyWebhook(item, 1, 1, 7) == nil {
++			t.Fatal("invalid original admitted")
++		}
++	}
++	if store.PreserveLegacyWebhook(legacyOriginal(7), 1, 1, 8) == nil {
++		t.Fatal("payload and requested entry identity differ")
++	}
++	if store.PreserveLegacyWebhook(nil, 1, 1, 7) == nil {
++		t.Fatal("nil original admitted")
++	}
++}
++
++func TestPostgresLegacyOriginalExactImmutableDurableDuplicate(t *testing.T) {
++	store, _, _ := realOutboxStore(t)
++	item := legacyOriginal(7)
++	// A caller's async/default setting must not weaken the preservation commit.
++	if _, err := store.db.Exec(`SET synchronous_commit=off`); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := store.db.Exec(`CREATE FUNCTION assert_legacy_sync() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF current_setting('synchronous_commit')<>'on' THEN RAISE EXCEPTION 'unsynchronized original'; END IF; RETURN NEW; END $$;
++ CREATE TRIGGER require_sync BEFORE INSERT ON webhook_legacy_originals FOR EACH ROW EXECUTE FUNCTION assert_legacy_sync();`); err != nil {
++		t.Fatal(err)
++	}
++	if err := store.PreserveLegacyWebhook(item, 1, 1, 7); err != nil {
++		t.Fatal(err)
++	}
++	if err := store.PreserveLegacyWebhook(item, 1, 1, 7); err != nil {
++		t.Fatal("exact duplicate must remain confirmable", err)
++	}
++	var body []byte
++	var signature, target, state, reason string
++	if err := store.db.QueryRow(`SELECT body,signature,target_url,state,reason FROM webhook_legacy_originals WHERE delivery_id=$1`, item.DeliveryID).Scan(&body, &signature, &target, &state, &reason); err != nil {
++		t.Fatal(err)
++	}
++	if string(body) != string(item.Body) || signature != item.Signature || target != item.URL || state != "held" || reason != "unsupported_save_entry_requires_manual_review" || legacyCount(t, store) != 1 {
++		t.Fatal("original mutated or falsely sent")
++	}
++	conflict := *item
++	conflict.URL = "https://changed.invalid/webhook"
++	if store.PreserveLegacyWebhook(&conflict, 1, 1, 7) == nil {
++		t.Fatal("same raw identity with changed endpoint admitted")
++	}
++	for _, query := range []string{`UPDATE webhook_legacy_originals SET state='held'`, `UPDATE webhook_legacy_originals SET signature=repeat('b',64)`, `DELETE FROM webhook_legacy_originals`} {
++		if _, err := store.db.Exec(query); err == nil {
++			t.Fatal("held original changed", query)
++		}
++	}
++	if err := store.CleanupWebhookReceipts(context.Background()); err != nil {
++		t.Fatal(err)
++	}
++	if claim, err := store.ClaimWebhook(context.Background()); err != nil || claim != nil {
++		t.Fatal("unsupported legacy payload became sendable", err)
++	}
++	if legacyCount(t, store) != 1 {
++		t.Fatal("cleanup deleted held original")
++	}
++}
++
++func TestPostgresLegacyOriginalSharedRowsAndExactDuplicateAtFullCapacity(t *testing.T) {
++	store, _, prepare := realOutboxStore(t)
++	item := legacyOriginal(7)
++	if err := store.PreserveLegacyWebhook(item, 1, 1, 7); err != nil {
++		t.Fatal(err)
++	}
++	_, err := store.db.Exec(`INSERT INTO webhook_outbox(delivery_id,body_sha256,user_id,feed_id,entry_id,target_url,signature,contract,body)
++ SELECT encode(sha256(i::text::bytea),'hex'),encode(sha256(i::text::bytea),'hex'),1,1,-i,'https://receiver.invalid',repeat('a',64),'audit',i::text::bytea FROM generate_series(1,4999) i`)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = store.PreserveLegacyWebhook(item, 1, 1, 7); err != nil {
++		t.Fatal("durable exact duplicate rejected at full", err)
++	}
++	if err = store.PreserveLegacyWebhook(legacyOriginal(8), 1, 1, 8); err == nil || !strings.Contains(err.Error(), "capacity") {
++		t.Fatal("combined legacy limit bypass", err)
++	}
++	if _, err = store.RefreshFeedEntriesWithOutbox(1, 1, model.Entries{realEntry("shared-full")}, false, prepare); err == nil || !strings.Contains(err.Error(), "capacity") {
++		t.Fatal("outbox ignored retained legacy charge", err)
++	}
++	entries, outbox := realCounts(t, store)
++	if entries != 0 || outbox != 4999 || legacyCount(t, store) != 1 {
++		t.Fatal("shared-full write was not atomic")
++	}
++}
++
++func TestPostgresLegacyOriginalSharedByteCap(t *testing.T) {
++	store, _, _ := realOutboxStore(t)
++	// Synthetic historical outbox materialization bypasses admission ONLY to
++	// reach the real 256MiB boundary cheaply; final preservation is real SQL.
++	_, err := store.db.Exec(`INSERT INTO webhook_outbox(delivery_id,body_sha256,user_id,feed_id,entry_id,target_url,signature,contract,body)
++ SELECT encode(sha256(body),'hex'),encode(sha256(body),'hex'),1,1,-i,'https://receiver.invalid',repeat('a',64),'audit',body
++ FROM (SELECT i,(lpad(i::text,6,'0')||repeat('x',1048570))::bytea AS body FROM generate_series(1,256) i) originals`)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = store.PreserveLegacyWebhook(legacyOriginal(7), 1, 1, 7); err == nil || !strings.Contains(err.Error(), "capacity") {
++		t.Fatal("shared byte limit bypass", err)
++	}
++	if legacyCount(t, store) != 0 {
++		t.Fatal("byte-full original committed")
++	}
++}
++
++func TestPostgresLegacyOriginalFailureBusyAndTimeoutHaveNoAcceptedRow(t *testing.T) {
++	store, _, _ := realOutboxStore(t)
++	tx, err := store.db.Begin()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err = tx.Exec(`SELECT pg_advisory_xact_lock(19500622)`); err != nil {
++		t.Fatal(err)
++	}
++	started := time.Now()
++	err = store.PreserveLegacyWebhook(legacyOriginal(7), 1, 1, 7)
++	if err == nil || time.Since(started) > time.Second {
++		t.Fatal("capacity lock did not immediately backpressure", err)
++	}
++	if err = tx.Rollback(); err != nil {
++		t.Fatal(err)
++	}
++	if legacyCount(t, store) != 0 {
++		t.Fatal("busy write committed")
++	}
++	_, err = store.db.Exec(`CREATE FUNCTION synthetic_legacy_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic disk unavailable'; END $$;
++ CREATE TRIGGER synthetic_legacy_fail BEFORE INSERT ON webhook_legacy_originals FOR EACH ROW EXECUTE FUNCTION synthetic_legacy_failure();`)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if store.PreserveLegacyWebhook(legacyOriginal(7), 1, 1, 7) == nil || legacyCount(t, store) != 0 {
++		t.Fatal("write failure accepted")
++	}
++	_, err = store.db.Exec(`CREATE OR REPLACE FUNCTION synthetic_legacy_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(5); RETURN NEW; END $$;`)
++	if err != nil {
++		t.Fatal(err)
++	}
++	started = time.Now()
++	err = store.PreserveLegacyWebhook(legacyOriginal(7), 1, 1, 7)
++	if err == nil || time.Since(started) > 4*time.Second || legacyCount(t, store) != 0 {
++		t.Fatal("bounded statement failure did not roll back", err)
++	}
++}
++
++func TestPostgresLegacyOriginalConcurrentExactDuplicates(t *testing.T) {
++	store, _, _ := realOutboxStore(t)
++	item := legacyOriginal(7)
++	var wait sync.WaitGroup
++	results := make(chan error, 16)
++	for range 16 {
++		wait.Add(1)
++		go func() { defer wait.Done(); results <- store.PreserveLegacyWebhook(item, 1, 1, 7) }()
++	}
++	wait.Wait()
++	close(results)
++	accepted := 0
++	for err := range results {
++		if err == nil {
++			accepted++
++		} else if !strings.Contains(err.Error(), "capacity lock unavailable") {
++			t.Fatal(err)
++		}
++	}
++	if accepted == 0 || legacyCount(t, store) != 1 {
++		t.Fatal("parallel preservation identity lost")
++	}
++	// Explicit isolated re-delivery confirms the retained bytes, not an internal
++	// retry loop or a production replay.
++	if err := store.PreserveLegacyWebhook(item, 1, 1, 7); err != nil {
++		t.Fatal(err)
++	}
++}
+diff --git a/internal/storage/storage.go b/internal/storage/storage.go
+index ffae969..ed7c521 100644
+--- a/internal/storage/storage.go
++++ b/internal/storage/storage.go
+@@ -14 +14,2 @@ type Storage struct {
+-	db *sql.DB
++	db        *sql.DB
++	handoffDB *sql.DB
+@@ -19 +20 @@ func NewStorage(db *sql.DB) *Storage {
+-	return &Storage{db}
++	return &Storage{db: db}
+diff --git a/internal/storage/webhook_outbox.go b/internal/storage/webhook_outbox.go
+index 7fd5d78..83eb530 100644
+--- a/internal/storage/webhook_outbox.go
++++ b/internal/storage/webhook_outbox.go
+@@ -86 +86,4 @@ func (s *Storage) enqueueWebhook(tx entryTransaction, item *model.DurableWebhook
+-	if err := tx.QueryRow(`SELECT count(*),COALESCE(sum(octet_length(body)+octet_length(target_url)+octet_length(contract)+1024),0) FROM webhook_outbox`).Scan(&count, &size); err != nil {
++	quotaSQL := `SELECT count(*),COALESCE(sum(charge),0) FROM (
++		 SELECT octet_length(body)+octet_length(target_url)+octet_length(contract)+1024 AS charge FROM webhook_outbox
++		 UNION ALL SELECT octet_length(body)+octet_length(target_url)+octet_length(contract)+1024 AS charge FROM webhook_legacy_originals) AS originals`
++	if err := tx.QueryRow(quotaSQL).Scan(&count, &size); err != nil {
+@@ -96,0 +100,14 @@ func (s *Storage) enqueueWebhook(tx entryTransaction, item *model.DurableWebhook
++// HasWebhookOutboxWork is only a read-only polling hint, NEVER a drain proof.
++// A missed concurrent insert is checked next tick. Actual claim and cleanup
++// still require admission, so an empty poll does not exhaust retained leases.
++func (s *Storage) HasWebhookOutboxWork(ctx context.Context, includeCleanup bool) (bool, error) {
++	var exists bool
++	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM webhook_outbox WHERE
++	 (state IN ('pending','inflight') AND (lease_until IS NULL OR lease_until<now())
++	  AND (attempts>=20 OR created_at<now()-interval '7 days'))
++	 OR (state='pending' AND next_attempt_at<=now())
++	 OR (state='inflight' AND lease_until<now())
++	 OR ($1 AND state='acked' AND acked_at<now()-interval '7 days'))`, includeCleanup).Scan(&exists)
++	return exists, err
++}
++
+diff --git a/internal/ui/category_refresh.go b/internal/ui/category_refresh.go
+index 5387f15..c899a53 100644
+--- a/internal/ui/category_refresh.go
++++ b/internal/ui/category_refresh.go
+@@ -58 +58,4 @@ func (h *handler) refreshCategory(w http.ResponseWriter, r *http.Request) int64
+-		go h.pool.Push(jobs)
++		if err := h.pool.PushAsync(jobs); err != nil {
++			response.HTMLServerError(w, r, err)
++			return 0
++		}
+diff --git a/internal/ui/entry_save.go b/internal/ui/entry_save.go
+index 83b4ad6..847557b 100644
+--- a/internal/ui/entry_save.go
++++ b/internal/ui/entry_save.go
+@@ -36 +36,4 @@ func (h *handler) saveEntry(w http.ResponseWriter, r *http.Request) {
+-	go integration.SendEntry(entry, userIntegrations)
++	if err := integration.StartSaveEntry(h.store, entry, userIntegrations); err != nil {
++		response.JSONServerError(w, r, err)
++		return
++	}
+diff --git a/internal/ui/feed_refresh.go b/internal/ui/feed_refresh.go
+index 3861b41..661d263 100644
+--- a/internal/ui/feed_refresh.go
++++ b/internal/ui/feed_refresh.go
+@@ -61 +61,4 @@ func (h *handler) refreshAllFeeds(w http.ResponseWriter, r *http.Request) {
+-		go h.pool.Push(jobs)
++		if err := h.pool.PushAsync(jobs); err != nil {
++			response.HTMLServerError(w, r, err)
++			return
++		}
+diff --git a/internal/ui/web_session_middleware.go b/internal/ui/web_session_middleware.go
+index 99eca38..8b10827 100644
+--- a/internal/ui/web_session_middleware.go
++++ b/internal/ui/web_session_middleware.go
+@@ -11,0 +12 @@ import (
++	"miniflux.app/v2/internal/config"
+@@ -38,0 +40,12 @@ func (m *webSessionMiddleware) handle(next http.Handler) http.Handler {
++		// The bounded controlled mode deliberately cannot start anonymous UI,
++		// OAuth or auth-proxy login sessions. Verify the existing cookie first;
++		// do not create a session or retained lease for an anonymous request.
++		if config.Opts.HasHandoff() {
++			if session == nil || !session.IsAuthenticated() {
++				http.Error(w, "controlled handoff requires an existing authenticated UI session", http.StatusServiceUnavailable)
++				return
++			}
++			if !request.AcquireAuthenticatedHandoff(w, r) {
++				return
++			}
++		}
+diff --git a/internal/worker/handoff_integration_test.go b/internal/worker/handoff_integration_test.go
+new file mode 100644
+index 0000000..08ae8b7
+--- /dev/null
++++ b/internal/worker/handoff_integration_test.go
+@@ -0,0 +1,236 @@
++// SPDX-License-Identifier: Apache-2.0
++package worker
++
++import (
++	"context"
++	"crypto/rand"
++	"crypto/sha256"
++	"database/sql"
++	"encoding/hex"
++	"encoding/json"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"os"
++	"strings"
++	"sync/atomic"
++	"testing"
++
++	"miniflux.app/v2/internal/config"
++	"miniflux.app/v2/internal/database"
++	"miniflux.app/v2/internal/handoff"
++	"miniflux.app/v2/internal/storage"
++)
++
++type idleFixture struct {
++	db    *sql.DB
++	store *storage.Storage
++}
++
++func idlePostgres(t *testing.T) idleFixture {
++	t.Helper()
++	raw := os.Getenv("MINIFLUX_OUTBOX_TEST_DSN")
++	if raw == "" {
++		t.Skip("explicit isolated PostgreSQL required; not persistence proof")
++	}
++	u, err := url.Parse(raw)
++	if err != nil || u.Scheme != "postgres" || (u.Hostname() != "127.0.0.1" && u.Hostname() != "localhost") || u.Path != "/synthetic_outbox" {
++		t.Fatal("synthetic loopback PostgreSQL only")
++	}
++	admin, err := sql.Open("postgres", raw)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var random [12]byte
++	if _, err = rand.Read(random[:]); err != nil {
++		t.Fatal(err)
++	}
++	schema := "pause_worker_" + hex.EncodeToString(random[:])
++	if _, err = admin.Exec(`CREATE SCHEMA ` + schema); err != nil {
++		admin.Close()
++		t.Fatal(err)
++	}
++	admin.Close()
++	q := u.Query()
++	q.Set("search_path", schema)
++	u.RawQuery = q.Encode()
++	db, err := sql.Open("postgres", u.String())
++	if err != nil {
++		t.Fatal(err)
++	}
++	db.SetMaxOpenConns(8)
++	leaseDB, err := sql.Open("postgres", u.String())
++	if err != nil {
++		t.Fatal(err)
++	}
++	leaseDB.SetMaxOpenConns(8)
++	t.Cleanup(func() { leaseDB.Close(); db.Close() })
++	if err = database.Migrate(db); err != nil {
++		t.Fatal(err)
++	}
++	prior := config.Opts
++	t.Cleanup(func() { config.Opts = prior })
++	for key, value := range map[string]string{"HANDOFF_ENABLED": "1", "HANDOFF_MANIFEST": strings.Repeat("a", 64), "HANDOFF_CONTROL_TOKEN": strings.Repeat("b", 64), "HANDOFF_CONTROL_ADDR": "127.0.0.1:19002", "WEBHOOK_OUTBOX": "1", "WEBHOOK_OUTBOX_CONTRACT": "synthetic", "INTEGRATION_ALLOW_PRIVATE_NETWORKS": "1"} {
++		t.Setenv(key, value)
++	}
++	config.Opts, err = config.NewConfigParser().ParseEnvironmentVariables()
++	if err != nil {
++		t.Fatal(err)
++	}
++	store := storage.NewStorage(db)
++	store.ConfigureHandoff(leaseDB)
++	if _, err = handoff.Initialize(context.Background(), db, strings.Repeat("a", 64), strings.Repeat("c", 64)); err != nil {
++		t.Fatal(err)
++	}
++	t.Log("retained worker schema", schema)
++	return idleFixture{db, store}
++}
++
++func (f idleFixture) leaseCount(t *testing.T) int {
++	t.Helper()
++	var n int
++	if e := f.db.QueryRow(`SELECT count(*) FROM handoff_leases`).Scan(&n); e != nil {
++		t.Fatal(e)
++	}
++	return n
++}
++
++func (f idleFixture) put(t *testing.T, body, target, state string, old bool) {
++	t.Helper()
++	raw := []byte(body)
++	sum := sha256.Sum256(raw)
++	id := hex.EncodeToString(sum[:])
++	_, err := f.db.Exec(`INSERT INTO webhook_outbox(delivery_id,body_sha256,user_id,feed_id,entry_id,target_url,signature,contract,body,state,acked_at) VALUES($1,$1,1,1,1,$2,$3,'synthetic',$4,$5,CASE WHEN $6 THEN now()-interval '8 days' ELSE NULL END)`, id, target, strings.Repeat("b", 64), raw, state, old)
++	if err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestPostgresHandoffIdlePollsDoNotConsumeRetainedLeases(t *testing.T) {
++	f := idlePostgres(t)
++	ctx := context.Background()
++	for range 32 {
++		runWebhookOutboxPass(ctx, f.store)
++	}
++	if n := f.leaseCount(t); n != 0 {
++		t.Fatalf("empty polling consumed %d leases", n)
++	}
++	if ready, e := f.store.HasWebhookOutboxWork(ctx, true); e != nil || ready {
++		t.Fatal(ready, e)
++	}
++	r, e := handoff.Pause(ctx, f.db, strings.Repeat("a", 64), strings.Repeat("d", 64))
++	if e != nil || !r.Confirmed {
++		t.Fatal(r, e)
++	}
++	for range 4 {
++		runWebhookOutboxPass(ctx, f.store)
++	}
++	if n := f.leaseCount(t); n != 0 {
++		t.Fatal("closed empty poll admitted", n)
++	}
++}
++
++func TestPostgresHandoffDueDeliveryKeepsGuardAndDoesNotGenerateIdleLeases(t *testing.T) {
++	f := idlePostgres(t)
++	body := `{"synthetic":"original exact bytes"}`
++	var seen atomic.Int32
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		raw, e := io.ReadAll(io.LimitReader(r.Body, 2048))
++		if e != nil || string(raw) != body {
++			t.Error("original body changed", e)
++		}
++		seen.Add(1)
++		sum := sha256.Sum256(raw)
++		id := hex.EncodeToString(sum[:])
++		w.Header().Set("Content-Type", "application/json")
++		w.WriteHeader(http.StatusAccepted)
++		_ = json.NewEncoder(w).Encode(map[string]any{"schema": 1, "durable": true, "delivery_id": id, "body_sha256": id})
++	}))
++	defer server.Close()
++	f.put(t, body, server.URL, "pending", false)
++	if ready, e := f.store.HasWebhookOutboxWork(context.Background(), false); e != nil || !ready {
++		t.Fatal(ready, e)
++	}
++	runWebhookOutboxPass(context.Background(), f.store)
++	var state string
++	var attempts int
++	if e := f.db.QueryRow(`SELECT state,attempts FROM webhook_outbox`).Scan(&state, &attempts); e != nil {
++		t.Fatal(e)
++	}
++	if state != "acked" || attempts != 1 || seen.Load() != 1 {
++		t.Fatal(state, attempts, seen.Load())
++	}
++	n := f.leaseCount(t)
++	if n != 2 {
++		t.Fatalf("pass/send must each be guarded, got %d", n)
++	}
++	var unfinished int
++	if e := f.db.QueryRow(`SELECT count(*) FROM handoff_leases WHERE status<>'finished'`).Scan(&unfinished); e != nil || unfinished != 0 {
++		t.Fatal(unfinished, e)
++	}
++	for range 16 {
++		runWebhookOutboxPass(context.Background(), f.store)
++	}
++	if f.leaseCount(t) != n || seen.Load() != 1 {
++		t.Fatal("idle or fresh ACK was reprocessed")
++	}
++}
++
++func TestPostgresHandoffCleanupCandidateHasGuardButNoSendLease(t *testing.T) {
++	f := idlePostgres(t)
++	f.put(t, "synthetic retained receipt", "https://must-not-send.invalid", "acked", true)
++	ctx := context.Background()
++	if ready, e := f.store.HasWebhookOutboxWork(ctx, false); e != nil || ready {
++		t.Fatal("cleanup mistaken for delivery", ready, e)
++	}
++	if ready, e := f.store.HasWebhookOutboxWork(ctx, true); e != nil || !ready {
++		t.Fatal("cleanup missing", ready, e)
++	}
++	runWebhookOutboxPass(ctx, f.store)
++	if f.leaseCount(t) != 1 {
++		t.Fatal("cleanup guard missing or idle sender admitted")
++	}
++	var rows int
++	if e := f.db.QueryRow(`SELECT count(*) FROM webhook_outbox`).Scan(&rows); e != nil || rows != 0 {
++		t.Fatal(rows, e)
++	}
++	for range 8 {
++		runWebhookOutboxPass(ctx, f.store)
++	}
++	if f.leaseCount(t) != 1 {
++		t.Fatal("cleanup idle leases")
++	}
++}
++
++func TestPostgresHandoffPausedDueOrCleanupCannotMutateOriginals(t *testing.T) {
++	for _, item := range []struct {
++		state string
++		old   bool
++	}{{"pending", false}, {"acked", true}} {
++		t.Run(item.state, func(t *testing.T) {
++			f := idlePostgres(t)
++			f.put(t, "preserved after pause", "https://must-not-send.invalid", item.state, item.old)
++			ctx := context.Background()
++			r, e := handoff.Pause(ctx, f.db, strings.Repeat("a", 64), strings.Repeat("d", 64))
++			if e != nil || !r.Confirmed {
++				t.Fatal(r, e)
++			}
++			if ready, e := f.store.HasWebhookOutboxWork(ctx, true); e != nil || !ready {
++				t.Fatal("fixture not candidate", ready, e)
++			}
++			for range 4 {
++				runWebhookOutboxPass(ctx, f.store)
++			}
++			var state string
++			var raw []byte
++			var attempts int
++			if e = f.db.QueryRow(`SELECT state,body,attempts FROM webhook_outbox`).Scan(&state, &raw, &attempts); e != nil {
++				t.Fatal(e)
++			}
++			if state != item.state || string(raw) != "preserved after pause" || attempts != 0 || f.leaseCount(t) != 0 {
++				t.Fatal("paused worker mutated original", state, attempts)
++			}
++		})
++	}
++}
+diff --git a/internal/worker/pool.go b/internal/worker/pool.go
+index d0c9339..72bd29b 100644
+--- a/internal/worker/pool.go
++++ b/internal/worker/pool.go
+@@ -6,0 +7 @@ import (
++	"errors"
+@@ -8,0 +10,2 @@ import (
++	"miniflux.app/v2/internal/config"
++	"miniflux.app/v2/internal/handoff"
+@@ -15,2 +18,20 @@ type Pool struct {
+-	queue chan model.Job
+-	wg    sync.WaitGroup
++	queue  chan admittedJob
++	wg     sync.WaitGroup
++	mu     sync.RWMutex
++	closed bool
++	store  *storage.Storage
++}
++
++type admittedJob struct {
++	job   model.Job
++	lease *handoff.Lease
++}
++
++// Disabled mode preserves the original asynchronous public refresh behavior.
++// Enabled mode registers every queued job before acknowledging the caller.
++func (p *Pool) PushAsync(jobs model.JobList) error {
++	if !config.Opts.HasHandoff() {
++		go p.Push(jobs)
++		return nil
++	}
++	return p.Push(jobs)
+@@ -20 +41,6 @@ type Pool struct {
+-func (p *Pool) Push(jobs model.JobList) {
++func (p *Pool) Push(jobs model.JobList) error {
++	p.mu.RLock()
++	defer p.mu.RUnlock()
++	if p.closed {
++		return errors.New("worker queue closed")
++	}
+@@ -22 +48,5 @@ func (p *Pool) Push(jobs model.JobList) {
+-		p.queue <- job
++		lease, err := p.store.BeginHandoff("queued_refresh")
++		if err != nil {
++			return err
++		}
++		p.queue <- admittedJob{job, lease}
+@@ -23,0 +54 @@ func (p *Pool) Push(jobs model.JobList) {
++	return nil
+@@ -28 +59,6 @@ func (p *Pool) Shutdown() {
+-	close(p.queue)
++	p.mu.Lock()
++	if !p.closed {
++		close(p.queue)
++		p.closed = true
++	}
++	p.mu.Unlock()
+@@ -35 +71 @@ func NewPool(store *storage.Storage, nbWorkers int) *Pool {
+-		queue: make(chan model.Job),
++		queue: make(chan admittedJob), store: store,
+diff --git a/internal/worker/webhook_outbox.go b/internal/worker/webhook_outbox.go
+index 7078fc6..60814fa 100644
+--- a/internal/worker/webhook_outbox.go
++++ b/internal/worker/webhook_outbox.go
+@@ -8,0 +9 @@ import (
++	"miniflux.app/v2/internal/handoff"
+@@ -32,0 +34,10 @@ func runWebhookOutboxPass(ctx context.Context, store *storage.Storage) {
++	if !outboxWorkHint(ctx, store, true) {
++		return
++	}
++	lease, gateErr := store.BeginHandoff("outbox_pass")
++	if gateErr != nil {
++		return
++	}
++	if lease != nil {
++		defer handoff.FinishOnReturn(lease)
++	}
+@@ -41,12 +52 @@ func runWebhookOutboxPass(ctx context.Context, store *storage.Storage) {
+-		dbCtx, cancel = context.WithTimeout(ctx, 3*time.Second)
+-		claim, err := store.ClaimWebhook(dbCtx)
+-		cancel()
+-		if err != nil {
+-			slog.Error("Webhook outbox claim failed")
+-			return
+-		}
+-		if claim == nil {
+-			return
+-		}
+-		retry, sendErr := webhook.SendDurable(ctx, &claim.DurableWebhook)
+-		if ctx.Err() != nil {
++		if !runAdmittedWebhook(ctx, store) {
+@@ -54,10 +53,0 @@ func runWebhookOutboxPass(ctx context.Context, store *storage.Storage) {
+-		} // lease safely expires; do not acknowledge uncertainty
+-		dbCtx, cancel = context.WithTimeout(ctx, 3*time.Second)
+-		err = store.FinishWebhook(dbCtx, claim, sendErr == nil, retry)
+-		cancel()
+-		if err != nil {
+-			slog.Error("Webhook outbox completion not recorded; evidence retained")
+-			return
+-		}
+-		if sendErr != nil {
+-			slog.Warn("Webhook outbox delivery retained", slog.String("delivery_id", claim.DeliveryID), slog.Bool("retry_scheduled", retry && claim.Attempts < 20))
+@@ -66,0 +57,49 @@ func runWebhookOutboxPass(ctx context.Context, store *storage.Storage) {
++
++func runAdmittedWebhook(ctx context.Context, store *storage.Storage) bool {
++	if !outboxWorkHint(ctx, store, false) {
++		return false
++	}
++	lease, gateErr := store.BeginHandoff("outbox_sender")
++	if gateErr != nil {
++		return false
++	}
++	if lease != nil {
++		defer handoff.FinishOnReturn(lease)
++	}
++	dbCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
++	claim, err := store.ClaimWebhook(dbCtx)
++	cancel()
++	if err != nil {
++		slog.Error("Webhook outbox claim failed")
++		return false
++	}
++	if claim == nil {
++		return false
++	}
++	retry, sendErr := webhook.SendDurable(ctx, &claim.DurableWebhook)
++	if ctx.Err() != nil {
++		return false
++	} // lease safely expires; do not acknowledge uncertainty
++	dbCtx, cancel = context.WithTimeout(ctx, 3*time.Second)
++	err = store.FinishWebhook(dbCtx, claim, sendErr == nil, retry)
++	cancel()
++	if err != nil {
++		slog.Error("Webhook outbox completion not recorded; evidence retained")
++		return false
++	}
++	if sendErr != nil {
++		slog.Warn("Webhook outbox delivery retained", slog.String("delivery_id", claim.DeliveryID), slog.Bool("retry_scheduled", retry && claim.Attempts < 20))
++	}
++	return true
++}
++
++func outboxWorkHint(ctx context.Context, store *storage.Storage, includeCleanup bool) bool {
++	dbCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
++	defer cancel()
++	ready, err := store.HasWebhookOutboxWork(dbCtx, includeCleanup)
++	if err != nil {
++		slog.Error("Webhook outbox work hint unavailable; no work admitted")
++		return false
++	}
++	return ready
++}
+diff --git a/internal/worker/worker.go b/internal/worker/worker.go
+index 7a8bdb8..e66a6c7 100644
+--- a/internal/worker/worker.go
++++ b/internal/worker/worker.go
+@@ -13 +12,0 @@ import (
+-	"miniflux.app/v2/internal/model"
+@@ -24 +23 @@ type worker struct {
+-func (w *worker) Run(c <-chan model.Job, wg *sync.WaitGroup) {
++func (w *worker) Run(c <-chan admittedJob, wg *sync.WaitGroup) {
+@@ -31 +30,2 @@ func (w *worker) Run(c <-chan model.Job, wg *sync.WaitGroup) {
+-	for job := range c {
++	for admitted := range c {
++		job := admitted.job
+@@ -40 +40 @@ func (w *worker) Run(c <-chan model.Job, wg *sync.WaitGroup) {
+-		localizedError := feedHandler.RefreshFeed(w.store, job.UserID, job.FeedID, false)
++		localizedError := feedHandler.RefreshFeedAdmitted(w.store, job.UserID, job.FeedID, false, admitted.lease)
