@@ -34,6 +34,13 @@ FILES = (
     "scripts/observe_handoff_capacity.py",
     "tests/test_production_handoff_adapter.py",
     "tests/test_handoff_capacity_observer.py",
+    "services/admission_fence.py",
+    "services/receiver_handoff_control.py",
+    "scripts/production_receiver_driver.py",
+    "scripts/verify_production_receiver_native.py",
+    "scripts/handoff_runtime_adapter.py",
+    "scripts/handoff_host_cron.py",
+    "tests/test_production_receiver_driver.py",
     "app.py",
     "docker-compose.yml",
     "worker_main.py",
@@ -52,7 +59,7 @@ assert platform.system() == 'Linux' and platform.machine() == 'x86_64'
 suite = unittest.TestSuite()
 for pattern in ('test_webhook_receipt_trial_plan.py', 'test_durable_handoff_cutover.py',
                 'test_handoff_operations_native.py', 'test_production_handoff_adapter.py',
-                'test_handoff_capacity_observer.py'):
+                'test_handoff_capacity_observer.py', 'test_production_receiver_driver.py'):
     suite.addTests(unittest.defaultTestLoader.discover('/work/tests', pattern=pattern))
 assert suite.countTestCases() > 0
 result = unittest.TextTestRunner(verbosity=2).run(suite)
