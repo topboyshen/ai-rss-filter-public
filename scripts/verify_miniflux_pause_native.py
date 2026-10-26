@@ -499,7 +499,9 @@ class Harness:
         return result
 
     def stop_new_drain_case(self, prior):
-        resumed = self.resume(prior, "5" * 64)
+        # Operation identities are retained across every native scenario. Keep
+        # this added scenario separate from the existing joint-host 5/6 IDs.
+        resumed = self.resume(prior, hashlib.sha256(b"native:stop-new-drain:resume").hexdigest())
         self.items.extend(["drain_first", "drain_queued"])
         self.control(self.items, hold=True)
         self.refresh()
@@ -512,7 +514,7 @@ class Harness:
             for key in ("drain_first", "drain_queued"))]
         if len(backlog) != 2 or not any(r["attempts"] == 0 and r["state"] == "pending" for r in backlog):
             raise ValueError("no actual unclaimed durable backlog before stop-new")
-        operation = "6" * 64
+        operation = hashlib.sha256(b"native:stop-new-drain:stop-new").hexdigest()
         pending = self.private_control("/stop-new", "POST", {"operation_id": operation}, expected=(200, 409))
         self.checked_draining(pending, operation, confirmed=pending.get("confirmed") is True)
         self.refresh(expected=503)
@@ -538,7 +540,7 @@ class Harness:
         self.wait(lambda: self.http("sender", "/healthcheck"), readiness=True)
         self.refresh(expected=503)
         restarted = self.checked_draining(self.private_control("/operations/" + operation), operation)
-        freeze = "7" * 64
+        freeze = hashlib.sha256(b"native:stop-new-drain:freeze").hexdigest()
         self.private_control("/pause", "POST", {"operation_id": freeze}, expected=(200, 409))
         closed = self.wait(lambda: self.query_closed(freeze))
         self.case("STOP_NEW_DRAINS_BACKLOG_AND_RESTART", {"resume": resumed, "inflight_handshake": received,

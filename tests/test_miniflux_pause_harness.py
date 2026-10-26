@@ -78,6 +78,28 @@ class FixtureTests(unittest.TestCase):
 
 
 class NativeGuardTests(unittest.TestCase):
+    def test_added_drain_and_existing_joint_scenarios_use_distinct_resume_operations(self):
+        import miniflux_host_joint_native as joint
+
+        class ReachedResume(Exception):
+            pass
+
+        harness = object.__new__(native.Harness)
+        harness.output = Path("unused-synthetic-evidence")
+        harness.owner = "a" * 32
+        # Exercise both real scenario entry points up to their first control
+        # request. No Docker, cron child, or synthetic file creation is needed.
+        operations = []
+        with patch.object(harness, "resume", side_effect=ReachedResume) as resume, \
+                patch.object(joint, "old_cron_proof", return_value={}):
+            for scenario in (harness.stop_new_drain_case, lambda prior: joint.run(harness, prior)):
+                with self.assertRaises(ReachedResume):
+                    scenario("4" * 64)
+                operations.append(resume.call_args.args[1])
+        self.assertEqual(len(set(operations)), 2)
+        for operation in operations:
+            self.assertRegex(operation, r"^[0-9a-f]{64}$")
+
     def test_stop_new_confirmation_requires_exact_producer_counts_and_distinct_state(self):
         harness = object.__new__(native.Harness)
         harness.manifest = "a" * 64
