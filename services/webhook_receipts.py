@@ -19,6 +19,8 @@ MAX_RECORDS = 4096
 MAX_BYTES = 256 * 1024 * 1024
 MAX_RECORD_BYTES = 8 * 1024 * 1024
 MAX_COMPLETION_BYTES = 16 * 1024
+_READ_VERIFY_CHUNK = 64 * 1024
+_READ_IDENTITY = ("st_dev", "st_ino", "st_size", "st_mode", "st_uid", "st_nlink", "st_mtime_ns", "st_ctime_ns")
 _INDEX_RESERVE = 2048
 # A new alias must have this much admission headroom before its first intent
 # write. A truncated intent cannot prove its actual size/identity, so charge a
@@ -68,26 +70,68 @@ def _private_directory(path):
 
 def _open_private(path):
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    info = os.fstat(fd)
-    if (not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600
-            or info.st_nlink != 1 or info.st_uid != os.getuid() or info.st_size > MAX_RECORD_BYTES):
-        os.close(fd)
-        raise ReceiptCorrupt("unsafe receipt file")
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_nlink != 1 or info.st_uid != os.getuid() or info.st_size > MAX_RECORD_BYTES):
+            raise ReceiptCorrupt("unsafe receipt file")
+    except BaseException as exc:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        if isinstance(exc, OSError):
+            raise ReceiptCorrupt("receipt metadata unavailable after open") from exc
+        raise
     return fd
 
 
-def _read(path):
-    with os.fdopen(_open_private(path), "rb") as stream:
-        before = os.fstat(stream.fileno())
-        if before.st_size > MAX_RECORD_BYTES:
-            raise ReceiptCorrupt("receipt exceeds per-file safety limit")
-        # The store's 256 MiB budget is not a per-read allocation. CPython
-        # allocates the requested buffer even when a receipt is only 1 KiB.
-        data = stream.read(before.st_size + 1)
-        after = os.fstat(stream.fileno())
-    identity = ("st_dev", "st_ino", "st_size", "st_mode", "st_uid", "st_nlink", "st_mtime_ns", "st_ctime_ns")
-    if len(data) != before.st_size or any(getattr(before, key) != getattr(after, key) for key in identity):
+def _verify_read(fd, data):
+    # Equal timestamps do not imply equal content. Read the same descriptor
+    # afresh: seeking a BufferedReader can reuse its stale cached bytes.
+    expected = memoryview(data)
+    for offset in range(0, len(data), _READ_VERIFY_CHUNK):
+        size = min(_READ_VERIFY_CHUNK, len(data) - offset)
+        if os.pread(fd, size, offset) != expected[offset:offset + size]:
+            raise ReceiptCorrupt("receipt changed during bounded read")
+    if os.pread(fd, 1, len(data)):
         raise ReceiptCorrupt("receipt changed during bounded read")
+
+
+def _read(path):
+    # Only failure of the initial open may mean "absent" to callers. Once a
+    # descriptor exists, any I/O/metadata failure must fail closed, not become
+    # a new admission or a proven partial-JSON hold.
+    fd = _open_private(path)
+    try:
+        stream = os.fdopen(fd, "rb")
+    except BaseException as exc:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        if isinstance(exc, OSError):
+            raise ReceiptCorrupt("receipt stream unavailable after open") from exc
+        raise
+    try:
+        with stream:
+            before = os.fstat(stream.fileno())
+            if before.st_size > MAX_RECORD_BYTES:
+                raise ReceiptCorrupt("receipt exceeds per-file safety limit")
+            # The store budget is not a per-read allocation. The second pass
+            # adds at most one fixed-size chunk, not another complete record.
+            data = stream.read(before.st_size + 1)
+            after = os.fstat(stream.fileno())
+            if len(data) != before.st_size or any(
+                getattr(before, key) != getattr(after, key) for key in _READ_IDENTITY
+            ):
+                raise ReceiptCorrupt("receipt changed during bounded read")
+            _verify_read(stream.fileno(), data)
+            final = os.fstat(stream.fileno())
+            if any(getattr(before, key) != getattr(final, key) for key in _READ_IDENTITY):
+                raise ReceiptCorrupt("receipt changed during bounded read")
+    except OSError as exc:
+        raise ReceiptCorrupt("receipt I/O failed during bounded read") from exc
     return data
 
 
