@@ -1,37 +1,15 @@
 """Opt-in actual fixed-source PostgreSQL reader/lock evidence, synthetic only."""
 
-import hashlib
 import json
 import os
 from pathlib import Path
-import re
-import secrets
-import sys
-from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 import pytest
 
 from services import sender_drain_contract as contract
 from scripts import sender_drain_inventory as inventory
+from scripts.production_startup_pg_fixture import create_fixture, close_fixture as close_seeded, phase
 from test_sender_drain_contract import synthetic_manifest
-
-SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
-sys.path.insert(0, str(SCRIPTS))
-
-
-def phase(value):
-    print("sender_pg_phase=" + value, flush=True)
-
-
-def source_sql(source, relative, pattern):
-    lock = json.loads(
-        (SCRIPTS.parent / "ops/miniflux/pause-source-lock.json").read_text()
-    )
-    raw = (source / relative).read_bytes()
-    assert hashlib.sha256(raw).hexdigest() == lock["patched_files_sha256"][relative]
-    found = re.findall(pattern, raw.decode(), re.S)
-    assert len(found) == 1
-    return found[0]
 
 
 @pytest.fixture
@@ -39,63 +17,10 @@ def actual(tmp_path):
     raw = os.environ.get("MINIFLUX_OUTBOX_TEST_DSN")
     if not raw:
         pytest.skip("actual isolated PostgreSQL DSN not configured; no PG proof")
-    import psycopg
-    url = urlsplit(raw)
-    assert (
-        url.scheme in {"postgres", "postgresql"}
-        and url.hostname in {"127.0.0.1", "localhost"}
-        and url.path == "/synthetic_outbox"
-    )
-    source = Path(os.environ["MINIFLUX_PATCHED_SOURCE"])
-    assert source.is_absolute()
-    schema = "sender_reader_" + secrets.token_hex(12)
-    phase("before_schema_create_" + schema)
-    with psycopg.connect(raw, autocommit=True) as admin:
-        admin.execute("CREATE SCHEMA " + schema)
-    query = parse_qs(url.query)
-    query.pop("search_path", None)
-    query["options"] = ["-c search_path=" + schema]
-    dsn = urlunsplit(
-        (url.scheme, url.netloc, url.path, urlencode(query, doseq=True), url.fragment)
-    )
-    connection = psycopg.connect(dsn, autocommit=True)
-    # Exact locked SQL fixture; migration transaction/marker behavior is tested
-    # by actual Go database.Migrate, not inferred from this fixture seed.
-    statements = [
-        source_sql(
-            source, "internal/database/webhook_outbox.go", r"tx.Exec\(`(.*?)`\)"
-        ),
-        source_sql(source, "internal/handoff/handoff.go", r"const SchemaSQL = `(.*?)`"),
-        source_sql(
-            source, "internal/database/legacy_handoff.go", r"tx.Exec\(`(.*?)`\)"
-        ),
-        source_sql(
-            source, "internal/handoff/drain.go", r"const DrainSchemaSQL = `(.*?)`"
-        ),
-    ]
-    for statement in statements:
-        connection.execute(statement)
-    connection.execute(
-        "CREATE TABLE schema_version(version integer); INSERT INTO schema_version VALUES(134)"
-    )
+    connection, fixture = create_fixture(raw, Path(os.environ["MINIFLUX_PATCHED_SOURCE"]))
     value, body = synthetic_manifest(tmp_path)
     binding = value["sender_binding"]
     receipt = value["control_receipt"]
-    connection.execute(
-        "INSERT INTO handoff_state VALUES(1,%s,%s,'draining',%s)",
-        (binding["manifest"], receipt["generation"], receipt["operation_id"]),
-    )
-    connection.execute(
-        """INSERT INTO handoff_operations(operation_id,manifest,action,previous_generation,generation,prior_operation,status,confirmed_at)
- VALUES(%s,%s,'stop_new',%s,%s,%s,'confirmed',clock_timestamp())""",
-        (
-            receipt["operation_id"],
-            binding["manifest"],
-            binding["generation"],
-            receipt["generation"],
-            binding["initial_operation_id"],
-        ),
-    )
     row = value["entries"][0]
     connection.execute(
         """INSERT INTO webhook_outbox(delivery_id,body_sha256,user_id,feed_id,entry_id,target_url,signature,contract,body)
@@ -109,19 +34,12 @@ def actual(tmp_path):
             body,
         ),
     )
-    actual = dict(
-        zip(
-            inventory.IDENTITY_KEYS,
-            connection.execute(inventory.IDENTITY_SQL).fetchone(),
-        )
-    )
     path = tmp_path / "dsn.json"
-    path.write_text(json.dumps({"dsn": dsn}))
+    path.write_text(json.dumps({"dsn": fixture["dsn"]}))
     path.chmod(0o600)
-    reader = inventory.PostgresReader(path, actual)
-    phase("source_bound_fixture_ready_" + schema)
+    reader = inventory.PostgresReader(path, fixture["expected_identity"])
     yield connection, reader, binding, receipt, value, body
-    phase("retaining_schema_" + schema)
+    phase("retaining_schema_" + fixture["schema"])
     connection.close()
 
 
@@ -155,20 +73,9 @@ def test_actual_readonly_bundle_preserves_exact_body_and_pg_identity(actual, tmp
 
 
 def close_fixture(connection, binding):
-    operation = "d" * 64
-    connection.execute(
-        "UPDATE webhook_outbox SET state='acked',acked_at=clock_timestamp()"
-    )
-    connection.execute(
-        "UPDATE handoff_state SET phase='closed',generation=generation+1,current_operation=%s",
-        (operation,),
-    )
-    connection.execute(
-        """INSERT INTO handoff_operations(operation_id,manifest,action,previous_generation,generation,prior_operation,status,confirmed_at)
- VALUES(%s,%s,'pause',3,4,%s,'confirmed',clock_timestamp())""",
-        (operation, binding["manifest"], "9" * 64),
-    )
-    return operation
+    schema = connection.execute("SELECT current_schema()").fetchone()[0]
+    return close_seeded(connection, {"manifest": binding["manifest"], "generation": 3,
+                                     "stop_operation_id": "9" * 64, "schema": schema})
 
 
 def test_actual_frozen_session_locks_block_control_and_release_only_on_exit(actual):
@@ -260,3 +167,18 @@ def test_actual_statement_timeout_shrinks_to_remaining_total_budget(actual):
             cursor.execute("SELECT pg_sleep(0.6)")
     assert time.monotonic() - started < 0.5
     phase("actual_postgres_cancelled_using_remaining_deadline")
+
+
+def test_actual_closed_state_with_pending_marker_cannot_grant_frozen_context(actual):
+    connection, reader, binding, _, _, _ = actual
+    operation = "e" * 64
+    connection.execute("UPDATE webhook_outbox SET state='acked',acked_at=clock_timestamp()")
+    connection.execute("UPDATE handoff_state SET phase='closed',generation=4,current_operation=%s", (operation,))
+    connection.execute("""INSERT INTO handoff_operations(operation_id,manifest,action,previous_generation,generation,prior_operation,status)
+ VALUES(%s,%s,'pause',3,4,%s,'pending')""", (operation, binding["manifest"], "9" * 64))
+    phase("before_pending_closed_marker_rejection")
+    with pytest.raises(Exception, match="pause operation"):
+        with reader.locked(operation, binding["manifest"]):
+            pytest.fail("unconfirmed marker granted a frozen context")
+    assert connection.execute("SELECT status FROM handoff_operations WHERE operation_id=%s", (operation,)).fetchone() == ("pending",)
+    phase("pending_marker_retained_no_confirmation_no_frozen_context")

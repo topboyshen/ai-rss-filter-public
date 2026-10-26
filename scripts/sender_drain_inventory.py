@@ -272,6 +272,13 @@ class FrozenPostgres:
                 and value["legacy"]["rows"] == 0 and value["expired_unacknowledged"] == 0,
                 "sender retained originals are not independently drained")
 
+    def _confirmed_operation(self, cursor):
+        cursor.execute("""SELECT manifest,action,previous_generation,generation,status,confirmed_at IS NOT NULL
+ FROM handoff_operations WHERE operation_id=%s""", (self.operation,))
+        generation = self.snapshot["gate"]["generation"]
+        require(cursor.fetchone() == (self.manifest, "pause", generation - 1, generation, "confirmed", True),
+                "actual sender pause operation is missing, pending, or mismatched")
+
     def check(self, *, deadline=None):
         deadline = _deadline(deadline)
         require(self.connection is not None, "sender PG locks no longer held")
@@ -279,6 +286,7 @@ class FrozenPostgres:
             cursor = _TimedCursor(raw_cursor, deadline)
             cursor.execute(IDENTITY_SQL)
             require(dict(zip(IDENTITY_KEYS, cursor.fetchone())) == self.reader.expected, "locked PG identity changed")
+            self._confirmed_operation(cursor)
             cursor.execute("""SELECT pg_backend_pid(),count(*) FROM pg_locks WHERE pid=pg_backend_pid()
  AND locktype='advisory' AND classid IN (20261024::oid,20261023::oid) AND objid=%s::oid
  AND objsubid=2 AND mode='ExclusiveLock' AND granted""", (self.reader.expected["state_table_oid"],))

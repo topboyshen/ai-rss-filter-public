@@ -53,3 +53,18 @@ def test_connection_minimum_cannot_restart_a_nearly_expired_budget(monkeypatch):
     assert calls == []
     assert inventory._deadline(10.5) == 10.5
     assert inventory._deadline(1000) == 20.0
+
+
+@pytest.mark.parametrize("row", [None, ("a" * 64, "pause", 3, 4, "pending", False),
+                                   ("a" * 64, "stop_new", 3, 4, "confirmed", True),
+                                   ("a" * 64, "pause", 2, 3, "confirmed", True)])
+def test_closed_state_alone_does_not_prove_confirmed_pause(row):
+    held = inventory.FrozenPostgres(None, "b" * 64, "a" * 64)
+    held.snapshot = {"gate": {"generation": 4}}
+    class Cursor:
+        def execute(self, sql, params):
+            assert params == ("b" * 64,)
+        def fetchone(self):
+            return row
+    with pytest.raises(CutoverError, match="pause operation"):
+        held._confirmed_operation(Cursor())
