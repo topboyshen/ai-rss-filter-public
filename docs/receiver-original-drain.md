@@ -67,3 +67,32 @@ durable spool/ReceiptStore files, loopback HTTP and a crashing child process,
 with a fake scoring function. Docker inspect rows in these unit fixtures are
 explicitly synthetic. Native container/PG and Go-to-Flask integration require
 the separate combined fixture; these tests do not claim that integration.
+
+The host-only `scripts/joint_drain_controller.py` composes actual SenderDriver
+and ReceiverDriver instances. Its fixed stages are `stop_new`,
+`transfer_originals`, `freeze_sender` and `freeze_receiver`; `query_transfer`
+recovers only an existing transfer after expiry. A retained sender pause intent
+goes directly to the same operation query even if the sender is already closed
+or the write window has ended. Each controller retains at most 32 attempts.
+For a host process that already completed the individual driver stages,
+`confirm_existing_boundaries` queries their original stop/pause operations;
+it takes no caller-provided receipts or empty booleans.
+
+Final receiver freeze holds the specified existing release/refresh locks, then
+the actual controller/activity locks, spool/journal and journal identity locks,
+then both PostgreSQL advisory locks. It independently reads queue envelopes,
+raw receipt records, continuation states, publication watermarks and both sender
+tables. Nonzero/unknown storage leaves the receiver in draining with no new
+freeze intent. A WAL-mode database missing either sidecar is refused before a
+SQLite connection could create it. The final receipt records this held-lock
+inventory but still reports switch, legacy-original and external-ingress
+authorization as false. Actual cron/ingress binding is an additional site fact;
+caller-selected release/refresh lock paths alone cannot prove its coverage.
+
+`tests/test_joint_drain_controller.py` runs the real receiver HTTP, durable files
+and SQLite boundaries with an explicitly synthetic sender PostgreSQL protocol.
+`scripts/receiver_drain_fixture_runtime.py` is a separate, explicitly marked
+synthetic entry point for the native Go/Flask/PG rehearsal. Its fixed authenticated
+test consumer calls the real queue claim/execute/complete path with a fake
+scorer, while its worker role holds only a bounded fixture identity. It is never
+a production startup command or evidence of a real model/worker rollout.

@@ -24,7 +24,7 @@ from tests.test_webhook_durable_delivery import CONTRACT, SECRET, delivery, raw_
 
 
 @pytest.fixture
-def receiver(delivery, tmp_path, monkeypatch):  # noqa: F811
+def receiver(delivery, tmp_path, monkeypatch, request):  # noqa: F811
     if sys.platform != "linux":
         monkeypatch.setattr(gate, "_boot_identity", lambda: "synthetic-local-boot")
     now = int(time.time())
@@ -39,7 +39,8 @@ def receiver(delivery, tmp_path, monkeypatch):  # noqa: F811
     fence = gate._configured()
     fence.open_trial("1" * 64, 0, "synthetic initial open")
     delivery.webhook._ensure_spool_dir()
-    fence.stop_new("2" * 64, 1, "synthetic stop all new receiver producers")
+    if getattr(request, "param", None) != "open":
+        fence.stop_new("2" * 64, 1, "synthetic stop all new receiver producers")
     return SimpleNamespace(delivery=delivery, fence=fence, root=tmp_path, control=transfer.DrainTransfer(fence))
 
 
