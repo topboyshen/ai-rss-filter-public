@@ -159,6 +159,17 @@ def test_actual_missing_application_limit_is_not_a_default_allowance(receiver, m
         transfer.body_limit()
 
 
+@pytest.mark.parametrize("phase", ["draining", "frozen"])
+def test_direct_shared_persist_cannot_bypass_actual_admission(receiver, phase):
+    if phase == "frozen":
+        receiver.fence.freeze("4" * 64, 2, "synthetic frozen direct-write test")
+    task = receiver.delivery.webhook.normalize_webhook_delivery(raw_body())
+    with pytest.raises(gate.AdmissionClosed):
+        receiver.delivery.webhook.persist_delivery_locked(receiver.delivery.webhook._webhook_spool_dir, task, raw_body())
+    assert pending(receiver) == []
+    assert not (receiver.delivery.webhook._webhook_spool_dir / "receipts").exists()
+
+
 def test_original_signature_rotation_refuses_without_resigning(receiver, monkeypatch):
     request, _ = bundle_and_plan(receiver)
     monkeypatch.setenv("MINIFLUX_WEBHOOK_SECRET", "new-key-must-not-resign-old-originals")

@@ -682,6 +682,7 @@ def _persist_webhook_delivery(task: dict, body: bytes) -> tuple[str, dict]:
     return result
 
 
+@guarded("persist_delivery_locked", kind="inherit")
 def persist_delivery_locked(directory: Path, task: dict, body: bytes) -> tuple[str, dict]:
     """Shared durable path; caller holds the real admission AND spool locks."""
     digest = _task_digest(task)
