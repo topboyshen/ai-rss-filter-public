@@ -252,7 +252,6 @@ python -m pytest
 生产发布前还应在 Linux 上执行全量测试，以覆盖 `flock`、`/proc`、systemd/cron 资产和
 发布脚本语义。
 
-## 许可证状态
+## 许可证
 
-仓库目前未附独立 `LICENSE` 文件。README 不替代正式授权文件；在维护者选择并提交明确
-许可证之前，请勿仅依据历史说明推定复制、分发或商用授权。
+本项目采用 [MIT License](LICENSE) 开源，完整条款见仓库根目录的 `LICENSE` 文件。
