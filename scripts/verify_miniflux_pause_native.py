@@ -491,6 +491,65 @@ class Harness:
                   "inflight_postgres": snapshot, "closed": result, "acked_outbox": row})
         return operation
 
+    def checked_draining(self, value, operation, *, confirmed=True):
+        result = self.checked_receipt(value, operation, "draining", action="stop_new", confirmed=confirmed)
+        for field in ("active_producer_leases", "uncertain_producer_leases"):
+            if type(result.get(field)) is not int or result[field] < 0 or (confirmed and result[field] != 0):
+                raise ValueError("stop-new lacks exact producer completion counts")
+        return result
+
+    def stop_new_drain_case(self, prior):
+        # Operation identities are retained across every native scenario. Keep
+        # this added scenario separate from the existing joint-host 5/6 IDs.
+        resumed = self.resume(prior, hashlib.sha256(b"native:stop-new-drain:resume").hexdigest())
+        self.items.extend(["drain_first", "drain_queued"])
+        self.control(self.items, hold=True)
+        self.refresh()
+        received = self.wait(lambda: next((r for r in self.events()
+            if r["kind"] == "webhook_received" and r["held"]
+            and any(json.loads(base64.b64decode(r["body_b64"]))["entries"][0]["url"].endswith("/" + key)
+                    for key in ("drain_first", "drain_queued"))), None), seconds=4)
+        backlog = [r for r in self.outbox() if any(
+            json.loads(base64.b64decode(r["body_b64"]))["entries"][0]["url"].endswith("/" + key)
+            for key in ("drain_first", "drain_queued"))]
+        if len(backlog) != 2 or not any(r["attempts"] == 0 and r["state"] == "pending" for r in backlog):
+            raise ValueError("no actual unclaimed durable backlog before stop-new")
+        operation = hashlib.sha256(b"native:stop-new-drain:stop-new").hexdigest()
+        pending = self.private_control("/stop-new", "POST", {"operation_id": operation}, expected=(200, 409))
+        self.checked_draining(pending, operation, confirmed=pending.get("confirmed") is True)
+        self.refresh(expected=503)
+        self.http("sender", f"/v1/entries/{self.entry_id}/save", "POST", expected=503)
+        self.control(self.items, release=True)
+        rows = [self.wait(lambda key=key: self.proved_row(key)) for key in ("drain_first", "drain_queued")]
+        if {r["body_sha256"] for r in rows} != {r["body_sha256"] for r in backlog}:
+            raise ValueError("drain changed original durable body identity")
+        result = self.checked_draining(self.private_control("/operations/" + operation), operation)
+        before = self.gate_snapshot()
+        if before["state"][0]["phase"] != "draining":
+            raise ValueError("stop-new did not retain durable draining phase")
+        # A real scheduler timer must reach the closed producer boundary.
+        baseline = self.command(["logs", self.names["sender"]]).count("Handoff scheduler admission refused")
+        feeds_before = len([r for r in self.events() if r["kind"] == "feed"])
+        self.sql("UPDATE feeds SET next_check_at=clock_timestamp()-interval '1 second' WHERE id=" + str(self.feed_id) + ";")
+        logs = self.wait(lambda: r if (r := self.command(["logs", self.names["sender"]])).count("Handoff scheduler admission refused") > baseline else None, seconds=75)
+        if len([r for r in self.events() if r["kind"] == "feed"]) != feeds_before:
+            raise ValueError("draining scheduler produced another feed request")
+        self.sample_memory("sender", "before_draining_restart")
+        self.command(["stop", "--time=15", self.names["sender"]], timeout=20)
+        self.command(["start", self.names["sender"]])
+        self.wait(lambda: self.http("sender", "/healthcheck"), readiness=True)
+        self.refresh(expected=503)
+        restarted = self.checked_draining(self.private_control("/operations/" + operation), operation)
+        freeze = hashlib.sha256(b"native:stop-new-drain:freeze").hexdigest()
+        self.private_control("/pause", "POST", {"operation_id": freeze}, expected=(200, 409))
+        closed = self.wait(lambda: self.query_closed(freeze))
+        self.case("STOP_NEW_DRAINS_BACKLOG_AND_RESTART", {"resume": resumed, "inflight_handshake": received,
+            "backlog_before_stop_new": backlog, "stop_new_response": pending, "confirmed_stop_new": result,
+            "acked_originals": rows, "draining_postgres": before, "restart_draining": restarted,
+            "scheduler_refusal_observed": logs.count("Handoff scheduler admission refused") > baseline,
+            "full_pause": closed, "stop_new_is_queue_empty_proof": False})
+        return freeze
+
     def postgres_restart_case(self, closed):
         before = self.gate_snapshot()
         self.sample_memory("pg", "before_restart")
@@ -598,6 +657,7 @@ def run(repo, source, image_id, binary, output):
         closed = harness.legacy_async_case()
         harness.restart_closed_case(closed)
         closed = harness.outbox_inflight_case(closed)
+        closed = harness.stop_new_drain_case(closed)
         harness.postgres_restart_case(closed)
         harness.closed_scheduler_case()
         from miniflux_host_joint_native import run as joint_run
@@ -616,7 +676,7 @@ def run(repo, source, image_id, binary, output):
         if error is None and evidence_errors:
             error = {"type": "EvidencePreservationIncomplete", "message": str(evidence_errors)}
     cases = sorted(path.name for path in output.glob("CASE_*.json"))
-    result = {"status": "passed" if error is None and len(cases) == 8 else "failed_or_evidence_insufficient",
+    result = {"status": "passed" if error is None and len(cases) == 9 else "failed_or_evidence_insufficient",
               "cases": cases, "error": error, "evidence_errors": evidence_errors, "elapsed_seconds": time.monotonic() - harness.started,
               "native_amd64": True, "resource_limits": {"sender_memory_bytes": MEMORY, "sender_pids": PIDS},
               "retained_network": harness.network, "retained_containers": list(harness.names.values()),
