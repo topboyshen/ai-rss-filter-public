@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager, ExitStack
 import hashlib
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -157,6 +158,8 @@ def validate_permit(permit, *, active=False):
 
 def _frozen(permit):
     record = permit["freeze"]
+    if record.get("kind") == "initial_closed":
+        return _initial_frozen(permit)
     gate._require(set(record) == {"root", "binding", "manifest_sha256", "operation_id", "generation", "receipt_sha256"},
                   "invalid frozen operation binding")
     fence = gate.Fence(record["root"], record["binding"], lock_seconds=0.1)
@@ -177,6 +180,71 @@ def _frozen(permit):
     gate._require(permit["compatibility"]["old_binding"] == fence.binding,
                   "old frozen runtime differs from reviewed compatibility endpoint")
     return fence
+
+
+def _initial_frozen(permit):
+    from services import production_initial_fence as initial
+    from scripts import private_release_contract as private
+    record = permit["freeze"]
+    gate._require(set(record) == {"root", "binding", "manifest_sha256", "operation_id", "generation",
+                                  "receipt_sha256", "kind"}, "invalid initial closed binding")
+    fence = gate.Fence(record["root"], record["binding"], lock_seconds=0.1)
+    with fence._metadata():
+        initial._pristine(fence)
+        initial.read_receipt(record["root"], record)
+        # Visible final bytes after a failed directory sync are not authority.
+        # The host confirms durability under its locks; runtime readers stay RO.
+        for name in ("initial_closed.intent.json", "initial_closed.json"):
+            gate._confirm_file(fence.root / "startup" / name)
+        gate._sync_directory(fence.root / "startup")
+    gate._require(permit["compatibility"]["old_binding"] == fence.binding, "initial compatibility binding differs")
+    contract, manifest, _digest = private.load(permit["config"]["private_contract_path"],
+                                               Path(__file__).resolve().parents[1])
+    rows = private.inspect_project(contract)
+    old_ids = {entry["id"] for entries in contract["review"]["existing_topology"].values() for entry in entries}
+    old = [row for row in rows if row["Id"] in old_ids]
+    gate._require(private.runtime_topology(old) == contract["review"]["existing_topology"],
+                  "initial migration previous topology changed")
+    mapped = {name for app in contract["app_services"] for name in contract["review"]["service_mapping"][app]}
+    for row in old:
+        if row["Config"]["Labels"].get("com.docker.compose.service") in mapped:
+            state = row["State"]
+            gate._require(not state["Running"] and not state.get("Restarting") and not state.get("Paused")
+                          and not state.get("Dead") and state["Status"] in {"exited", "created"},
+                          "initial migration previous application is not safely stopped")
+    # Candidate creation may follow migration while this session stays held.
+    # Extra names must be exactly the reviewed candidate roles, never old or
+    # arbitrary running producers. Startup control verifies grants separately.
+    candidate = [row for row in rows if row["Id"] not in old_ids]
+    names = [row["Config"]["Labels"].get("com.docker.compose.service") for row in candidate]
+    gate._require(len(names) == len(set(names)) and set(names) <= set(contract["app_services"]),
+                  "unreviewed initial migration container")
+    if candidate:
+        _initial_candidates(permit, contract, manifest, candidate)
+    return fence
+
+
+def _initial_candidates(permit, contract, manifest, rows):
+    from scripts import private_release_contract as private
+    image_id = permit["source"]["image_id"]
+    image = json.loads(private.run(["docker", "image", "inspect", image_id]))[0]
+    directory = Path(permit["config"]["private_contract_path"]).parent
+    values = private.environment_values(private.private_file(directory / "environment", sealed=True)[0])
+    for row in rows:
+        service = manifest["services"][row["Config"]["Labels"]["com.docker.compose.service"]]
+        env = private.role_environment(service, image["Config"], values)
+        gate._require(row["Image"] == image_id and row["RestartCount"] == 0
+                      and env.get("AI_FILTER_PRODUCTION_STARTUP_OPERATION") == permit["parent_operation_id"]
+                      and env.get("AI_FILTER_ADMISSION_MODE") == "enforced"
+                      and env.get("AI_FILTER_PRODUCTION_STARTUP_ROOT")
+                      and gate._parsed(env.get("AI_FILTER_ADMISSION_BINDING", "null")) == permit["freeze"]["binding"],
+                      "candidate is not bound to the reviewed closed startup")
+        roots = [mount for mount in row["Mounts"] if mount["Destination"] == env.get("AI_FILTER_ADMISSION_ROOT")]
+        gate._require(len(roots) == 1 and roots[0]["Type"] == "bind" and roots[0]["RW"] is True
+                      and roots[0]["Source"] == permit["freeze"]["root"], "initial candidate fence mount differs")
+        private.verify_execution(service, row, image, values, expected_running=row["State"]["Running"])
+        from services.production_startup_control import _topology
+        _topology(contract, manifest, service, row)
 
 
 class _Connection(sqlite3.Connection):

@@ -65,6 +65,10 @@ def _clock(value, *, active):
 def _frozen(descriptor):
     record = descriptor["freeze"]
     root = _path(record["root"], directory=True)
+    if record.get("kind") == "initial_closed":
+        from services.production_initial_fence import read_receipt
+        read_receipt(root, record)
+        return
     state = gate._read(root / "state.json")
     manifest = gate._read(root / "manifest.json")
     receipt = isolation._read_complete(root / "operations" / (record["operation_id"] + ".json"))
@@ -123,7 +127,7 @@ def _database(descriptor):
         conn.close()
 
 
-def load(*, active=True, verify_database=True):
+def load(*, active=True, verify_database=True, allow_activated=False):
     operation = os.environ.get(ENV_OPERATION)
     gate._require(isinstance(operation, str) and gate.HEX64.fullmatch(operation)
                   and isolation.ENV_OPERATION not in os.environ
@@ -140,7 +144,18 @@ def load(*, active=True, verify_database=True):
     gate._require(1 <= len(web) <= 4 and set(slots) == {"worker-1", *[f"web-{i}" for i in range(1, len(web) + 1)]}
                   and all(slots[name] == ("web" if name.startswith("web-") else "worker") for name in slots)
                   and type(descriptor["threads"]) is int and 4 <= descriptor["threads"] <= 64, "invalid finite startup slots")
-    _clock(descriptor["clock"], active=active)
+    activated = False
+    if allow_activated:
+        state = gate._read(Path(descriptor["freeze"]["root"]) / "state.json")
+        if state["phase"] != "frozen" or state["generation"] != descriptor["freeze"]["generation"]:
+            from services.production_activation import resume_phase
+            activated = resume_phase(root, descriptor) != "resuming"
+            if not activated:
+                # The exact resume intent still blocks every admission. Do
+                # not poison live owners during the durable two-file commit.
+                _clock(descriptor["clock"], active=active)
+                activated = "resuming"
+    _clock(descriptor["clock"], active=active and activated is not True)
     _path(descriptor["state_path"], directory=True)
     from core.config import config as holder
     config = descriptor["config"]
@@ -151,7 +166,8 @@ def load(*, active=True, verify_database=True):
     gate._require(os.environ.get("AI_FILTER_ADMISSION_ROOT") == descriptor["freeze"]["root"]
                   and gate._parsed(os.environ.get("AI_FILTER_ADMISSION_BINDING", "null")) == descriptor["freeze"]["binding"]
                   and os.environ.get("AI_FILTER_DB_PATH") == descriptor["database"]["path"], "actual admission or database environment differs")
-    _frozen(descriptor)
+    if not activated:
+        _frozen(descriptor)
     configured = gate._configured()
     gate._require(str(configured.root) == descriptor["freeze"]["root"]
                   and configured.binding == descriptor["freeze"]["binding"], "actual application fence differs")
@@ -267,7 +283,7 @@ def claim(role, *, slot=None, attempt=0):
 
 def check_owner(key):
     fd, receipt = _OWNERS[key]
-    _root, descriptor = load(verify_database=False)
+    _root, descriptor = load(verify_database=False, allow_activated=True)
     _dispatch, intent, final = _state_paths(descriptor, receipt["slot"], receipt["attempt"])
     info = os.fstat(fd)
     gate._require(receipt["owner"] == process_identity() and isolation._read_complete(final) == receipt
@@ -282,6 +298,10 @@ def _after_fork():
         os.close(fd)
     _OWNERS.clear()
     _OWNER_LOCK = threading.Lock()
+    import sys
+    activation = sys.modules.get("services.production_activation")
+    if activation is not None:
+        activation._MONITOR = None
 
 
 os.register_at_fork(after_in_child=_after_fork)
@@ -317,12 +337,21 @@ def pre_fork(server, worker):
 
 
 def closed_worker_loop():
-    """No Redis, dispatcher, quotes, quant, bootstrap or dashboard retry starts."""
+    """Stay closed until the exact retained owner receives one prepare grant."""
     import signal
+    from services import production_activation as activation
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     while not stop.wait(1):
         gate._require(len(_OWNERS) == 1, "closed worker owner absent")
         check_owner(next(iter(_OWNERS)))
+        if activation.permission_present():
+            from worker_main import run_business
+            permission = activation.RuntimeActivation()
+            try:
+                return run_business(activation=permission)
+            except Exception as error:
+                permission.fail(error)
+                raise
     return 0

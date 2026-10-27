@@ -126,10 +126,10 @@ index 28687c6..d52ca6d 100644
 +		httpServers = append(httpServers, server.StartWebServer(store, pool)...)
 diff --git a/internal/cli/handoff_control.go b/internal/cli/handoff_control.go
 new file mode 100644
-index 0000000..43d7384
+index 0000000..16197dd
 --- /dev/null
 +++ b/internal/cli/handoff_control.go
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,136 @@
 +// SPDX-License-Identifier: Apache-2.0
 +package cli
 +
@@ -198,6 +198,14 @@ index 0000000..43d7384
 +		}
 +		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 +		defer cancel()
++		if r.Method == "GET" && r.URL.Path == "/activation-registration" {
++			if store.ActivationHandoffAvailable(ctx) != nil {
++				http.Error(w, "activation capability unavailable", http.StatusConflict)
++				return
++			}
++			json.NewEncoder(w).Encode(map[string]any{"schema": 1, "manifest": config.Opts.HandoffManifest(), "protocol": "miniflux-pg-activation-v1", "database_schema": 135, "capabilities": []string{"initialize_closed", "production_resume"}, "business_open_not_assumed": true})
++			return
++		}
 +		var result any
 +		var err error
 +		if r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/operations/") {
@@ -207,6 +215,18 @@ index 0000000..43d7384
 +			fields, err = handoffFields(r)
 +			if err == nil {
 +				switch r.URL.Path {
++				case "/initialize-closed":
++					if len(fields) != 1 {
++						err = errors.New("exact closed initialize fields required")
++						break
++					}
++					result, err = store.InitializeClosedHandoff(ctx, fields["operation_id"])
++				case "/production-resume":
++					if len(fields) != 2 {
++						err = errors.New("exact production resume fields required")
++						break
++					}
++					result, err = store.ResumeProductionHandoff(ctx, fields["closed_operation_id"], fields["operation_id"])
 +				case "/initialize":
 +					result, err = store.InitializeHandoff(ctx, fields["operation_id"])
 +				case "/stop-new":
@@ -442,10 +462,10 @@ index 9859e41..0d5122e 100644
 +	}
 diff --git a/internal/database/handoff.go b/internal/database/handoff.go
 new file mode 100644
-index 0000000..2704180
+index 0000000..7ffc62b
 --- /dev/null
 +++ b/internal/database/handoff.go
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,18 @@
 +// SPDX-License-Identifier: Apache-2.0
 +package database
 +
@@ -462,12 +482,14 @@ index 0000000..2704180
 +}
 +
 +func handoffDrainMigration(tx *sql.Tx) error { return handoff.MigrateDrain(tx) }
++
++func handoffActivationMigration(tx *sql.Tx) error { return handoff.MigrateActivation(tx) }
 diff --git a/internal/database/handoff_upgrade_integration_test.go b/internal/database/handoff_upgrade_integration_test.go
 new file mode 100644
-index 0000000..672dbb1
+index 0000000..f09b1fa
 --- /dev/null
 +++ b/internal/database/handoff_upgrade_integration_test.go
-@@ -0,0 +1,299 @@
+@@ -0,0 +1,391 @@
 +// SPDX-License-Identifier: Apache-2.0
 +package database
 +
@@ -592,7 +614,7 @@ index 0000000..672dbb1
 +	}
 +}
 +
-+func TestPGActual132And133Migrate134RetainOriginalsAndOldEvidence(t *testing.T) {
++func TestPGActual132And133Migrate135RetainOriginalsAndOldEvidence(t *testing.T) {
 +	for _, prior := range []int{132, 133} {
 +		t.Run(fmt.Sprint(prior), func(t *testing.T) {
 +			db, _ := upgradeFixture(t, prior)
@@ -601,7 +623,7 @@ index 0000000..672dbb1
 +			if err := Migrate(db); err != nil {
 +				t.Fatal(err)
 +			}
-+			upgradeVersion(t, db, 134)
++			upgradeVersion(t, db, 135)
 +			if upgradeEvidence(t, db, prior == 133) != before {
 +				t.Fatal("original or prior operation rewritten")
 +			}
@@ -609,7 +631,7 @@ index 0000000..672dbb1
 +			if err := db.QueryRow(`SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid='handoff_state'::regclass AND conname='handoff_state_phase_check'`).Scan(&constraint); err != nil || !strings.Contains(constraint, "draining") {
 +				t.Fatal(constraint, err)
 +			}
-+			t.Log("phase=committed schema_marker134_and_draining_constraint_match retained_originals_unchanged")
++			t.Log("phase=committed schema_marker135_and_draining_constraint_match retained_originals_unchanged")
 +			// A restart seeing the committed marker must execute no migration again.
 +			if err := Migrate(db); err != nil {
 +				t.Fatal(err)
@@ -692,7 +714,7 @@ index 0000000..672dbb1
 +}
 +
 +func TestPGActualUpgradeLostCommitACKOnlyQueriesExactMarker(t *testing.T) {
-+	for _, lose := range []int32{1, 2} {
++	for _, lose := range []int32{1, 2, 3} {
 +		t.Run(fmt.Sprint(lose), func(t *testing.T) {
 +			db, dsn := upgradeFixture(t, 132)
 +			before := upgradeSeed(t, db, false)
@@ -767,6 +789,98 @@ index 0000000..672dbb1
 +	}
 +	t.Log("phase=legacy_boundary version>=133_is_not_compatibility new_action_stop_new_requires_new_reader legacy_held_remains old_executable_not_run")
 +}
++
++func TestPG135MarkerFailureRetains134AndClosedInitFails(t *testing.T) {
++	db, _ := upgradeFixture(t, 134)
++	before := upgradeSeed(t, db, true)
++	_, err := db.Exec(`CREATE FUNCTION fail_activation_marker() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.version='135' THEN RAISE EXCEPTION 'synthetic135 marker failed'; END IF; RETURN NEW; END $$; CREATE TRIGGER fail_activation_marker BEFORE INSERT ON schema_version FOR EACH ROW EXECUTE FUNCTION fail_activation_marker()`)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Log("phase=before135_marker_failure")
++	if err = Migrate(db); err == nil {
++		t.Fatal("accepted failed135 marker")
++	}
++	upgradeVersion(t, db, 134)
++	if upgradeEvidence(t, db, true) != before {
++		t.Fatal("failed135 migration rewrote originals")
++	}
++	if err = handoff.ActivationAvailable(context.Background(), db); err == nil {
++		t.Fatal("134 advertised135 capability")
++	}
++	var constraint string
++	if err = db.QueryRow(`SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid='handoff_operations'::regclass AND conname='handoff_operations_action_check'`).Scan(&constraint); err != nil || strings.Contains(constraint, "initialize_closed") {
++		t.Fatal(constraint, err)
++	}
++	t.Log("phase=rollback134_retained_no_activation_capability")
++}
++
++func TestPGActual132And133FirstClosed135PreservesHeldOriginals(t *testing.T) {
++	for _, prior := range []int{132, 133} {
++		t.Run(fmt.Sprint(prior), func(t *testing.T) {
++			db, _ := upgradeFixture(t, prior)
++			before := upgradeSeed(t, db, false)
++			t.Log("phase=before_first_closed135_upgrade")
++			if err := Migrate(db); err != nil {
++				t.Fatal(err)
++			}
++			upgradeVersion(t, db, 135)
++			r, err := handoff.InitializeClosed(context.Background(), db, strings.Repeat("a", 64), strings.Repeat("e", 64))
++			if err != nil || !r.Durable || !r.Confirmed || r.State != "closed" || r.Generation != 0 || r.PreviousGeneration != -1 {
++				t.Fatal(r, err)
++			}
++			if upgradeEvidence(t, db, false) != before {
++				t.Fatal("closed init changed held raw")
++			}
++			if _, err = handoff.Begin(context.Background(), db, strings.Repeat("a", 64), "scheduler"); !errors.Is(err, handoff.ErrClosed) {
++				t.Fatal("producer admitted", err)
++			}
++			if _, err = handoff.BeginOutbox(context.Background(), db, strings.Repeat("a", 64), "outbox_sender"); !errors.Is(err, handoff.ErrClosed) {
++				t.Fatal("consumer admitted", err)
++			}
++			t.Log("phase=atomic_first_closed135_raw_retained_queue_not_proven_empty")
++		})
++	}
++}
++
++func TestPG135InitialClosedAndProductionResumeUnknownACKOnlyQuery(t *testing.T) {
++	db, dsn := upgradeFixture(t, 135)
++	manifest, initial, next := strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64)
++	for _, action := range []string{"initialize_closed", "production_resume"} {
++		t.Run(action, func(t *testing.T) {
++			connector, err := pq.NewConnector(dsn)
++			if err != nil {
++				t.Fatal(err)
++			}
++			wrapped := &lostUpgradeConnector{original: connector, lose: 1}
++			lost := sql.OpenDB(wrapped)
++			t.Log("phase=before_actual_" + action + "_ACK_loss")
++			op := initial
++			if action == "initialize_closed" {
++				_, err = handoff.InitializeClosed(context.Background(), lost, manifest, initial)
++			} else {
++				op = next
++				_, err = handoff.ResumeProduction(context.Background(), lost, manifest, initial, next)
++			}
++			lost.Close()
++			if err == nil || !strings.Contains(err.Error(), "ACK lost") {
++				t.Fatal(err)
++			}
++			receipt, err := handoff.Query(context.Background(), db, manifest, op)
++			if err != nil || !receipt.Durable || !receipt.Confirmed || receipt.OperationID != op {
++				t.Fatal(receipt, err)
++			}
++			var n int
++			if err = db.QueryRow(`SELECT count(*) FROM handoff_operations WHERE operation_id=$1`, op).Scan(&n); err != nil || n != 1 {
++				t.Fatal(n, err)
++			}
++			if wrapped.commits.Load() != 1 {
++				t.Fatal("replayed mutation", wrapped.commits.Load())
++			}
++			t.Log("phase=actual_" + action + "_exact_query_no_replay")
++		})
++	}
++}
 diff --git a/internal/database/legacy_handoff.go b/internal/database/legacy_handoff.go
 new file mode 100644
 index 0000000..9c25c89
@@ -800,12 +914,13 @@ index 0000000..9c25c89
 +	return err
 +}
 diff --git a/internal/database/migrations.go b/internal/database/migrations.go
-index 84cbe03..38e1bd1 100644
+index 84cbe03..0366d84 100644
 --- a/internal/database/migrations.go
 +++ b/internal/database/migrations.go
-@@ -1548,0 +1549,2 @@ var migrations = [...]func(tx *sql.Tx) error{
+@@ -1548,0 +1549,3 @@ var migrations = [...]func(tx *sql.Tx) error{
 +	handoffMigration,
 +	handoffDrainMigration,
++	handoffActivationMigration,
 diff --git a/internal/fever/handler.go b/internal/fever/handler.go
 index 3945e42..162b371 100644
 --- a/internal/fever/handler.go
@@ -851,6 +966,378 @@ index 9450ed0..c0aba63 100644
 +	if !request.AcquireAuthenticatedHandoff(w, r) {
 +		return
 +	}
+diff --git a/internal/handoff/activation.go b/internal/handoff/activation.go
+new file mode 100644
+index 0000000..487dd4f
+--- /dev/null
++++ b/internal/handoff/activation.go
+@@ -0,0 +1,169 @@
++// SPDX-License-Identifier: Apache-2.0
++package handoff
++
++import (
++	"context"
++	"database/sql"
++	"errors"
++)
++
++// Migration 135 is append-only. It does not rewrite any earlier receipt or
++// original. A closed initialization proves admission state, never queue emptiness
++// or coverage of sends that happened before instrumentation.
++const ActivationSchemaSQL = `
++ALTER TABLE handoff_operations DROP CONSTRAINT handoff_operations_action_check;
++ALTER TABLE handoff_operations ADD CONSTRAINT handoff_operations_action_check
++ CHECK(action IN ('initialize','initialize_closed','stop_new','pause','resume'));
++`
++
++func MigrateActivation(tx *sql.Tx) error { _, err := tx.Exec(ActivationSchemaSQL); return err }
++
++func activationSchema(ctx context.Context, tx *sql.Tx) error {
++	var count, supported int
++	if err := tx.QueryRowContext(ctx, `SELECT count(*),count(*) FILTER(WHERE version COLLATE "C"='135') FROM schema_version`).Scan(&count, &supported); err != nil {
++		return err
++	}
++	if count != 1 || supported != 1 {
++		return ErrConflict
++	}
++	return nil
++}
++
++// ActivationAvailable is a capability check, not an admission/open receipt.
++func ActivationAvailable(ctx context.Context, db *sql.DB) error {
++	if db == nil {
++		return ErrConflict
++	}
++	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
++	if err != nil {
++		return err
++	}
++	defer tx.Rollback()
++	if err = activationSchema(ctx, tx); err != nil {
++		return err
++	}
++	return tx.Commit()
++}
++
++func closedInitialReceipt(ctx context.Context, tx *sql.Tx, s state, manifest, op string) (Receipt, error) {
++	r, err := readReceipt(ctx, tx, manifest, op)
++	if err != nil {
++		return Receipt{}, err
++	}
++	if s.manifest != manifest || s.operation != op || s.phase != "closed" || s.generation != 0 || r.Action != "initialize_closed" || r.PreviousGeneration != -1 || r.Generation != 0 || !r.Confirmed || r.ActiveLeases != 0 || r.UncertainLeases != 0 {
++		return Receipt{}, ErrConflict
++	}
++	if err = activationSchema(ctx, tx); err != nil {
++		return Receipt{}, err
++	}
++	return r, nil
++}
++
++// InitializeClosed creates both the durable operation and CLOSED state in one
++// transaction. Missing state already refuses admission; no OPEN interval exists.
++// An unknown commit may only be recovered by querying the exact operation.
++func InitializeClosed(ctx context.Context, db *sql.DB, manifest, op string) (Receipt, error) {
++	var empty Receipt
++	if db == nil {
++		return empty, ErrConflict
++	}
++	if err := validate(manifest, op); err != nil {
++		return empty, err
++	}
++	conn, err := db.Conn(ctx)
++	if err != nil {
++		return empty, err
++	}
++	defer discard(conn)
++	got, err := activity(ctx, conn, false)
++	if err != nil {
++		return empty, err
++	}
++	if !got {
++		return empty, ErrUncertain
++	}
++	tx, err := beginTx(ctx, conn)
++	if err != nil {
++		return empty, err
++	}
++	defer tx.Rollback()
++	if err = activationSchema(ctx, tx); err != nil {
++		return empty, err
++	}
++	s, err := readState(ctx, tx)
++	if err == nil {
++		r, e := closedInitialReceipt(ctx, tx, s, manifest, op)
++		if e != nil {
++			return empty, e
++		}
++		if e = tx.Commit(); e != nil {
++			return empty, e
++		}
++		r.Durable = true
++		return r, nil
++	}
++	if !errors.Is(err, sql.ErrNoRows) {
++		return empty, err
++	}
++	var rows int
++	if err = tx.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM handoff_operations)+(SELECT count(*) FROM handoff_leases)`).Scan(&rows); err != nil {
++		return empty, err
++	}
++	if rows != 0 {
++		return empty, ErrConflict
++	}
++	if err = insertOperation(ctx, tx, manifest, op, "initialize_closed", "", -1, true); err != nil {
++		return empty, err
++	}
++	if _, err = tx.ExecContext(ctx, `INSERT INTO handoff_state VALUES(1,$1,0,'closed',$2)`, manifest, op); err != nil {
++		return empty, err
++	}
++	s, err = readState(ctx, tx)
++	if err != nil {
++		return empty, err
++	}
++	r, err := closedInitialReceipt(ctx, tx, s, manifest, op)
++	if err != nil {
++		return empty, err
++	}
++	if err = tx.Commit(); err != nil {
++		return empty, err
++	}
++	r.Durable = true
++	return r, nil
++}
++
++// ResumeProduction requires the reviewed capability inside the same CAS
++// transaction. Receiver capability verification is the source-bound host
++// controller's job; this endpoint alone grants no cross-service safety proof.
++func ResumeProduction(ctx context.Context, db *sql.DB, manifest, closedOp, newOp string) (Receipt, error) {
++	return resume(ctx, db, manifest, closedOp, newOp, true)
++}
++
++func confirmInitialClosed(ctx context.Context, conn *sql.Conn, manifest, op string) (Receipt, error) {
++	got, err := activity(ctx, conn, false)
++	if err != nil {
++		return Receipt{}, err
++	}
++	if !got {
++		return Receipt{}, ErrUncertain
++	}
++	tx, err := beginTx(ctx, conn)
++	if err != nil {
++		return Receipt{}, err
++	}
++	defer tx.Rollback()
++	s, err := readState(ctx, tx)
++	if err != nil {
++		return Receipt{}, err
++	}
++	r, err := closedInitialReceipt(ctx, tx, s, manifest, op)
++	if err != nil {
++		return Receipt{}, err
++	}
++	if err = tx.Commit(); err != nil {
++		return Receipt{}, err
++	}
++	r.Durable = true
++	return r, nil
++}
+diff --git a/internal/handoff/activation_integration_test.go b/internal/handoff/activation_integration_test.go
+new file mode 100644
+index 0000000..f703ada
+--- /dev/null
++++ b/internal/handoff/activation_integration_test.go
+@@ -0,0 +1,191 @@
++// SPDX-License-Identifier: Apache-2.0
++package handoff
++
++import (
++	"context"
++	"errors"
++	"strings"
++	"sync"
++	"testing"
++)
++
++func activationGate(t *testing.T) fixture {
++	t.Helper()
++	f := realGate(t)
++	tx, err := f.db.Begin()
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer tx.Rollback()
++	if err = MigrateDrain(tx); err != nil {
++		t.Fatal(err)
++	}
++	if err = MigrateActivation(tx); err != nil {
++		t.Fatal(err)
++	}
++	if _, err = tx.Exec(`CREATE TABLE schema_version(version text NOT NULL); INSERT INTO schema_version VALUES('135')`); err != nil {
++		t.Fatal(err)
++	}
++	if err = tx.Commit(); err != nil {
++		t.Fatal(err)
++	}
++	return f
++}
++
++func TestPGClosedInitialNeverOpensAndExactResumeCAS(t *testing.T) {
++	f := activationGate(t)
++	ctx := context.Background()
++	for range 2 {
++		r, err := InitializeClosed(ctx, f.db, testManifest, initializeOp)
++		if err != nil || !r.Durable || !r.Confirmed || r.State != "closed" || r.Generation != 0 {
++			t.Fatal(r, err)
++		}
++	}
++	r, err := Query(ctx, f.db, testManifest, initializeOp)
++	if err != nil || r.Action != "initialize_closed" || r.State != "closed" {
++		t.Fatal(r, err)
++	}
++	for _, source := range []string{"scheduler", "manual", "legacy_async"} {
++		if _, err = Begin(ctx, f.pool, testManifest, source); !errors.Is(err, ErrClosed) {
++			t.Fatal(source, err)
++		}
++	}
++	if _, err = Initialize(ctx, f.db, testManifest, initializeOp); err == nil {
++		t.Fatal("old initializer adopted new closed operation")
++	}
++	if _, err = Resume(ctx, f.db, testManifest, initializeOp, resumeOp); err == nil {
++		t.Fatal("legacy resume adopted initialclosed")
++	}
++	if _, err = ResumeProduction(ctx, f.db, testManifest, pauseOp, resumeOp); err == nil {
++		t.Fatal("wrong closed CAS accepted")
++	}
++	r, err = ResumeProduction(ctx, f.db, testManifest, initializeOp, resumeOp)
++	if err != nil || r.Generation != 1 || r.State != "open" {
++		t.Fatal(r, err)
++	}
++	for range 2 {
++		r, err = Query(ctx, f.db, testManifest, resumeOp)
++		if err != nil || r.Generation != 1 {
++			t.Fatal(r, err)
++		}
++	}
++	if _, err = Query(ctx, f.db, testManifest, initializeOp); err == nil {
++		t.Fatal("historicalclosed certifiedcurrent")
++	}
++	var n int
++	if err = f.db.QueryRow(`SELECT count(*) FROM handoff_operations`).Scan(&n); err != nil || n != 2 {
++		t.Fatal(n, err)
++	}
++}
++
++func TestPGClosedInitConcurrentAndExistingGateNeverReset(t *testing.T) {
++	f := activationGate(t)
++	ctx := context.Background()
++	var wg sync.WaitGroup
++	results := make(chan error, 2)
++	for _, op := range []string{initializeOp, pauseOp} {
++		wg.Go(func() { _, err := InitializeClosed(ctx, f.db, testManifest, op); results <- err })
++	}
++	wg.Wait()
++	close(results)
++	successes := 0
++	for err := range results {
++		if err == nil {
++			successes++
++		}
++	}
++	if successes != 1 {
++		t.Fatal(successes)
++	}
++	var count int
++	if err := f.db.QueryRow(`SELECT count(*) FROM handoff_operations`).Scan(&count); err != nil || count != 1 {
++		t.Fatal(count, err)
++	}
++	other := activationGate(t)
++	if _, err := Initialize(ctx, other.db, testManifest, initializeOp); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := InitializeClosed(ctx, other.db, testManifest, pauseOp); err == nil {
++		t.Fatal("existing OPEN overwritten")
++	}
++}
++
++func TestPGClosedInitLockOrTransactionFailureAddsNothing(t *testing.T) {
++	f := activationGate(t)
++	ctx := context.Background()
++	conn, err := f.db.Conn(ctx)
++	if err != nil {
++		t.Fatal(err)
++	}
++	got, err := activity(ctx, conn, true)
++	if err != nil || !got {
++		t.Fatal(got, err)
++	}
++	if _, err = InitializeClosed(ctx, f.db, testManifest, initializeOp); !errors.Is(err, ErrUncertain) {
++		t.Fatal(err)
++	}
++	discard(conn)
++	if _, err = f.db.Exec(`CREATE FUNCTION fail_initial_state() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic insert fail'; END $$; CREATE TRIGGER fail_initial BEFORE INSERT ON handoff_state FOR EACH ROW EXECUTE FUNCTION fail_initial_state()`); err != nil {
++		t.Fatal(err)
++	}
++	if _, err = InitializeClosed(ctx, f.db, testManifest, initializeOp); err == nil {
++		t.Fatal("failed state accepted")
++	}
++	var n int
++	if err = f.db.QueryRow(`SELECT (SELECT count(*) FROM handoff_state)+(SELECT count(*) FROM handoff_operations)`).Scan(&n); err != nil || n != 0 {
++		t.Fatal(n, err)
++	}
++}
++
++func TestPGActivationOnlyCanonical135AndRetainsUncertainCapacity(t *testing.T) {
++	f := activationGate(t)
++	ctx := context.Background()
++	for _, version := range []string{"134", "136", "0135", " 135", "135 ", "135.0", "true", "１３５", ""} {
++		if _, err := f.db.Exec(`UPDATE schema_version SET version=$1`, version); err != nil {
++			t.Fatal(err)
++		}
++		if err := ActivationAvailable(ctx, f.db); err == nil {
++			t.Fatal("bad version", version)
++		}
++		if _, err := InitializeClosed(ctx, f.db, testManifest, initializeOp); err == nil {
++			t.Fatal("bad init", version)
++		}
++	}
++	if _, err := f.db.Exec(`UPDATE schema_version SET version='135'`); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := InitializeClosed(ctx, f.db, testManifest, initializeOp); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := f.db.Exec(`INSERT INTO handoff_leases(lease_id,manifest,source,status,backend_pid) VALUES($1,$2,'synthetic','uncertain',1)`, strings.Repeat("e", 32), testManifest); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := ResumeProduction(ctx, f.db, testManifest, initializeOp, resumeOp); err == nil {
++		t.Fatal("resumed unknown")
++	}
++	if _, err := Query(ctx, f.db, testManifest, initializeOp); err == nil {
++		t.Fatal("confirmed unknown closed")
++	}
++}
++
++func TestPGProductionResumeReservesLastPauseCapacity(t *testing.T) {
++	f := activationGate(t)
++	ctx := context.Background()
++	if _, err := InitializeClosed(ctx, f.db, testManifest, initializeOp); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := f.db.Exec(`INSERT INTO handoff_operations(operation_id,manifest,action,previous_generation,generation,prior_operation,status,confirmed_at) SELECT lpad(to_hex(n),64,'0'),$1,'initialize',-1,0,'','confirmed',now() FROM generate_series(1,$2) n`, testManifest, MaxRetainedRecords-2); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := ResumeProduction(ctx, f.db, testManifest, initializeOp, resumeOp); err == nil || !strings.Contains(err.Error(), "capacity") {
++		t.Fatal(err)
++	}
++	r, err := Query(ctx, f.db, testManifest, initializeOp)
++	if err != nil || r.State != "closed" {
++		t.Fatal(r, err)
++	}
++	var n int
++	if err = f.db.QueryRow(`SELECT count(*) FROM handoff_operations`).Scan(&n); err != nil || n != MaxRetainedRecords-1 {
++		t.Fatal(n, err)
++	}
++}
 diff --git a/internal/handoff/drain.go b/internal/handoff/drain.go
 new file mode 100644
 index 0000000..b920da3
@@ -1155,10 +1642,10 @@ index 0000000..1d786c0
 +}
 diff --git a/internal/handoff/handoff.go b/internal/handoff/handoff.go
 new file mode 100644
-index 0000000..fff990b
+index 0000000..336642e
 --- /dev/null
 +++ b/internal/handoff/handoff.go
-@@ -0,0 +1,765 @@
+@@ -0,0 +1,791 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Package handoff implements a durable admission gate, not a delivery ACK.
 +// A retained active/uncertain lease blocks closing even after its backend dies.
@@ -1612,6 +2099,9 @@ index 0000000..fff990b
 +	}
 +	r.Confirmed = status == "confirmed"
 +	r.State = "open"
++	if r.Action == "initialize_closed" {
++		r.State = "closed"
++	}
 +	if r.Action == "pause" {
 +		r.State = "closing"
 +		if r.Confirmed {
@@ -1828,6 +2318,12 @@ index 0000000..fff990b
 +	if r.Generation != s.generation {
 +		return empty, ErrConflict
 +	}
++	if r.Action == "initialize_closed" {
++		r, err = closedInitialReceipt(ctx, tx, s, manifest, op)
++		if err != nil {
++			return empty, err
++		}
++	}
 +	if err = tx.Commit(); err != nil {
 +		return empty, err
 +	}
@@ -1837,6 +2333,9 @@ index 0000000..fff990b
 +	if r.Action == "stop_new" {
 +		return confirmStopNew(ctx, conn, manifest, op)
 +	}
++	if r.Action == "initialize_closed" {
++		return confirmInitialClosed(ctx, conn, manifest, op)
++	}
 +	r.Durable = true
 +	return r, nil
 +}
@@ -1844,6 +2343,10 @@ index 0000000..fff990b
 +// Resume is an explicit CAS from one confirmed closed operation. It cannot
 +// erase uncertain work, change the manifest, or reopen automatically on restart.
 +func Resume(ctx context.Context, db *sql.DB, manifest, closedOp, newOp string) (Receipt, error) {
++	return resume(ctx, db, manifest, closedOp, newOp, false)
++}
++
++func resume(ctx context.Context, db *sql.DB, manifest, closedOp, newOp string, production bool) (Receipt, error) {
 +	var empty Receipt
 +	if db == nil {
 +		return empty, ErrConflict
@@ -1871,6 +2374,11 @@ index 0000000..fff990b
 +		return empty, err
 +	}
 +	defer tx.Rollback()
++	if production {
++		if err = activationSchema(ctx, tx); err != nil {
++			return empty, err
++		}
++	}
 +	s, err := readState(ctx, tx)
 +	if err != nil {
 +		return empty, err
@@ -1884,7 +2392,7 @@ index 0000000..fff990b
 +		if e == nil {
 +			e = tx.QueryRowContext(ctx, `SELECT prior_operation FROM handoff_operations WHERE operation_id=$1`, newOp).Scan(&prior)
 +		}
-+		if e != nil || r.Action != "resume" || prior != closedOp {
++		if e != nil || r.Action != "resume" || prior != closedOp || s.phase != "open" || r.Generation != s.generation || !r.Confirmed {
 +			return empty, ErrConflict
 +		}
 +		if e = tx.Commit(); e != nil {
@@ -1900,7 +2408,12 @@ index 0000000..fff990b
 +	if err != nil {
 +		return empty, err
 +	}
-+	if !prior.Confirmed || prior.Action != "pause" || prior.ActiveLeases != 0 || prior.UncertainLeases != 0 {
++	validClosed := prior.Action == "pause"
++	if production && prior.Action == "initialize_closed" {
++		_, err = closedInitialReceipt(ctx, tx, s, manifest, closedOp)
++		validClosed = err == nil
++	}
++	if !prior.Confirmed || !validClosed || prior.Generation != s.generation || prior.ActiveLeases != 0 || prior.UncertainLeases != 0 {
 +		return empty, ErrUncertain
 +	}
 +	if err = insertOperation(ctx, tx, manifest, newOp, "resume", closedOp, s.generation, true); err != nil {
@@ -4222,10 +4735,10 @@ index 09ae115..c942514 100644
 +			}
 diff --git a/internal/storage/handoff.go b/internal/storage/handoff.go
 new file mode 100644
-index 0000000..1174a79
+index 0000000..274765b
 --- /dev/null
 +++ b/internal/storage/handoff.go
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,94 @@
 +// SPDX-License-Identifier: Apache-2.0
 +package storage
 +
@@ -4309,6 +4822,16 @@ index 0000000..1174a79
 +	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 +	defer cancel()
 +	return handoff.BeginOutboxPass(ctx, s.handoffDB, config.Opts.HandoffManifest())
++}
++
++func (s *Storage) InitializeClosedHandoff(ctx context.Context, op string) (handoff.Receipt, error) {
++	return handoff.InitializeClosed(ctx, s.db, config.Opts.HandoffManifest(), op)
++}
++func (s *Storage) ResumeProductionHandoff(ctx context.Context, closed, op string) (handoff.Receipt, error) {
++	return handoff.ResumeProduction(ctx, s.db, config.Opts.HandoffManifest(), closed, op)
++}
++func (s *Storage) ActivationHandoffAvailable(ctx context.Context) error {
++	return handoff.ActivationAvailable(ctx, s.db)
 +}
 diff --git a/internal/storage/legacy_handoff.go b/internal/storage/legacy_handoff.go
 new file mode 100644

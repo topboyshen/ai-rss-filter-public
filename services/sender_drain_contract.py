@@ -131,7 +131,7 @@ def digest(value):
 
 def validate_identity(value):
     require(isinstance(value, dict) and set(value) == set(IDENTITY_KEYS), "complete sender PostgreSQL identity required")
-    require(type(value["schema_version"]) is int and value["schema_version"] == 134, "sender schema 134 required")
+    require(type(value["schema_version"]) is int and value["schema_version"] in (134, 135), "sender schema 134 or 135 required")
     for key in IDENTITY_KEYS:
         if key.endswith("_oid"):
             require(type(value[key]) is int and 0 < value[key] < 2**32, "invalid sender table OID")

@@ -81,7 +81,7 @@ def _bootstrap_dashboard_publication() -> None:
 
 def main() -> int:
     from routes.shared import _security_cfg, init_db
-    from services.shared_cache import process_role, redis_enabled, redis_ping
+    from services.shared_cache import process_role
 
     role = process_role()
     if role not in {"worker", "all"}:
@@ -96,8 +96,17 @@ def main() -> int:
     if production_startup.enabled():
         return production_startup.closed_worker_loop()
 
+    return run_business()
+
+
+def run_business(*, activation=None) -> int:
+    """Start real subsystems once; activated production never reinitializes DB."""
+    from services.shared_cache import process_role, redis_enabled, redis_ping
+    role = process_role()
     if not redis_enabled() or not redis_ping():
         logger.error("Redis is required and must be reachable before worker starts")
+        if activation is not None:
+            raise RuntimeError("activation dependency preparation failed")
         return 2
 
     from routes.webhook_routes import (
@@ -112,7 +121,6 @@ def main() -> int:
         write_worker_health,
     )
     from services.quant_market_context import (
-        quant_context_enabled,
         start_quant_market_context_poller,
         stop_quant_market_context_poller,
     )
@@ -130,6 +138,14 @@ def main() -> int:
     dispatcher_thread = start_webhook_dispatcher()
     quant_context_thread = start_quant_market_context_poller()
 
+    business_threads = {"quotes": quotes_thread, "dispatcher": dispatcher_thread, "quant_context": quant_context_thread}
+    if activation is not None:
+        activation.prepared(business_threads, {"redis": True})
+        while not activation.opened():
+            if stop.wait(1):
+                raise RuntimeError("activated worker stopped before confirmed opening")
+            activation.pulse()
+
     # Bootstrap the fixed Glance cards in the single maintenance lane.  The
     # durable task survives a worker restart, coalesces with refresh-triggered
     # publication, and never makes the Web process compute on a public GET.
@@ -138,48 +154,28 @@ def main() -> int:
     except AdmissionClosed:
         logger.info("[Worker] bootstrap held by admission fence")
 
-    def _ensure_subsystems() -> dict[str, bool]:
-        nonlocal quotes_thread, dispatcher_thread, quant_context_thread
-
-        if quotes_thread is None or not quotes_thread.is_alive():
-            stop_quotes_refresher(timeout=0.0)
-            quotes_thread = _ensure_quotes_refresher()
-        if dispatcher_thread is None or not dispatcher_thread.is_alive():
-            dispatcher_thread = start_webhook_dispatcher()
-        if quant_context_enabled() and (
-            quant_context_thread is None or not quant_context_thread.is_alive()
-        ):
-            stop_quant_market_context_poller(timeout=0.0)
-            quant_context_thread = start_quant_market_context_poller()
-        subsystems = {
-            "quotes": bool(quotes_thread is not None and quotes_thread.is_alive()),
-            "dispatcher": bool(
-                dispatcher_thread is not None and dispatcher_thread.is_alive()
-            ),
-        }
-        # An operator can leave this optional integration disabled.  Once a URL
-        # is configured, a dead poller is a real worker subsystem failure; a
-        # remote outage itself is handled inside the live poller fail-neutrally.
-        if quant_context_enabled():
-            subsystems["quant_context"] = bool(
-                quant_context_thread is not None and quant_context_thread.is_alive()
-            )
-        return subsystems
     logger.info("[Worker] background services started (role=%s)", role)
     try:
         write_worker_health(
             webhook_dispatcher_alive(),
-            subsystems=_ensure_subsystems(),
+            subsystems=_worker_subsystems(business_threads, activation),
             force_dependency_probe=True,
         )
     except Exception:
         logger.exception("[Worker] failed to write initial health snapshot")
 
-    while not stop.wait(HEALTH_WRITE_INTERVAL_SECONDS):
+    interval = 1 if activation is not None else HEALTH_WRITE_INTERVAL_SECONDS
+    next_health = time.monotonic() + HEALTH_WRITE_INTERVAL_SECONDS
+    while not stop.wait(interval):
+        if activation is not None:
+            activation.pulse()
+            if time.monotonic() < next_health:
+                continue
+            next_health = time.monotonic() + HEALTH_WRITE_INTERVAL_SECONDS
         _retry_pending_dashboard_publication()
         try:
             write_worker_health(
-                webhook_dispatcher_alive(), subsystems=_ensure_subsystems()
+                webhook_dispatcher_alive(), subsystems=_worker_subsystems(business_threads, activation)
             )
         except Exception:
             # A stale/missing snapshot will make the container unhealthy, but
@@ -200,6 +196,51 @@ def main() -> int:
     logger.info("[Worker] stopped")
     return 0
 
+
+def _worker_subsystems(threads, activation):
+    from routes.dashboard_routes import _ensure_quotes_refresher, stop_quotes_refresher
+    from routes.webhook_routes import start_webhook_dispatcher
+    from services.quant_market_context import (quant_context_enabled, start_quant_market_context_poller, stop_quant_market_context_poller)
+    quotes_thread, dispatcher_thread, quant_context_thread = (threads[key] for key in ("quotes", "dispatcher", "quant_context"))
+
+    if activation is not None:
+        activation.pulse()
+        # Never enter the ordinary self-healing lane after activation. A
+        # thread can die between pulse() and the following reads; that race
+        # must retain the original owner and fail, not create a replacement.
+        required = {"quotes", "dispatcher"}
+        if quant_context_enabled():
+            required.add("quant_context")
+        if any(threads[name] is not activation.threads[name] or threads[name] is None
+               or not threads[name].is_alive() for name in required):
+            raise RuntimeError("activated business subsystem died or changed; restart forbidden")
+        return {name: True for name in sorted(required)}
+
+    if quotes_thread is None or not quotes_thread.is_alive():
+        stop_quotes_refresher(timeout=0.0)
+        quotes_thread = _ensure_quotes_refresher()
+    if dispatcher_thread is None or not dispatcher_thread.is_alive():
+        dispatcher_thread = start_webhook_dispatcher()
+    if quant_context_enabled() and (
+        quant_context_thread is None or not quant_context_thread.is_alive()
+    ):
+        stop_quant_market_context_poller(timeout=0.0)
+        quant_context_thread = start_quant_market_context_poller()
+    subsystems = {
+        "quotes": bool(quotes_thread is not None and quotes_thread.is_alive()),
+        "dispatcher": bool(
+            dispatcher_thread is not None and dispatcher_thread.is_alive()
+        ),
+    }
+    # An operator can leave this optional integration disabled.  Once a URL
+    # is configured, a dead poller is a real worker subsystem failure; a
+    # remote outage itself is handled inside the live poller fail-neutrally.
+    if quant_context_enabled():
+        subsystems["quant_context"] = bool(
+            quant_context_thread is not None and quant_context_thread.is_alive()
+        )
+    threads.update(quotes=quotes_thread, dispatcher=dispatcher_thread, quant_context=quant_context_thread)
+    return subsystems
 
 if __name__ == "__main__":
     raise SystemExit(main())

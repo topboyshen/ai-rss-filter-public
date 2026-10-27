@@ -160,12 +160,12 @@ def test_outbox_cleanup_credit_cannot_be_omitted(tmp_path):
         contract.validate_manifest(value)
 
 
-@pytest.mark.parametrize("version", ["134", "0134", "134 ", "", 133, 135, 134.0, True, None])
-def test_identity_contract_still_requires_exact_integer_134(tmp_path, version):
+@pytest.mark.parametrize("version", ["134", "0134", "134 ", "", 133, 136, 134.0, True, None])
+def test_identity_contract_requires_exact_supported_integer(tmp_path, version):
     value, _ = synthetic_manifest(tmp_path)
     identity = value["postgres_identity"]
     identity["schema_version"] = version
-    with pytest.raises(contract.DrainContractError, match="schema 134 required"):
+    with pytest.raises(contract.DrainContractError, match="schema 134 or 135 required"):
         contract.validate_identity(identity)
 
 
@@ -228,3 +228,11 @@ def test_duplicate_json_keys_and_unsafe_modes_fail(tmp_path):
     with pytest.raises(ValueError):
         contract.load_bundle(root)
     assert not list(root.glob("*.pending"))
+
+
+@pytest.mark.parametrize("version", [134, 135])
+def test_exact_supported_sender_schema_capabilities(tmp_path, version):
+    value, _ = synthetic_manifest(tmp_path)
+    identity = value["postgres_identity"]
+    identity["schema_version"] = version
+    assert contract.validate_identity(identity) == identity

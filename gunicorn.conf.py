@@ -50,6 +50,8 @@ def post_worker_init(worker):
     if production_startup.enabled():
         slot, attempt = worker.production_slot
         initialize_app(slot=slot, attempt=attempt)
+        from services.production_activation import start_web_monitor
+        start_web_monitor()
         return
     initialize_app()
 

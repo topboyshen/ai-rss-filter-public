@@ -31,7 +31,16 @@ class CompletionNativeGuards(unittest.TestCase):
                     "tests/test_sender_pg_deadlines.py", "tests/test_production_startup_pg_fixture.py",
                     "tests/test_receiver_drain_transfer.py", "tests/test_receiver_drain_driver.py",
                     "tests/test_takeover_readonly_preflight.py", "tests/test_joint_drain_controller.py",
-                    "tests/test_receiver_drain_fixture_runtime.py", "tests/test_sender_receiver_joint_native.py"}
+                    "tests/test_receiver_drain_fixture_runtime.py", "tests/test_sender_receiver_joint_native.py",
+                    "tests/test_production_activation.py",
+                    "tests/test_production_initial_fence.py",
+                    "tests/test_production_initial_candidates.py", "tests/test_production_initial_migration.py",
+                    "tests/test_production_container_lifecycle.py",
+                    "tests/test_production_active_verification.py",
+                    "tests/test_release_container_lifecycle.py",
+                    "tests/test_miniflux_activation_adapter.py",
+                    "tests/test_sender_activation_driver.py",
+                    "tests/test_production_activation_native.py"}
         actual = {node.value for node in ast.walk(ast.parse(runner.CONTAINER_TEST))
                   if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.startswith("tests/")}
         self.assertEqual(set(runner.TESTS), expected)

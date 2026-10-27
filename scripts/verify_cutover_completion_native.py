@@ -36,7 +36,16 @@ TESTS = ("tests/test_independent_drain_inventory.py", "tests/test_frozen_cutover
          "tests/test_sender_pg_deadlines.py", "tests/test_production_startup_pg_fixture.py",
          "tests/test_receiver_drain_transfer.py", "tests/test_receiver_drain_driver.py",
          "tests/test_takeover_readonly_preflight.py", "tests/test_joint_drain_controller.py",
-         "tests/test_receiver_drain_fixture_runtime.py", "tests/test_sender_receiver_joint_native.py")
+         "tests/test_receiver_drain_fixture_runtime.py", "tests/test_sender_receiver_joint_native.py",
+         "tests/test_production_activation.py",
+         "tests/test_production_initial_fence.py",
+         "tests/test_production_initial_candidates.py", "tests/test_production_initial_migration.py",
+         "tests/test_production_container_lifecycle.py",
+         "tests/test_production_active_verification.py",
+         "tests/test_release_container_lifecycle.py",
+         "tests/test_miniflux_activation_adapter.py",
+         "tests/test_sender_activation_driver.py",
+         "tests/test_production_activation_native.py")
 MOUNTS = ("scripts", "tests", "services", "routes", "core", "db", "utils", "workers", "modules",
           "templates", "app.py", "worker_main.py", "sse_engine.py", "logging_bootstrap.py",
           "scoring_provenance.py", "scoring_explanation.py", "config.yaml", "docker-compose.yml",
@@ -69,7 +78,16 @@ try:
         'tests/test_sender_pg_deadlines.py', 'tests/test_production_startup_pg_fixture.py',
         'tests/test_receiver_drain_transfer.py', 'tests/test_receiver_drain_driver.py',
         'tests/test_takeover_readonly_preflight.py', 'tests/test_joint_drain_controller.py',
-        'tests/test_receiver_drain_fixture_runtime.py', 'tests/test_sender_receiver_joint_native.py'], plugins=[summary])
+        'tests/test_receiver_drain_fixture_runtime.py', 'tests/test_sender_receiver_joint_native.py',
+        'tests/test_production_activation.py',
+        'tests/test_production_initial_fence.py',
+        'tests/test_production_initial_candidates.py', 'tests/test_production_initial_migration.py',
+        'tests/test_production_container_lifecycle.py',
+        'tests/test_production_active_verification.py',
+        'tests/test_release_container_lifecycle.py',
+        'tests/test_miniflux_activation_adapter.py',
+        'tests/test_sender_activation_driver.py',
+        'tests/test_production_activation_native.py'], plugins=[summary])
 finally:
     # This exact private subtree is already the evidence bind, so preserve
     # original inodes in place, including sparse files and failure originals.

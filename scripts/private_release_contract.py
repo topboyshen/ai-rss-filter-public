@@ -854,7 +854,11 @@ def verify_app_loaders(contract, manifest, containers, directory, digest):
 
 
 def verify_runtime(contract, manifest, directory, digest):
-    containers = inspect_project(contract)
+    _verify_runtime_records(contract, manifest, directory, digest, inspect_project(contract))
+
+
+def _verify_runtime_records(contract, manifest, directory, digest, containers):
+    """All execution checks; caller must bind the complete approved runtime set."""
     verify_service_execution(contract, manifest, containers, directory, digest)
     actual_topology = runtime_topology(containers)
     expected_names = {name for name, service in manifest["services"].items() if not service.get("profiles")}

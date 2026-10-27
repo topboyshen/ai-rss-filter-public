@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 from durable_handoff_cutover import durable_write, encoded, parsed, private_directory, read_private, require
 from handoff_host_cron import locked, present
 from handoff_runtime_adapter import inspect_binding
-from miniflux_handoff_adapter import MinifluxDrainControl, HEX64, checked_binding, source_sha256 as bridge_source
+from miniflux_handoff_adapter import MinifluxDrainControl, MinifluxActivationControl, HEX64, checked_binding, source_sha256 as bridge_source
 from production_receiver_driver import _capture
 from sender_drain_inventory import PostgresReader
 from services import sender_drain_contract as contract
@@ -68,9 +68,12 @@ class NativeSenderTransport:
         require(isinstance(component_id, str) and HEX64.fullmatch(component_id), "exact sender container ID required")
         return parsed(_capture(["/usr/bin/docker", "--host", "unix:///var/run/docker.sock", "inspect", component_id]))
 
+    def _allowed(self, method, path):
+        return ((method == "GET" and (path == "/registration" or (path.startswith("/operations/") and HEX64.fullmatch(path[12:]))))
+                or (method == "POST" and path in {"/stop-new", "/pause"}))
+
     def request(self, method, path, payload=None):
-        require((method == "GET" and (path == "/registration" or (path.startswith("/operations/") and HEX64.fullmatch(path[12:]))))
-                or (method == "POST" and path in {"/stop-new", "/pause"}), "sender control operation not allowed")
+        require(self._allowed(method, path), "sender control operation not allowed")
         token = self._token()
         require(contract.digest(token) == self.token_sha256, "sender credential changed")
         body = None if payload is None else encoded(payload)
@@ -216,3 +219,94 @@ class SenderDriver:
         self.bind()
         value = self.control.freeze(operation, stop_operation, reason)
         return {"receipt":value,"queue_checked":False,"window_aborted":True,"switch_authorized":False}
+
+
+class NativeSenderActivationTransport(NativeSenderTransport):
+    """Separate explicit135 capability; ordinary drain transport never reopens."""
+    def _allowed(self, method, path):
+        return ((method == "GET" and (path == "/activation-registration"
+                 or (path.startswith("/operations/") and HEX64.fullmatch(path[12:]))))
+                or (method == "POST" and path in {"/initialize-closed", "/production-resume"}))
+
+
+class SenderActivationDriver(SenderDriver):
+    """Source/PG/image bound135 actions, never first OPEN or historical repair."""
+    def __init__(self, plan, transport, postgres, evidence_root):
+        super().__init__(plan, transport, postgres, evidence_root)
+        require(self.plan["postgres_identity"]["schema_version"] == 135, "production activation requires schema135")
+        self.control = MinifluxActivationControl(self.plan["binding"], transport, self._inspect,
+                                                self.root/"control", self.plan["window"])
+
+    def bind(self):
+        validate_plan(self.plan)
+        require(contract.digest(self.plan) == self.plan_sha256, "activation plan mutated")
+        binding = self.plan["binding"]
+        rows = self._inspect()
+        inspect_binding(rows, {binding["component_name"]:binding["component"]})
+        for row in rows:
+            env = dict(item.split("=",1) for item in row["Config"]["Env"])
+            require(env.get("HANDOFF_ENABLED") == "1" and env.get("HANDOFF_MANIFEST") == binding["manifest"],
+                    "actual sender is not the bound instrumented instance")
+        self.control.registration()
+        sample = self.postgres.initial_snapshot()
+        require(sample["database_identity"] == self.plan["postgres_identity"], "actual activation PG identity differs")
+        if sample["gate"] is not None:
+            require(sample["gate"]["manifest"] == binding["manifest"], "actual activation manifest differs")
+        return sample
+
+    def initialize_closed(self, operation):
+        self._window()
+        sample = self.bind()
+        require(sample["gate"] is None and sample["retained_operations"] == 0
+                and sample["retained_leases"]["records"] == 0, "sender gate already initialized or retained control history exists")
+        receipt = self.control.initialize_closed(operation)
+        self._check_closed(self.bind(), receipt)
+        return receipt
+
+    def _check_closed(self, sample, receipt):
+        require(sample["gate"] == {"manifest":receipt["manifest"], "generation":receipt["generation"],
+                                  "phase":"closed", "current_operation":receipt["operation_id"]}
+                and sample["retained_leases"]["active"] == sample["retained_leases"]["uncertain"] == 0,
+                "actual sender closed state differs")
+
+    def query_initialize_closed(self, operation):
+        self.bind()
+        receipt = self.control.query_initialize_closed(operation)
+        self._check_closed(self.bind(), receipt)
+        return receipt
+
+    def production_resume(self, closed_operation, generation, receiver_activation_proof):
+        self._window()
+        sample = self.bind()
+        require(sample["gate"] == {"manifest":self.plan["binding"]["manifest"], "generation":generation,
+                                  "phase":"closed", "current_operation":closed_operation}, "production closed CAS differs")
+        require(sample["retained_leases"]["active"] == sample["retained_leases"]["uncertain"] == 0,
+                "sender activity/uncertainty remains")
+        require(sample["retained_operations"] < 9999 and sample["retained_leases"]["records"] <= 9997,
+                "retained capacity cannot reserve one producer, outbox pair and final pause; preserve originals")
+        require(not any(sample["states"][k] for k in ("pending", "inflight", "held"))
+                and sample["legacy"]["rows"] == 0 and sample["expired_unacknowledged"] == 0,
+                "sender original inventory is not independently clear")
+        value = self.control.production_resume(closed_operation, generation, receiver_activation_proof)
+        self._check_open(self.bind(), value)
+        return value
+
+    def _check_open(self, sample, value):
+        receipt = value["pg_receipt"]
+        require(sample["gate"] == {"manifest":receipt["manifest"], "generation":receipt["generation"],
+                                  "phase":"open", "current_operation":receipt["operation_id"]}, "actual sender resumed state differs")
+
+    def query_production_resume(self, operation, receiver_activation_proof):
+        self.bind()
+        value = self.control.query_production_resume(operation, receiver_activation_proof)
+        self._check_open(self.bind(), value)
+        return value
+
+    def stop_new(self, *args, **kwargs):
+        raise ValueError("use separately bound staged sender driver after activation")
+
+    def query_stop_new(self, *args, **kwargs):
+        raise ValueError("use staged sender stop query")
+
+    def seal_originals(self, *args, **kwargs):
+        raise ValueError("activation never exports or replays historical originals")

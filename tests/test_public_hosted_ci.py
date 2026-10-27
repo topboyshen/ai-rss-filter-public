@@ -139,11 +139,23 @@ def test_private_release_workflow_covers_its_tests_without_unrelated_paths(event
     ("cutover-completion.yml", "scripts/production_startup_pg_fixture.py", True),
     ("cutover-completion.yml", "scripts/production_startup_fixture.py", True),
     ("cutover-completion.yml", "scripts/private_release_contract.py", True),
+    ("cutover-completion.yml", "scripts/check_release_container_lifecycle.py", True),
+    ("cutover-completion.yml", "scripts/release.sh", True),
+    ("cutover-completion.yml", "tests/test_release_container_lifecycle.py", True),
+    ("cutover-completion.yml", "tests/test_miniflux_activation_adapter.py", True),
+    ("cutover-completion.yml", "tests/test_sender_activation_driver.py", True),
     ("cutover-completion.yml", "scripts/prepare_synthetic_evidence.py", True),
     ("cutover-completion.yml", "tests/test_prepare_synthetic_evidence.py", True),
     ("cutover-completion.yml", "ops/miniflux/pause-source-lock.json", True),
     ("cutover-completion.yml", "tests/test_sender_pg_deadlines.py", True),
     ("cutover-completion.yml", "scripts/verify_production_startup_native.py", True),
+    ("cutover-completion.yml", "scripts/verify_production_activation_native.py", True),
+    ("cutover-completion.yml", "scripts/production_activation_fixture.py", True),
+    ("cutover-completion.yml", "services/production_container_lifecycle.py", True),
+    ("cutover-completion.yml", "services/production_activation_control.py", True),
+    ("cutover-completion.yml", "tests/test_production_activation_native.py", True),
+    ("cutover-completion.yml", "tests/test_production_initial_migration.py", True),
+    ("cutover-completion.yml", "scripts/production_activation_notes.md", False),
     ("cutover-completion.yml", "tests/test_production_startup.py", True),
     ("cutover-completion.yml", "tests/test_production_startup_native.py", True),
     ("cutover-completion.yml", "tests/test_joint_drain_controller.py", True),
@@ -176,7 +188,7 @@ def test_private_release_workflow_covers_its_tests_without_unrelated_paths(event
 def test_combined_cutover_regressions_trigger_the_relevant_native_gate(workflow, changed_path, expected):
     _, value = _workflow(workflow)
     triggers = value.get("on", value.get(True))
-    for event in ["pull_request"] + (["push"] if workflow == "miniflux-pause.yml" else []):
+    for event in ("pull_request", "push"):
         assert any(fnmatchcase(changed_path, pattern) for pattern in triggers[event]["paths"]) is expected
 
 
@@ -207,3 +219,31 @@ def test_host_postgres_driver_is_pinned_without_changing_application_dependencie
     for name in ("cutover-completion.yml", "miniflux-pause.yml"):
         source, _ = _workflow(name)
         assert "--only-binary=:all: -r requirements.txt -r requirements-ops.txt" in source
+
+
+def test_frozen_cutover_merge_push_is_master_only_and_preserves_pr_scope():
+    _, workflow = _workflow("cutover-completion.yml")
+    triggers = workflow.get("on", workflow.get(True))
+    assert triggers["push"]["branches"] == ["master"]
+    assert triggers["pull_request"]["branches"] == ["master", "codex/**"]
+    assert triggers["push"]["paths"] == triggers["pull_request"]["paths"]
+    assert "tags" not in triggers["push"]
+    for branch, expected in (("master", True), ("codex/activation", False), ("feature/activation", False), ("main", False)):
+        assert any(fnmatchcase(branch, pattern) for pattern in triggers["push"]["branches"]) is expected
+
+
+def test_activation_native_runs_after_closed_startup_and_preserves_failures():
+    _, workflow = _workflow("cutover-completion.yml")
+    steps = workflow["jobs"]["native-amd64"]["steps"]
+    closed = next(i for i, step in enumerate(steps) if "scripts/verify_production_startup_native.py" in step.get("run", ""))
+    activation = next(i for i, step in enumerate(steps) if "scripts/verify_production_activation_native.py" in step.get("run", ""))
+    assert closed < activation
+    run = steps[activation]["run"]
+    assert "--source \"$RUNNER_TEMP/startup-miniflux\"" in run
+    assert "CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -p 1 -trimpath" in run
+    assert 'chmod 0755 "$RUNNER_TEMP/production-activation-build/miniflux"' in run
+    assert "redis:7-alpine@sha256:" in run and "--platform=linux/amd64" in run
+    prepare = next(step for step in steps if "scripts/prepare_synthetic_evidence.py" in step.get("run", ""))
+    assert prepare["if"] == "always()"
+    for name in ("production-activation", "production-activation-build"):
+        assert f'--source "{name}=${{RUNNER_TEMP}}/{name}"' in prepare["run"]

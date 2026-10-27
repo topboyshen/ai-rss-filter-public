@@ -60,7 +60,8 @@ def test_connection_minimum_cannot_restart_a_nearly_expired_budget(monkeypatch):
                                    ("a" * 64, "stop_new", 3, 4, "confirmed", True),
                                    ("a" * 64, "pause", 2, 3, "confirmed", True)])
 def test_closed_state_alone_does_not_prove_confirmed_pause(row):
-    held = inventory.FrozenPostgres(None, "b" * 64, "a" * 64)
+    from types import SimpleNamespace
+    held = inventory.FrozenPostgres(SimpleNamespace(expected={"schema_version":134}), "b" * 64, "a" * 64)
     held.snapshot = {"gate": {"generation": 4}}
     class Cursor:
         def execute(self, sql, params):
@@ -87,3 +88,24 @@ def test_actual_inventory_fields_are_not_exempted_by_age_projection(change):
     new["acked_at_least_7_days"] = 1
     change(new)
     assert inventory.stable_inventory(old) != inventory.stable_inventory(new)
+
+
+@pytest.mark.parametrize("version,action,generation,allowed", [
+    (134,"pause",4,True), (135,"pause",4,True), (135,"initialize_closed",0,True),
+    (134,"initialize_closed",0,False), (135,"initialize_closed",1,False),
+    (135,"initialize",0,False), (135,"resume",1,False),
+])
+def test_locked_operation_accepts_only_reviewed_schema_action_pairs(version,action,generation,allowed):
+    from types import SimpleNamespace
+    held=inventory.FrozenPostgres(SimpleNamespace(expected={"schema_version":version}),"b"*64,"a"*64)
+    held.snapshot={"gate":{"generation":generation}}
+    class Cursor:
+        def execute(self,sql,params):
+            assert params == ("b"*64,)
+        def fetchone(self):
+            return ("a"*64,action,generation-1,generation,"confirmed",True)
+    if allowed:
+        held._confirmed_operation(Cursor())
+    else:
+        with pytest.raises(CutoverError):
+            held._confirmed_operation(Cursor())

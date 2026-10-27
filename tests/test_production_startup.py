@@ -239,7 +239,12 @@ def test_other_open_fence_cannot_substitute_for_descriptor_frozen_fence(started,
     app = Flask("synthetic-open-fence-substitution")
     app.add_url_rule("/protected", "protected", lambda: "synthetic handler reached")
     install_http_admission(app)
-    assert app.test_client().get("/protected").status_code == 200
+    with monkeypatch.context() as unbound:
+        unbound.delenv(runtime.ENV_OPERATION)
+        unbound.delenv(runtime.ENV_ROOT)
+        assert app.test_client().get("/protected").status_code == 200
+    # Production slots now also refuse the substitution at HTTP admission.
+    assert app.test_client().get("/protected").status_code == 503
     with pytest.raises(gate.AdmissionError, match="environment differs"):
         runtime.load()
 

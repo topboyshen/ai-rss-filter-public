@@ -257,14 +257,20 @@ def _query_slot(root):
     def slot():
         # One bridge is one stop plus an optional explicitly approved resume.
         # Query capacity is retained, finite and never garbage-collected.
-        count = 0
+        slots = set()
         with os.scandir(root) as paths:
             for total, path in enumerate(paths):
                 require(total < 96, "bridge file capacity exceeded")
-                if path.name.startswith("query-"):
-                    count += 1
-                    require(count < 32, "query evidence budget exhausted")
+                if path.name.startswith(("query-", "attempt-")):
+                    match = re.fullmatch(r"(?:query|attempt)-(\d{2})\.json(?:\.pending)?", path.name)
+                    require(match is not None, "unrecognized retained query evidence")
+                    slots.add(int(match.group(1)))
+        count = len(slots)
+        require(slots == set(range(count)) and count < 32, "query evidence budget exhausted or conflicting")
         name = f"query-{count:02d}"
+        # Charge before any request, including timeout/unknown outcomes. Old
+        # query files and new reservations share the SAME32-slot namespace.
+        durable_write(root / f"attempt-{count:02d}.json", {"schema":1,"slot":count,"status":"reserved"})
         yield name
     return slot()
 
@@ -393,3 +399,176 @@ class MinifluxDrainControl(MinifluxPauseControl):
 
     def query_freeze(self, operation):
         return self._query_stage("pause", operation)
+
+
+class MinifluxActivationControl(MinifluxPauseControl):
+    """Explicit135 first CLOSED and receiver-capability-bound production CAS.
+
+    No queue/history claim follows from initialize_closed. The Go endpoint
+    validates its own CAS only; actual receiver checks belong to the retained
+    ReceiverActivationSession capability, before and after the one POST.
+    """
+    _scope = "instrumented_sender_only"
+
+    def __init__(self, binding, client, inspect_current, evidence_root, window):
+        import time
+        super().__init__(binding, client, inspect_current, evidence_root)
+        self.window = self._checked_window(window)
+        self.deadline = time.monotonic() + max(0, window["expires_at"] - time.time())
+        path = self.root / "activation-binding.json"
+        value = {"binding_sha256": self.binding_sha256, "window": self.window}
+        if present(path):
+            require(read_private(path) == value, "activation binding/window changed across recovery")
+        durable_write(path, value)
+
+    @staticmethod
+    def _checked_window(value):
+        require(isinstance(value, dict) and set(value) == {"not_before", "expires_at"}
+                and all(type(v) is int for v in value.values())
+                and 0 < value["expires_at"] - value["not_before"] <= 7200, "finite activation window required")
+        return dict(value)
+
+    def _window(self):
+        import time
+        require(self.window["not_before"] <= time.time() < self.window["expires_at"]
+                and time.monotonic() < self.deadline, "sender activation window expired; query original operation only")
+
+    def registration(self):
+        status, raw = self._exchange("GET", "/activation-registration")
+        expected = {"schema": 1, "manifest": self.binding["manifest"], "protocol": "miniflux-pg-activation-v1",
+                    "database_schema": 135, "capabilities": ["initialize_closed", "production_resume"],
+                    "business_open_not_assumed": True}
+        require(status == 200 and set(raw) == set(expected)
+                and all(type(raw[k]) is type(v) and raw[k] == v for k, v in expected.items()),
+                "exact schema135 activation capability required")
+        return expected
+
+    def stop(self, *args, **kwargs):
+        raise CutoverError("use staged sender stop/drain control")
+
+    def query(self, *args, **kwargs):
+        raise CutoverError("use exact named activation operation query")
+
+    def resume(self, *args, **kwargs):
+        raise CutoverError("production resume requires real receiver activation capability")
+
+    def query_resume(self, *args, **kwargs):
+        raise CutoverError("use exact production activation query")
+
+    def _closed_intent(self, operation):
+        require(self.binding["generation"] == 0 and operation == self.binding["initial_operation_id"],
+                "first closed operation must match generation0 binding")
+        return {"schema": 1, "action": "initialize_closed", "operation_id": operation,
+                "binding_sha256": self.binding_sha256, "generation": 0, "window": self.window}
+
+    def _persist_result(self, name, value):
+        path = self.root / (name + ".confirmed.json")
+        if present(path):
+            require(read_private(path) == value, "activation confirmed original differs")
+        durable_write(path, value)
+        return value
+
+    def initialize_closed(self, operation):
+        with locked(self.root / "control.lock", True):
+            self._window()
+            intent = self._closed_intent(operation)
+            require(not present(self.root / "initialize_closed.intent.json")
+                    and not present(self.root / "initialize_closed.intent.json.pending"), "initial close attempted; exact query only")
+            self.registration()
+            self._window()
+            durable_write(self.root / "initialize_closed.intent.json", intent)
+            status, raw = self._exchange("POST", "/initialize-closed", {"operation_id": operation})
+            self._save_exchange("initialize_closed-response", status, raw)
+            receipt = self._confirmed(status, raw, operation, 0, "initialize_closed", "closed")
+            return self._persist_result("initialize_closed", receipt)
+
+    def query_initialize_closed(self, operation):
+        with locked(self.root / "control.lock", True):
+            require(not present(self.root / "initialize_closed.intent.json.pending")
+                    and read_private(self.root / "initialize_closed.intent.json") == self._closed_intent(operation),
+                    "original closed initialization intent missing/conflicting")
+            self.registration()
+            with _query_slot(self.root) as name:
+                status, raw = self._exchange("GET", "/operations/" + operation)
+                self._save_exchange(name, status, raw)
+            receipt = self._confirmed(status, raw, operation, 0, "initialize_closed", "closed")
+            return self._persist_result("initialize_closed", receipt)
+
+    def _receiver_proof(self, receiver_activation_proof, *, active=True):
+        from services.production_activation_control import ReceiverActivationSession
+        require(type(receiver_activation_proof) is ReceiverActivationSession,
+                "actual ReceiverActivationSession capability required; no caller readiness flag")
+        value = receiver_activation_proof.check_sender_resume(active=active)
+        keys = {"operation_id", "descriptor_sha256", "manifest_sha256", "binding_sha256", "generation", "slots_sha256", "window"}
+        require(isinstance(value, dict) and set(value) == keys
+                and all(isinstance(value[k], str) and HEX64.fullmatch(value[k]) for k in keys - {"generation", "window"})
+                and type(value["generation"]) is int and 0 <= value["generation"] < 2**63 - 2,
+                "exact actual receiver activation proof required")
+        self._checked_window(value["window"])
+        # Detach immutable evidence from the live capability's in-memory object.
+        from durable_handoff_cutover import parsed
+        return parsed(encoded(value))
+
+    def _production_intent(self, closed_operation, generation, proof):
+        require(isinstance(closed_operation, str) and HEX64.fullmatch(closed_operation)
+                and type(generation) is int and 0 <= generation < 2**63 - 2, "exact closed CAS identity required")
+        identity = {"domain": "miniflux-production-resume-v1", "binding_sha256": self.binding_sha256,
+                    "closed_operation_id": closed_operation, "closed_generation": generation,
+                    "receiver_activation_proof": proof}
+        return {"schema": 1, "action": "production_resume", **identity,
+                "operation_id": sha(identity), "receiver_activation_proof_sha256": sha(proof), "window": self.window}
+
+    def production_resume(self, closed_operation, generation, receiver_activation_proof):
+        with locked(self.root / "control.lock", True):
+            self._window()
+            proof = self._receiver_proof(receiver_activation_proof)
+            intent = self._production_intent(closed_operation, generation, proof)
+            require(not present(self.root / "production_resume.intent.json")
+                    and not present(self.root / "production_resume.intent.json.pending"), "production resume attempted; exact query only")
+            self.registration()
+            status, raw = self._exchange("GET", "/operations/" + closed_operation)
+            action = raw.get("result", {}).get("action")
+            require(action == "pause" or (action == "initialize_closed" and generation == 0), "exact supported closed action required")
+            receipt = self._confirmed(status, raw, closed_operation, generation, action, "closed")
+            durable_write(self.root / "production-closed-original.json", receipt)
+            require(self._receiver_proof(receiver_activation_proof) == proof, "receiver proof changed before resume")
+            self._window()
+            durable_write(self.root / "production_resume.intent.json", intent)
+            status, raw = self._exchange("POST", "/production-resume", {
+                "operation_id": intent["operation_id"], "closed_operation_id": closed_operation})
+            self._save_exchange("production_resume-response", status, raw)
+            return self._production_confirmed(intent, status, raw, receiver_activation_proof, recovery=False)
+
+    def _production_confirmed(self, intent, status, raw, capability, *, recovery):
+        receipt = self._confirmed(status, raw, intent["operation_id"], intent["closed_generation"] + 1,
+                                  "resume", "open", allow_work=True)
+        # A failed post-check retains the actual response and original intent;
+        # it never retries the write or reports a cross-service confirmation.
+        require(self._receiver_proof(capability, active=not recovery) == intent["receiver_activation_proof"],
+                "receiver changed after sender operation; preserve outcome and stop")
+        value = {"pg_receipt": receipt, "operation_id": intent["operation_id"],
+                 "receiver_activation_proof_sha256": intent["receiver_activation_proof_sha256"],
+                 "historical_coverage": "unknown_before_T0_no_replay", "switch_authorized": False}
+        # Work can start after OPEN; preserve each raw query's real counters.
+        path = self.root / "production_resume.confirmed.json"
+        if present(path):
+            original = read_private(path)
+            def stable(v):
+                return {k: x for k, x in v.items() if k not in {"active_leases", "uncertain_leases"}}
+            require({k:v for k,v in original.items() if k != "pg_receipt"} == {k:v for k,v in value.items() if k != "pg_receipt"}
+                    and stable(original["pg_receipt"]) == stable(receipt), "production confirmed original conflicts")
+            return value
+        return self._persist_result("production_resume", value)
+
+    def query_production_resume(self, operation, receiver_activation_proof):
+        with locked(self.root / "control.lock", True):
+            require(not present(self.root / "production_resume.intent.json.pending"), "resume intent sync uncertain")
+            intent = read_private(self.root / "production_resume.intent.json")
+            require(intent == self._production_intent(intent["closed_operation_id"], intent["closed_generation"],
+                                                       intent["receiver_activation_proof"])
+                    and operation == intent["operation_id"], "exact original production resume intent required")
+            self.registration()
+            with _query_slot(self.root) as name:
+                status, raw = self._exchange("GET", "/operations/" + operation)
+                self._save_exchange(name, status, raw)
+            return self._production_confirmed(intent, status, raw, receiver_activation_proof, recovery=True)
