@@ -62,7 +62,7 @@ def prepare(directory, source, workers, raw_dsn, miniflux_source):
             "anchor": anchor, "target": target, "database": db, "binding": binding, "fence": fence, "frozen": frozen,
             "postgres": pg, "postgres_fixture": pg_fixture, "closed_operation": closed, "dsn": dsn,
             "operation": operation, "project": project, "manifest": manifest, "manifest_path": manifest_path,
-            "environment": environment}
+            "environment": environment, "strategy": config.config.cfg["scoring_strategy_version"]}
 
 
 def seed_databases(data):
@@ -132,7 +132,7 @@ def seal_inputs(root, fixture):
     review = {**p["source"], "approved": True, "approved_by": "synthetic-startup-workflow",
         "approved_at": int(time.time()) - 1, "expires_at": int(time.time()) + 1800,
         "runtime_config_sha256": private.sha(p["config"].read_bytes()), "input_manifest_sha256": private.sha(p["manifest_path"].read_bytes()),
-        "environment_sha256": private.sha(p["environment"].read_bytes()), "strategy": "synthetic-startup",
+        "environment_sha256": private.sha(p["environment"].read_bytes()), "strategy": p["strategy"],
         "project": p["project"], "project_directory": str(p["paths"]["project"]), "health_services": ["ai-filter-api"],
         "existing_topology": private.runtime_topology(records), "service_mapping": {name: [name] for name in manifest["services"]},
         "topology": topology}

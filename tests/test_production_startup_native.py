@@ -76,3 +76,30 @@ def test_slot_wait_requires_all_successes_in_the_same_fresh_round(tmp_path, monk
     monkeypatch.setattr(native.control, "query", query)
     result = native.wait_for_slots(object(), {"paths": {"slots": tmp_path, "grants": tmp_path}}, ["web-1", "worker-1"])
     assert len(calls) == 6 and result["web-1"]["round_query"] == 5 and result["worker-1"]["round_query"] == 6
+
+
+
+def test_review_strategy_uses_actual_loader_derived_version(tmp_path, monkeypatch):
+    from core import config
+    path = tmp_path / "synthetic.yaml"
+    path.write_text("scoring_strategy_version: synthetic-startup\nfeeds: []\n")
+    monkeypatch.setattr(config, "CONFIG_PATH", str(path))
+    actual = config.load_config()["scoring_strategy_version"]
+    assert actual.startswith("synthetic-startup:") and actual != "synthetic-startup"
+    paths = {key: tmp_path / key for key in ("data", "fence", "grants", "slots", "project")}
+    (tmp_path / "Dockerfile").write_text("FROM python@sha256:" + "a" * 64 + "\n")
+    manifest = fixture.manifest_input(paths, "synthetic", "a" * 64, 1, {"synthetic": True})
+    manifest_path, environment = tmp_path / "manifest.json", tmp_path / "environment"
+    manifest_path.write_text(json.dumps(manifest))
+    environment.write_text("AI_FILTER_API_KEY=synthetic\n")
+    monkeypatch.setenv("AI_FILTER_API_KEY", "synthetic")
+    monkeypatch.setattr(private, "run", lambda *a, **k: b"")
+    monkeypatch.setattr(private, "inspect_project", lambda _: [])
+    observed = []
+    def seal(*args):
+        observed.append(json.loads(args[4].read_text())["strategy"])
+        return args[5] / "contract.json"
+    monkeypatch.setattr(private, "seal", seal)
+    fixture.seal_inputs(tmp_path, {"source": {}, "manifest": manifest, "config": path, "directory": tmp_path,
+        "paths": paths, "project": "synthetic", "manifest_path": manifest_path, "environment": environment, "strategy": actual})
+    assert observed == [actual]
