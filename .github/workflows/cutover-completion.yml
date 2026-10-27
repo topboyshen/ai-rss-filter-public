@@ -4,6 +4,71 @@ permissions:
   contents: read
 
 on:
+  push:
+    branches: [master]
+    paths:
+      - 'services/controlled_startup.py'
+      - 'services/production_*.py'
+      - 'services/receiver_drain*.py'
+      - 'services/sender_drain_contract.py'
+      - 'services/admission_http.py'
+      - 'routes/webhook_routes.py'
+      - 'requirements-ops.txt'
+      - 'Dockerfile'
+      - 'requirements.txt'
+      - 'requirements-prod.txt'
+      - 'start.sh'
+      - 'config.yaml'
+      - 'db/startup_migration_steps.py'
+      - 'db/database.py'
+      - 'app.py'
+      - 'worker_main.py'
+      - 'gunicorn.conf.py'
+      - 'scripts/production_sender_driver.py'
+      - 'scripts/production_startup_pg_fixture.py'
+      - 'scripts/production_startup_fixture.py'
+      - 'scripts/private_release_contract.py'
+      - 'scripts/check_release_container_lifecycle.py'
+      - 'scripts/release.sh'
+      - 'tests/test_release_container_lifecycle.py'
+      - 'tests/test_miniflux_activation_adapter.py'
+      - 'tests/test_sender_activation_driver.py'
+      - 'scripts/prepare_synthetic_evidence.py'
+      - 'tests/test_prepare_synthetic_evidence.py'
+      - 'ops/miniflux/**'
+      - 'scripts/apply_miniflux_pause.py'
+      - 'scripts/apply_miniflux_outbox.py'
+      - 'scripts/sender_drain_inventory.py'
+      - 'scripts/joint_drain_controller.py'
+      - 'scripts/receiver_drain*.py'
+      - 'scripts/verify_sender_receiver_joint_native.py'
+      - 'tests/test_sender_receiver_joint_native.py'
+      - 'scripts/verify_production_startup_native.py'
+      - 'scripts/verify_production_activation_native.py'
+      - 'scripts/production_activation_fixture.py'
+      - 'scripts/takeover_readonly_preflight.py'
+      - 'tests/test_production_*.py'
+      - 'tests/test_receiver_drain*.py'
+      - 'tests/test_sender_drain*.py'
+      - 'tests/test_sender_pg_deadlines.py'
+      - 'tests/test_joint_drain*.py'
+      - 'tests/test_takeover_readonly_preflight.py'
+      - 'services/admission_fence.py'
+      - 'scripts/*cutover*.py'
+      - 'scripts/handoff_*.py'
+      - 'scripts/miniflux_handoff_adapter.py'
+      - 'scripts/miniflux_host_joint_native.py'
+      - 'scripts/independent_drain_inventory.py'
+      - 'scripts/run_controlled_startup.py'
+      - 'tests/test_*cutover*.py'
+      - 'tests/test_handoff_runtime_adapter.py'
+      - 'tests/test_miniflux_handoff_adapter.py'
+      - 'tests/test_miniflux_host_joint_native.py'
+      - 'tests/test_durable_handoff_crash_diagnostics.py'
+      - 'tests/test_controlled_startup.py'
+      - 'tests/test_independent_drain_inventory.py'
+      - 'ops/isolation/Dockerfile.cutover-completion'
+      - '.github/workflows/cutover-completion.yml'
   pull_request:
     branches: [master, 'codex/**']
     paths:
@@ -28,6 +93,11 @@ on:
       - 'scripts/production_startup_pg_fixture.py'
       - 'scripts/production_startup_fixture.py'
       - 'scripts/private_release_contract.py'
+      - 'scripts/check_release_container_lifecycle.py'
+      - 'scripts/release.sh'
+      - 'tests/test_release_container_lifecycle.py'
+      - 'tests/test_miniflux_activation_adapter.py'
+      - 'tests/test_sender_activation_driver.py'
       - 'scripts/prepare_synthetic_evidence.py'
       - 'tests/test_prepare_synthetic_evidence.py'
       - 'ops/miniflux/**'
@@ -39,6 +109,8 @@ on:
       - 'scripts/verify_sender_receiver_joint_native.py'
       - 'tests/test_sender_receiver_joint_native.py'
       - 'scripts/verify_production_startup_native.py'
+      - 'scripts/verify_production_activation_native.py'
+      - 'scripts/production_activation_fixture.py'
       - 'scripts/takeover_readonly_preflight.py'
       - 'tests/test_production_*.py'
       - 'tests/test_receiver_drain*.py'
@@ -91,6 +163,10 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.4'
+          cache: false
       - name: Fixed host controller and real PostgreSQL driver dependencies
         run: |
           python -m pip install --only-binary=:all: -r requirements.txt -r requirements-ops.txt
@@ -118,6 +194,32 @@ jobs:
             --repo . --output "${RUNNER_TEMP}/production-startup" \
             --postgres-dsn-file "${RUNNER_TEMP}/startup-synthetic-dsn.json" \
             --miniflux-source "${RUNNER_TEMP}/startup-miniflux"
+      - name: Build fixed sender and verify actual T0 activation
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -m 700 "$RUNNER_TEMP/production-activation-build"
+          cd "$RUNNER_TEMP/startup-miniflux"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -p 1 -trimpath \
+            -ldflags "-X miniflux.app/v2/internal/version.Version=2.3.2 -X miniflux.app/v2/internal/version.Commit=${GITHUB_SHA}" \
+            -o "$RUNNER_TEMP/production-activation-build/miniflux" . \
+            2>&1 | tee "$RUNNER_TEMP/production-activation-build/BUILD.log"
+          chmod 0755 "$RUNNER_TEMP/production-activation-build/miniflux"
+          cd "$GITHUB_WORKSPACE"
+          docker --host unix:///var/run/docker.sock build --platform=linux/amd64 --pull=false \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            -f ops/miniflux/Dockerfile -t "miniflux-activation-isolation:${GITHUB_SHA}" \
+            "$RUNNER_TEMP/production-activation-build" \
+            2>&1 | tee "$RUNNER_TEMP/production-activation-build/IMAGE_BUILD.log"
+          docker --host unix:///var/run/docker.sock image inspect "miniflux-activation-isolation:${GITHUB_SHA}" \
+            > "$RUNNER_TEMP/production-activation-build/IMAGE.json"
+          docker --host unix:///var/run/docker.sock pull --platform=linux/amd64 \
+            redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+          image_id="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))[0]["Id"])' "$RUNNER_TEMP/production-activation-build/IMAGE.json")"
+          python -I -B scripts/verify_production_activation_native.py \
+            --repo . --source "$RUNNER_TEMP/startup-miniflux" \
+            --binary "$RUNNER_TEMP/production-activation-build/miniflux" --image-id "$image_id" \
+            --output "$RUNNER_TEMP/production-activation"
       - name: Preserve actual synthetic PostgreSQL state on success or failure
         if: always()
         env:
@@ -149,6 +251,8 @@ jobs:
             --source "production-startup=${RUNNER_TEMP}/production-startup" \
             --source "production-startup-postgres=${RUNNER_TEMP}/production-startup-postgres" \
             --source "production-startup-source=${RUNNER_TEMP}/production-startup-source" \
+            --source "production-activation=${RUNNER_TEMP}/production-activation" \
+            --source "production-activation-build=${RUNNER_TEMP}/production-activation-build" \
             --output "${RUNNER_TEMP}/cutover-safe-upload"
 
       - name: Preserve original evidence including failures
