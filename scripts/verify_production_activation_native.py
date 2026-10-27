@@ -275,10 +275,12 @@ def scenario(harness, output):
         harness.stage("retain_old_stopped_containers_and_seal")
         sealed = fixture.seal_inputs(harness.repo, p)
         contract, _manifest, contract_sha = private.load(sealed, harness.repo, require_fresh=True)
-        harness.stage("build_and_probe_exact_application_image")
+        harness.stage("build_exact_application_image")
         digest = startup_native.build_candidate(harness.repo, p["directory"], p["source"],
                     "ai-filter-activation-native:" + p["project"], contract, contract_sha)
+        harness.stage("probe_exact_application_image")
         startup_native.probe_candidate(contract, sealed.parent, digest, p["directory"])
+        harness.stage("bind_exact_migration_permit")
         permit = fixture.migration_permit(p, sealed, digest)
         migration_root = p["directory"] / "migration"
         harness.stage("actual_locked_migration_create_grant_start")
@@ -300,6 +302,16 @@ def scenario(harness, output):
             p["anchor"].close()
 
 
+def record_failure(error, repo, output, stage):
+    failure = {"type": type(error).__name__, "message_sha256": hashlib.sha256(str(error).encode()).hexdigest(),
+               "locations": [{"file": Path(row.filename).name, "function": row.name, "line": row.lineno}
+                             for row in traceback.extract_tb(error.__traceback__) if Path(row.filename).resolve().is_relative_to(repo)]}
+    print("activation_native_failure=" + json.dumps({"type": failure["type"],
+          "message_sha256": failure["message_sha256"], "stage": stage}, sort_keys=True), flush=True)
+    fixture.save(output / "FAILURE.json", failure)
+    return failure
+
+
 def execute(repo, source, image_id, binary, output):
     binding = source_binding(repo, source, binary)
     harness = ActivationHarness(repo, source, image_id, binary, output)
@@ -311,10 +323,7 @@ def execute(repo, source, image_id, binary, output):
         harness.redis()
         scenario(harness, output)
     except BaseException as error:
-        failure = {"type": type(error).__name__, "message_sha256": hashlib.sha256(str(error).encode()).hexdigest(),
-                   "locations": [{"file": Path(row.filename).name, "function": row.name, "line": row.lineno}
-                                 for row in traceback.extract_tb(error.__traceback__) if Path(row.filename).resolve().is_relative_to(repo)]}
-        fixture.save(output / "FAILURE.json", failure)
+        failure = record_failure(error, repo, output, harness.current_stage)
     finally:
         if "pg" in harness.names:
             try:

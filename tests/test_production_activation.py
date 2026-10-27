@@ -2,6 +2,8 @@
 from copy import deepcopy
 import math
 import os
+from pathlib import Path
+import sqlite3
 import threading
 import time
 
@@ -97,6 +99,35 @@ def prepare_runtime(p):
 
 def locked(p):
     return control.locked_activation(p["root"], p["runtime_root"], p["state"], operation_id="b" * 64)
+
+
+@pytest.mark.parametrize("anchor_failure", [False, True])
+def test_sender_exit_failure_releases_actual_locks_and_preserves_errors(activation_case, anchor_failure):
+    p = activation_case
+    with pytest.raises(gate.AdmissionError, match="synthetic sender lock lost") as raised:
+        with locked(p) as session:
+            retained = list(session.shadow.fds)
+            anchor = session.anchor
+            if anchor_failure:
+                class FailingAnchorClose:
+                    def close(self):
+                        anchor.close()
+                        raise OSError("synthetic additional anchor close failure")
+                session.anchor = FailingAnchorClose()
+            p["sender"].live = False
+    assert not session.live and session.shadow.fds == []
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        anchor.execute("SELECT 1")
+    for name, fd in retained:
+        with pytest.raises(OSError):
+            os.fstat(fd)
+        probe = gate._lock(Path(p["permit"]["locks"][name]["path"]), True, 0.1)
+        os.close(probe)
+    if anchor_failure:
+        cause = raised.value.__cause__
+        assert isinstance(cause, BaseExceptionGroup)
+        assert len(cause.exceptions) == 1 and isinstance(cause.exceptions[0], OSError)
+        assert "additional anchor close" in str(cause.exceptions[0])
 
 
 def test_same_slots_prepare_confirm_resume_without_initializer_or_grant_replacement(activation_case):

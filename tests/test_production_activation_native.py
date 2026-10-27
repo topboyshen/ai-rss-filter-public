@@ -148,3 +148,20 @@ def test_non_native_fails_before_creating_output_or_contacting_docker(tmp_path, 
     with pytest.raises(ValueError, match="native Linux AMD64"):
         native.ActivationHarness(Path("/repo"), Path("/source"), "sha256:" + "a" * 64, Path("/binary"), output)
     assert not output.exists()
+
+
+def test_failure_log_only_contains_type_hash_and_stage(tmp_path, capsys):
+    secret = "synthetic-secret-token-and-body-never-log"
+    try:
+        raise RuntimeError(secret)
+    except RuntimeError as error:
+        failure = native.record_failure(error, Path(__file__).resolve().parents[1], tmp_path,
+                                        "probe_exact_application_image")
+    output = capsys.readouterr().out
+    summary = json.loads(output.removeprefix("activation_native_failure="))
+    assert summary == {"type": "RuntimeError", "message_sha256": hashlib.sha256(secret.encode()).hexdigest(),
+                       "stage": "probe_exact_application_image"}
+    assert secret not in output and "locations" not in output
+    retained = json.loads((tmp_path / "FAILURE.json").read_bytes())
+    assert retained == failure and retained["locations"]
+    assert secret not in (tmp_path / "FAILURE.json").read_text()

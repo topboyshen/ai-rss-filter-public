@@ -276,6 +276,28 @@ class ReceiverActivationSession:
                 "business_open": True, "slots": confirmation["slots"]}
 
 
+def _close_session(session):
+    """Release every owned resource even when final PG verification fails."""
+    session.live = False
+    actions = []
+    if session.storage is not None:
+        actions.append(session.storage.close)
+    if session.anchor is not None:
+        actions.append(session.anchor.close)
+    actions.extend(lambda fd=fd: os.close(fd) for _name, fd in reversed(session.shadow.fds))
+    failures = []
+    for close in actions:
+        try:
+            close()
+        except BaseException as error:
+            failures.append(error)
+    session.shadow.fds.clear()
+    if len(failures) > 1:
+        raise failures[0] from BaseExceptionGroup("additional activation cleanup failures", failures[1:])
+    if failures:
+        raise failures[0]
+
+
 @contextmanager
 def locked_activation(migration_root, runtime_root, state, *, operation_id):
     session = ReceiverActivationSession(migration_root, runtime_root, state, operation_id=operation_id)
@@ -304,11 +326,4 @@ def locked_activation(migration_root, runtime_root, state, *, operation_id):
         if not session.opened and not session.recovering:
             session.shadow.check()
     finally:
-        session.live = False
-        if session.storage is not None:
-            session.storage.close()
-        if session.anchor is not None:
-            session.anchor.close()
-        for _name, fd in reversed(session.shadow.fds):
-            os.close(fd)
-        session.shadow.fds.clear()
+        _close_session(session)

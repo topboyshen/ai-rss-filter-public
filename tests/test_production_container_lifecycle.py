@@ -167,3 +167,52 @@ def test_partial_grant_failure_preserves_all_prior_material(setup_lifecycle, mon
     with pytest.raises(gate.AdmissionError, match="already attempted"):
         create(p)
     assert len(p["calls"]) == 1
+
+
+@pytest.mark.parametrize("recover_before_first_start", [False, True])
+def test_created_rename_sync_failure_requires_start_directory_barrier(
+    setup_lifecycle, monkeypatch, recover_before_first_start,
+):
+    p = setup_lifecycle
+    evidence = p["dirs"][2]
+    created_path = evidence / "created.json"
+    original_sync, original_run = gate._sync_directory, lifecycle.private.run
+    sync_failed, events = [True], []
+
+    def sync(path):
+        if path == evidence and created_path.exists():
+            events.append("sync_failed" if sync_failed[0] else "sync_confirmed")
+            if sync_failed[0]:
+                raise OSError("synthetic created/start directory sync failure")
+        original_sync(path)
+
+    def run(command):
+        assert events[-1] == "sync_confirmed"
+        events.append("docker_start")
+        return original_run(command)
+
+    monkeypatch.setattr(gate, "_sync_directory", sync)
+    monkeypatch.setattr(lifecycle.private, "run", run)
+    with pytest.raises(OSError, match="directory sync failure"):
+        create(p)
+    created_bytes = created_path.read_bytes()
+    created_inode = created_path.stat().st_ino
+    assert not created_path.with_suffix(".json.pending").exists()
+    assert len(p["calls"]) == 1 and events == ["sync_failed"]
+
+    sync_failed[0] = not recover_before_first_start
+    if recover_before_first_start:
+        result = lifecycle.start(p["session"], *p["dirs"], operation_id="9" * 64)
+        assert result["status"] == "closed_initialized"
+        assert events[:3] == ["sync_failed", "sync_confirmed", "docker_start"]
+        assert len(p["calls"]) == 2
+    else:
+        with pytest.raises(OSError, match="directory sync failure"):
+            lifecycle.start(p["session"], *p["dirs"], operation_id="9" * 64)
+        assert (evidence / "start.intent.json").exists()
+        assert events == ["sync_failed", "sync_failed"] and len(p["calls"]) == 1
+        sync_failed[0] = False
+    with pytest.raises(gate.AdmissionError, match="already attempted"):
+        lifecycle.start(p["session"], *p["dirs"], operation_id="9" * 64)
+    assert created_path.read_bytes() == created_bytes and created_path.stat().st_ino == created_inode
+    assert events.count("docker_start") == int(recover_before_first_start)

@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from fnmatch import fnmatchcase
+import re
 
 import pytest
 import yaml
@@ -241,9 +242,41 @@ def test_activation_native_runs_after_closed_startup_and_preserves_failures():
     run = steps[activation]["run"]
     assert "--source \"$RUNNER_TEMP/startup-miniflux\"" in run
     assert "CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -p 1 -trimpath" in run
-    assert 'chmod 0755 "$RUNNER_TEMP/production-activation-build/miniflux"' in run
+    assert 'chmod 0755 "$RUNNER_TEMP/production-startup-source/production-activation-build/miniflux"' in run
     assert "redis:7-alpine@sha256:" in run and "--platform=linux/amd64" in run
     prepare = next(step for step in steps if "scripts/prepare_synthetic_evidence.py" in step.get("run", ""))
     assert prepare["if"] == "always()"
+    assert '--output "$RUNNER_TEMP/production-startup-source/production-activation"' in run
+    assert prepare["run"].count("--source ") == 4
+    assert '--source "production-startup-source=${RUNNER_TEMP}/production-startup-source"' in prepare["run"]
+    assert '--source "production-activation' not in prepare["run"]
+
+
+def test_activation_nested_evidence_fits_real_four_source_preparer(tmp_path):
+    from scripts import prepare_synthetic_evidence as evidence
+    _, workflow = _workflow("cutover-completion.yml")
+    steps = workflow["jobs"]["native-amd64"]["steps"]
+    prepare = next(step["run"] for step in steps if "scripts/prepare_synthetic_evidence.py" in step.get("run", ""))
+    pairs = re.findall(r'--source "([a-z-]+)=\$\{RUNNER_TEMP\}/([a-z-]+)"', prepare)
+    sources = {label: tmp_path / name for label, name in pairs}
+    assert len(pairs) == len(sources) == 4
+    for path in sources.values():
+        path.mkdir(mode=0o700)
     for name in ("production-activation", "production-activation-build"):
-        assert f'--source "{name}=${{RUNNER_TEMP}}/{name}"' in prepare["run"]
+        directory = sources["production-startup-source"] / name
+        directory.mkdir(mode=0o700)
+        original = directory / "original.json"
+        original.write_bytes(b'{"synthetic":true}')
+        original.chmod(0o600)
+    result = evidence.prepare(sources, tmp_path / "upload")
+    assert result["complete"] and not result["errors"]
+    assert len(result["files"]) == 2
+    assert evidence.MAX_BYTES == 8 * 1024**3 and evidence.MAX_ENTRIES == 50_000
+    assert evidence.MAX_METADATA == 8 * 1024**2 and evidence.MAX_OUTPUT_METADATA == 32 * 1024**2
+    for name in ("production-activation", "production-activation-build"):
+        assert (tmp_path / "upload/files/production-startup-source" / name / "original.json").read_bytes() == b'{"synthetic":true}'
+    expanded = {**sources, "production-activation": tmp_path / "legacy-extra-1",
+                "production-activation-build": tmp_path / "legacy-extra-2"}
+    with pytest.raises(evidence.EvidenceError, match="source_count_bound"):
+        evidence.prepare(expanded, tmp_path / "six-root-output")
+    assert not (tmp_path / "six-root-output").exists()
