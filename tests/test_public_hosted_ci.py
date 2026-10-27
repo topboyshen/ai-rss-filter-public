@@ -139,6 +139,8 @@ def test_private_release_workflow_covers_its_tests_without_unrelated_paths(event
     ("cutover-completion.yml", "scripts/production_startup_pg_fixture.py", True),
     ("cutover-completion.yml", "scripts/production_startup_fixture.py", True),
     ("cutover-completion.yml", "scripts/private_release_contract.py", True),
+    ("cutover-completion.yml", "scripts/prepare_synthetic_evidence.py", True),
+    ("cutover-completion.yml", "tests/test_prepare_synthetic_evidence.py", True),
     ("cutover-completion.yml", "ops/miniflux/pause-source-lock.json", True),
     ("cutover-completion.yml", "tests/test_sender_pg_deadlines.py", True),
     ("cutover-completion.yml", "scripts/verify_production_startup_native.py", True),
@@ -151,6 +153,7 @@ def test_private_release_workflow_covers_its_tests_without_unrelated_paths(event
     ("cutover-completion.yml", "requirements-dev.txt", False),
     ("cutover-completion.yml", "start.sh.example", False),
     ("cutover-completion.yml", "scripts/private_release_contract_notes.md", False),
+    ("cutover-completion.yml", "scripts/prepare_synthetic_evidence_notes.md", False),
     ("miniflux-pause.yml", "scripts/production_sender_driver.py", True),
     ("miniflux-pause.yml", "scripts/sender_drain_inventory.py", True),
     ("miniflux-pause.yml", "services/sender_drain_contract.py", True),
@@ -175,6 +178,22 @@ def test_combined_cutover_regressions_trigger_the_relevant_native_gate(workflow,
     triggers = value.get("on", value.get(True))
     for event in ["pull_request"] + (["push"] if workflow == "miniflux-pause.yml" else []):
         assert any(fnmatchcase(changed_path, pattern) for pattern in triggers[event]["paths"]) is expected
+
+
+@pytest.mark.parametrize('name,job,upload_name,destination', [
+    ('ci.yml', 'test', 'Preserve isolated synthetic cutover evidence', 'ai-filter-synthetic-upload'),
+    ('cutover-completion.yml', 'native-amd64', 'Preserve original evidence including failures', 'cutover-safe-upload'),
+])
+def test_synthetic_uploads_only_use_prepared_link_free_evidence_even_on_failure(name, job, upload_name, destination):
+    _, workflow = _workflow(name)
+    steps = workflow['jobs'][job]['steps']
+    prepared = [step for step in steps if 'scripts/prepare_synthetic_evidence.py' in step.get('run', '')]
+    assert len(prepared) == 1 and prepared[0]['if'] == 'always()'
+    upload = next(step for step in steps if step.get('name') == upload_name)
+    assert steps.index(prepared[0]) < steps.index(upload) and upload['if'] == 'always()'
+    assert upload['with']['path'] == '${{ runner.temp }}/' + destination + '/'
+    assert upload['with']['include-hidden-files'] is True and upload['with']['if-no-files-found'] == 'error'
+    assert '--output "${RUNNER_TEMP}/' + destination + '"' in prepared[0]['run']
 
 
 def test_host_postgres_driver_is_pinned_without_changing_application_dependencies():
