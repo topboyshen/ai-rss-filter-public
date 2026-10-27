@@ -217,16 +217,33 @@ class Runner(base.Runner):
         self.sql(f"SET search_path={missing},pg_catalog; {observer.PG_IDENTITY_SQL};", expect_ok=False)
         self.record("actual_read_only_rr_shared_capacity_and_missing_legacy_is_not_zero")
 
+    def materialize_boundary(self, schema, suffix, bodies, size):
+        # Exact source-schema fixture materialization, not HTTP/admission history.
+        # Keep the complete quota fixture, but bound each autocommitted INSERT to
+        # 8MiB under the unchanged 3s SQL deadline. Failure stops immediately;
+        # previous batches and command evidence remain, with no retry or cleanup.
+        body = f"repeat('x',{size}-8)||lpad(n::text,8,'0')"
+        batch_rows = min(bodies, 8 * 1048576 // size)
+        ranges = [(first, min(first + batch_rows - 1, bodies)) for first in range(1, bodies + 1, batch_rows)]
+        self.save(suffix + "_MATERIALIZATION.json", {
+            "schema": schema, "rows": bodies, "body_bytes": size, "logical_body_bytes": bodies * size,
+            "body_expression": body, "batch_ranges_inclusive": ranges,
+            "maximum_batch_body_bytes": 8 * 1048576, "retry": False, "cleanup": False,
+        })
+        for index, (first, last) in enumerate(ranges, 1):
+            self.sql(f"INSERT INTO {schema}.webhook_outbox(delivery_id,body_sha256,user_id,feed_id,entry_id,target_url,signature,contract,body,state,attempts) "
+                     f"SELECT encode(sha256(convert_to(b,'UTF8')),'hex'),encode(sha256(convert_to(b,'UTF8')),'hex'),1,1,n,'http://synthetic.invalid/webhook',repeat('a',64),'synthetic-contract',convert_to(b,'UTF8'),'held',0 FROM (SELECT n,{body} b FROM generate_series({first},{last}) n) fixture;")
+            self.save(suffix + f"_MATERIALIZED-{index:03d}.json", {
+                "first": first, "last": last, "command_evidence": f"COMMAND-{self.number:03d}.json",
+            })
+
     def boundary_cases(self, suffix, bodies, size):
         schema = self.names["SOURCE"] + suffix
         self.create_source(schema)
         audit = {key: value + suffix for key, value in self.names.items()}
         self.sql(base.render((HERE / "legacy_audit.sql").read_text(), audit))
         self.sql(f"GRANT {audit['REVIEWER']} TO {self.logins['review']};")
-        # Exact source-schema fixture materialization, not HTTP/admission history.
-        body = f"repeat('x',{size}-8)||lpad(n::text,8,'0')"
-        self.sql(f"INSERT INTO {schema}.webhook_outbox(delivery_id,body_sha256,user_id,feed_id,entry_id,target_url,signature,contract,body,state,attempts) "
-                 f"SELECT encode(sha256(convert_to(b,'UTF8')),'hex'),encode(sha256(convert_to(b,'UTF8')),'hex'),1,1,n,'http://synthetic.invalid/webhook',repeat('a',64),'synthetic-contract',convert_to(b,'UTF8'),'held',0 FROM (SELECT n,{body} b FROM generate_series(1,{bodies}) n) fixture;")
+        self.materialize_boundary(schema, suffix, bodies, size)
         first = "legacy " + "y" * (size - 7)
         self.seed_legacy(schema, first, "8 days")
         below = self.actual_sample(schema)

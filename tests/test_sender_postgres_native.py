@@ -95,10 +95,10 @@ def test_actual_text_schema_marker_accepts_only_canonical_supported_version(actu
     assert connection.execute("SELECT version,pg_typeof(version)::text FROM schema_version").fetchone() == ("134", "text")
     assert reader.snapshot()["database_identity"]["schema_version"] == 134
     phase("actual_miniflux_text_schema_134_bound_without_permissive_cast")
-    for value in ("", "0134", "+134", " 134", "134 ", "134.0", "true", "false", "133", "135", "１３４"):
+    for value in ("", "0134", "+134", " 134", "134 ", "134.0", "true", "false", "133", "136", "１３４"):
         connection.execute("UPDATE schema_version SET version=%s", (value,))
         identity = dict(zip(inventory.IDENTITY_KEYS, connection.execute(inventory.IDENTITY_SQL).fetchone()))
-        with pytest.raises(contract.DrainContractError, match="schema 134 required"):
+        with pytest.raises(contract.DrainContractError, match="schema 134 or 135 required"):
             contract.validate_identity(identity)
         with pytest.raises(Exception, match="PostgreSQL identity changed"):
             reader.snapshot()
@@ -248,3 +248,19 @@ def test_actual_retained_attempt_change_under_locks_still_fails(actual):
             held.check()
     assert bytes(connection.execute("SELECT body FROM webhook_outbox").fetchone()[0]) == body
     phase("real_attempt_change_rejected_original_retained_no_cleanup")
+
+
+def test_actual_appended135_sql_marker_keeps134_inventory_readable(actual):
+    from scripts.production_startup_pg_fixture import source_sql
+    connection, reader, _, _, _, _ = actual
+    phase("before_actual135_append_transaction")
+    sql = source_sql(Path(os.environ["MINIFLUX_PATCHED_SOURCE"]), "internal/handoff/activation.go",
+                     r"const ActivationSchemaSQL = `(.*?)`")
+    with connection.transaction():
+        connection.execute(sql)
+        connection.execute("UPDATE schema_version SET version='135'")
+    expected = dict(reader.expected, schema_version=135)
+    updated = inventory.PostgresReader(reader.path, expected)
+    sample = updated.snapshot()
+    assert sample["database_identity"] == expected and sample["gate"]["phase"] == "draining"
+    phase("actual135_append_keeps_original134_stop_new_readable_no_new_closed_seed")

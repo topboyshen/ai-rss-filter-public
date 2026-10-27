@@ -14,6 +14,7 @@
 | [首次被拒证据留存](first-rejection-retention.md) | 评分与审计开发者 | 可回放的首次被拒证据表、上限、追加型触发器、回放工具与隐私边界 |
 | [Quant 集成契约](quant-integration.md) | AI/Quant 集成开发者 | 双向只读边界、Outbox 游标、市场旁证与恢复语义 |
 | [部署、迁移与恢复](deployment-and-recovery.md) | 运维与发布人员 | 不可变镜像、服务凭据、数据迁移、回滚和备份边界 |
+| [受控生产激活](production-activation.md) | 发布与审计人员 | 首次 CLOSED、精确 create/grant/start、同进程 activation、sender 最后恢复与未知结果边界 |
 | [运行镜像依赖边界](runtime-image-dependencies.md) | 构建与审计人员 | 基础镜像锁定、打包工具清除、最终安装内容检查与审计限制 |
 | [日常操作入口](../ops/DAILY-OPS.md) | 运维与发布人员 | 状态查看、有界等锁、正式发布入口及失败后的核对顺序 |
 | [主机运维](../ops/README.md) | 生产运维人员 | systemd、cron、备份、恢复演练、监控与漂移验证 |

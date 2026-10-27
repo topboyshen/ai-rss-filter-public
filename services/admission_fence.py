@@ -405,6 +405,10 @@ class Fence:
                     raise AdmissionClosed("fence is not admitting activities")
                 if kind == "intake" and state["phase"] != "open":
                     raise AdmissionClosed("new intake is stopped")
+                # A production-startup process cannot use an open fence while
+                # its retained consumer owners/readiness are absent or stale.
+                from services.production_activation import require_business_ready
+                require_business_ready()
                 leases, finishes = self._leases()
                 if self._orphaned(leases, finishes) or any(row["outcome"] == "uncertain" for row in finishes.values()):
                     raise AdmissionUncertain("uncertain lease requires explicit review")
@@ -436,7 +440,7 @@ class Fence:
             os.close(fd)
             raise
 
-    def _intent(self, action, operation_id, expected_generation, reason):
+    def _intent(self, action, operation_id, expected_generation, reason, activation=None):
         _require(isinstance(operation_id, str) and HEX64.fullmatch(operation_id)
                  and type(expected_generation) is int and 0 <= expected_generation < 2**63 - 1
                  and isinstance(reason, str) and 0 < len(reason) <= 256, "explicit operation/CAS/reason required")
@@ -444,22 +448,30 @@ class Fence:
         intent_path = self.root / "operations" / (operation_id + ".intent.json")
         request = {"action": action, "operation_id": operation_id, "expected_generation": expected_generation,
                    "reason": reason, "manifest_sha256": _hash(self._manifest())}
+        if action == "resume":
+            from services.production_activation_control import ReceiverActivationSession
+            _require(type(activation) is ReceiverActivationSession, "live production activation capability required")
+            proof = activation.check_receiver_resume()
+            _require(proof["operation_id"] == operation_id and proof["generation"] == expected_generation
+                     and proof["root"] == str(self.root) and proof["binding"] == self.binding,
+                     "activation capability fence differs")
+            request["activation_sha256"] = proof["activation_sha256"]
         if _present(intent_path) or _present(intent_path.with_name(intent_path.name + ".pending")):
             raise AdmissionUncertain("operation already attempted; query exact operation only")
         intents, pending = self._operation_inventory()
         _require(not pending and not state["pending_operation"] and len(intents) < MAX_OPERATIONS, "unconfirmed operation or capacity limit")
-        expected = {"open": "frozen", "stop_new": "open", "freeze": "draining"}[action]
+        expected = {"open": "frozen", "resume": "frozen", "stop_new": "open", "freeze": "draining"}[action]
         _require(state["phase"] == expected and state["generation"] == expected_generation, "phase/generation CAS differs")
         _require(action != "open" or expected_generation == 0, "resume/new policy requires separate reviewed provisioning")
         if action == "open" and _present(self.root / "startup") and _bounded_paths(self.root / "startup", 16):
             from services.controlled_startup import require_startup_complete
             require_startup_complete(self)
         policy = self._manifest()["policy"]
-        _require(action != "open" or policy["not_before"] <= time.time() < policy["expires_at"], "approved opening window not current")
+        _require(action not in {"open", "resume"} or policy["not_before"] <= time.time() < policy["expires_at"], "approved opening window not current")
         after = {"schema": 1, "generation": expected_generation + 1,
-                 "phase": {"open": "open", "stop_new": "draining", "freeze": "freezing"}[action],
+                 "phase": {"open": "open", "resume": "open", "stop_new": "draining", "freeze": "freezing"}[action],
                  "pending_operation": operation_id,
-                 "opening_clock": {"boot_id": _boot_identity(), "elapsed": _elapsed(), "wall": time.time()} if action == "open" else state["opening_clock"]}
+                 "opening_clock": {"boot_id": _boot_identity(), "elapsed": _elapsed(), "wall": time.time()} if action in {"open", "resume"} else state["opening_clock"]}
         intent = {"schema": 1, "request": request, "request_sha256": _hash(request), "before": state, "after": after}
         _write(intent_path, intent)
         return intent
@@ -474,16 +486,18 @@ class Fence:
                  and request["manifest_sha256"] == _hash(self._manifest())
                  and value["request_sha256"] == _hash(request), "operation binding differs")
         before, after = _state(value["before"]), _state(value["after"])
-        _require(request["action"] in {"open", "stop_new", "freeze"}
+        _require(request["action"] in {"open", "resume", "stop_new", "freeze"}
                  and type(request["expected_generation"]) is int
                  and before["generation"] == request["expected_generation"]
                  and after["generation"] == before["generation"] + 1
                  and after["pending_operation"] == operation_id, "operation state identity differs")
         action = request["action"]
-        _require(before["phase"] == {"open": "frozen", "stop_new": "open", "freeze": "draining"}[action]
-                 and after["phase"] == {"open": "open", "stop_new": "draining", "freeze": "freezing"}[action]
+        _require(before["phase"] == {"open": "frozen", "resume": "frozen", "stop_new": "open", "freeze": "draining"}[action]
+                 and after["phase"] == {"open": "open", "resume": "open", "stop_new": "draining", "freeze": "freezing"}[action]
                  and not before["pending_operation"] and (action != "open" or before["generation"] == 0), "operation phase identity differs")
-        _require(action == "open" or after["opening_clock"] == before["opening_clock"], "opening deadline cannot reset")
+        _require(action in {"open", "resume"} or after["opening_clock"] == before["opening_clock"], "opening deadline cannot reset")
+        if action == "resume":
+            _require(HEX64.fullmatch(str(request.get("activation_sha256", ""))), "activation receipt binding missing")
         return value
 
     def _advance(self, intent, wait_seconds):
@@ -554,7 +568,31 @@ class Fence:
         with _locked(self.root / "locks/controller.lock", True, self.lock_seconds):
             with self._metadata():
                 intent = self._load_intent(operation_id)
+                _require(intent["request"]["action"] != "resume", "production resume needs its retained activation capability")
             return self._advance(intent, wait_seconds)
+
+    def resume_production(self, activation):
+        """Controller lock is already held by this exact live capability."""
+        from services.production_activation_control import ReceiverActivationSession
+        _require(type(activation) is ReceiverActivationSession, "live production activation capability required")
+        proof = activation.check_receiver_resume()
+        # Check the capability before taking metadata: its inventory checks
+        # use the same metadata lock and must never recursively acquire it.
+        with self._metadata():
+            state = _state(_read(self.root / "state.json"))
+            _require(state["phase"] == "frozen" and state["generation"] == proof["generation"], "resume CAS differs")
+        intent = self._intent("resume", proof["operation_id"], proof["generation"], "confirmed production activation", activation)
+        return self._advance(intent, 0.1)
+
+    def query_production_resume(self, activation):
+        from services.production_activation_control import ReceiverActivationSession
+        _require(type(activation) is ReceiverActivationSession, "live production activation capability required")
+        proof = activation.check_receiver_resume(active=False, recovery=True)
+        with self._metadata():
+            intent = self._load_intent(proof["operation_id"])
+            _require(intent["request"]["action"] == "resume"
+                     and intent["request"]["activation_sha256"] == proof["activation_sha256"], "query original production resume only")
+        return self._advance(intent, 0.1)
 
 
 class Lease:

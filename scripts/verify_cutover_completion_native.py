@@ -13,8 +13,11 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
+import stat
 import subprocess
+import time
 import uuid
 
 
@@ -24,6 +27,89 @@ def base_runner():
     value = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(value)
     return value
+
+
+def write_fixture_record(path, value):
+    raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+    parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(parent)
+    finally:
+        os.close(parent)
+    return hashlib.sha256(raw).hexdigest()
+
+
+def fixture_storage_identity(fixtures, evidence_root):
+    evidence_path = evidence_root / "disk-fixtures" / fixtures.name
+    assert fixtures.samefile(evidence_path)
+    for path in (fixtures, evidence_path):
+        info = path.lstat()
+        assert stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o700
+    info = fixtures.lstat()
+    return {"container_path": str(fixtures), "evidence_relative_path": "disk-fixtures/" + fixtures.name,
+            "device": info.st_dev, "inode": info.st_ino, "retained_in_place": True, "root_tmpfs_bytes": 134217728}
+
+
+def retain_fixture_storage(fixtures, evidence_root):
+    value = fixture_storage_identity(fixtures, evidence_root)
+    digest = write_fixture_record(evidence_root / "FIXTURE_STORAGE.json", value)
+    write_fixture_record(evidence_root / "FIXTURE_STORAGE_INITIAL.json",
+                         {"phase": "initial", "mapping_sha256": digest, "test_completion_confirmed": False})
+    return value, digest
+
+
+def confirm_fixture_storage(fixtures, evidence_root, initial, digest):
+    assert fixture_storage_identity(fixtures, evidence_root) == initial
+    path = evidence_root / "FIXTURE_STORAGE.json"
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(fd)
+        assert stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and info.st_nlink == 1
+        assert stat.S_IMODE(info.st_mode) == 0o600 and info.st_size <= 8192
+        assert hashlib.sha256(os.read(fd, 8193)).hexdigest() == digest
+    finally:
+        os.close(fd)
+    write_fixture_record(evidence_root / "FIXTURE_STORAGE_FINAL.json",
+                         {"phase": "finally", "mapping_sha256": digest, "identity_reconfirmed": True,
+                          "test_completion_confirmed": False})
+
+
+class NativeDiagnostics:
+    """Bounded phase timing only; no parametrized values or failure text."""
+    def __init__(self):
+        self.passed = self.failed = self.skipped = self.started = 0
+        self.origin = time.monotonic()
+
+    def emit(self, nodeid, phase, **fields):
+        if self.started > 2000:
+            return
+        parts = nodeid.split("::")
+        filename, function = Path(parts[0]).name, parts[-1].split("[", 1)[0]
+        filename = filename if re.fullmatch(r"test_[A-Za-z0-9_]{1,100}\.py", filename) else "redacted"
+        function = function if re.fullmatch(r"test_[A-Za-z0-9_]{1,150}", function) else "redacted"
+        print(json.dumps({"native_test": phase, "index": self.started, "file": filename, "function": function,
+              "elapsed": round(time.monotonic() - self.origin, 6), **fields}, sort_keys=True), flush=True)
+
+    def pytest_runtest_logstart(self, nodeid, location):
+        self.started += 1
+        self.emit(nodeid, "start")
+
+    def pytest_runtest_logreport(self, report):
+        if report.when == "call" and report.passed:
+            self.passed += 1
+        if report.failed:
+            self.failed += 1
+        if report.skipped:
+            self.skipped += 1
+        self.emit(report.nodeid, report.when, duration=round(report.duration, 6))
+
+    def pytest_runtest_logfinish(self, nodeid, location):
+        self.emit(nodeid, "end")
 
 
 TESTS = ("tests/test_independent_drain_inventory.py", "tests/test_frozen_cutover.py",
@@ -36,13 +122,24 @@ TESTS = ("tests/test_independent_drain_inventory.py", "tests/test_frozen_cutover
          "tests/test_sender_pg_deadlines.py", "tests/test_production_startup_pg_fixture.py",
          "tests/test_receiver_drain_transfer.py", "tests/test_receiver_drain_driver.py",
          "tests/test_takeover_readonly_preflight.py", "tests/test_joint_drain_controller.py",
-         "tests/test_receiver_drain_fixture_runtime.py", "tests/test_sender_receiver_joint_native.py")
+         "tests/test_receiver_drain_fixture_runtime.py", "tests/test_sender_receiver_joint_native.py",
+         "tests/test_production_activation.py",
+         "tests/test_production_initial_fence.py",
+         "tests/test_production_initial_candidates.py", "tests/test_production_initial_migration.py",
+         "tests/test_production_container_lifecycle.py",
+         "tests/test_production_create_scope.py",
+         "tests/test_production_active_verification.py",
+         "tests/test_release_container_lifecycle.py",
+         "tests/test_miniflux_activation_adapter.py",
+         "tests/test_sender_activation_driver.py",
+         "tests/test_production_activation_native.py")
 MOUNTS = ("scripts", "tests", "services", "routes", "core", "db", "utils", "workers", "modules",
           "templates", "app.py", "worker_main.py", "sse_engine.py", "logging_bootstrap.py",
           "scoring_provenance.py", "scoring_explanation.py", "config.yaml", "docker-compose.yml",
           "ops/isolation", "ops/miniflux", ".github/workflows", "gunicorn.conf.py")
 CONTAINER_TEST = r'''
 import json, os, pathlib, platform, sys, tempfile, pytest
+from scripts.verify_cutover_completion_native import NativeDiagnostics, retain_fixture_storage, confirm_fixture_storage
 assert platform.system() == 'Linux' and platform.machine() == 'x86_64'
 fixture_mount = pathlib.Path('/tmp/cutover-fixtures')
 assert fixture_mount.samefile('/evidence/disk-fixtures')
@@ -50,15 +147,10 @@ assert fixture_mount.stat().st_uid == os.getuid() and fixture_mount.stat().st_mo
 fixtures = pathlib.Path(tempfile.mkdtemp(prefix='cutover-synthetic-', dir=str(fixture_mount)))
 os.environ['AI_FILTER_CUTOVER_EVIDENCE_DIR'] = str(fixtures)
 os.environ['AI_FILTER_HANDOFF_EVIDENCE_DIR'] = str(fixtures)
-class Summary:
-    passed = failed = skipped = 0
-    def pytest_runtest_logreport(self, report):
-        if report.when == 'call' and report.passed: self.passed += 1
-        if report.failed: self.failed += 1
-        if report.skipped: self.skipped += 1
-summary = Summary()
+initial, mapping_sha256 = retain_fixture_storage(fixtures, pathlib.Path('/evidence'))
+summary = NativeDiagnostics()
 try:
-    code = pytest.main(['-q', '-o', 'addopts=', '-p', 'no:cacheprovider', '--basetemp=' + str(fixtures / 'pytest'),
+    code = pytest.main(['-q', '-o', 'addopts=', '-o', 'faulthandler_timeout=30', '-p', 'no:cacheprovider', '--basetemp=' + str(fixtures / 'pytest'),
         'tests/test_independent_drain_inventory.py', 'tests/test_frozen_cutover.py',
         'tests/test_handoff_runtime_adapter.py', 'tests/test_controlled_startup.py',
         'tests/test_frozen_cutover_actual_startup.py', 'tests/test_miniflux_handoff_adapter.py',
@@ -69,20 +161,22 @@ try:
         'tests/test_sender_pg_deadlines.py', 'tests/test_production_startup_pg_fixture.py',
         'tests/test_receiver_drain_transfer.py', 'tests/test_receiver_drain_driver.py',
         'tests/test_takeover_readonly_preflight.py', 'tests/test_joint_drain_controller.py',
-        'tests/test_receiver_drain_fixture_runtime.py', 'tests/test_sender_receiver_joint_native.py'], plugins=[summary])
+        'tests/test_receiver_drain_fixture_runtime.py', 'tests/test_sender_receiver_joint_native.py',
+        'tests/test_production_activation.py',
+        'tests/test_production_initial_fence.py',
+        'tests/test_production_initial_candidates.py', 'tests/test_production_initial_migration.py',
+        'tests/test_production_container_lifecycle.py',
+        'tests/test_production_create_scope.py',
+        'tests/test_production_active_verification.py',
+        'tests/test_release_container_lifecycle.py',
+        'tests/test_miniflux_activation_adapter.py',
+        'tests/test_sender_activation_driver.py',
+        'tests/test_production_activation_native.py'], plugins=[summary])
 finally:
     # This exact private subtree is already the evidence bind, so preserve
     # original inodes in place, including sparse files and failure originals.
     # Its container path remains under /tmp; the isolation guard is unchanged.
-    evidence_path = pathlib.Path('/evidence/disk-fixtures') / fixtures.name
-    assert fixtures.samefile(evidence_path)
-    with open('/evidence/FIXTURE_STORAGE.json', 'x') as stream:
-        os.chmod(stream.name, 0o600)
-        json.dump({'container_path':str(fixtures), 'evidence_relative_path':'disk-fixtures/' + fixtures.name,
-                   'device':fixtures.stat().st_dev, 'inode':fixtures.stat().st_ino,
-                   'retained_in_place':True, 'root_tmpfs_bytes':134217728}, stream)
-        stream.flush()
-        os.fsync(stream.fileno())
+    confirm_fixture_storage(fixtures, pathlib.Path('/evidence'), initial, mapping_sha256)
 peak = pathlib.Path('/sys/fs/cgroup/memory.peak')
 events = pathlib.Path('/sys/fs/cgroup/memory.events')
 ok = code == 0 and summary.passed >= 25 and not summary.failed and not summary.skipped

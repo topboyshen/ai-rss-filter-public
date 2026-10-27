@@ -1,7 +1,12 @@
 """Resource/evidence runner guards; these unit checks are not native proof."""
 import importlib.util
 import ast
+import json
+import os
 from pathlib import Path
+import subprocess
+import sys
+from types import SimpleNamespace
 import unittest
 
 import pytest
@@ -31,7 +36,17 @@ class CompletionNativeGuards(unittest.TestCase):
                     "tests/test_sender_pg_deadlines.py", "tests/test_production_startup_pg_fixture.py",
                     "tests/test_receiver_drain_transfer.py", "tests/test_receiver_drain_driver.py",
                     "tests/test_takeover_readonly_preflight.py", "tests/test_joint_drain_controller.py",
-                    "tests/test_receiver_drain_fixture_runtime.py", "tests/test_sender_receiver_joint_native.py"}
+                    "tests/test_receiver_drain_fixture_runtime.py", "tests/test_sender_receiver_joint_native.py",
+                    "tests/test_production_activation.py",
+                    "tests/test_production_initial_fence.py",
+                    "tests/test_production_initial_candidates.py", "tests/test_production_initial_migration.py",
+                    "tests/test_production_container_lifecycle.py",
+                    "tests/test_production_create_scope.py",
+                    "tests/test_production_active_verification.py",
+                    "tests/test_release_container_lifecycle.py",
+                    "tests/test_miniflux_activation_adapter.py",
+                    "tests/test_sender_activation_driver.py",
+                    "tests/test_production_activation_native.py"}
         actual = {node.value for node in ast.walk(ast.parse(runner.CONTAINER_TEST))
                   if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.startswith("tests/")}
         self.assertEqual(set(runner.TESTS), expected)
@@ -118,6 +133,145 @@ def test_cutover_storage_retains_originals_in_place_without_sparse_file_copy():
     calls = [node for node in ast.walk(parsed) if isinstance(node, ast.Call)]
     assert not any(isinstance(node.func, ast.Attribute) and node.func.attr == "copytree" for node in calls)
     assert "fixture_mount.samefile('/evidence/disk-fixtures')" in runner.CONTAINER_TEST
-    assert "assert fixtures.samefile(evidence_path)" in runner.CONTAINER_TEST
-    assert "'retained_in_place':True" in runner.CONTAINER_TEST
+    assert "retain_fixture_storage(fixtures" in runner.CONTAINER_TEST
+    assert runner.CONTAINER_TEST.index("retain_fixture_storage(fixtures") < runner.CONTAINER_TEST.index("pytest.main(")
+    assert "confirm_fixture_storage(fixtures" in runner.CONTAINER_TEST
     assert "disk_fixtures=True" in Path(runner.__file__).read_text()
+
+
+def fixture_disk(tmp_path):
+    evidence = tmp_path / "evidence"
+    evidence.mkdir(mode=0o700)
+    disk = evidence / "disk-fixtures"
+    disk.mkdir(mode=0o700)
+    fixtures = disk / "cutover-synthetic-exact"
+    fixtures.mkdir(mode=0o700)
+    return fixtures, evidence
+
+
+def test_mapping_is_durable_before_tests_and_final_is_separate(tmp_path, monkeypatch):
+    fixtures, evidence = fixture_disk(tmp_path)
+    original, synced = os.fsync, []
+    def sync(fd):
+        synced.append(os.fstat(fd).st_ino)
+        original(fd)
+    monkeypatch.setattr(runner.os, "fsync", sync)
+    value, digest = runner.retain_fixture_storage(fixtures, evidence)
+    raw = (evidence / "FIXTURE_STORAGE.json").read_bytes()
+    assert len(synced) == 4  # both original records and their containing directory
+    assert set(value) == {"container_path", "evidence_relative_path", "device", "inode", "retained_in_place", "root_tmpfs_bytes"}
+    assert json.loads((evidence / "FIXTURE_STORAGE_INITIAL.json").read_bytes()) == {
+        "phase": "initial", "mapping_sha256": digest, "test_completion_confirmed": False}
+    assert not (evidence / "FIXTURE_STORAGE_FINAL.json").exists()
+    runner.confirm_fixture_storage(fixtures, evidence, value, digest)
+    assert (evidence / "FIXTURE_STORAGE.json").read_bytes() == raw
+    final = json.loads((evidence / "FIXTURE_STORAGE_FINAL.json").read_bytes())
+    assert final["identity_reconfirmed"] is True and final["test_completion_confirmed"] is False
+    assert all(p.stat().st_mode & 0o777 == 0o600 for p in evidence.glob("*.json"))
+    with pytest.raises(FileExistsError):
+        runner.retain_fixture_storage(fixtures, evidence)
+
+
+@pytest.mark.parametrize("drift", ["mode", "directory", "mapping", "mapping_link"])
+def test_mapping_drift_never_creates_final_confirmation(tmp_path, drift):
+    fixtures, evidence = fixture_disk(tmp_path)
+    value, digest = runner.retain_fixture_storage(fixtures, evidence)
+    mapping = evidence / "FIXTURE_STORAGE.json"
+    if drift == "mode":
+        fixtures.chmod(0o755)
+    elif drift == "directory":
+        fixtures.rename(fixtures.with_name("retained-old"))
+        fixtures.mkdir(mode=0o700)
+    elif drift == "mapping":
+        mapping.write_bytes(b"changed")
+    else:
+        mapping.rename(mapping.with_name("retained-mapping.json"))
+        mapping.symlink_to(evidence / "retained-mapping.json")
+    with pytest.raises((AssertionError, OSError)):
+        runner.confirm_fixture_storage(fixtures, evidence, value, digest)
+    assert not (evidence / "FIXTURE_STORAGE_FINAL.json").exists()
+
+
+def test_initial_mapping_sync_failure_is_not_confirmed(tmp_path, monkeypatch):
+    fixtures, evidence = fixture_disk(tmp_path)
+    monkeypatch.setattr(runner.os, "fsync", lambda _fd: (_ for _ in ()).throw(OSError("synthetic sync failure")))
+    with pytest.raises(OSError, match="synthetic sync failure"):
+        runner.retain_fixture_storage(fixtures, evidence)
+    assert not (evidence / "FIXTURE_STORAGE_INITIAL.json").exists()
+    assert not (evidence / "FIXTURE_STORAGE_FINAL.json").exists()
+
+
+@pytest.mark.parametrize("unsafe", ["mode", "symlink", "wrong_mount"])
+def test_initial_mapping_refuses_unverified_fixture_identity(tmp_path, unsafe):
+    fixtures, evidence = fixture_disk(tmp_path)
+    if unsafe == "mode":
+        fixtures.chmod(0o755)
+    elif unsafe == "symlink":
+        old = fixtures.with_name("retained-original")
+        fixtures.rename(old)
+        fixtures.symlink_to(old, target_is_directory=True)
+    else:
+        other = tmp_path / fixtures.name
+        other.mkdir(mode=0o700)
+        fixtures = other
+    with pytest.raises(AssertionError):
+        runner.retain_fixture_storage(fixtures, evidence)
+    assert not (evidence / "FIXTURE_STORAGE.json").exists()
+
+
+def test_diagnostics_bound_phase_times_without_parameter_values(capsys):
+    summary = runner.NativeDiagnostics()
+    nodeid = "tests/test_synthetic.py::test_original[DO_NOT_PRINT_BODY_OR_TOKEN]"
+    summary.pytest_runtest_logstart(nodeid, ())
+    for phase in ("setup", "call", "teardown"):
+        summary.pytest_runtest_logreport(SimpleNamespace(nodeid=nodeid, when=phase, duration=0.25,
+                                                       passed=True, failed=False, skipped=False))
+    summary.pytest_runtest_logfinish(nodeid, ())
+    output = capsys.readouterr().out
+    assert "DO_NOT_PRINT" not in output
+    rows = [json.loads(line) for line in output.splitlines()]
+    assert [row["native_test"] for row in rows] == ["start", "setup", "call", "teardown", "end"]
+    assert all(row["function"] == "test_original" and row["file"] == "test_synthetic.py" for row in rows)
+    assert summary.passed == 1 and summary.failed == summary.skipped == 0
+    summary.started = 2000
+    summary.pytest_runtest_logstart(nodeid, ())
+    summary.pytest_runtest_logreport(SimpleNamespace(nodeid=nodeid, when="call", duration=0.25,
+                                                   passed=True, failed=False, skipped=False))
+    assert capsys.readouterr().out == "" and summary.passed == 2
+    assert "'faulthandler_timeout=30'" in runner.CONTAINER_TEST
+    assert 'command(DOCKER + ["start", "-a", name], output / "tests", 180)' in Path(runner.base_runner().__file__).read_text()
+
+
+def test_real_nested_pytest_diagnostics_preserve_capture_and_json_stdout(tmp_path):
+    path = tmp_path / "test_native_capture.py"
+    path.write_text('''import json, os, pytest
+@pytest.mark.parametrize("value", [1], ids=["DO_NOT_LOG_PRIVATE_PARAMETER"])
+def test_capsys_json(capsys, value):
+    assert capsys.readouterr().out == ""
+    print(json.dumps({"value": value}))
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {"value": 1}
+    assert captured.err == ""
+
+def test_capfd_stdout(capfd):
+    assert capfd.readouterr().out == ""
+    os.write(1, b"exact stdout\\n")
+    assert capfd.readouterr().out == "exact stdout\\n"
+
+@pytest.fixture
+def setup_output(capsys):
+    print("actual fixture setup")
+
+def test_setup_capture(capsys, setup_output):
+    assert capsys.readouterr().out == "actual fixture setup\\n"
+''')
+    code = ("import pytest,sys; from scripts.verify_cutover_completion_native import NativeDiagnostics; "
+            "sys.exit(pytest.main(['-q','-o','addopts=','-p','no:cacheprovider',sys.argv[1]], plugins=[NativeDiagnostics()]))")
+    result = subprocess.run([sys.executable, "-B", "-c", code, str(path)], cwd=ROOT,
+                            capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "3 passed" in result.stdout
+    assert "DO_NOT_LOG_PRIVATE_PARAMETER" not in result.stdout + result.stderr
+    phases = [json.loads(line[line.index("{"):])["native_test"] for line in result.stdout.splitlines()
+              if '"native_test":' in line]
+    assert phases == ["start", "setup", "call", "teardown", "end"] * 3

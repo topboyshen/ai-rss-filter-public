@@ -16,7 +16,7 @@ from services.sender_drain_contract import (IDENTITY_KEYS, MAX_BODY_BYTES, MAX_M
 # marker, without trim/cast coercion of malformed or future versions.
 IDENTITY_SQL = capacity.PG_IDENTITY_SQL + """, 'handoff_state'::regclass::oid::bigint,
  'handoff_operations'::regclass::oid::bigint, 'handoff_leases'::regclass::oid::bigint,
- (SELECT CASE WHEN version COLLATE "C" = '134' THEN 134 ELSE NULL END FROM schema_version), current_user, session_user"""
+ (SELECT CASE version COLLATE "C" WHEN '134' THEN 134 WHEN '135' THEN 135 ELSE NULL END FROM schema_version), current_user, session_user"""
 ROWS_SQL = """SELECT delivery_id,body_sha256,body,target_url,signature,contract,user_id,feed_id,entry_id,state,attempts
  FROM webhook_outbox WHERE state IN ('pending','inflight') ORDER BY delivery_id LIMIT 5001"""
 
@@ -167,7 +167,7 @@ def freeze_bundle(connect, dsn, expected, binding, receipt, window, root):
         connection.close()
 
 
-def observe(connect, dsn, expected, *, deadline=None):
+def observe(connect, dsn, expected, *, deadline=None, allow_uninitialized=False):
     """Fixed read-only SQL; returns counts plus actual gate, never a permit."""
     validate_identity(expected)
     deadline = _deadline(deadline)
@@ -187,8 +187,9 @@ def observe(connect, dsn, expected, *, deadline=None):
             sample = capacity._postgres_counts(cursor.fetchall())
             cursor.execute("SELECT manifest,generation,phase,current_operation FROM handoff_state WHERE id=1")
             row = cursor.fetchone()
-            require(row is not None and len(row) == 4, "actual sender gate missing")
-            gate = dict(zip(("manifest", "generation", "phase", "current_operation"), row))
+            require((row is None and allow_uninitialized and expected["schema_version"] == 135)
+                    or (row is not None and len(row) == 4), "actual sender gate missing")
+            gate = None if row is None else dict(zip(("manifest", "generation", "phase", "current_operation"), row))
             cursor.execute("""SELECT count(*),count(*) FILTER(WHERE status='active'),count(*) FILTER(WHERE status='uncertain'),
  count(*) FILTER(WHERE status='active' AND source NOT IN ('outbox_pass','outbox_sender')),
  count(*) FILTER(WHERE status='uncertain' AND source NOT IN ('outbox_pass','outbox_sender')) FROM handoff_leases""")
@@ -229,6 +230,12 @@ class PostgresReader:
     def snapshot(self, *, deadline=None):
         import psycopg
         return observe(psycopg.connect, self._dsn(), self.expected, deadline=deadline)
+
+    def initial_snapshot(self):
+        """Read actual135 identity even before the first gate row; never a permit."""
+        import psycopg
+        require(self.expected["schema_version"] == 135, "closed initialization requires schema135")
+        return observe(psycopg.connect, self._dsn(), self.expected, allow_uninitialized=True)
 
     def freeze(self, binding, receipt, window, root):
         import psycopg
@@ -288,8 +295,11 @@ class FrozenPostgres:
         cursor.execute("""SELECT manifest,action,previous_generation,generation,status,confirmed_at IS NOT NULL
  FROM handoff_operations WHERE operation_id=%s""", (self.operation,))
         generation = self.snapshot["gate"]["generation"]
-        require(cursor.fetchone() == (self.manifest, "pause", generation - 1, generation, "confirmed", True),
-                "actual sender pause operation is missing, pending, or mismatched")
+        row = cursor.fetchone()
+        supported = [(self.manifest, "pause", generation - 1, generation, "confirmed", True)]
+        if self.reader.expected["schema_version"] == 135 and generation == 0:
+            supported.append((self.manifest, "initialize_closed", -1, 0, "confirmed", True))
+        require(row in supported, "actual sender pause operation or135 closed initialization is missing, pending, or mismatched")
 
     def check(self, *, deadline=None):
         deadline = _deadline(deadline)

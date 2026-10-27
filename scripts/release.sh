@@ -1661,6 +1661,9 @@ compose_up() {
   local ref="$1" manifest="$2" file
   validate_runtime_digest "$ref"
   file="$(manifest_path "$manifest")"
+  # Controlled startup grants bind exact container IDs. Ordinary convergence
+  # would recreate/remove them, so it may never handle those manifests.
+  python3 -I "${ROOT}/scripts/check_release_container_lifecycle.py" "$file" || return $?
   # Modern gateway manifests are converged in dependency order. Keeping the
   # old gateway alive while replacing a slow-starting API can make its proxied
   # health check turn unhealthy, which causes Compose to abandon the worker.

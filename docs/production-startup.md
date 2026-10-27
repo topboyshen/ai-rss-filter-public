@@ -4,6 +4,11 @@ This protocol is separate from `controlled_startup` and its temporary-directory,
 pristine-fence isolation guard. It never removes that guard, reopens business,
 copies a production DB, invokes models, or offers automatic rollback.
 
+This document covers migration and closed startup only. The subsequent
+[production activation protocol](production-activation.md) prepares and resumes
+the same retained processes under separate authorization; it does not rerun
+`init_db()` or treat closed startup as permission to reopen business.
+
 ## Initialization audit
 
 The ordinary `db.database.init_db()` remains compatible and is not invoked by
