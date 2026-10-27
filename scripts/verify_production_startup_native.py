@@ -126,6 +126,7 @@ def scenario(root, workspace, workers, raw_dsn, miniflux_source, stage, report):
         digest = build_candidate(root, p["directory"], p["source"], "ai-filter-startup-native:" + p["project"], contract, contract_sha)
         stage(f"n{workers}_probe_actual_image_configuration")
         probe_candidate(contract, sealed.parent, digest, p["directory"])
+        stage(f"n{workers}_prepare_migration_permit")
         permit = fixture.migration_permit(p, sealed, digest)
         stage(f"n{workers}_create_actual_application_containers")
         private.compose(contract, sealed.parent, digest, ["-f", str(sealed.parent / "compose.json"), "create", "--force-recreate", "--no-build", "--pull", "never"])

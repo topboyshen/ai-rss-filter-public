@@ -3,6 +3,7 @@ import json
 import io
 import os
 from pathlib import Path
+import sqlite3
 import sys
 import tarfile
 
@@ -85,6 +86,29 @@ def test_image_probe_transport_preserves_original_time_and_byte_limits(tmp_path,
     monkeypatch.setattr(native, "archive_command", archive)
     native.probe_candidate({}, tmp_path, "sha256:" + "a" * 64, tmp_path)
     assert calls == [{"seconds": 120, "limit": private.MAX_BYTES}]
+
+
+def test_migration_sample_gets_fresh_bounded_reader_after_long_image_build(tmp_path, monkeypatch):
+    migration = fixture.migration
+    now = migration.time.monotonic
+    elapsed = [0]
+    monkeypatch.setattr(migration.time, "monotonic", lambda: now() + elapsed[0])
+    anchor, _target = fixture.seed_databases(tmp_path)
+    path = tmp_path / "fixture.db"
+    sidecars = [Path(str(path) + suffix) for suffix in ("-wal", "-shm")]
+    try:
+        before = migration.database_fingerprint(anchor)
+        identities = [(p.stat().st_dev, p.stat().st_ino) for p in sidecars]
+        elapsed[0] = 31  # Actual image build can outlast a SQL read budget.
+        with pytest.raises(sqlite3.OperationalError, match="interrupted"):
+            migration.database_fingerprint(anchor)
+        assert fixture.database_before(path) == before
+        assert [(p.stat().st_dev, p.stat().st_ino) for p in sidecars] == identities
+        # The old anchor was neither closed nor given a renewed deadline.
+        with pytest.raises(sqlite3.OperationalError, match="interrupted"):
+            migration.database_fingerprint(anchor)
+    finally:
+        anchor.close()
 
 
 def test_command_deadline_is_bounded_and_keeps_early_bytes(tmp_path):

@@ -142,6 +142,16 @@ def seal_inputs(root, fixture):
     return sealed
 
 
+def database_before(path):
+    # The seed connection only anchors WAL/SHM across the image build. Its
+    # original query deadline must not be reused or reset after that wait.
+    conn = migration._connection(path, readonly=True)
+    try:
+        return migration.database_fingerprint(conn)
+    finally:
+        conn.close()
+
+
 def migration_permit(p, sealed, digest):
     from core.config import config as holder
     from scripts import independent_drain_inventory as inventory
@@ -174,7 +184,7 @@ def migration_permit(p, sealed, digest):
         "database": migration.database_identity(db), "freeze": {"root": str(paths["fence"]), "binding": p["binding"],
             "manifest_sha256": gate._hash(p["fence"]._manifest()), "operation_id": "3" * 64, "generation": 3,
             "receipt_sha256": gate._hash(p["frozen"])}, "locks": {key: migration.file_identity(path) for key, path in lock_paths.items()},
-        "before": migration.database_fingerprint(p["anchor"]), "target_schema_sha256": p["target"], "step_ids": list(steps.STEP_IDS),
+        "before": database_before(db), "target_schema_sha256": p["target"], "step_ids": list(steps.STEP_IDS),
         "sender": sender, "sender_contract_sha256": gate._hash(sender), "inventory": spec, "inventory_sha256": inventory_sha,
         "minimum_free_bytes": 64 * 1024**2, "max_database_bytes": 4 * 1024**3}
     permit["compatibility"] = {"old_binding": p["binding"], "candidate_source": permit["source"],
