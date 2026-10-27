@@ -28,6 +28,8 @@ on:
       - 'scripts/production_startup_pg_fixture.py'
       - 'scripts/production_startup_fixture.py'
       - 'scripts/private_release_contract.py'
+      - 'scripts/prepare_synthetic_evidence.py'
+      - 'tests/test_prepare_synthetic_evidence.py'
       - 'ops/miniflux/**'
       - 'scripts/apply_miniflux_pause.py'
       - 'scripts/apply_miniflux_outbox.py'
@@ -139,16 +141,22 @@ jobs:
           preserve PG_MEMORY_EVENTS.txt docker --host unix:///var/run/docker.sock exec "$PG_ID" cat /sys/fs/cgroup/memory.events
           preserve SYNTHETIC_DATABASE.sql docker --host unix:///var/run/docker.sock exec "$PG_ID" pg_dump -U postgres -d synthetic_outbox
           exit "$failed"
+      - name: Prepare evidence without following fixture links
+        if: always()
+        run: |
+          python -I -B scripts/prepare_synthetic_evidence.py \
+            --source "cutover-completion=${RUNNER_TEMP}/cutover-completion" \
+            --source "production-startup=${RUNNER_TEMP}/production-startup" \
+            --source "production-startup-postgres=${RUNNER_TEMP}/production-startup-postgres" \
+            --source "production-startup-source=${RUNNER_TEMP}/production-startup-source" \
+            --output "${RUNNER_TEMP}/cutover-safe-upload"
+
       - name: Preserve original evidence including failures
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: cutover-completion-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/cutover-completion/**
-            ${{ runner.temp }}/production-startup/**
-            ${{ runner.temp }}/production-startup-postgres/**
-            ${{ runner.temp }}/production-startup-source/**
+          path: ${{ runner.temp }}/cutover-safe-upload/
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
