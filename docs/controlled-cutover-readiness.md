@@ -1,10 +1,15 @@
 # Controlled cutover readiness and remaining field evidence
 
-This implementation combines the staged sender, exact-original receiver drain,
+The migration and closed-startup stages described here combine the staged sender, exact-original receiver drain,
 transaction-step migration, closed application startup and bounded identity
 preflight. It is an implementation and isolation-test proposal, not a release
 permit. It does not change an existing `.126` image or tag, contact production,
 reopen business admission, or offer automatic rollback.
+
+The separate [production activation protocol](production-activation.md) extends
+these stages with first CLOSED initialization and same-process business resume.
+Its additional grants, live capabilities and verification are required; a
+closed-startup result by itself does not authorize that later stage.
 
 ## What each result can establish
 

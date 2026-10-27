@@ -12,7 +12,25 @@ import time
 
 from scripts import private_release_contract as private, production_startup_fixture as startup
 from scripts.verify_private_release_native import save
-from services import admission_fence as gate
+from services import admission_fence as gate, webhook_receipts
+
+
+def initialize_synthetic_empty_receipts(spool):
+    """Prepare only this new synthetic spool; never repair existing inventory."""
+    webhook_receipts._private_directory(spool)
+    with gate._locked(spool / ".lock", True, 1):
+        gate._require({path.name for path in spool.iterdir()} == {".lock", "inflight", "dead-letter"},
+                      "synthetic empty spool must be pristine")
+        for name in ("inflight", "dead-letter"):
+            webhook_receipts._private_directory(spool / name)
+            gate._require(not list((spool / name).iterdir()), "synthetic spool contains retained work")
+        store = webhook_receipts.ReceiptStore(spool)
+        gate._require(store._directories(create=True), "synthetic receipt initialization failed")
+        for path in (store.tasks, store.directory, spool, spool.parent):
+            webhook_receipts._fsync_directory(path)
+        gate._require(not list(store.tasks.iterdir())
+                      and {path.name for path in store.directory.iterdir()} == {"tasks"},
+                      "synthetic preparation created receipt originals")
 
 
 def prepare_disk(directory, source, network, previous_image_id, *, workers=2):
@@ -49,6 +67,10 @@ def prepare_disk(directory, source, network, previous_image_id, *, workers=2):
     for path in (paths["spool"] / ".lock", paths["journal"] / ".lock",
                  directory / "release.lock", directory / "refresh.lock"):
         save(path, b"")
+    initialize_synthetic_empty_receipts(paths["spool"])
+    gate._write(directory / "SYNTHETIC_EMPTY_RECEIPT_STORE.json", {
+        "synthetic_only": True, "accepted_originals": 0, "business_open": False,
+        "production_missing_metadata_authorized": False})
     operation = gate.secrets.token_hex(32)
     project = "activation-native-" + gate.secrets.token_hex(6)
     manifest = manifest_input(paths, project, operation, workers, binding, network)

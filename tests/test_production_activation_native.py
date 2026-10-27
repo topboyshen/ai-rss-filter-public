@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -35,6 +36,11 @@ def test_synthetic_disk_is_never_opened_and_has_no_llm_backend(tmp_path, monkeyp
         assert config.config.cfg["llm"] == []
         assert config.config.blacklist_re.search("Synthetic activation-original")
         assert config.config.cfg["feeds"][0]["url"] == "http://fixture:8080/feed"
+        from scripts import observe_handoff_capacity as capacity
+        sample = capacity.sample_receiver(p["paths"]["spool"], capacity.spool_identity(p["paths"]["spool"]))
+        assert sample["records"] == sample["reserved_bytes"] == sample["bytes_read"] == 0
+        assert all(value == 0 for value in sample["states"].values())
+        assert gate._read(p["directory"] / "SYNTHETIC_EMPTY_RECEIPT_STORE.json")["production_missing_metadata_authorized"] is False
     finally:
         p["anchor"].close()
 
@@ -165,3 +171,76 @@ def test_failure_log_only_contains_type_hash_and_stage(tmp_path, capsys):
     retained = json.loads((tmp_path / "FAILURE.json").read_bytes())
     assert retained == failure and retained["locations"]
     assert secret not in (tmp_path / "FAILURE.json").read_text()
+
+
+def fresh_synthetic_spool(tmp_path):
+    spool = tmp_path / "spool"
+    spool.mkdir(mode=0o700)
+    for name in ("inflight", "dead-letter"):
+        (spool / name).mkdir(mode=0o700)
+    (spool / ".lock").touch(mode=0o600)
+    return spool
+
+
+def test_empty_receipt_preparation_uses_actual_exclusive_lock_and_sync(tmp_path, monkeypatch):
+    spool = fresh_synthetic_spool(tmp_path)
+    create, sync = webhook_receipts.ReceiptStore._directories, webhook_receipts._fsync_directory
+    synchronized = []
+    def check_locked(store, **kwargs):
+        with pytest.raises(gate.AdmissionBusy):
+            gate._lock(spool / ".lock", True, 0)
+        return create(store, **kwargs)
+    def record_sync(path):
+        synchronized.append(path)
+        sync(path)
+    monkeypatch.setattr(webhook_receipts.ReceiptStore, "_directories", check_locked)
+    monkeypatch.setattr(webhook_receipts, "_fsync_directory", record_sync)
+    monkeypatch.setattr(webhook_receipts.ReceiptStore, "accept", lambda *_a, **_k: pytest.fail("must not fabricate original"))
+    fixture.initialize_synthetic_empty_receipts(spool)
+    assert set(synchronized) == {spool, spool.parent, spool / "receipts", spool / "receipts/tasks"}
+    assert all(path.stat().st_mode & 0o777 == 0o700 for path in (spool / "receipts", spool / "receipts/tasks"))
+    assert list((spool / "receipts/tasks").iterdir()) == []
+    assert not list(spool.rglob("*.json"))
+
+
+def test_missing_receipt_metadata_remains_readonly_failure(tmp_path):
+    from scripts import observe_handoff_capacity as capacity
+    spool = fresh_synthetic_spool(tmp_path)
+    before = {str(path.relative_to(spool)): path.lstat().st_ino for path in spool.rglob("*")}
+    webhook_receipts.ReceiptStore(spool)  # the constructor intentionally does not initialize storage
+    with pytest.raises(FileNotFoundError):
+        capacity.sample_receiver(spool, capacity.spool_identity(spool))
+    assert before == {str(path.relative_to(spool)): path.lstat().st_ino for path in spool.rglob("*")}
+
+
+def test_empty_receipt_preparation_propagates_sync_failure_and_retains_partial(tmp_path, monkeypatch):
+    spool = fresh_synthetic_spool(tmp_path)
+    def fail(_path):
+        raise OSError("synthetic directory fsync failure")
+    with monkeypatch.context() as patch:
+        patch.setattr(webhook_receipts, "_fsync_directory", fail)
+        with pytest.raises(OSError, match="directory fsync failure"):
+            fixture.initialize_synthetic_empty_receipts(spool)
+    assert (spool / "receipts").is_dir() and not (spool / "receipts/tasks").exists()
+    with pytest.raises(gate.AdmissionError, match="must be pristine"):
+        fixture.initialize_synthetic_empty_receipts(spool)
+
+
+@pytest.mark.parametrize("unsafe", ["original", "link", "busy"])
+def test_empty_receipt_preparation_refuses_retained_work_or_unsafe_storage(tmp_path, unsafe):
+    spool = fresh_synthetic_spool(tmp_path)
+    fd = None
+    try:
+        if unsafe == "original":
+            (spool / "inflight/original.body").write_bytes(b"synthetic retained original")
+        elif unsafe == "link":
+            (spool / "receipts").symlink_to(tmp_path)
+        else:
+            fd = gate._lock(spool / ".lock", True, 0)
+        before = {str(path.relative_to(spool)): path.lstat().st_ino for path in spool.rglob("*")}
+        with pytest.raises(gate.AdmissionBusy if unsafe == "busy" else gate.AdmissionError):
+            fixture.initialize_synthetic_empty_receipts(spool)
+        assert before == {str(path.relative_to(spool)): path.lstat().st_ino for path in spool.rglob("*")}
+    finally:
+        if fd is not None:
+            os.close(fd)
