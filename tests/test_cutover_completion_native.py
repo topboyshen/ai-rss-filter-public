@@ -68,6 +68,9 @@ def test_only_owned_evidence_child_can_be_the_disk_fixture_mount(tmp_path):
         base.disk_fixture_arguments(root, True)
     unsafe = tmp_path.resolve() / "public"
     unsafe.mkdir(mode=0o755)
+    # The full gate intentionally uses umask 077; build the actual unsafe mode.
+    unsafe.chmod(0o755)
+    assert unsafe.stat().st_mode & 0o777 == 0o755
     with pytest.raises(ValueError):
         base.disk_fixture_arguments(unsafe, True)
     link = tmp_path.resolve() / "alias"
