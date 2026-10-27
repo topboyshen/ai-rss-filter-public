@@ -25,6 +25,7 @@ for directory in (ROOT, ROOT / "scripts"):
         sys.path.insert(0, str(directory))
 
 from services import admission_fence as gate  # noqa: E402
+from durable_handoff_cutover import CutoverError  # noqa: E402
 from scripts import production_sender_bootstrap as bootstrap  # noqa: E402
 from scripts import production_legacy_takeover as legacy  # noqa: E402
 from scripts import production_namespace_native as export  # noqa: E402
@@ -35,6 +36,7 @@ SAFE_FILES = ("SOURCE.json", "SEED132.json", "LEGACY_STOP.json", "CREATED.json",
               "CLOSED.json", "QUERY.json", "PROOF.json", "RESULT.json", "FAILURE.json", "CANDIDATE_FINAL.json",
               "RECEIVER_OLD_STORAGE.json", "RECEIVER_BOOTSTRAP_PROOF.json", "RECEIVER_SQLITE_PRESERVED.json")
 MAX_SECONDS = 180
+DUPLICATE_INITIALIZE_MESSAGE = "sender gate already initialized or retained control history exists"
 OLD_PROCESS = ("import signal,sys,time; signal.signal(signal.SIGTERM,lambda *_:sys.exit(0)); "
                "print('synthetic_TERM_ready',flush=True); time.sleep(600)")
 TERM_READY = ("from pathlib import Path; import signal; "
@@ -230,7 +232,7 @@ def prepare_bootstrap(harness, directory, stopped, binding, records):
         "WEBHOOK_OUTBOX": "1", "HANDOFF_MANIFEST": manifest, "WEBHOOK_OUTBOX_CONTRACT": "synthetic-bootstrap-no-model",
         "HANDOFF_CONTROL_TOKEN": harness.token, "HANDOFF_CONTROL_ADDR": "127.0.0.1:8787",
         "LISTEN_ADDR": "0.0.0.0:8080", "WORKER_POOL_SIZE": "1", "POLLING_FREQUENCY": "60"}
-    spec = {"image": harness.image_id, "environment": {key: "${" + key + "}" for key in env}, "user": "65534:65534",
+    spec = {"image": harness.image_id, "environment": {key: "${" + key + ":?}" for key in env}, "user": "65534:65534",
         "mem_limit": 768 * 1024**2, "memswap_limit": 768 * 1024**2, "pids_limit": 256, "cpus": 1,
         "cap_drop": ["ALL"], "security_opt": ["no-new-privileges:true"], "restart": "no", "read_only": True,
         "volumes": [], "ports": [], "networks": ["sender"], "platform": "linux/amd64", "healthcheck": {"disable": True},
@@ -263,9 +265,14 @@ def _ready(plan, created):
     return identity
 
 
-def rejected_original(function):
+def rejected_original(function, *, expected_cutover_message=None):
     try:
         function()
+    except CutoverError as error:
+        if (type(error) is CutoverError and expected_cutover_message == DUPLICATE_INITIALIZE_MESSAGE
+                and str(error) == expected_cutover_message):
+            return True
+        raise
     except (ValueError, gate.AdmissionError):
         return True
     raise AssertionError("a repeated original action was accepted")
@@ -313,7 +320,8 @@ def exercise_locked(harness, binding, daemon, records, receiver, release):
         identity = harness.wait(lambda: _ready(plan, created), seconds=15, readiness=True)
         closed = bootstrap.initialize(cap, plan, evidence)
         _save(root / "CLOSED.json", closed)
-        rejected_original(lambda: bootstrap.initialize(cap, plan, evidence))
+        rejected_original(lambda: bootstrap.initialize(cap, plan, evidence),
+                          expected_cutover_message=DUPLICATE_INITIALIZE_MESSAGE)
         queried = bootstrap.query(cap, plan, evidence)
         _save(root / "QUERY.json", queried)
         gate._require(closed["pg_receipt"] == queried["pg_receipt"] and closed["pg_receipt"]["state"] == "closed"

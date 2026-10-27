@@ -13,6 +13,9 @@ import pytest
 
 from scripts import production_sender_bootstrap_native as native
 from services import admission_fence as gate
+from test_miniflux_activation_adapter import activation  # noqa: F401
+from test_production_sender_driver import setup as sender_setup  # noqa: F401
+from test_sender_activation_driver import driver as activation_driver  # noqa: F401
 
 
 def _fallback_arguments(tmp_path):
@@ -594,3 +597,142 @@ def test_legacy_mounts_same_retained_receiver_data_only_for_application_roles(tm
     assert "--mount" not in launches["old-sender"][1]
     assert wanted not in launches["old-gateway"][1]
     assert all(item[2][-1] == native.OLD_PROCESS for item in launches.values())
+
+
+@pytest.fixture
+def prepared_bootstrap(records, monkeypatch):
+    """Real native sealed inputs and production parsers; only external IO doubled."""
+    directory = records.root.parent / "inputs"
+    directory.mkdir(mode=0o700)
+    network = {"Name": "owned-internal", "Id": "c" * 64, "Driver": "bridge", "Scope": "local",
+               "Internal": True, "Options": {}, "IPAM": {}}
+    pg = {"NetworkSettings": {"Networks": {network["Name"]: {"IPAddress": "172.31.0.2"}}}}
+    harness = SimpleNamespace(owner="d" * 32, password="synthetic", token="e" * 64, image_id=records.image,
+        network=network["Name"], names={"pg": "owned-pg"}, repo=native.ROOT)
+    def command(args):
+        assert args in (["network", "inspect", network["Name"]], ["inspect", "owned-pg"])
+        return json.dumps([network if args[0] == "network" else pg])
+    harness.command = command
+    monkeypatch.setattr(native, "postgres_before", lambda _dsn: {"schema_version": 132})
+    binding = {"revision": records.revision, "upstream_revision": "f" * 40, "binary_sha256": "a" * 64}
+    plan = native.prepare_bootstrap(harness, directory, {"operation_id": "b" * 64, "plan_sha256": "c" * 64}, binding,
+                                    native.build_records(records.root, records.image, records.revision))
+    image = {"Id": records.image, "Architecture": "amd64", "Os": "linux",
+             "Config": {"Entrypoint": ["/usr/bin/miniflux"], "Cmd": [], "Env": ["PATH=/usr/bin:/bin"]}}
+    def docker(args, **_options):
+        assert args == ["image", "inspect", records.image]
+        return json.dumps([image]).encode()
+    monkeypatch.setattr(native.bootstrap, "_docker", docker)
+    private = native.bootstrap.private
+    values = private.environment_values(native.bootstrap._file(plan["environment"]))
+    manifest = json.loads(native.bootstrap._file(plan["compose"]))
+    return SimpleNamespace(plan=plan, manifest=manifest, values=values, image=image, private=private)
+
+
+def test_actual_prepare_bootstrap_environment_resolves_through_production_manifest(prepared_bootstrap):
+    p = prepared_bootstrap
+    manifest, service, image = native.bootstrap._manifest(p.plan, p.private.encoded(p.manifest), p.values)
+    actual = p.private.role_environment(service, image["Config"], p.values)
+    assert manifest == p.manifest and image == p.image
+    assert set(service["environment"]) == set(p.values)
+    assert all(p.private.REFERENCE.fullmatch(reference).group(1) == key for key, reference in service["environment"].items())
+    assert actual == {"PATH": "/usr/bin:/bin", **p.values}
+    assert actual["DATABASE_URL"] == gate._read(Path(p.plan["dsn_file"]))["dsn"]
+    assert actual["HANDOFF_CONTROL_TOKEN"] == gate._read(Path(p.plan["token_file"]))["token"]
+    assert actual["RUN_MIGRATIONS"] == actual["HANDOFF_ENABLED"] == actual["WEBHOOK_OUTBOX"] == "1"
+    assert actual["CREATE_ADMIN"] == "0" and actual["HANDOFF_MANIFEST"] == p.plan["manifest"]
+
+
+@pytest.mark.parametrize("change", ["missing_database", "missing_token", "wrong_dsn", "weak_database", "weak_protection", "extra_dsn_key"])
+def test_prepare_environment_does_not_relax_required_keys_or_exact_dsn(prepared_bootstrap, change):
+    p = prepared_bootstrap
+    service = p.manifest["services"][p.plan["service"]]
+    error, message = gate.AdmissionError, "same sealed DSN"
+    if change in ("missing_database", "missing_token"):
+        key = "DATABASE_URL" if change == "missing_database" else "HANDOFF_CONTROL_TOKEN"
+        del p.values[key]
+        error, message = KeyError, key
+    elif change == "wrong_dsn":
+        p.values["DATABASE_URL"] += "&application_name=different"
+    elif change == "weak_database":
+        service["environment"]["DATABASE_URL"] = "${DATABASE_URL}"
+    elif change == "weak_protection":
+        service["environment"]["HANDOFF_ENABLED"] = "${HANDOFF_ENABLED}"
+        message = "first CLOSED protections"
+    else:
+        path = Path(p.plan["dsn_file"])
+        changed = path.with_name("extra-dsn.json")
+        native._save(changed, {**gate._read(path), "unexpected": True})
+        p.plan["dsn_file"] = str(changed)
+    with pytest.raises(error, match=message):
+        native.bootstrap._manifest(p.plan, p.private.encoded(p.manifest), p.values)
+    if change in ("weak_database", "weak_protection"):
+        actual = p.private.role_environment(service, p.image["Config"], p.values)
+        key = "DATABASE_URL" if change == "weak_database" else "HANDOFF_ENABLED"
+        assert actual[key] == "${" + key + "}"  # Production parser keeps weak references literal.
+
+
+def test_real_closed_driver_repeat_is_expected_without_repost_or_receipt_change(request):
+    driver, transport, _capability, reader = request.getfixturevalue("activation_driver")
+    assert type(driver) is native.bootstrap.SenderActivationDriver
+    operation = driver.plan["binding"]["initial_operation_id"]
+    closed = driver.initialize_closed(operation)
+    reader.operations = 1
+    assert closed["state"] == "closed" and closed["generation"] == 0
+    originals = {path.name: path.read_bytes() for path in driver.control.root.iterdir() if path.is_file()}
+    assert native.rejected_original(lambda: driver.initialize_closed(operation),
+                                    expected_cutover_message=native.DUPLICATE_INITIALIZE_MESSAGE) is True
+    assert [call[1] for call in transport.calls if call[0] == "POST"] == ["/initialize-closed"]
+    assert all((driver.control.root / name).read_bytes() == value for name, value in originals.items())
+    assert driver.query_initialize_closed(operation) == closed
+    assert [call[1] for call in transport.calls if call[0] == "POST"] == ["/initialize-closed"]
+    assert all((driver.control.root / name).read_bytes() == value for name, value in originals.items())
+
+
+@pytest.mark.parametrize("kind", ["runtime", "io", "canonical_other", "canonical_without_expectation", "pause_pending",
+                                 "stop_pending", "unknown_subclass", "noncanonical"])
+def test_expected_duplicate_does_not_swallow_pending_or_other_failure(kind):
+    from durable_handoff_cutover import CutoverError
+    from miniflux_handoff_adapter import PausePending, StopNewPending
+    from scripts import durable_handoff_cutover as noncanonical
+    assert native.CutoverError is CutoverError
+    assert native.bootstrap.SenderActivationDriver.initialize_closed.__globals__["require"].__globals__["CutoverError"] is CutoverError
+    expected = native.DUPLICATE_INITIALIZE_MESSAGE
+    if kind == "runtime":
+        error = RuntimeError(expected)
+    elif kind == "io":
+        error = OSError(expected)
+    elif kind == "canonical_other":
+        expected = "different unconfirmed control failure"
+        error = CutoverError(expected)
+    elif kind == "canonical_without_expectation":
+        error, expected = CutoverError(expected), None
+    elif kind in ("pause_pending", "stop_pending"):
+        error = (PausePending if kind == "pause_pending" else StopNewPending)(expected)
+    elif kind == "unknown_subclass":
+        error = type("UnknownCutoverFailure", (CutoverError,), {})(expected)
+    else:
+        assert noncanonical.CutoverError is not CutoverError
+        error = noncanonical.CutoverError(expected)
+    def fail():
+        raise error
+    with pytest.raises(type(error)) as raised:
+        native.rejected_original(fail, expected_cutover_message=expected)
+    assert raised.value is error
+
+
+def test_only_duplicate_initialize_selects_specific_cutover_rejection():
+    import ast
+    source = ast.parse(Path(native.__file__).read_text())
+    function = next(node for node in source.body if isinstance(node, ast.FunctionDef) and node.name == "exercise_locked")
+    calls = [node for node in ast.walk(function) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+             and node.func.id == "rejected_original"]
+    assert len(calls) == 3
+    selected = []
+    for call in calls:
+        action = call.args[0].body.func.attr
+        if call.keywords:
+            assert [(kw.arg, ast.unparse(kw.value)) for kw in call.keywords] == [
+                ("expected_cutover_message", "DUPLICATE_INITIALIZE_MESSAGE")]
+            selected.append(action)
+    assert selected == ["initialize"]
