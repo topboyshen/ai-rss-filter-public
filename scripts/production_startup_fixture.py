@@ -100,7 +100,7 @@ def manifest_input(paths, project, operation, workers, binding):
         "AI_FILTER_DB_PATH": "/app/data/business/fixture.db", "AI_FILTER_ADMISSION_MODE": "enforced",
         "AI_FILTER_ADMISSION_ROOT": "/app/data/admission_fence", "AI_FILTER_ADMISSION_BINDING": json.dumps(binding, sort_keys=True),
         "AI_FILTER_PRODUCTION_STARTUP_OPERATION": operation, "AI_FILTER_PRODUCTION_STARTUP_ROOT": "/app/data/startup_contract"}
-    common = {"image": private.IMAGE, "mem_limit": "768m", "pids_limit": 256, "user": f"{os.geteuid()}:{os.getegid()}",
+    common = {"image": private.IMAGE, "mem_limit": "768m", "memswap_limit": "768m", "pids_limit": 256, "user": f"{os.geteuid()}:{os.getegid()}",
               "cap_drop": ["ALL"], "security_opt": ["no-new-privileges:true"], "network_mode": "none", "restart": "no",
               "volumes": mounts, "healthcheck": {"disable": True}}
     return {"name": project, "services": {

@@ -54,7 +54,7 @@ def test_synthetic_manifest_exact_real_commands_and_closed_limits(tmp_path):
     assert services["ai-filter-api"]["command"] == ["/app/start.sh"]
     assert services["ai-filter-worker"]["command"] == ["python", "worker_main.py"]
     for service in services.values():
-        assert service["mem_limit"] == "768m" and service["pids_limit"] == 256
+        assert service["mem_limit"] == service["memswap_limit"] == "768m" and service["pids_limit"] == 256
         assert service["network_mode"] == "none" and service["cap_drop"] == ["ALL"]
         assert service["restart"] == "no" and service["user"] == f"{os.geteuid()}:{os.getegid()}"
         assert all(mount["target"].startswith("/app/data/") or mount["target"] == "/app/config.yaml" for mount in service["volumes"])

@@ -98,7 +98,7 @@ def replace_worker(session, p, contract, sealed, digest, old):
     service = p["manifest"]["services"]["ai-filter-worker"]
     env = private.environment_values(private.private_file(sealed.parent / "environment", sealed=True)[0])
     image = json.loads(private.run(["docker", "image", "inspect", digest]))[0]
-    args = ["docker", "create", "--network", "none", "--memory", "768m", "--pids-limit", "256", "--cap-drop", "ALL",
+    args = ["docker", "create", "--network", "none", "--memory", "768m", "--memory-swap", "768m", "--pids-limit", "256", "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges:true", "--user", service["user"], "--workdir", "/app"]
     for key, value in {"com.docker.compose.project": p["project"], "com.docker.compose.service": "ai-filter-worker",
                        "com.docker.compose.project.working_dir": str(p["paths"]["project"])}.items():
@@ -264,7 +264,7 @@ def preserve_scenario(p):
         record = json.loads((evidence / (identifier + "-inspect.stdout")).read_bytes())[0]
         if record["State"]["Running"]:
             code = ("import json;from pathlib import Path;p=Path('/sys/fs/cgroup');"
-                    "names=['memory.max','memory.peak','memory.current','memory.events','pids.max','pids.current'];"
+                    "names=['memory.max','memory.peak','memory.current','memory.events','memory.swap.max','memory.swap.current','pids.max','pids.current'];"
                     "print(json.dumps({n:(p/n).read_text()[:16384] for n in names if (p/n).exists()}))")
             archive_command(["docker", "exec", identifier, "python", "-I", "-c", code], evidence / (identifier + "-cgroup"))
     database_evidence = evidence / "database-before-close"
