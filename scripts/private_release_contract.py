@@ -762,8 +762,13 @@ def command_vector(value):
     return result
 
 
-def verify_execution(service, container, image_info, values):
-    require(container["Image"] == image_info["Id"] and container["State"]["Running"], "runtime image identity mismatch")
+def verify_execution(service, container, image_info, values, *, expected_running=True):
+    require(container["Image"] == image_info["Id"] and container["State"]["Running"] is expected_running, "runtime image identity mismatch")
+    if expected_running is False:
+        require(container["State"].get("Status") == "created" and container.get("RestartCount") == 0
+                and container["State"].get("StartedAt") == "0001-01-01T00:00:00Z"
+                and not container["State"].get("Restarting") and not container["State"].get("Dead"),
+                "initial runtime container has already started or has unknown state")
     actual = container["Config"]
     defaults = image_info["Config"]
     require((actual.get("WorkingDir") or "") == working_directory(service, defaults),

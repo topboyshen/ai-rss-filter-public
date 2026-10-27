@@ -67,8 +67,11 @@ policy proves only the supported forward transition. Old-image execution and
 backward compatibility remain explicitly unproven, with no fallback branch;
 a random compatibility hash is not accepted as evidence.
 
-The permit sets an explicit DB file-size limit up to a 16 GiB hard ceiling;
-this is a disk bound, not permission to copy or load the whole file. SQLite's
+The permit sets an explicit bound up to a 16 GiB ceiling. `max_page_count`
+limits logical SQLite pages, while progress and precommit checks bound the
+observed DB+WAL+SHM aggregate and enforce the current free-space floor. This is
+a conservative application check, not an OS disk quota or permission to copy
+or load the whole database. SQLite's
 cache is 16 MiB and maximum row/scalar length is 8 MiB. Schema/meta inventories,
 outbox rows/bytes and SQL/step durations are separately bounded. A synthetic
 sparse-file test covers a 2 GiB identity, not production-size SQL performance.
@@ -102,5 +105,63 @@ process-fault tests alone.
 The local migration tests use real synthetic SQLite and file locks, with test
 doubles for the already separately tested private release loader and PG adapter.
 They do not constitute native PostgreSQL or real application startup proof.
-The multiworker/worker runtime and native fixture are added as the next part of
-this same implementation; this migration module alone authorizes no cutover.
+The actual PG session and local lock identities are rechecked immediately
+before and after each SQLite COMMIT. PostgreSQL and SQLite are not one atomic
+system: a lock loss detected after commit leaves the committed journal and an
+unknown result, never a claim that the transaction rolled back. Future or
+noncanonical news schema versions are refused before authorization.
+
+## Closed process startup and replacement
+
+`production_startup_control` is host-only. Its `authorize`, `grant`, `query`
+and `replace` operations require the live migration lock capability. Every
+new action rechecks the independent raw inventory without reacquiring its
+already held locks. It accepts only a completed exact migration operation.
+The descriptor contains narrow runtime paths, source/config hashes, the full
+completed DB-journal hash and frozen binding; no Git checkout or PG DSN is
+mounted into the application. Only actual created, never-started containers
+with zero restart count may receive initial grants. Host inspection checks
+image, command, working directory, healthcheck configuration, user/groups,
+privileges/resources, exact environment, project, mounts and network/ports.
+
+The runtime independently binds the actual admission environment to that same
+frozen root and binding and checks actual DB inode, schema, full journal and
+postconditions. The configured private runtime file and runtime source bytes
+must match. It never calls `init_db` or the host private release/Git/PG loader.
+The descriptor/grants directory is mounted read-only and must be disjoint from
+writable state; writable bind aliases or ancestors exposing it or the runtime
+config are rejected. The ordinary isolation entry and its guards are retained.
+
+Gunicorn N=1..4 has independent `web-1`..`web-N` slots, each with a distinct
+operation/process nonce, dispatch intent, PID/start ticks/namespace/boot,
+parent/master identity and held owner flock. Dispatch must come from the
+actual container PID 1 Gunicorn master; claim must come from that master's
+live direct child. One actual process cannot fill multiple slots. The separate
+worker must itself be container PID 1; init wrappers and other process trees
+are unsupported. Its closed branch starts no Redis probe, bootstrap,
+dashboard recovery, quotes, quant or webhook dispatcher. This protocol does
+not subsequently activate business subsystems or open admission.
+
+A child exit leaves its slot vacant. The master does not silently grant a
+replacement or kill healthy siblings. At most one replacement per slot needs
+a new finite operation and the exact retained original receipt, independent
+proof that its old process/lease is dead, a fresh inventory check and the same
+frozen migration/config/source contract. A worker replacement requires a new
+never-started container. All original intents/receipts remain. Unknown or
+missing receipts cannot be treated as dead or cleared. Same-operation queries
+remain available after expiry; expiry never creates a new grant or window.
+An initialized slot is not a health, business-opening or full cutover proof.
+
+The native CLI is `scripts/verify_production_startup_native.py --repo ...
+--output ... --postgres-dsn-file ... --miniflux-source ...`. It builds the real
+application Dockerfile from the clean archive, exercises N=1..4 Gunicorn and
+closed worker containers with 768 MiB/256 PID bounds and no network, and retains
+actual host PostgreSQL activity/metadata locks throughout migration/startup.
+The PostgreSQL fixture is a new schema-134 seed from hash-locked source DDL;
+it does not prove a legacy PG upgrade or execution of the previous production
+binary. The native cases include closed HTTP, distinct real processes, one
+web-child crash preserving siblings, and one bounded replacement of web and
+worker. Synthetic source/build/pull, DB/WAL/SHM, intents/slots and actual
+container inspect/log/stats/cgroup evidence are retained under the private
+output tree. Evidence collection failure retains containers and does not
+replace the original failure. No power-loss or production cutover is claimed.

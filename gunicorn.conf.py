@@ -46,6 +46,11 @@ def post_worker_init(worker):
     # and before it accepts traffic, which gives database initialization an
     # explicit production startup boundary.
     from app import initialize_app
+    from services import production_startup
+    if production_startup.enabled():
+        slot, attempt = worker.production_slot
+        initialize_app(slot=slot, attempt=attempt)
+        return
     initialize_app()
 
     role = process_role()
@@ -60,3 +65,15 @@ def post_worker_init(worker):
     _ensure_quotes_refresher()
     from routes.webhook_routes import start_webhook_dispatcher
     start_webhook_dispatcher()
+
+
+def when_ready(server):
+    from services import production_startup
+    if production_startup.enabled():
+        production_startup.install_gunicorn(server)
+
+
+def pre_fork(server, worker):
+    from services import production_startup
+    if production_startup.enabled():
+        production_startup.pre_fork(server, worker)

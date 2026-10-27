@@ -17,6 +17,7 @@ import threading
 import time
 from services.admission_fence import AdmissionClosed, guarded
 from services.controlled_startup import initialize_runtime_database
+from services import production_startup
 
 logging.basicConfig(
     level=logging.INFO,
@@ -91,6 +92,9 @@ def main() -> int:
     if not (_security_cfg().get("api_key") or "").strip():
         logger.error("Effective security.api_key is required before worker starts")
         return 2
+
+    if production_startup.enabled():
+        return production_startup.closed_worker_loop()
 
     if not redis_enabled() or not redis_ping():
         logger.error("Redis is required and must be reachable before worker starts")

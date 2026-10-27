@@ -758,3 +758,31 @@ def test_actual_code_mount_drift_rejected_before_loader(fixture, monkeypatch):
     with pytest.raises(private.ContractError, match="mount, network, or port"):
         private.verify_runtime(contract, manifest, path.parent, DIGEST)
     assert not any(args[:2] == ["docker", "exec"] for args, _ in calls)
+
+
+@pytest.mark.parametrize("change", ["none", "exited", "started", "restart", "dead", "restarting"])
+def test_created_execution_contract_is_explicit_and_never_accepts_previous_start(fixture, change):
+    contract_path = seal(fixture)
+    contract, manifest, _ = private.load(contract_path, fixture["root"])
+    records = inspect_records(fixture, contract_path.parent)
+    container = records[0]
+    container["State"].update(Running=False, Status="created", StartedAt="0001-01-01T00:00:00Z", Restarting=False, Dead=False)
+    container["RestartCount"] = 0
+    if change == "exited":
+        container["State"]["Status"] = "exited"
+    elif change == "started":
+        container["State"]["StartedAt"] = "2026-01-01T00:00:00Z"
+    elif change == "restart":
+        container["RestartCount"] = 1
+    elif change in {"dead", "restarting"}:
+        container["State"][change.title()] = True
+    service = manifest["services"]["ai-filter-api"]
+    image = {"Id": DIGEST, "Config": {"Env": [], "Cmd": [], "Entrypoint": None, "WorkingDir": "/app"}}
+    values = private.environment_values(fixture["environment"].read_bytes())
+    if change == "none":
+        private.verify_execution(service, container, image, values, expected_running=False)
+        with pytest.raises(private.ContractError):
+            private.verify_execution(service, container, image, values)
+    else:
+        with pytest.raises(private.ContractError):
+            private.verify_execution(service, container, image, values, expected_running=False)
