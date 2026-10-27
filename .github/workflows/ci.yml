@@ -163,13 +163,21 @@ jobs:
             AI_FILTER_CUTOVER_EVIDENCE_DIR="${RUNNER_TEMP}/ai-filter-synthetic-cutover-evidence" \
             ./scripts/run-release-tests.sh full
 
+      - name: Prepare synthetic evidence without following links
+        if: always()
+        run: |
+          python -I -B scripts/prepare_synthetic_evidence.py \
+            --source "synthetic=${RUNNER_TEMP}/ai-filter-synthetic-cutover-evidence" \
+            --output "${RUNNER_TEMP}/ai-filter-synthetic-upload"
+
       - name: Preserve isolated synthetic cutover evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: synthetic-cutover-python-3.11-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/ai-filter-synthetic-cutover-evidence/
-          if-no-files-found: warn
+          path: ${{ runner.temp }}/ai-filter-synthetic-upload/
+          include-hidden-files: true
+          if-no-files-found: error
           retention-days: 14
 
       - name: Validate Compose and build the production image
