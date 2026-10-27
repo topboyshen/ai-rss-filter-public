@@ -30,6 +30,9 @@ def selected(path, patterns):
     "scripts/production_gateway_native.py", "scripts/production_namespace_native.py",
     "scripts/production_sender_bootstrap.py", "tests/test_production_namespace_native.py",
     "scripts/production_sender_bootstrap_native.py",
+    "scripts/production_receiver_bootstrap.py", "scripts/production_receiver_bootstrap_native.py",
+    "tests/test_production_receiver_bootstrap.py",
+    "tests/test_production_receiver_bootstrap_native.py",
     "scripts/production_sender_native_bridge.py", "tests/test_sender_external_postgres_identity.py",
     "tests/production_admission_environment_support.py",
     "scripts/verify_production_activation_native.py", "scripts/production_activation_fixture.py",
@@ -47,6 +50,7 @@ def test_each_real_adapter_path_triggers_native(event, path):
 @pytest.mark.parametrize("path", [
     "docs/production-release.md", "README.md", "core/scorer.py",
     "scripts/controlled_production_release.py.bak", "scripts/nested/private_control_subpaths.py",
+    "scripts/production_receiver_bootstrap.py.bak", "scripts/nested/production_receiver_bootstrap_native.py",
     "tests/nested/test_controlled_release_finalize.py", "tests/test_unrelated.py",
 ])
 def test_unrelated_and_lookalike_paths_do_not_trigger(event, path):

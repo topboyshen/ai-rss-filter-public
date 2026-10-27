@@ -85,6 +85,7 @@ class NativeDiagnostics:
     """Bounded phase timing only; no parametrized values or failure text."""
     def __init__(self, expected_files=None):
         self.passed = self.failed = self.skipped = self.started = self.finished = 0
+        self.subtests_passed = self.subtests_failed = self.subtests_skipped = 0
         self.origin = time.monotonic()
         self.expected_files = tuple(expected_files) if expected_files is not None else None
         self.collection_verified = False
@@ -120,13 +121,20 @@ class NativeDiagnostics:
         self.emit(nodeid, "start")
 
     def pytest_runtest_logreport(self, report):
+        from _pytest.subtests import SubtestReport
+        subtest = isinstance(report, SubtestReport)
         if report.when == "call" and report.passed:
-            self.passed += 1
+            if subtest:
+                self.subtests_passed += 1
+            else:
+                self.passed += 1
         if report.failed:
             self.failed += 1
+            self.subtests_failed += int(subtest)
         if report.skipped:
             self.skipped += 1
-        self.emit(report.nodeid, report.when, duration=round(report.duration, 6))
+            self.subtests_skipped += int(subtest)
+        self.emit(report.nodeid, report.when, duration=round(report.duration, 6), subtest=subtest)
 
     def pytest_runtest_logfinish(self, nodeid, location):
         self.finished += 1
@@ -173,6 +181,8 @@ TESTS = ("tests/test_independent_drain_inventory.py", "tests/test_frozen_cutover
          "tests/test_production_admission_environment.py",
          "tests/test_production_sender_bootstrap.py",
          "tests/test_production_sender_bootstrap_native.py",
+         "tests/test_production_receiver_bootstrap.py",
+         "tests/test_production_receiver_bootstrap_native.py",
          "tests/test_production_sender_native_bridge.py",
          "tests/test_sender_external_postgres_identity.py")
 TEST_GROUPS = (("foundation", TESTS[:22]), ("activation", TESTS[22:34]), ("adapters", TESTS[34:]))
@@ -243,6 +253,8 @@ frozen_test_files = ('tests/test_independent_drain_inventory.py',
  'tests/test_production_admission_environment.py',
  'tests/test_production_sender_bootstrap.py',
  'tests/test_production_sender_bootstrap_native.py',
+ 'tests/test_production_receiver_bootstrap.py',
+ 'tests/test_production_receiver_bootstrap_native.py',
  'tests/test_production_sender_native_bridge.py',
  'tests/test_sender_external_postgres_identity.py')
 summary = NativeDiagnostics(frozen_test_files)
@@ -259,6 +271,7 @@ ok = code == 0 and summary.passed >= 25 and not summary.failed and not summary.s
 print(json.dumps({'status':'passed' if ok else 'failed', 'tests_run':summary.passed,
     'collected':summary.collected,'started':summary.started,'finished':summary.finished,'collection_verified':summary.collection_verified,
     'collection_sha256':summary.collection_sha256,'selected_files':frozen_test_files,
+    'subtests_passed':summary.subtests_passed,'subtests_failed':summary.subtests_failed,'subtests_skipped':summary.subtests_skipped,
     'failures':summary.failed,'errors':int(code not in (0,1)), 'skipped':summary.skipped,
     'memory_peak_bytes':int(peak.read_text()) if peak.exists() else None,
     'memory_events':events.read_text() if events.exists() else None,

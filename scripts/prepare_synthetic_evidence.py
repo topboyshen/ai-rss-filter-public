@@ -25,6 +25,7 @@ MAX_OUTPUT_METADATA = 32 * 1024**2
 CHUNK = 1024**2
 DEADLINE = 300
 NOFOLLOW = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+NATIVE_GROUPS = ('native', 'native-foundation', 'native-activation', 'native-adapters')
 
 
 class EvidenceError(ValueError):
@@ -213,10 +214,11 @@ def copy_file(fd, name, row, root, relative, deadline, *, output_ids=None):
             os.close(output)
 
 
-def native_mapping(fd, entries, label):
+def native_mapping(fd, entries, group):
     """Only the actual retained native fixture mount has a container alias."""
-    name = 'native/fixtures/FIXTURE_STORAGE.json'
-    if label != 'cutover-completion' or name not in entries:
+    require(group in NATIVE_GROUPS, 'unknown_native_group')
+    name = group + '/fixtures/FIXTURE_STORAGE.json'
+    if name not in entries:
         return None
     row = entries[name]
     require(row['kind'] == 'file' and row['identity']['size'] <= 8192
@@ -228,29 +230,46 @@ def native_mapping(fd, entries, label):
         value = json.loads(os.read(source, 8193), object_pairs_hook=unique)
     expected = {'container_path', 'evidence_relative_path', 'device', 'inode',
                 'retained_in_place', 'root_tmpfs_bytes'}
-    require(set(value) == expected and value['retained_in_place'] is True
-            and value['root_tmpfs_bytes'] == 134217728, 'invalid_native_mapping')
+    require(isinstance(value, dict) and set(value) == expected and value['retained_in_place'] is True
+            and type(value['root_tmpfs_bytes']) is int and value['root_tmpfs_bytes'] == 134217728
+            and type(value['device']) is int and type(value['inode']) is int, 'invalid_native_mapping')
     logical = value['container_path']
     require(isinstance(logical, str)
             and re.fullmatch(r'/tmp/cutover-fixtures/cutover-synthetic-[A-Za-z0-9_-]+', logical), 'invalid_native_mapping')
     relative = 'disk-fixtures/' + PurePosixPath(logical).name
     require(value['evidence_relative_path'] == relative, 'invalid_native_mapping')
-    actual = 'native/fixtures/' + relative
+    actual = group + '/fixtures/' + relative
     info = entries.get(actual, {})
     require(info.get('kind') == 'directory' and info['identity']['dev'] == value['device']
             and info['identity']['ino'] == value['inode'], 'native_mapping_identity_mismatch')
     return logical, actual
 
 
-def link_record(name, row, root, entries, mapping):
+def native_mappings(fd, entries, label):
+    """Aliases are independent per fixed group, including the legacy layout."""
+    if label != 'cutover-completion':
+        return None
+    require(all('/' in name or not name.startswith('native-') or name in NATIVE_GROUPS
+                for name in entries), 'unknown_native_group')
+    result = {}
+    for group in NATIVE_GROUPS:
+        mapping = native_mapping(fd, entries, group)
+        if mapping:
+            result[group] = mapping
+    return result
+
+
+def link_record(name, row, root, entries, mappings):
     """Lexical checks only: no stat, open, resolve or read on the link target."""
     target = row['target']
     path = PurePosixPath(target)
     require(target and '\x00' not in target and not target.startswith('//'), 'ambiguous_link_target')
     require('..' not in path.parts, 'ambiguous_link_parent_component')
+    group = PurePosixPath(name).parts[0]
     if path.is_absolute():
-        mappings = [(str(root), '')] + ([mapping] if mapping else [])
-        candidates = [(logical, actual) for logical, actual in mappings
+        mapping = mappings.get(group) if mappings is not None else None
+        aliases = [(str(root), '')] + ([mapping] if mapping else [])
+        candidates = [(logical, actual) for logical, actual in aliases
                       if path == PurePosixPath(logical) or PurePosixPath(logical) in path.parents]
         require(len(candidates) == 1, 'external_or_ambiguous_link_target')
         logical, actual = candidates[0]
@@ -264,6 +283,9 @@ def link_record(name, row, root, entries, mapping):
             normalized.pop()
         elif part != '.':
             normalized.append(part)
+    target_group = normalized[0] if normalized else None
+    if mappings is not None and (group in NATIVE_GROUPS or target_group in NATIVE_GROUPS):
+        require(group == target_group, 'cross_native_group_link')
     for index in range(1, len(normalized) + 1):
         require(entries.get('/'.join(normalized[:index]), {}).get('kind') != 'symlink', 'link_target_contains_link')
     return {'path': name, 'target': target, 'target_relative_path': '/'.join(normalized),
@@ -294,16 +316,16 @@ def prepare_source(label, root, output, budget, deadline, report):
             if row['kind'] == 'file':
                 key = (row['identity']['dev'], row['identity']['ino'])
                 inodes.setdefault(key, []).append(name)
-        mapping = None
+        mappings = {}
         try:
-            mapping = native_mapping(fd, entries, label)
+            mappings = native_mappings(fd, entries, label)
         except (OSError, ValueError):
             report['errors'].append({'source': label, 'code': 'invalid_native_mapping'})
         for name, row in entries.items():
             check_time(deadline)
             try:
                 if row['kind'] == 'symlink':
-                    report['links'].append({'source': label, **link_record(name, row, root, entries, mapping)})
+                    report['links'].append({'source': label, **link_record(name, row, root, entries, mappings)})
                 elif row['kind'] == 'file':
                     links = inodes[(row['identity']['dev'], row['identity']['ino'])]
                     require(len(links) == row['identity']['nlink'], 'hardlink_inventory_incomplete')

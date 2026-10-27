@@ -57,6 +57,8 @@ class CompletionNativeGuards(unittest.TestCase):
                     "tests/test_production_namespace_native.py", "tests/test_production_admission_image_sources.py",
                     "tests/test_production_admission_environment.py", "tests/test_production_sender_bootstrap.py",
                     "tests/test_production_sender_bootstrap_native.py", "tests/test_production_sender_native_bridge.py",
+                    "tests/test_production_receiver_bootstrap.py",
+                    "tests/test_production_receiver_bootstrap_native.py",
                     "tests/test_sender_external_postgres_identity.py"}
         actual = {node.value for node in ast.walk(ast.parse(runner.CONTAINER_TEST))
                   if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.startswith("tests/")}
@@ -292,7 +294,7 @@ def test_fixed_partition_keeps_every_file_once_and_programs_bind_collection():
     from collections import Counter
     runner.validate_groups()
     assert [(name, len(files)) for name, files in runner.TEST_GROUPS] == [
-        ("foundation", 22), ("activation", 12), ("adapters", 20)]
+        ("foundation", 22), ("activation", 12), ("adapters", 22)]
     selected = []
     for name, files in runner.TEST_GROUPS:
         program = runner.native_test_program(name)
@@ -357,6 +359,40 @@ def test_native_success_requires_every_collected_case_to_finish(drift):
         setattr(summary, drift, 29)
     assert summary.complete() is (drift is None)
     assert "summary.complete()" in runner.CONTAINER_TEST
+
+
+@pytest.mark.parametrize("outcome", ["passed", "failed", "skipped"])
+@pytest.mark.parametrize("family", ["fixture", "unittest"])
+def test_real_subtests_are_counted_separately_and_never_hide_failure(tmp_path, outcome, family):
+    path = tmp_path / "test_native_subtests.py"
+    action = {"passed": "assert True", "failed": "assert False", "skipped": "pytest.skip('synthetic skip')"}[outcome]
+    if family == "fixture":
+        source = ("import pytest\ndef test_two_subtests(subtests):\n"
+                  "    with subtests.test(case=1):\n        assert True\n"
+                  "    with subtests.test(case=2):\n        " + action + "\n")
+    else:
+        action = action.replace("pytest.skip", "self.skipTest")
+        source = ("import unittest\nclass TestNative(unittest.TestCase):\n"
+                  "    def test_two_subtests(self):\n"
+                  "        with self.subTest(case=1):\n            assert True\n"
+                  "        with self.subTest(case=2):\n            " + action + "\n")
+    path.write_text(source)
+    code = ("import pytest,sys,json; from scripts.verify_cutover_completion_native import NativeDiagnostics; "
+            "s=NativeDiagnostics(); r=pytest.main(['-q','-o','addopts=','-p','no:cacheprovider',sys.argv[1]], plugins=[s]); "
+            "print(json.dumps({'complete':s.complete(),'collected':s.collected,'started':s.started,'finished':s.finished,"
+            "'passed':s.passed,'subtests_passed':s.subtests_passed,'failed':s.failed,'skipped':s.skipped,"
+            "'subtests_failed':s.subtests_failed,'subtests_skipped':s.subtests_skipped})); sys.exit(r)")
+    result = subprocess.run([sys.executable, "-B", "-c", code, str(path)], cwd=ROOT,
+                            capture_output=True, text=True, timeout=20)
+    value = json.loads(result.stdout.splitlines()[-1])
+    assert value["collected"] == value["started"] == value["finished"] == 1
+    assert value["passed"] in ({0, 1} if outcome == "failed" else {1})
+    assert value["subtests_passed"] == (2 if outcome == "passed" else 1)
+    assert value["subtests_failed"] == int(outcome == "failed")
+    assert value["failed"] >= int(outcome == "failed")
+    assert value["subtests_skipped"] == value["skipped"] == int(outcome == "skipped")
+    assert value["complete"] is (outcome == "passed")
+    assert result.returncode == int(outcome == "failed")
 
 
 @pytest.mark.parametrize("failed_group", [None, "foundation", "activation", "adapters"])

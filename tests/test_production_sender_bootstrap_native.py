@@ -257,3 +257,39 @@ def test_old_synthetic_process_has_explicit_term_handler_and_exits_without_kill(
             process.wait(timeout=3)
         process.stdout.close()
         process.stderr.close()
+
+
+def test_legacy_mounts_same_retained_receiver_data_only_for_application_roles(tmp_path, monkeypatch):
+    from test_production_legacy_takeover import container
+    monkeypatch.setattr(native.legacy, "ROOT_UID", os.geteuid())  # Only the offline fixture owner.
+    root = tmp_path.resolve()
+    root.chmod(0o700)
+    launches = {}
+    harness = SimpleNamespace(owner="a" * 32, python_id="sha256:" + "b" * 64, names={})
+    def launch(role, image, options, command):
+        launches[role] = (image, options, command)
+        harness.names[role] = role
+    harness.launch = launch
+    harness.wait = lambda check, **_options: check()
+    def command(argv):
+        if argv[0] == "exec":
+            return "1"
+        role = argv[1].removeprefix("old-")
+        return json.dumps([container(list(native.legacy.ROLES).index(role) + 1, role)])
+    harness.command = command
+    record = native.legacy._record
+    def binaries(path, **options):
+        if str(path) in {"/usr/bin/flock", "/usr/bin/docker"}:
+            return {"path": str(path), "sha256": "c" * 64}, b"synthetic binary double"
+        return record(path, **options)
+    monkeypatch.setattr(native.legacy, "_record", binaries)
+    monkeypatch.setattr(native.legacy, "_process", lambda pid: {"pid": pid})
+    monkeypatch.setattr(native.legacy.NativeTransport, "host_boot", lambda _self: "synthetic-boot")
+    data = root / "original-data"
+    data.mkdir(mode=0o700)
+    native.prepare_legacy(harness, root, SimpleNamespace(pid=123), data)
+    wanted = "type=bind,src=" + str(data) + ",dst=/app/data"
+    assert wanted in launches["old-api"][1] and wanted in launches["old-worker"][1]
+    assert "--mount" not in launches["old-sender"][1]
+    assert wanted not in launches["old-gateway"][1]
+    assert all(item[2][-1] == native.OLD_PROCESS for item in launches.values())

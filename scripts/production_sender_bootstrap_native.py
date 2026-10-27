@@ -27,10 +27,12 @@ from services import admission_fence as gate  # noqa: E402
 from scripts import production_sender_bootstrap as bootstrap  # noqa: E402
 from scripts import production_legacy_takeover as legacy  # noqa: E402
 from scripts import production_namespace_native as export  # noqa: E402
+from scripts import production_receiver_bootstrap_native as receiver_native  # noqa: E402
 from scripts.verify_miniflux_pause_native import Harness, source_binding, sha, image_checks, memory_evidence  # noqa: E402
 
 SAFE_FILES = ("SOURCE.json", "SEED132.json", "LEGACY_STOP.json", "CREATED.json", "STARTED.json",
-              "CLOSED.json", "QUERY.json", "PROOF.json", "RESULT.json", "FAILURE.json", "CANDIDATE_FINAL.json")
+              "CLOSED.json", "QUERY.json", "PROOF.json", "RESULT.json", "FAILURE.json", "CANDIDATE_FINAL.json",
+              "RECEIVER_OLD_STORAGE.json", "RECEIVER_BOOTSTRAP_PROOF.json", "RECEIVER_SQLITE_PRESERVED.json")
 MAX_SECONDS = 180
 OLD_PROCESS = ("import signal,sys,time; signal.signal(signal.SIGTERM,lambda *_:sys.exit(0)); "
                "print('synthetic_TERM_ready',flush=True); time.sleep(600)")
@@ -145,7 +147,7 @@ def cron_command(path):
             + " fd=os.open(p.parent,os.O_RDONLY|os.O_DIRECTORY); os.fsync(fd); os.close(fd)\n").encode()
 
 
-def prepare_legacy(harness, directory, daemon):
+def prepare_legacy(harness, directory, daemon, receiver_data):
     operation, now = gate._hash({"synthetic-legacy": harness.owner}), int(time.time())
     route = _record(directory / "gateway.conf", b"# owned synthetic original gateway\n")
     rows = {}
@@ -153,6 +155,8 @@ def prepare_legacy(harness, directory, daemon):
         extra = ["--read-only", "--cap-drop=ALL", "--user", "0:0"]
         if role == "gateway":
             extra += ["--mount", "type=bind,src=" + route["path"] + ",dst=/etc/nginx/conf.d/default.conf,readonly"]
+        if role in {"api", "worker"}:
+            extra += ["--mount", "type=bind,src=" + str(receiver_data) + ",dst=/app/data"]
         harness.launch("old-" + role, harness.python_id, extra, ["python", "-I", "-B", "-c", OLD_PROCESS])
         harness.wait(lambda: harness.command(["exec", harness.names["old-" + role], "python", "-I", "-c", TERM_READY]).strip() == "1",
                      seconds=3, readiness=True)
@@ -272,13 +276,19 @@ def closed_http(harness, actual):
 
 
 def exercise(harness, binding, daemon, records):
+    with receiver_native.prepared(harness.output) as receiver:
+        with receiver_native.receiver.retained_release_lock(receiver["release_lock"]) as release:
+            return exercise_locked(harness, binding, daemon, records, receiver, release)
+
+
+def exercise_locked(harness, binding, daemon, records, receiver, release):
     root = harness.output
     directory, evidence = root / "inputs", root / "bootstrap"
     directory.mkdir(mode=0o700)
     evidence.mkdir(mode=0o700)
     old = root / "legacy"
     old.mkdir(mode=0o700)
-    path = prepare_legacy(harness, directory, daemon)
+    path = prepare_legacy(harness, directory, daemon, receiver["data"])
     with legacy.locked_takeover(path, old) as cap:
         stopped = cap.stop()
         _save(root / "LEGACY_STOP.json", stopped)
@@ -303,11 +313,16 @@ def exercise(harness, binding, daemon, records):
         gate._require(actual["Mounts"] == [], "external PG sender unexpectedly gained a dummy mount")
         denied = closed_http(harness, actual)
         _deadline(harness)
+        driver = bootstrap._driver(cap, plan, evidence, recovery=True)
+        receiver_proof = receiver_native.exercise(root, receiver, cap, release, driver, binding["revision"])
+        _deadline(harness)
         proof = {"status": "passed", "synthetic_only": True, "production_access": False, "real_models": 0,
             "container_id": actual["Id"], "image_id": actual["Image"], "actual_mounts": [], "schema_before": 132,
             "schema_after": identity["schema_version"], "postgres_identity": identity, "closed_receipt": closed["pg_receipt"],
             "business_http_status": 503, "business_request": denied, "open_actions": 0, "namespace_transport": True,
             "duplicate_create_start_initialize_rejected": True,
+            "receiver_metadata_bootstrap": {"operation_id": receiver_proof["result"]["operation_id"],
+                                            "proof_sha256": gate._hash(receiver_proof)},
             "old_retained": cap.check_stopped(), "cron_scope": "synthetic_file_command_not_system_cron",
             "historical_raw_coverage": "unknown_before_T0_no_replay", "binary": created["binary"],
             "build_original_sha256": {name: value["sha256"] for name, value in records["files"].items()},
