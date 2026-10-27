@@ -7,6 +7,13 @@ from scripts import production_startup_pg_fixture as fixture
 from services.sender_drain_contract import DrainContractError
 
 
+def test_fixture_options_use_uri_percent_space_not_form_plus():
+    schema = "sender_fixture_" + "a" * 24
+    dsn = fixture.fixture_dsn("postgres://localhost/synthetic_outbox?sslmode=disable", schema)
+    assert "options=-c%20search_path%3D" + schema in dsn
+    assert "+" not in dsn
+
+
 @pytest.mark.parametrize("dsn", [
     "postgres://localhost/production", "postgres://production.invalid/synthetic_outbox",
     "postgres://localhost/synthetic_outbox?host=production.invalid",

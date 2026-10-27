@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 import re
 import secrets
-from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qs, quote, urlencode, urlsplit, urlunsplit
 
 from scripts import sender_drain_inventory as inventory
 from services.sender_drain_contract import HEX64, require
@@ -50,7 +50,8 @@ def fixture_dsn(raw, schema):
     require(set(query) <= {"sslmode", "connect_timeout"}
             and re.fullmatch(r"sender_fixture_[0-9a-f]{24}", schema), "unrecognized fixture connection override")
     query["options"] = ["-c search_path=" + schema]
-    return urlunsplit((url.scheme, url.netloc, url.path, urlencode(query, doseq=True), ""))
+    # libpq URI decoding does not treat form-encoded '+' as a space.
+    return urlunsplit((url.scheme, url.netloc, url.path, urlencode(query, doseq=True, quote_via=quote), ""))
 
 
 def create_fixture(raw_dsn, miniflux_source):

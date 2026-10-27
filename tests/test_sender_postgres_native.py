@@ -8,8 +8,26 @@ import pytest
 
 from services import sender_drain_contract as contract
 from scripts import sender_drain_inventory as inventory
-from scripts.production_startup_pg_fixture import create_fixture, close_fixture as close_seeded, phase
+from scripts.production_startup_pg_fixture import create_fixture, close_fixture as close_seeded, fixture_dsn, phase
 from test_sender_drain_contract import synthetic_manifest
+
+
+def test_actual_libpq_fixture_uri_parser_without_database_connection():
+    if not os.environ.get("MINIFLUX_OUTBOX_TEST_DSN"):
+        pytest.importorskip("psycopg", reason="host-only libpq dependency not installed")
+    from psycopg.conninfo import conninfo_to_dict
+
+    schema = "sender_fixture_" + "a" * 24
+    raw = "postgres://synthetic:literal%2Bplus@127.0.0.1:5432/synthetic_outbox?sslmode=disable&connect_timeout=3"
+    dsn = fixture_dsn(raw, schema)
+    parsed = conninfo_to_dict(dsn)
+    assert parsed["options"] == "-c search_path=" + schema
+    assert parsed["password"] == "literal+plus"
+    assert parsed["connect_timeout"] == "3" and parsed["sslmode"] == "disable"
+    # Preserve the original failure: libpq, unlike parse_qs, keeps this '+'.
+    old_form_encoded = dsn.replace("%20", "+")
+    assert conninfo_to_dict(old_form_encoded)["options"] == "-c+search_path=" + schema
+    phase("actual_libpq_uri_percent_space_parsed_without_connect")
 
 
 @pytest.fixture
