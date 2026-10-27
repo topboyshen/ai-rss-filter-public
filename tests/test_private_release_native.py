@@ -1,4 +1,4 @@
-"""Failure reporting tests without invoking Docker or reading private inputs."""
+"""Synthetic failure reporting and private seal tests without invoking Docker."""
 
 import json
 from pathlib import Path
@@ -6,6 +6,8 @@ from pathlib import Path
 import pytest
 
 from scripts import verify_private_release_native as native
+from scripts import private_release_contract as private
+from scripts import production_startup_fixture as fixture
 
 
 def test_native_failure_retains_previous_stages_without_private_error_text(tmp_path):
@@ -94,3 +96,56 @@ def test_reader_identity_proof_keeps_capabilities_dropped_and_file_private(tmp_p
     assert all(args[args.index("--cap-drop") + 1] == "ALL" and "--cap-add" not in args for args in calls)
     assert "except PermissionError" in calls[0][-1]
     assert config.stat().st_mode & 0o777 == 0o400
+
+
+def test_native_manifest_seals_and_reloads_with_actual_private_contract(tmp_path, monkeypatch):
+    """Only Docker discovery is doubled; Git/config/manifest/seal are real."""
+    import subprocess
+    from core import config
+    repo = tmp_path / "public"
+    repo.mkdir()
+    (repo / "config.yaml").write_text("public_base_url: https://example.invalid\n")
+    (repo / "docker-compose.yml").write_text("services: {}\n")
+    (repo / "Dockerfile").write_text("FROM python@sha256:" + "b" * 64 + "\n")
+    for args in (["init", "-q"], ["add", "."], ["-c", "user.name=Synthetic", "-c", "user.email=fixture@example.org", "commit", "-qm", "fixture"]):
+        subprocess.run(["git", "-C", str(repo), *args], capture_output=True, check=True)
+    directory = tmp_path / "private"
+    directory.mkdir(mode=0o700)
+    paths = {name: directory / name for name in ("data", "fence", "grants", "slots", "project")}
+    for path in paths.values():
+        path.mkdir(mode=0o700)
+    cfg, environment = directory / "runtime.yaml", directory / "environment"
+    fixture.save(cfg, b"threshold:\n  pass: 7\nscoring_strategy_version: synthetic-startup\nfeeds: []\n")
+    fixture.save(environment, b"AI_FILTER_API_KEY=synthetic-not-used-for-a-request\n")
+    monkeypatch.setenv("AI_FILTER_API_KEY", "synthetic-not-used-for-a-request")
+    monkeypatch.setattr(config, "CONFIG_PATH", str(cfg))
+    manifest = fixture.manifest_input(paths, "synthetic-native", "a" * 64, 4, {"synthetic": True})
+    manifest_path = directory / "manifest.json"
+    fixture.save(manifest_path, manifest)
+    records = []
+    for number, (name, service) in enumerate(manifest["services"].items()):
+        mounts = [{"Type": "bind", "Source": str(cfg) if m["source"] == private.RUNTIME else m["source"],
+                   "Destination": m["target"], "RW": not m.get("read_only", False)} for m in service["volumes"]]
+        records.append({"Id": str(number) * 64, "Image": "sha256:" + "b" * 64, "State": {"Running": False},
+            "Config": {"Labels": {"com.docker.compose.service": name}}, "Mounts": mounts,
+            "HostConfig": {"PortBindings": {}}, "NetworkSettings": {"Networks": {"none": {}}}})
+    original_run = private.run
+    def run(args, **kwargs):
+        if args[0] == "docker":
+            assert "create" in args
+            return b""
+        return original_run(args, **kwargs)
+    monkeypatch.setattr(private, "run", run)
+    monkeypatch.setattr(private, "inspect_project", lambda _: records)
+    p = {"directory": directory, "source": private.source_identity(repo), "manifest": manifest, "config": cfg,
+         "paths": paths, "project": "synthetic-native", "manifest_path": manifest_path, "environment": environment,
+         "strategy": config.load_config()["scoring_strategy_version"]}
+    try:
+        sealed = fixture.seal_inputs(repo, p)
+        contract, actual, _digest = private.load(sealed, repo, require_fresh=True)
+        assert contract["review"]["strategy"] == p["strategy"]
+        assert set(actual["services"]) == {"ai-filter-api", "ai-filter-worker"}
+        assert all(s["memswap_limit"] == "768m" and s["network_mode"] == "none" for s in actual["services"].values())
+    finally:
+        if (directory / "sealed").exists():
+            (directory / "sealed").chmod(0o700)
