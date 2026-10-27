@@ -24,6 +24,7 @@ class CompletionNativeGuards(unittest.TestCase):
                     "tests/test_frozen_cutover_actual_startup.py", "tests/test_miniflux_handoff_adapter.py",
                     "tests/test_miniflux_host_joint_native.py", "tests/test_durable_handoff_crash_diagnostics.py",
                     "tests/test_durable_handoff_cutover.py", "tests/test_production_migration.py",
+                    "tests/test_production_startup.py", "tests/test_production_startup_native.py",
                     "tests/test_production_sender_driver.py", "tests/test_sender_drain_contract.py",
                     "tests/test_sender_pg_deadlines.py", "tests/test_production_startup_pg_fixture.py",
                     "tests/test_receiver_drain_transfer.py", "tests/test_receiver_drain_driver.py",
