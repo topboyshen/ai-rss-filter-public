@@ -66,6 +66,18 @@ def _begin_request():
         return None
     try:
         declared_request_bytes = _declared_request_bytes()
+        if (kind == "intake" and request.method == "POST"
+                and request.endpoint == "webhook.webhook_receiver"
+                and request.url_rule.rule == "/webhook"):
+            fence = admission_fence._configured()
+            if fence is not None and fence.snapshot()["phase"] == "draining":
+                from services.receiver_drain_transfer import admitted_webhook_task
+                signature = request.headers.get("X-Miniflux-Signature", "").strip()
+                if signature.lower().startswith("sha256="):
+                    signature = signature.split("=", 1)[1].strip()
+                task = admitted_webhook_task(request.get_data(), request.url, signature)
+                setattr(g, "_admission_frozen_delivery_task", task)
+                kind = "drain"
         # This is an admission reservation, not actual/persisted body usage.
         lease = admission_fence.reserve_lease(
             "http_request", kind=kind, charge_bytes=declared_request_bytes
@@ -77,7 +89,12 @@ def _begin_request():
             lease.finish(False)
             raise
         setattr(g, _REQUEST_LEASE, (lease, activation))
+        if hasattr(g, "_admission_frozen_delivery_task"):
+            from services.receiver_drain_transfer import confirm_admitted_webhook
+            confirm_admitted_webhook(request.get_data())
     except Exception:
+        if hasattr(g, _REQUEST_LEASE):
+            _finish_request(False)
         logger.warning("HTTP admission refused", exc_info=False)
         return _unavailable()
     return None

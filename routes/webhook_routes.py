@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode, urlsplit
 
-from flask import Blueprint, Response, request
+from flask import Blueprint, Response, g, request
 
 from routes.shared import _cfg, DB
 from core.processor import (
@@ -281,6 +281,23 @@ def _locked_spool_admitted():
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
+
+
+@contextmanager
+def locked_transfer_spool():
+    """The SAME spool locks, with bounded waits for the transfer controller."""
+    from services import admission_fence as gate
+    from services.receiver_drain_storage import create_lock
+    with admission("transfer_spool", kind="drain"):
+        gate._require(_webhook_spool_lock.acquire(timeout=1), "transfer spool thread lock busy")
+        try:
+            directory = Path(_webhook_spool_dir)
+            gate._directory(directory)
+            create_lock(directory / _SPOOL_LOCK_FILE)
+            with gate._locked(directory / _SPOOL_LOCK_FILE, True, 1):
+                yield directory
+        finally:
+            _webhook_spool_lock.release()
 
 
 def _fsync_directory(directory: Path, *, strict: bool = True) -> None:
@@ -659,48 +676,47 @@ def _public_delivery(directory: Path, record: dict) -> dict:
 @guarded("persist_delivery", kind="inherit")
 def _persist_webhook_delivery(task: dict, body: bytes) -> tuple[str, dict]:
     """Acknowledge only a synced queue AND an independently retained raw receipt."""
-    digest = _task_digest(task)
     with _locked_spool() as directory:
-        store = _receipt_store(directory)
-        existing = store.find_task(digest)
-        if existing:
-            receipt, _ = store.accept(
-                body, task, strategy=existing["accepted_strategy"],
-                revision=existing["accepted_revision"],
-            )
-            return "duplicate", _public_delivery(directory, receipt)
-        paths = [directory / f"{digest}.json", directory / _SPOOL_INFLIGHT_DIR / f"{digest}.json"]
-        paths.extend((directory / _SPOOL_DLQ_DIR).glob(f"{digest}.*.json"))
-        present = [path for path in paths if path.exists()]
-        if len(present) > 1:
-            raise ValueError("delivery has ambiguous queue state")
-        if present:
-            envelope = _load_spooled_task(present[0])
-            if envelope is None or "receipt_context" not in envelope:
-                raise ValueError("legacy task has no verifiable delivery receipt")
-            _confirm_spool_file(present[0])
-            primary = _delivery_receipt(directory, envelope)
-            receipt, _ = store.accept(
-                body, task, strategy=primary["accepted_strategy"],
-                revision=primary["accepted_revision"],
-            )
-            return "duplicate", _public_delivery(directory, receipt)
-        if digest in _load_receipts_unlocked(directory):
-            raise ValueError("legacy completion cannot prove durable delivery")
-        if _active_task_count_unlocked(directory) >= _webhook_spool_max_tasks:
-            raise OSError("delivery queue is full")
-        envelope = _new_spool_envelope(task, digest)
-        envelope["receipt_context"] = {
-            "raw_body_b64": base64.b64encode(body).decode("ascii"),
-            "strategy": _delivery_strategy(),
-            "revision": os.environ.get("AI_FILTER_REVISION", "unknown"),
-            "accepted_at": envelope["created_at"],
-        }
-        _atomic_write(directory, paths[0], _canonical_json(envelope))
-        receipt = _delivery_receipt(directory, envelope)
-        result = _public_delivery(directory, receipt)
+        result = persist_delivery_locked(directory, task, body)
     _webhook_dispatcher_wake.set()
-    return "stored", result
+    return result
+
+
+@guarded("persist_delivery_locked", kind="inherit")
+def persist_delivery_locked(directory: Path, task: dict, body: bytes) -> tuple[str, dict]:
+    """Shared durable path; caller holds the real admission AND spool locks."""
+    digest = _task_digest(task)
+    store = _receipt_store(directory)
+    existing = store.find_task(digest)
+    if existing:
+        receipt, _ = store.accept(body, task, strategy=existing["accepted_strategy"], revision=existing["accepted_revision"])
+        return "duplicate", _public_delivery(directory, receipt)
+    paths = [directory / f"{digest}.json", directory / _SPOOL_INFLIGHT_DIR / f"{digest}.json"]
+    paths.extend((directory / _SPOOL_DLQ_DIR).glob(f"{digest}.*.json"))
+    present = [path for path in paths if path.exists()]
+    if len(present) > 1:
+        raise ValueError("delivery has ambiguous queue state")
+    if present:
+        envelope = _load_spooled_task(present[0])
+        if envelope is None or "receipt_context" not in envelope:
+            raise ValueError("legacy task has no verifiable delivery receipt")
+        _confirm_spool_file(present[0])
+        primary = _delivery_receipt(directory, envelope)
+        receipt, _ = store.accept(body, task, strategy=primary["accepted_strategy"], revision=primary["accepted_revision"])
+        return "duplicate", _public_delivery(directory, receipt)
+    if digest in _load_receipts_unlocked(directory):
+        raise ValueError("legacy completion cannot prove durable delivery")
+    if _active_task_count_unlocked(directory) >= _webhook_spool_max_tasks:
+        raise OSError("delivery queue is full")
+    envelope = _new_spool_envelope(task, digest)
+    envelope["receipt_context"] = {
+        "raw_body_b64": base64.b64encode(body).decode("ascii"),
+        "strategy": _delivery_strategy(), "revision": os.environ.get("AI_FILTER_REVISION", "unknown"),
+        "accepted_at": envelope["created_at"],
+    }
+    _atomic_write(directory, paths[0], _canonical_json(envelope))
+    receipt = _delivery_receipt(directory, envelope)
+    return "stored", _public_delivery(directory, receipt)
 
 
 def _submit_webhook_delivery(task: dict, body: bytes) -> tuple[str, dict | None]:
@@ -2180,52 +2196,34 @@ class _WebhookEntry:
 # ── 路由 ─────────────────────────────────────────────────────
 
 
-@webhook_bp.route("/webhook", methods=["POST"])
-def webhook_receiver():
-    """验签后严格同步任务及原始消息回执；202只表示接收保全。"""
-    body = request.get_data()
-    if not _delivery_header_valid(body):
-        return _delivery_response({"error": "delivery_identity_mismatch"}, 400)
+class WebhookPayloadError(ValueError):
+    def __init__(self, message, status=400, **details):
+        super().__init__(message)
+        self.payload = {"error": message, **details}
+        self.status = status
 
+
+def normalize_webhook_delivery(body: bytes) -> dict:
+    """The one normalization path, frozen once for a controlled transfer."""
     try:
         payload = json.loads(body)
-    except Exception:
-        return Response(
-            json.dumps({"error": "Invalid JSON"}),
-            status=400,
-            mimetype="application/json",
-        )
-
+    except Exception as error:
+        raise WebhookPayloadError("Invalid JSON") from error
     if not isinstance(payload, dict) or "entries" not in payload:
-        return Response(
-            json.dumps({"error": "Missing entries"}),
-            status=400,
-            mimetype="application/json",
-        )
-
+        raise WebhookPayloadError("Missing entries")
     entries = payload.get("entries")
     if not isinstance(entries, list):
-        return Response(
-            json.dumps({"error": "entries must be an array"}),
-            status=400,
-            mimetype="application/json",
-        )
+        raise WebhookPayloadError("entries must be an array")
     if len(entries) > _webhook_max_entries:
-        return Response(
-            json.dumps({"error": "Too many entries", "max_entries": _webhook_max_entries}),
-            status=413,
-            mimetype="application/json",
-        )
-
+        raise WebhookPayloadError("Too many entries", 413, max_entries=_webhook_max_entries)
     feed_info = payload.get("feed", {})
     if not isinstance(feed_info, dict):
         feed_info = {}
     normalized_entries = _normalize_webhook_entries(entries, _cfg())
-
     raw_feed_url = _clip_text(
         feed_info.get("feed_url", "unknown"), _MAX_URL_CHARS
     )
-    task = {
+    return {
         # Canonicalize before hashing/persisting the durable task.  Otherwise
         # Miniflux's pre-rewrite URL and the container URL can occupy two queue
         # slots and emit the same article twice.
@@ -2233,6 +2231,19 @@ def webhook_receiver():
         "entries": normalized_entries,
     }
 
+
+@webhook_bp.route("/webhook", methods=["POST"])
+def webhook_receiver():
+    """验签后严格同步任务及原始消息回执；202只表示接收保全。"""
+    body = request.get_data()
+    if not _delivery_header_valid(body):
+        return _delivery_response({"error": "delivery_identity_mismatch"}, 400)
+    try:
+        task = getattr(g, "_admission_frozen_delivery_task", None)
+        if task is None:
+            task = normalize_webhook_delivery(body)
+    except WebhookPayloadError as error:
+        return _delivery_response(error.payload, error.status)
     submission, receipt = _submit_webhook_delivery(task, body)
     if not submission or submission == "full":
         response = Response(

@@ -1,0 +1,56 @@
+name: Private release config native
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [master, 'codex/**']
+    paths:
+      - 'scripts/private_release_contract.py'
+      - 'scripts/verify_private_release_native.py'
+      - 'scripts/release.sh'
+      - 'scripts/run-release-gate.sh'
+      - 'tests/test_private_release_*.py'
+      - 'tests/test_release_script.py'
+      - 'Dockerfile'
+      - 'core/config.py'
+      - '.github/workflows/private-release-config.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'scripts/*release*'
+      - 'tests/test_private_release_*.py'
+      - 'Dockerfile'
+      - 'core/config.py'
+      - '.github/workflows/private-release-config.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  native-amd64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Install config parser from pinned production requirements
+        run: python -m pip install -r requirements-prod.txt
+      - name: Native synthetic config, image, and existing project proof
+        run: python -I -B scripts/verify_private_release_native.py --repo . --output "${RUNNER_TEMP}/private-release-public-report"
+      - name: Preserve public allowlisted result only
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: private-release-config-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/private-release-public-report/report.json
+          if-no-files-found: error
+          retention-days: 14

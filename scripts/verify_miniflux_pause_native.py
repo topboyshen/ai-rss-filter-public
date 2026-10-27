@@ -303,14 +303,14 @@ class Harness:
                                               "source_lock": sha(self.repo / "ops/miniflux/pause-source-lock.json")}, sort_keys=True).encode()).hexdigest()
         self.manifest = manifest
         self.launch("sender", self.image_id, ["--read-only", "--cap-drop=ALL", "--tmpfs", "/tmp:rw,nosuid,nodev,size=16777216",
-                    "--label", "io.ai-filter.handoff.role=miniflux-synthetic",
+                    "--label", "io.ai-filter.handoff.role=" + getattr(self, "sender_role", "miniflux-synthetic"),
                     "--mount", "type=bind,src=" + str(self.repo / "ops/miniflux/pause-source-lock.json") + ",dst=/handoff-source-lock.json,readonly",
                     "-e", "DATABASE_URL=postgres://synthetic:" + self.password + "@pg:5432/synthetic_pause?sslmode=disable",
                     "-e", "RUN_MIGRATIONS=1", "-e", "CREATE_ADMIN=1", "-e", "ADMIN_USERNAME=synthetic",
                     "-e", "ADMIN_PASSWORD=" + self.password, "-e", "LISTEN_ADDR=0.0.0.0:8080",
                     "-e", "LOG_LEVEL=debug", "-e", "POLLING_FREQUENCY=1", "-e", "WORKER_POOL_SIZE=1",
                     "-e", "INTEGRATION_ALLOW_PRIVATE_NETWORKS=1", "-e", "FETCHER_ALLOW_PRIVATE_NETWORKS=1", "-e", "WEBHOOK_OUTBOX=1",
-                    "-e", "WEBHOOK_OUTBOX_CONTRACT=synthetic-no-model-contract", "-e", "HANDOFF_ENABLED=1",
+                    "-e", "WEBHOOK_OUTBOX_CONTRACT=" + getattr(self, "sender_contract", "synthetic-no-model-contract"), "-e", "HANDOFF_ENABLED=1",
                     "-e", "HANDOFF_MANIFEST=" + manifest, "-e", "HANDOFF_CONTROL_ADDR=127.0.0.1:8787",
                     "-e", "HANDOFF_CONTROL_TOKEN=" + self.token])
         copied = self.output / "actual-miniflux"
@@ -491,6 +491,102 @@ class Harness:
                   "inflight_postgres": snapshot, "closed": result, "acked_outbox": row})
         return operation
 
+    def checked_draining(self, value, operation, *, confirmed=True):
+        result = self.checked_receipt(value, operation, "draining", action="stop_new", confirmed=confirmed)
+        for field in ("active_producer_leases", "uncertain_producer_leases"):
+            if type(result.get(field)) is not int or result[field] < 0 or (confirmed and result[field] != 0):
+                raise ValueError("stop-new lacks exact producer completion counts")
+        return result
+
+    def stop_new_drain_case(self, prior):
+        # Operation identities are retained across every native scenario. Keep
+        # this added scenario separate from the existing joint-host 5/6 IDs.
+        resumed = self.resume(prior, hashlib.sha256(b"native:stop-new-drain:resume").hexdigest())
+        self.items.extend(["drain_first", "drain_queued"])
+        self.control(self.items, hold=True)
+        self.refresh()
+        received = self.wait(lambda: next((r for r in self.events()
+            if r["kind"] == "webhook_received" and r["held"]
+            and any(json.loads(base64.b64decode(r["body_b64"]))["entries"][0]["url"].endswith("/" + key)
+                    for key in ("drain_first", "drain_queued"))), None), seconds=4)
+        backlog = [r for r in self.outbox() if any(
+            json.loads(base64.b64decode(r["body_b64"]))["entries"][0]["url"].endswith("/" + key)
+            for key in ("drain_first", "drain_queued"))]
+        if len(backlog) != 2 or not any(r["attempts"] == 0 and r["state"] == "pending" for r in backlog):
+            raise ValueError("no actual unclaimed durable backlog before stop-new")
+        operation = hashlib.sha256(b"native:stop-new-drain:stop-new").hexdigest()
+        pending = self.private_control("/stop-new", "POST", {"operation_id": operation}, expected=(200, 409))
+        self.checked_draining(pending, operation, confirmed=pending.get("confirmed") is True)
+        self.refresh(expected=503)
+        self.http("sender", f"/v1/entries/{self.entry_id}/save", "POST", expected=503)
+        self.control(self.items, release=True)
+        rows = [self.wait(lambda key=key: self.proved_row(key)) for key in ("drain_first", "drain_queued")]
+        if {r["body_sha256"] for r in rows} != {r["body_sha256"] for r in backlog}:
+            raise ValueError("drain changed original durable body identity")
+        result = self.checked_draining(self.private_control("/operations/" + operation), operation)
+        before = self.gate_snapshot()
+        if before["state"][0]["phase"] != "draining":
+            raise ValueError("stop-new did not retain durable draining phase")
+        # A real scheduler timer must reach the closed producer boundary.
+        baseline = self.command(["logs", self.names["sender"]]).count("Handoff scheduler admission refused")
+        feeds_before = len([r for r in self.events() if r["kind"] == "feed"])
+        self.sql("UPDATE feeds SET next_check_at=clock_timestamp()-interval '1 second' WHERE id=" + str(self.feed_id) + ";")
+        logs = self.wait(lambda: r if (r := self.command(["logs", self.names["sender"]])).count("Handoff scheduler admission refused") > baseline else None, seconds=75)
+        if len([r for r in self.events() if r["kind"] == "feed"]) != feeds_before:
+            raise ValueError("draining scheduler produced another feed request")
+        self.sample_memory("sender", "before_draining_restart")
+        self.command(["stop", "--time=15", self.names["sender"]], timeout=20)
+        self.command(["start", self.names["sender"]])
+        self.wait(lambda: self.http("sender", "/healthcheck"), readiness=True)
+        self.refresh(expected=503)
+        restarted = self.checked_draining(self.private_control("/operations/" + operation), operation)
+        freeze = hashlib.sha256(b"native:stop-new-drain:freeze").hexdigest()
+        self.private_control("/pause", "POST", {"operation_id": freeze}, expected=(200, 409))
+        closed = self.wait(lambda: self.query_closed(freeze))
+        self.case("STOP_NEW_DRAINS_BACKLOG_AND_RESTART", {"resume": resumed, "inflight_handshake": received,
+            "backlog_before_stop_new": backlog, "stop_new_response": pending, "confirmed_stop_new": result,
+            "acked_originals": rows, "draining_postgres": before, "restart_draining": restarted,
+            "scheduler_refusal_observed": logs.count("Handoff scheduler admission refused") > baseline,
+            "full_pause": closed, "stop_new_is_queue_empty_proof": False})
+        return freeze
+
+    def staged_host_bridge_case(self):
+        from miniflux_handoff_adapter import MinifluxDrainControl, source_sha256 as bridge_source
+        from miniflux_host_joint_native import component
+
+        prior = self.gate_snapshot()["state"]
+        if len(prior) != 1 or prior[0]["phase"] != "closed":
+            raise ValueError("staged host bridge requires the actual prior closed operation")
+        resume = hashlib.sha256(b"native:staged-host:resume").hexdigest()
+        resumed = self.resume(prior[0]["current_operation"], resume)
+        def inspect():
+            return json.loads(self.command(["inspect", self.names["sender"]]))
+        row = inspect()[0]
+        binding = {"schema": 1, "scope": "instrumented_sender_only", "run_id": self.owner,
+                   "control_id": "miniflux", "component_name": row["Name"].lstrip("/"), "component": component(row),
+                   "manifest": self.manifest, "application_source_sha256": sha(self.repo / "ops/miniflux/pause-source-lock.json"),
+                   "source_sha256": bridge_source(), "generation": resumed["generation"],
+                   "initial_operation_id": resume, "entrances": ["miniflux_scheduler", "miniflux_manual", "legacy_async_sender"]}
+        harness = self
+        class Client:
+            def request(self, method, path, payload):
+                return harness.private_exchange(path, method, payload)
+        control = MinifluxDrainControl(binding, Client(), inspect, self.output / "staged-host-bridge")
+        operation = hashlib.sha256(b"native:staged-host:stop-new").hexdigest()
+        stop = control.stop_new(operation, resumed["generation"], "actual synthetic host producer stop")
+        queried_stop = control.query_stop_new(operation)
+        self.refresh(expected=503)
+        stopped_snapshot = self.gate_snapshot()
+        freeze = hashlib.sha256(b"native:staged-host:freeze").hexdigest()
+        paused = control.freeze(freeze, operation, "actual synthetic host full pause")
+        queried_pause = control.query_freeze(freeze)
+        closed = self.query_closed(freeze)
+        self.case("ACTUAL_STAGED_HOST_BRIDGE", {"binding": binding, "producer_stop": stop,
+            "queried_stop": queried_stop, "draining_postgres": stopped_snapshot,
+            "pause": paused, "queried_pause": queried_pause, "closed": closed,
+            "queue_checked": False, "legacy_originals_proven": False, "switch_authorized": False,
+            "scope": "actual host bridge phases only; independent inventory and receiver transfer tested separately"})
+
     def postgres_restart_case(self, closed):
         before = self.gate_snapshot()
         self.sample_memory("pg", "before_restart")
@@ -598,10 +694,12 @@ def run(repo, source, image_id, binary, output):
         closed = harness.legacy_async_case()
         harness.restart_closed_case(closed)
         closed = harness.outbox_inflight_case(closed)
+        closed = harness.stop_new_drain_case(closed)
         harness.postgres_restart_case(closed)
         harness.closed_scheduler_case()
         from miniflux_host_joint_native import run as joint_run
         joint_run(harness, closed)
+        harness.staged_host_bridge_case()
     except Exception as failure:
         error = {"type": type(failure).__name__, "message": harness.redacted(str(failure))}
         save(output / "FAILURE.json", error)
@@ -616,7 +714,7 @@ def run(repo, source, image_id, binary, output):
         if error is None and evidence_errors:
             error = {"type": "EvidencePreservationIncomplete", "message": str(evidence_errors)}
     cases = sorted(path.name for path in output.glob("CASE_*.json"))
-    result = {"status": "passed" if error is None and len(cases) == 8 else "failed_or_evidence_insufficient",
+    result = {"status": "passed" if error is None and len(cases) == 10 else "failed_or_evidence_insufficient",
               "cases": cases, "error": error, "evidence_errors": evidence_errors, "elapsed_seconds": time.monotonic() - harness.started,
               "native_amd64": True, "resource_limits": {"sender_memory_bytes": MEMORY, "sender_pids": PIDS},
               "retained_network": harness.network, "retained_containers": list(harness.names.values()),

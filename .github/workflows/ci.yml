@@ -163,13 +163,21 @@ jobs:
             AI_FILTER_CUTOVER_EVIDENCE_DIR="${RUNNER_TEMP}/ai-filter-synthetic-cutover-evidence" \
             ./scripts/run-release-tests.sh full
 
+      - name: Prepare synthetic evidence without following links
+        if: always()
+        run: |
+          python -I -B scripts/prepare_synthetic_evidence.py \
+            --source "synthetic=${RUNNER_TEMP}/ai-filter-synthetic-cutover-evidence" \
+            --output "${RUNNER_TEMP}/ai-filter-synthetic-upload"
+
       - name: Preserve isolated synthetic cutover evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: synthetic-cutover-python-3.11-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/ai-filter-synthetic-cutover-evidence/
-          if-no-files-found: warn
+          path: ${{ runner.temp }}/ai-filter-synthetic-upload/
+          include-hidden-files: true
+          if-no-files-found: error
           retention-days: 14
 
       - name: Validate Compose and build the production image
@@ -202,6 +210,8 @@ jobs:
             --build-arg AI_FILTER_BUILD_MANIFEST_SHA="${manifest_sha}" \
             --build-arg AI_FILTER_BUILD_CONFIG_SHA="${config_sha}" \
             --build-arg AI_FILTER_BUILD_SOURCE_ID="${source_identity}" \
+            --build-arg AI_FILTER_PRIVATE_RELEASE_SHA=none \
+            --build-arg AI_FILTER_RUNTIME_CONFIG_SHA="${config_sha}" \
             --build-arg AI_FILTER_MAPPING_MIGRATION_GENERATION="${mapping_generation}" .
 
           assert_image_label() {
@@ -219,6 +229,8 @@ jobs:
           assert_image_label io.ai-filter.compose-manifest.sha256 "${manifest_sha}"
           assert_image_label io.ai-filter.config.sha256 "${config_sha}"
           assert_image_label io.ai-filter.source.identity "${source_identity}"
+          assert_image_label io.ai-filter.private-release.sha256 none
+          assert_image_label io.ai-filter.runtime-config.sha256 "${config_sha}"
           assert_image_label io.ai-filter.event-mapping-generation "${mapping_generation}"
 
           embedded_config_sha="$(docker run --rm --entrypoint sha256sum \

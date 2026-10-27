@@ -344,8 +344,11 @@ def require_startup_complete(fence):
         gate._require(live, "startup role process is no longer holding its original lease")
 
 
-def initialize_runtime_database(role, initializer, entrance):
+def initialize_runtime_database(role, initializer, entrance, *, slot=None, attempt=0):
     """Legacy behavior unchanged without an explicit one-shot startup operation."""
+    from services import production_startup
+    if production_startup.enabled():
+        return production_startup.claim(role, slot=slot, attempt=attempt)
     operation_id = os.environ.get(ENV_OPERATION)
     if operation_id is None:
         with gate.admission(entrance, kind="intake"):

@@ -20,8 +20,12 @@ IMAGE = "python:3.11.17-slim-trixie@sha256:e88e9763f943ec1834f992a4b51e0f2450048
 DOCKER = ["docker", "--host", "unix:///var/run/docker.sock"]
 MEMORY = 768 * 1024 * 1024
 PIDS = 256
-READONLY_MOUNTS = ("scripts", "tests", "services", "routes", "app.py", "docker-compose.yml", "worker_main.py")
+DISK_FIXTURE_TARGET = "/tmp/cutover-fixtures"
+TMPFS = {"/tmp": "rw,nosuid,nodev,size=134217728"}
+READONLY_MOUNTS = ("scripts", "tests", "services", "routes", "app.py", "docker-compose.yml", "worker_main.py",
+                   ".github/workflows/handoff-operations.yml")
 FILES = (
+    ".github/workflows/handoff-operations.yml",
     "scripts/verify_handoff_operations_native.py",
     "services/webhook_receipts.py",
     "scripts/plan_webhook_receipt_trial.py",
@@ -34,6 +38,13 @@ FILES = (
     "scripts/observe_handoff_capacity.py",
     "tests/test_production_handoff_adapter.py",
     "tests/test_handoff_capacity_observer.py",
+    "services/admission_fence.py",
+    "services/receiver_handoff_control.py",
+    "scripts/production_receiver_driver.py",
+    "scripts/verify_production_receiver_native.py",
+    "scripts/handoff_runtime_adapter.py",
+    "scripts/handoff_host_cron.py",
+    "tests/test_production_receiver_driver.py",
     "app.py",
     "docker-compose.yml",
     "worker_main.py",
@@ -52,7 +63,7 @@ assert platform.system() == 'Linux' and platform.machine() == 'x86_64'
 suite = unittest.TestSuite()
 for pattern in ('test_webhook_receipt_trial_plan.py', 'test_durable_handoff_cutover.py',
                 'test_handoff_operations_native.py', 'test_production_handoff_adapter.py',
-                'test_handoff_capacity_observer.py'):
+                'test_handoff_capacity_observer.py', 'test_production_receiver_driver.py'):
     suite.addTests(unittest.defaultTestLoader.discover('/work/tests', pattern=pattern))
 assert suite.countTestCases() > 0
 result = unittest.TextTestRunner(verbosity=2).run(suite)
@@ -104,7 +115,10 @@ def native_host(info):
                 raise ValueError("AMD64 emulator is not allowed")
 
 
-def check_state(state, image_id):
+def check_state(state, image_id, *, disk_fixtures=False, evidence_root=None):
+    if type(disk_fixtures) is not bool:
+        raise ValueError("explicit disk fixture mode required")
+    writable = {"/evidence", DISK_FIXTURE_TARGET} if disk_fixtures else {"/evidence"}
     config, runtime = state.get("HostConfig", {}), state.get("State", {})
     checks = {
         "exact_image": state.get("Image") == image_id,
@@ -113,25 +127,57 @@ def check_state(state, image_id):
         "memory_swap": config.get("MemorySwap") == MEMORY,
         "pids": config.get("PidsLimit") == PIDS,
         "cpu": config.get("NanoCpus") == 1_000_000_000,
+        "tmpfs": config.get("Tmpfs") == TMPFS,
         "network_none": config.get("NetworkMode") == "none",
         "readonly_root": config.get("ReadonlyRootfs") is True,
         "cap_drop": "ALL" in (config.get("CapDrop") or []),
         "no_new_privileges": any(v in {"no-new-privileges", "no-new-privileges:true"}
                                  for v in (config.get("SecurityOpt") or [])),
-        "readonly_test_mounts": len(state.get("Mounts", [])) == len(READONLY_MOUNTS) + 1 and all(
+        "readonly_test_mounts": len(state.get("Mounts", [])) == len(READONLY_MOUNTS) + len(writable) and all(
             mount.get("Type") == "bind" and mount.get("RW") is False
             and mount.get("Destination") in {"/work/" + name for name in READONLY_MOUNTS}
-            for mount in state.get("Mounts", []) if mount.get("Destination") != "/evidence"
+            for mount in state.get("Mounts", []) if mount.get("Destination") not in writable
         ) and {m.get("Destination") for m in state.get("Mounts", [])} ==
-            {"/work/" + name for name in READONLY_MOUNTS} | {"/evidence"},
+            {"/work/" + name for name in READONLY_MOUNTS} | writable,
         "owned_evidence_mount": len([m for m in state.get("Mounts", []) if
             m.get("Destination") == "/evidence" and m.get("Type") == "bind" and m.get("RW") is True]) == 1,
         "not_oom": runtime.get("OOMKilled") is False,
         "exited_zero": runtime.get("ExitCode") == 0 and runtime.get("Running") is False,
     }
+    if disk_fixtures:
+        checks["owned_disk_fixture_mount"] = _check_disk_fixture_mount(state, evidence_root)
     if not all(checks.values()):
         raise ValueError("isolation/resource/state mismatch: " + ",".join(k for k, v in checks.items() if not v))
     return checks
+
+
+
+def _check_disk_fixture_mount(state, evidence_root):
+    if evidence_root is None:
+        return False
+    root = Path(evidence_root)
+    if not root.is_absolute() or root.resolve() != root:
+        return False
+    actual = {m.get("Destination"): m for m in state.get("Mounts", [])
+              if m.get("Destination") in {"/evidence", DISK_FIXTURE_TARGET}}
+    expected = {"/evidence": root, DISK_FIXTURE_TARGET: root / "disk-fixtures"}
+    return len(actual) == 2 and all(actual[target].get("Type") == "bind"
+        and actual[target].get("RW") is True and actual[target].get("Source") == str(source)
+        for target, source in expected.items())
+
+
+def disk_fixture_arguments(evidence_root, enabled):
+    if type(enabled) is not bool:
+        raise ValueError("explicit disk fixture mode required")
+    if not enabled:
+        return []
+    root = Path(evidence_root)
+    info = root.lstat()
+    if not root.is_absolute() or root.resolve() != root or info.st_uid != os.getuid() or info.st_mode & 0o777 != 0o700:
+        raise ValueError("owned private evidence directory required")
+    child = root / "disk-fixtures"
+    child.mkdir(mode=0o700, exist_ok=False)
+    return ["--mount", "type=bind,src=" + str(child) + ",dst=" + DISK_FIXTURE_TARGET]
 
 
 def preserve_failed_container(name, output):
@@ -146,7 +192,7 @@ def preserve_failed_container(name, output):
     command(DOCKER + ["logs", name], output / "failure-container-logs", 15)
 
 
-def run(repo, output, *, files=FILES, container_test=CONTAINER_TEST, prepared_image=None):
+def run(repo, output, *, files=FILES, container_test=CONTAINER_TEST, prepared_image=None, disk_fixtures=False):
     if platform.system() != "Linux" or platform.machine() != "x86_64":
         raise ValueError("native Linux AMD64 required before Docker access")
     output.mkdir(mode=0o700, parents=True, exist_ok=False)
@@ -172,6 +218,7 @@ def run(repo, output, *, files=FILES, container_test=CONTAINER_TEST, prepared_im
             raise ValueError("fixed test image platform mismatch")
         save(output / "IMAGE.json", {key: image.get(key) for key in ("Id", "RepoDigests", "Architecture", "Os")})
         (output / "fixtures").mkdir(mode=0o700)
+        disk_arguments = disk_fixture_arguments(output / "fixtures", disk_fixtures)
         args = DOCKER + ["create", "--name", name, "--label", "ai-filter.synthetic-operations=" + name,
                 "--user", f"{os.getuid()}:{os.getgid()}",
                 "--network=none", "--read-only", "--no-healthcheck", "--cap-drop=ALL",
@@ -179,7 +226,7 @@ def run(repo, output, *, files=FILES, container_test=CONTAINER_TEST, prepared_im
                 "--pids-limit=256", "--cpus=1", "--tmpfs", "/tmp:rw,nosuid,nodev,size=134217728",
                 *[argument for name in READONLY_MOUNTS for argument in
                   ("--mount", "type=bind,src=" + str(repo / name) + ",dst=/work/" + name + ",readonly")],
-                "--mount", "type=bind,src=" + str(output / "fixtures") + ",dst=/evidence",
+                "--mount", "type=bind,src=" + str(output / "fixtures") + ",dst=/evidence", *disk_arguments,
                 "--workdir=/work", "--env", "PYTHONDONTWRITEBYTECODE=1", "--entrypoint=python",
                 "--env", "AI_FILTER_CUTOVER_EVIDENCE_DIR=/evidence",
                 "--env", "AI_FILTER_HANDOFF_EVIDENCE_DIR=/evidence",
@@ -188,7 +235,7 @@ def run(repo, output, *, files=FILES, container_test=CONTAINER_TEST, prepared_im
         created = True
         rc, stdout = command(DOCKER + ["start", "-a", name], output / "tests", 180)
         state = json.loads(checked(DOCKER + ["inspect", name], output / "container-inspect"))[0]
-        checks = check_state(state, image["Id"])
+        checks = check_state(state, image["Id"], disk_fixtures=disk_fixtures, evidence_root=output / "fixtures")
         if rc != 0:
             raise RuntimeError("isolated operation tests failed")
         summary = json.loads(stdout.strip().splitlines()[-1])

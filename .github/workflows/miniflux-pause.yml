@@ -9,6 +9,28 @@ on:
       - 'ops/miniflux/**'
       - 'scripts/*miniflux*pause*.py'
       - 'scripts/miniflux_handoff_adapter.py'
+      - 'scripts/production_sender_driver.py'
+      - 'scripts/production_startup_pg_fixture.py'
+      - 'scripts/sender_drain_inventory.py'
+      - 'services/sender_drain_contract.py'
+      - 'services/receiver_drain*.py'
+      - 'services/admission_http.py'
+      - 'services/admission_fence.py'
+      - 'routes/webhook_routes.py'
+      - 'scripts/receiver_drain*.py'
+      - 'scripts/joint_drain_controller.py'
+      - 'scripts/verify_sender_receiver_joint_native.py'
+      - 'tests/test_sender_receiver_joint_native.py'
+      - 'tests/test_receiver_drain*.py'
+      - 'tests/test_joint_drain*.py'
+      - 'Dockerfile'
+      - 'requirements-prod.txt'
+      - 'tests/test_production_sender_driver.py'
+      - 'tests/test_sender_drain_contract.py'
+      - 'tests/test_sender_postgres_native.py'
+      - 'tests/test_sender_pg_deadlines.py'
+      - 'tests/test_production_startup_pg_fixture.py'
+      - 'requirements-ops.txt'
       - 'scripts/miniflux_host_joint_native.py'
       - 'scripts/miniflux_dump_selection.py'
       - 'scripts/apply_miniflux_outbox.py'
@@ -33,6 +55,28 @@ on:
       - 'ops/miniflux/**'
       - 'scripts/*miniflux*pause*.py'
       - 'scripts/miniflux_handoff_adapter.py'
+      - 'scripts/production_sender_driver.py'
+      - 'scripts/production_startup_pg_fixture.py'
+      - 'scripts/sender_drain_inventory.py'
+      - 'services/sender_drain_contract.py'
+      - 'services/receiver_drain*.py'
+      - 'services/admission_http.py'
+      - 'services/admission_fence.py'
+      - 'routes/webhook_routes.py'
+      - 'scripts/receiver_drain*.py'
+      - 'scripts/joint_drain_controller.py'
+      - 'scripts/verify_sender_receiver_joint_native.py'
+      - 'tests/test_sender_receiver_joint_native.py'
+      - 'tests/test_receiver_drain*.py'
+      - 'tests/test_joint_drain*.py'
+      - 'Dockerfile'
+      - 'requirements-prod.txt'
+      - 'tests/test_production_sender_driver.py'
+      - 'tests/test_sender_drain_contract.py'
+      - 'tests/test_sender_postgres_native.py'
+      - 'tests/test_sender_pg_deadlines.py'
+      - 'tests/test_production_startup_pg_fixture.py'
+      - 'requirements-ops.txt'
       - 'scripts/miniflux_host_joint_native.py'
       - 'scripts/miniflux_dump_selection.py'
       - 'scripts/apply_miniflux_outbox.py'
@@ -81,6 +125,12 @@ jobs:
         with:
           go-version: '1.26.4'
           cache: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Fixed host PostgreSQL inventory dependencies
+        run: |
+          python -m pip install --only-binary=:all: -r requirements.txt -r requirements-ops.txt
       - name: Fixed upstream plus two separately verified patches
         run: |
           set -euo pipefail
@@ -97,11 +147,19 @@ jobs:
           cd "$RUNNER_TEMP/miniflux-pause"
           test -z "$(gofmt -l $(git ls-files --modified --others --exclude-standard -- '*.go'))"
           go test -p 1 -count=1 -v ./... 2>&1 | tee "$RUNNER_TEMP/pause-source-evidence/FULL_TEST.log"
-          go test -race -p 1 -count=1 -v ./internal/handoff ./internal/http/request ./internal/integration ./internal/worker ./internal/storage ./internal/http/server 2>&1 | tee "$RUNNER_TEMP/pause-source-evidence/RACE_TEST.log"
+          go test -race -p 1 -count=1 -v ./internal/handoff ./internal/database ./internal/http/request ./internal/integration ./internal/worker ./internal/storage ./internal/http/server 2>&1 | tee "$RUNNER_TEMP/pause-source-evidence/RACE_TEST.log"
           go vet ./...
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-X miniflux.app/v2/internal/version.Version=2.3.2 -X miniflux.app/v2/internal/version.Commit=${GITHUB_SHA}" -o "$RUNNER_TEMP/pause-build/miniflux" .
           go version -m "$RUNNER_TEMP/pause-build/miniflux" > "$RUNNER_TEMP/pause-source-evidence/BINARY_INFO.txt"
           sha256sum "$RUNNER_TEMP/pause-build/miniflux" > "$RUNNER_TEMP/pause-source-evidence/BINARY.sha256"
+      - name: Actual PostgreSQL host inventory and continuously held locks
+        env:
+          MINIFLUX_OUTBOX_TEST_DSN: 'postgres://postgres:synthetic-ci-only@127.0.0.1:5432/synthetic_outbox?sslmode=disable'
+        run: |
+          set -euo pipefail
+          export MINIFLUX_PATCHED_SOURCE="$RUNNER_TEMP/miniflux-pause"
+          python -m pytest -v -s -o addopts= tests/test_sender_postgres_native.py \
+            2>&1 | tee "$RUNNER_TEMP/pause-source-evidence/HOST_PG_TEST.log"
       - name: Actual legacy-original permissions and shared capacity
         env:
           PG_ID: '${{ job.services.postgres.id }}'
@@ -127,6 +185,27 @@ jobs:
           python scripts/verify_miniflux_pause_native.py --source "$RUNNER_TEMP/miniflux-pause" \
             --sender-image "$image_id" --binary "$RUNNER_TEMP/pause-build/miniflux" \
             --output "$RUNNER_TEMP/pause-native-evidence" --run
+      - name: Build actual receiver image for the separate joint synthetic scenario
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/joint-receiver-context" "$RUNNER_TEMP/joint-receiver-build"
+          source_sha=$(git rev-parse HEAD)
+          git archive --format=tar "$source_sha" | tar -xf - -C "$RUNNER_TEMP/joint-receiver-context"
+          docker --host unix:///var/run/docker.sock build --platform=linux/amd64 --pull=false \
+            --build-arg "AI_FILTER_BUILD_GIT_SHA=$source_sha" --build-arg AI_FILTER_BUILD_VERSION=joint-native \
+            -t "ai-filter-joint-native:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" "$RUNNER_TEMP/joint-receiver-context" \
+            2>&1 | tee "$RUNNER_TEMP/joint-receiver-build/BUILD.log"
+          docker --host unix:///var/run/docker.sock image inspect "ai-filter-joint-native:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            > "$RUNNER_TEMP/joint-receiver-build/IMAGE.json"
+      - name: Actual Go sender to Flask queue and durable receipt before joint freeze
+        run: |
+          set -euo pipefail
+          image_id=$(docker --host unix:///var/run/docker.sock image inspect "miniflux-pause-isolation:${GITHUB_SHA}" --format '{{.Id}}')
+          receiver_image_id=$(docker --host unix:///var/run/docker.sock image inspect "ai-filter-joint-native:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --format '{{.Id}}')
+          python scripts/verify_sender_receiver_joint_native.py --repo "$GITHUB_WORKSPACE" \
+            --source "$RUNNER_TEMP/miniflux-pause" --binary "$RUNNER_TEMP/pause-build/miniflux" \
+            --sender-image "$image_id" --receiver-image "$receiver_image_id" \
+            --output "$RUNNER_TEMP/sender-receiver-joint" --run
       - name: Preserve actual unit-test PostgreSQL state and identity
         if: always()
         env:
@@ -170,4 +249,6 @@ jobs:
             ${{ runner.temp }}/pause-source-evidence/
             ${{ runner.temp }}/pause-native-evidence/
             ${{ runner.temp }}/legacy-held-evidence/
+            ${{ runner.temp }}/joint-receiver-build/
+            ${{ runner.temp }}/sender-receiver-joint/
           if-no-files-found: error

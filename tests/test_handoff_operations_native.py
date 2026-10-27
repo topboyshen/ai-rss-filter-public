@@ -17,7 +17,7 @@ class OperationsNativeGateTests(unittest.TestCase):
     def good_state(self):
         return {"Image": "sha256:fixture", "Config": {"User": f"{os.getuid()}:{os.getgid()}"}, "HostConfig": {
             "Memory": 805306368, "MemorySwap": 805306368, "PidsLimit": 256,
-            "NanoCpus": 1000000000, "NetworkMode": "none", "ReadonlyRootfs": True,
+            "NanoCpus": 1000000000, "Tmpfs": MODULE.TMPFS.copy(), "NetworkMode": "none", "ReadonlyRootfs": True,
             "CapDrop": ["ALL"], "SecurityOpt": ["no-new-privileges:true"],
         }, "State": {"OOMKilled": False, "ExitCode": 0, "Running": False},
             "Mounts": [{"Type": "bind", "RW": False, "Destination": "/work/" + name}
