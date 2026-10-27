@@ -42,9 +42,12 @@ MOUNTS = ("scripts", "tests", "services", "routes", "core", "db", "utils", "work
           "scoring_provenance.py", "scoring_explanation.py", "config.yaml", "docker-compose.yml",
           "ops/isolation", "ops/miniflux", ".github/workflows", "gunicorn.conf.py")
 CONTAINER_TEST = r'''
-import json, os, pathlib, platform, shutil, sys, tempfile, pytest
+import json, os, pathlib, platform, sys, tempfile, pytest
 assert platform.system() == 'Linux' and platform.machine() == 'x86_64'
-fixtures = pathlib.Path(tempfile.mkdtemp(prefix='cutover-synthetic-', dir='/tmp'))
+fixture_mount = pathlib.Path('/tmp/cutover-fixtures')
+assert fixture_mount.samefile('/evidence/disk-fixtures')
+assert fixture_mount.stat().st_uid == os.getuid() and fixture_mount.stat().st_mode & 0o777 == 0o700
+fixtures = pathlib.Path(tempfile.mkdtemp(prefix='cutover-synthetic-', dir=str(fixture_mount)))
 os.environ['AI_FILTER_CUTOVER_EVIDENCE_DIR'] = str(fixtures)
 os.environ['AI_FILTER_HANDOFF_EVIDENCE_DIR'] = str(fixtures)
 class Summary:
@@ -68,9 +71,18 @@ try:
         'tests/test_takeover_readonly_preflight.py', 'tests/test_joint_drain_controller.py',
         'tests/test_receiver_drain_fixture_runtime.py', 'tests/test_sender_receiver_joint_native.py'], plugins=[summary])
 finally:
-    # Preserve only this process's own private synthetic fixtures on all exits.
-    # The startup runner continues refusing non-temporary database paths.
-    shutil.copytree(fixtures, '/evidence/fixtures-final', symlinks=True)
+    # This exact private subtree is already the evidence bind, so preserve
+    # original inodes in place, including sparse files and failure originals.
+    # Its container path remains under /tmp; the isolation guard is unchanged.
+    evidence_path = pathlib.Path('/evidence/disk-fixtures') / fixtures.name
+    assert fixtures.samefile(evidence_path)
+    with open('/evidence/FIXTURE_STORAGE.json', 'x') as stream:
+        os.chmod(stream.name, 0o600)
+        json.dump({'container_path':str(fixtures), 'evidence_relative_path':'disk-fixtures/' + fixtures.name,
+                   'device':fixtures.stat().st_dev, 'inode':fixtures.stat().st_ino,
+                   'retained_in_place':True, 'root_tmpfs_bytes':134217728}, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
 peak = pathlib.Path('/sys/fs/cgroup/memory.peak')
 events = pathlib.Path('/sys/fs/cgroup/memory.events')
 ok = code == 0 and summary.passed >= 25 and not summary.failed and not summary.skipped
@@ -107,7 +119,7 @@ def run(repo, output):
     image = json.loads(base.checked(base.DOCKER + ["image", "inspect", tag], output / "test-image"))[0]
     base.save(output / "TEST_IMAGE.json", {key: image.get(key) for key in ("Id", "Architecture", "Os", "RepoTags")})
     base.READONLY_MOUNTS = MOUNTS
-    base.run(repo, output / "native", files=files, container_test=CONTAINER_TEST, prepared_image=image["Id"])
+    base.run(repo, output / "native", files=files, container_test=CONTAINER_TEST, prepared_image=image["Id"], disk_fixtures=True)
     inspect_actual_runtime(base, repo, output / "actual-runtime", image["Id"])
 
 
