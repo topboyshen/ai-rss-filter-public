@@ -14,6 +14,67 @@ from scripts import production_sender_bootstrap_native as native
 from services import admission_fence as gate
 
 
+def _fallback_arguments(tmp_path):
+    return ["--repo", str(tmp_path / "not-the-source"), "--source", str(tmp_path / "upstream"),
+            "--binary", str(tmp_path / "binary"), "--output", str(tmp_path / "output"),
+            "--build-evidence", str(tmp_path / "build"), "--image-id", "sha256:" + "a" * 64]
+
+
+def test_real_bootstrap_fallback_exit3_retains_only_public_locations(tmp_path):
+    result = subprocess.run([sys.executable, "-I", "-B", native.__file__, *_fallback_arguments(tmp_path)],
+                            capture_output=True, timeout=20, check=False)
+    assert result.returncode == 3 and not result.stderr
+    value = json.loads(result.stdout)
+    assert set(value) == {"status", "error_type", "error_sha256", "safe_export_complete", "locations"}
+    assert value["status"] == "unconfirmed" and value["safe_export_complete"] is False
+    assert value["error_type"] == "AdmissionError" and len(value["error_sha256"]) == 64
+    assert 0 < len(value["locations"]) <= 8
+    assert all(set(frame) == {"file", "line", "function"} and "/" not in frame["file"] for frame in value["locations"])
+    assert any(frame["file"] == "production_sender_bootstrap_native.py" and frame["function"] == "execute" for frame in value["locations"])
+    assert str(tmp_path).encode() not in result.stdout and not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("diagnostic_failure", [False, True])
+def test_fallback_message_and_args_stay_private_even_if_locator_fails(tmp_path, monkeypatch, capsys, diagnostic_failure):
+    from scripts import verify_production_startup_native as startup
+    monkeypatch.setattr(native.sys, "argv", ["native", *_fallback_arguments(tmp_path)])
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("SECRET_MESSAGE_AND_ARGS")
+    monkeypatch.setattr(native, "execute", fail)
+    if diagnostic_failure:
+        monkeypatch.setattr(startup, "public_exception_locations", fail)
+    assert native.main() == 3
+    captured = capsys.readouterr()
+    value = json.loads(captured.out)
+    assert not captured.err and "SECRET_" not in captured.out and str(tmp_path) not in captured.out
+    assert value["error_type"] == "RuntimeError"
+    assert value["error_sha256"] == hashlib.sha256(b"SECRET_MESSAGE_AND_ARGS").hexdigest()
+    if diagnostic_failure:
+        assert value["locations"] == []
+    else:
+        assert len(value["locations"]) == 1
+        assert value["locations"][0]["file"] == "production_sender_bootstrap_native.py"
+        assert value["locations"][0]["function"] == "main" and type(value["locations"][0]["line"]) is int
+
+
+def test_actual_fallback_archive_emits_diagnostic_but_still_fails(tmp_path, capsys):
+    from scripts import verify_production_startup_native as startup
+    from scripts import private_release_contract as private
+    path = tmp_path / "archived"
+    with pytest.raises(private.ContractError, match="synthetic command failed; original evidence retained"):
+        startup.archive_command([sys.executable, "-I", "-B", native.__file__, *_fallback_arguments(tmp_path)], path)
+    captured = capsys.readouterr()
+    record = json.loads(captured.err)
+    assert not captured.out and len(captured.err.encode()) <= 4096
+    assert record["execution_proof"] is False and record["exception_type"] == "AdmissionError"
+    assert record["status"] == "locations_available"
+    assert any(frame["function"] == "execute" for frame in record["locations"])
+    original = json.loads(Path(str(path) + ".stdout").read_bytes())
+    assert original["status"] == "unconfirmed" and original["safe_export_complete"] is False
+    assert original["locations"] == record["locations"]
+    assert str(tmp_path) not in captured.err and not Path(str(path) + ".stderr").read_bytes()
+
+
 def test_nonroot_rejected_before_source_or_docker(monkeypatch, tmp_path):
     monkeypatch.setattr(native.os, "geteuid", lambda: 1001)
     with pytest.raises(gate.AdmissionError, match="Linux root"):

@@ -14,6 +14,150 @@ from scripts import production_startup_fixture as fixture
 from scripts import private_release_contract as private
 
 
+@pytest.fixture
+def diagnostic_source(tmp_path, monkeypatch):
+    root = tmp_path / "public-source"
+    (root / "scripts").mkdir(parents=True)
+    path = root / "scripts/public_failure.py"
+    path.write_text("def fail():\n    raise RuntimeError('SECRET_MESSAGE_CANARY')\n\nfail()\n")
+    monkeypatch.setattr(native, "DIAGNOSTIC_ROOT", root)
+    return path
+
+
+def diagnostic_record(capsys):
+    captured = capsys.readouterr()
+    assert not captured.out
+    assert len(captured.err.encode()) <= native.DIAGNOSTIC_BYTES
+    record = json.loads(captured.err)
+    assert record["execution_proof"] is False
+    assert set(record) == {"schema", "native_command_diagnostic", "execution_proof", "status", "exception_type", "locations"}
+    return record
+
+
+def test_real_child_traceback_only_emits_public_coordinates_after_original_sync(diagnostic_source, tmp_path, capsys, monkeypatch):
+    path, synced = tmp_path / "failed", []
+    original_sync, original_emit = native.gate._sync_directory, native._emit_archive_diagnostic
+    def sync(directory):
+        original_sync(directory)
+        synced.append(directory)
+    def emit(captured, complete):
+        assert synced == [path.parent]
+        assert all(Path(str(path) + suffix).stat().st_mode & 0o777 == 0o600 for suffix in (".stdout", ".stderr"))
+        assert b"SECRET_MESSAGE_CANARY" in Path(str(path) + ".stderr").read_bytes()
+        original_emit(captured, complete)
+    monkeypatch.setattr(native.gate, "_sync_directory", sync)
+    monkeypatch.setattr(native, "_emit_archive_diagnostic", emit)
+    with pytest.raises(private.ContractError, match="synthetic command failed; original evidence retained"):
+        native.archive_command([sys.executable, "-I", "-B", str(diagnostic_source)], path)
+    record = diagnostic_record(capsys)
+    assert record["exception_type"] == "RuntimeError" and record["status"] == "locations_available"
+    assert record["locations"][-1] == {"file": "public_failure.py", "line": 2, "function": "fail"}
+    assert all(value not in json.dumps(record) for value in (str(tmp_path), "SECRET_MESSAGE_CANARY", "raise RuntimeError"))
+    original = Path(str(path) + ".stderr").read_bytes()
+    assert original.startswith(b"Traceback (most recent call last):\n") and original.endswith(b"RuntimeError: SECRET_MESSAGE_CANARY\n")
+
+
+@pytest.mark.parametrize("kind", ["fallback", "FAILURE.json", "RESULT.json"])
+def test_complete_structured_child_failure_is_only_diagnostic_candidates(diagnostic_source, tmp_path, capsys, kind):
+    frame = {"file": diagnostic_source.name, "line": 2, "function": "fail"}
+    failure = {"type": "RuntimeError", "locations": [frame], "message": "SECRET_MESSAGE_CANARY"}
+    if kind == "fallback":
+        packet = {"status": "unconfirmed", "safe_export_complete": False, "error_type": "RuntimeError",
+                  "locations": [frame], "error_sha256": "a" * 64, "token": "SECRET_TOKEN_CANARY"}
+    else:
+        content = failure if kind == "FAILURE.json" else {"failure": failure}
+        packet = {"status": "unconfirmed", "safe_evidence": {"files": {kind: {"content": content}}}}
+    raw = json.dumps(packet).encode() + b"\n"
+    path = tmp_path / "structured"
+    with pytest.raises(private.ContractError):
+        native.archive_command([sys.executable, "-c", "import sys;sys.stdout.buffer.write(" + repr(raw) + ");sys.exit(3)"], path)
+    record = diagnostic_record(capsys)
+    assert record["locations"] == [frame] and record["exception_type"] == "RuntimeError"
+    assert "SECRET_" not in json.dumps(record) and Path(str(path) + ".stdout").read_bytes() == raw
+
+
+@pytest.mark.parametrize("change", ["external", "fake_project_path", "function", "line", "truncated", "no_exception", "prefix", "unknown_class"])
+def test_fake_or_partial_stderr_never_exports_unverified_text(diagnostic_source, tmp_path, capsys, change):
+    file = "/outside/SECRET_PATH/public_failure.py" if change == "external" else str(diagnostic_source)
+    if change == "fake_project_path":
+        file = str(diagnostic_source.parent.parent / "nonexistent/public_failure.py")
+    function, line = ("SECRET_FUNCTION", 2) if change == "function" else ("fail", 999999 if change == "line" else 2)
+    kind = "SECRET_CLASS" if change == "unknown_class" else "RuntimeError"
+    raw = (f'Traceback (most recent call last):\n  File "{file}", line {line}, in {function}\n'
+           f'    raise RuntimeError("SECRET_SOURCE")\n{kind}: SECRET_MESSAGE\n').encode()
+    if change == "truncated":
+        raw = raw[:-1]
+    elif change == "no_exception":
+        raw = raw[:raw.rfind(kind.encode())]
+    elif change == "prefix":
+        raw = b"arbitrary prefix\n" + raw
+    path = tmp_path / "untrusted"
+    with pytest.raises(private.ContractError):
+        native.archive_command([sys.executable, "-c", "import sys;sys.stderr.buffer.write(" + repr(raw) + ");sys.exit(9)"], path)
+    record = diagnostic_record(capsys)
+    assert "SECRET_" not in json.dumps(record) and str(tmp_path) not in json.dumps(record)
+    if change == "unknown_class":
+        assert record["exception_type"] == "unknown"
+    else:
+        assert record["status"] == "no_verified_frames" and not record["locations"]
+    assert Path(str(path) + ".stderr").read_bytes() == raw
+
+
+@pytest.mark.parametrize("change", ["duplicate_json", "truncated_json", "oversized", "ambiguous_source", "source_symlink", "too_many_frames"])
+def test_structured_diagnostic_rejects_ambiguity_and_bounds(diagnostic_source, tmp_path, capsys, change):
+    frame = {"file": diagnostic_source.name, "line": 2, "function": "fail"}
+    packet = {"status": "unconfirmed", "safe_export_complete": False, "error_type": "RuntimeError", "locations": [frame]}
+    if change == "too_many_frames":
+        packet["locations"] *= 65
+    raw = json.dumps(packet).encode() + b"\n"
+    if change == "duplicate_json":
+        raw = raw.replace(b'"status":', b'"status":"unconfirmed","status":')
+    elif change == "truncated_json":
+        raw = raw[:-2]
+    elif change == "oversized":
+        raw += b" " * native.DIAGNOSTIC_INPUT_BYTES[0]
+    elif change == "ambiguous_source":
+        (diagnostic_source.parent.parent / diagnostic_source.name).write_bytes(diagnostic_source.read_bytes())
+    elif change == "source_symlink":
+        outside = tmp_path / "outside.py"
+        diagnostic_source.rename(outside)
+        diagnostic_source.symlink_to(outside)
+    path, input_file = tmp_path / "rejected", tmp_path / "child-input"
+    input_file.write_bytes(raw)
+    with pytest.raises(private.ContractError):
+        native.archive_command([sys.executable, "-c", "import pathlib,sys;sys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes());sys.exit(3)",
+                                str(input_file)], path)
+    assert diagnostic_record(capsys)["status"] == "no_verified_frames"
+    assert Path(str(path) + ".stdout").read_bytes() == raw
+
+
+def test_diagnostic_write_failure_does_not_replace_original_command_failure(tmp_path, monkeypatch):
+    class Unavailable:
+        def write(self, _raw):
+            raise OSError("SECRET_OUTPUT_FAILURE")
+    with monkeypatch.context() as patch:
+        patch.setattr(native.sys, "stderr", Unavailable())
+        with pytest.raises(private.ContractError, match="synthetic command failed; original evidence retained"):
+            native.archive_command([sys.executable, "-c", "raise SystemExit(17)"], tmp_path / "failed")
+
+
+def test_output_limit_still_fails_without_treating_partial_capture_as_complete(tmp_path, capsys):
+    path = tmp_path / "bounded"
+    with pytest.raises(private.ContractError, match="evidence byte bound"):
+        native.archive_command([sys.executable, "-u", "-c", "import sys;sys.stderr.write('SECRET'*1000)"], path, limit=32)
+    record = diagnostic_record(capsys)
+    assert record["status"] == "no_verified_frames" and "SECRET" not in json.dumps(record)
+
+
+def test_diagnostic_frame_and_class_bound_does_not_treat_plain_class_as_exception(diagnostic_source, capsys):
+    diagnostic_source.write_text("class PlainPublicClass:\n    pass\n\ndef fail():\n    raise RuntimeError('SECRET')\n")
+    packet = {"status": "unconfirmed", "safe_export_complete": False, "error_type": "PlainPublicClass",
+              "locations": [{"file": diagnostic_source.name, "line": 5, "function": "fail"}] * 64}
+    native._emit_archive_diagnostic([json.dumps(packet).encode(), b""], True)
+    value = diagnostic_record(capsys)
+    assert len(value["locations"]) == 8 and value["exception_type"] == "unknown"
+
+
 def test_bounded_archive_retains_both_original_streams(tmp_path):
     path = tmp_path / "command"
     native.archive_command([sys.executable, "-c", "import sys;print('synthetic stdout');print('synthetic stderr',file=sys.stderr)"], path)

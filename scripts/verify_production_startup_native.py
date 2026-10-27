@@ -6,12 +6,16 @@ legacy binary execution, model request, rollback or power-loss proof occurs.
 from __future__ import annotations
 
 import argparse
+import ast
+import builtins
 import hashlib
 import json
 import os
+import re
 import selectors
 import signal
 import shutil
+import stat
 from pathlib import Path
 import subprocess
 import sys
@@ -24,6 +28,180 @@ from scripts import production_startup_fixture as fixture  # noqa: E402
 from scripts.verify_private_release_native import advance_stage, save  # noqa: E402
 from services import admission_fence as gate, controlled_startup as isolation, production_migration as migration  # noqa: E402
 from services import production_startup_control as control  # noqa: E402
+
+DIAGNOSTIC_ROOT = Path(__file__).resolve().parents[1]
+DIAGNOSTIC_BYTES = 4096
+DIAGNOSTIC_FRAMES = 8
+DIAGNOSTIC_INPUT_BYTES = (512 * 1024, 64 * 1024)
+
+
+def _diagnostic_path(name, root):
+    """Resolve only a unique fixed public-source path, never child input."""
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,100}\.py", name):
+        return None
+    paths = [root / directory / name for directory in ("", "scripts", "services", "core", "db", "utils", "workers", "routes", "modules")]
+    paths = [path for path in paths if path.is_file()]
+    if len(paths) != 1:
+        return None
+    path = paths[0]
+    if path.resolve() != path or not path.is_relative_to(root):
+        return None
+    return path
+
+
+def _diagnostic_source(name, root):
+    """Read only a unique, bounded public source; never a child-supplied path."""
+    path = _diagnostic_path(name, root)
+    if path is None:
+        return None
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= 256 * 1024:
+            return None
+        raw = os.read(fd, 256 * 1024 + 1)
+        after = os.fstat(fd)
+        fields = ("st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if len(raw) != info.st_size or any(getattr(after, key) != getattr(info, key) for key in fields):
+            return None
+        return path, ast.parse(raw)
+    finally:
+        os.close(fd)
+
+
+def _diagnostic_frame(frame, root):
+    if not isinstance(frame, dict) or set(frame) != {"file", "line", "function"}:
+        return None
+    line, function = frame["line"], frame["function"]
+    if (type(line) is not int or not 0 < line <= 1_000_000 or not isinstance(function, str)
+            or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,100}|<module>", function)):
+        return None
+    source = _diagnostic_source(frame["file"], root)
+    if source is None:
+        return None
+    path, tree = source
+    nodes = list(ast.walk(tree))
+    if line > max((getattr(node, "end_lineno", 0) or 0 for node in nodes), default=0):
+        return None
+    scopes = [node for node in nodes if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+              and node.lineno <= line <= node.end_lineno]
+    scope = min(scopes, key=lambda node: node.end_lineno - node.lineno).name if scopes else "<module>"
+    if function != scope:
+        return None
+    classes = {name for name, value in vars(builtins).items()
+               if isinstance(value, type) and issubclass(value, BaseException)}
+    declared = [node for node in nodes if isinstance(node, ast.ClassDef) and len(node.name) <= 100]
+    for _round in range(len(declared)):
+        classes.update(node.name for node in declared
+                       if any(isinstance(base, ast.Name) and base.id in classes for base in node.bases))
+    return {"file": path.name, "line": line, "function": scope}, classes
+
+
+def _validated_diagnostic(exception_type, locations, *, root=None):
+    root = (root or DIAGNOSTIC_ROOT).resolve()
+    frames, classes = [], set()
+    if isinstance(locations, list) and len(locations) <= 64:
+        for frame in locations[-DIAGNOSTIC_FRAMES:]:
+            result = _diagnostic_frame(frame, root)
+            if result is not None:
+                row, declared = result
+                frames.append(row)
+                classes.update(declared)
+    allowed = {name for name, value in vars(builtins).items()
+               if isinstance(value, type) and issubclass(value, BaseException)} | classes
+    kind = exception_type if isinstance(exception_type, str) and exception_type in allowed else "unknown"
+    return {"exception_type": kind, "locations": frames[-DIAGNOSTIC_FRAMES:]}
+
+
+def public_exception_locations(error, *, root=None):
+    """Actual local traceback, restricted to public-source coordinates only."""
+    root = (root or DIAGNOSTIC_ROOT).resolve()
+    frames, current = [], error.__traceback__
+    for _index in range(64):
+        if current is None:
+            break
+        code = current.tb_frame.f_code
+        path = Path(code.co_filename)
+        if path.is_absolute() and path.is_relative_to(root) and path == _diagnostic_path(path.name, root):
+            frames.append({"file": path.name, "line": current.tb_lineno, "function": code.co_name})
+        current = current.tb_next
+    if current is not None:
+        return []  # Incomplete extraction is not a diagnostic backtrace.
+    return _validated_diagnostic(type(error).__name__, frames, root=root)["locations"]
+
+
+def _stdout_diagnostic(raw):
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("ambiguous diagnostic JSON")
+            value[key] = item
+        return value
+    packet = json.loads(raw, object_pairs_hook=unique)
+    if not isinstance(packet, dict) or packet.get("status") != "unconfirmed":
+        return None
+    if packet.get("safe_export_complete") is False:
+        return packet.get("error_type"), packet.get("locations", [])
+    files = packet.get("safe_evidence", {}).get("files", {})
+    failure = files.get("FAILURE.json", {}).get("content")
+    if failure is None:
+        result = files.get("RESULT.json", {}).get("content", {})
+        failure = result.get("failure")
+    if isinstance(failure, dict):
+        return failure.get("type"), failure.get("locations", [])
+    return None
+
+
+def _stderr_diagnostic(raw):
+    """Only a complete conventional traceback; arbitrary text is not a frame."""
+    text = raw.decode("utf-8", errors="strict")
+    if not text.endswith("\n"):
+        return None
+    lines = text.splitlines()
+    if not lines or lines[0] != "Traceback (most recent call last):":
+        return None
+    final = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]{0,100})(?::[^\r\n]*)?", lines[-1])
+    if final is None:
+        return None
+    frames, current = [], False
+    for line in lines[1:-1]:
+        match = re.fullmatch(r'  File "([^"\r\n]{1,1024})", line ([1-9][0-9]{0,6}), in ([A-Za-z_][A-Za-z0-9_]{0,100}|<module>)', line)
+        if match:
+            current = True
+            path = Path(match[1])
+            # stderr paths must be the actual local public source, not merely
+            # a matching basename outside it. Structured exports contain no path.
+            root = DIAGNOSTIC_ROOT.resolve()
+            if path.is_absolute() and path.is_relative_to(root) and path == _diagnostic_path(path.name, root):
+                frames.append({"file": path.name, "line": int(match[2]), "function": match[3]})
+        elif not current or not line.startswith("    "):
+            return None
+    return (final[1], frames) if current and len(frames) <= 64 else None
+
+
+def _emit_archive_diagnostic(captured, complete):
+    """Untrusted output yields diagnostic candidates, never execution proof."""
+    value = {"exception_type": "unknown", "locations": []}
+    if complete:
+        for raw, parser in zip(captured, (_stdout_diagnostic, _stderr_diagnostic)):
+            try:
+                candidate = parser(bytes(raw)) if raw is not None else None
+                if candidate is not None:
+                    checked = _validated_diagnostic(*candidate)
+                    if checked["locations"] or value["exception_type"] == "unknown":
+                        value = checked
+            except Exception:
+                continue  # No child text or parser exception is printed.
+    record = {"schema": 1, "native_command_diagnostic": "source_validated_candidates",
+              "execution_proof": False, "status": "locations_available" if value["locations"] else "no_verified_frames", **value}
+    try:
+        raw = json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+        if len(raw.encode()) <= DIAGNOSTIC_BYTES:
+            sys.stderr.write(raw)
+            sys.stderr.flush()
+    except Exception:
+        pass  # Diagnostic output must never replace the original failure.
 
 
 def wait_for_slots(session, p, expected, *, attempts=None, seconds=40):
@@ -194,7 +372,8 @@ def archive_command(args, path, *, seconds=120, limit=8 * 1024**2, child_umask=-
     """Bound both pipes while retaining original synthetic tool output."""
     private.require(stdin_bytes is None or (isinstance(stdin_bytes, bytes) and len(stdin_bytes) <= 256),
                     "fixed synthetic command stdin bound exceeded")
-    total = 0
+    total, complete, failure = 0, False, None
+    captured = [bytearray(), bytearray()]
     deadline = time.monotonic() + seconds
     files = [open(str(path) + suffix, "xb") for suffix in (".stdout", ".stderr")]
     for stream in files:
@@ -208,8 +387,8 @@ def archive_command(args, path, *, seconds=120, limit=8 * 1024**2, child_umask=-
                     process.stdin.write(stdin_bytes)
                     process.stdin.close()
                 with selectors.DefaultSelector() as selector:
-                    for pipe, stream in zip((process.stdout, process.stderr), files):
-                        selector.register(pipe, selectors.EVENT_READ, stream)
+                    for index, (pipe, stream) in enumerate(zip((process.stdout, process.stderr), files)):
+                        selector.register(pipe, selectors.EVENT_READ, (index, stream))
                     while selector.get_map():
                         private.require(time.monotonic() < deadline, "synthetic command deadline exceeded")
                         for key, _events in selector.select(min(1, max(0, deadline - time.monotonic()))):
@@ -219,19 +398,31 @@ def archive_command(args, path, *, seconds=120, limit=8 * 1024**2, child_umask=-
                                 continue
                             total += len(chunk)
                             private.require(total <= limit, "synthetic command evidence byte bound exceeded")
-                            key.data.write(chunk)
+                            index, stream = key.data
+                            stream.write(chunk)
+                            if captured[index] is not None:
+                                if len(captured[index]) + len(chunk) > DIAGNOSTIC_INPUT_BYTES[index]:
+                                    captured[index] = None
+                                else:
+                                    captured[index].extend(chunk)
+                    complete = True
                     private.require(process.wait(timeout=max(0.01, deadline - time.monotonic())) == 0,
                                     "synthetic command failed; original evidence retained")
             finally:
                 if process.poll() is None:
                     os.killpg(process.pid, signal.SIGKILL)
                     process.wait()
+    except BaseException as error:
+        failure = error
+        raise
     finally:
         for stream in files:
             stream.flush()
             os.fsync(stream.fileno())
             stream.close()
         gate._sync_directory(path.parent)
+        if failure is not None:
+            _emit_archive_diagnostic(captured, complete)
 
 
 def extract_public_source(archive, context, evidence):

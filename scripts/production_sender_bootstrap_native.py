@@ -471,8 +471,15 @@ def main():
         print(gate._encoded(packet).decode(), flush=True)
         return 0 if packet["status"] == "passed" else 3
     except BaseException as error:
+        locations = []
+        try:
+            from scripts.verify_production_startup_native import public_exception_locations
+            locations = public_exception_locations(error, root=ROOT)
+        except Exception:
+            pass  # Keep the original fallback even if diagnostics are unavailable.
         print(json.dumps({"status": "unconfirmed", "error_type": type(error).__name__,
-                          "error_sha256": hashlib.sha256(str(error).encode()).hexdigest(), "safe_export_complete": False}), flush=True)
+                          "error_sha256": hashlib.sha256(str(error).encode()).hexdigest(),
+                          "safe_export_complete": False, "locations": locations}), flush=True)
         return 3
 
 

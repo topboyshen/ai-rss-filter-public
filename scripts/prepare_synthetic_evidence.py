@@ -26,6 +26,9 @@ CHUNK = 1024**2
 DEADLINE = 300
 NOFOLLOW = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
 NATIVE_GROUPS = ('native', 'native-foundation', 'native-activation', 'native-adapters')
+PRIORITY_SOURCE = 'production-startup-source'
+PRIORITY_FILES = ('BOOTSTRAP_PROCESS.stderr', 'BOOTSTRAP_PROCESS.stdout')
+PRIORITY_BYTES = 512 * 1024
 
 
 class EvidenceError(ValueError):
@@ -66,6 +69,15 @@ def check_time(deadline):
     require(time.monotonic() <= deadline, 'preparation_deadline')
 
 
+def charge_entry(name, row, budget):
+    budget['entries'] += 1
+    budget['bytes'] += row['identity']['size'] if row['kind'] == 'file' else 0
+    budget['metadata'] += len(encoded({name: row}))
+    require(budget['entries'] <= MAX_ENTRIES, 'entry_count_bound')
+    require(budget['bytes'] <= MAX_BYTES, 'logical_byte_bound')
+    require(budget['metadata'] <= MAX_METADATA, 'metadata_bound')
+
+
 def scan(fd, budget, deadline, prefix=''):
     result = {}
     check_time(deadline)
@@ -82,12 +94,7 @@ def scan(fd, budget, deadline, prefix=''):
             if kind == 'symlink':
                 row['target'] = os.readlink(child.name, dir_fd=fd)
                 require(len(os.fsencode(row['target'])) <= 4096, 'link_target_bound')
-            budget['entries'] += 1
-            budget['bytes'] += info.st_size if kind == 'file' else 0
-            budget['metadata'] += len(encoded({name: row}))
-            require(budget['entries'] <= MAX_ENTRIES, 'entry_count_bound')
-            require(budget['bytes'] <= MAX_BYTES, 'logical_byte_bound')
-            require(budget['metadata'] <= MAX_METADATA, 'metadata_bound')
+            charge_entry(name, row, budget)
             result[name] = row
             if kind == 'directory':
                 nested = os.open(child.name, NOFOLLOW | os.O_DIRECTORY, dir_fd=fd)
@@ -304,6 +311,78 @@ def write_json(path, value, identities=None):
             return identity(os.fstat(stream.fileno()))
 
 
+def prepare_priority(root, output, budget, deadline, report):
+    """Save only the producer-bounded logs, charging the original shared budget.
+
+    The subsequent full inventory conservatively charges these entries again.
+    Preserving these two files never makes an incomplete full inventory complete.
+    """
+    state = report['priority_diagnostics']
+    with directory(root) as fd:
+        private_directory(fd)
+        state['root_identity'] = identity(os.fstat(fd))
+        for name in PRIORITY_FILES:
+            check_time(deadline)
+            try:
+                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                state['entries'][name] = {'status': 'optional_absent'}
+                continue
+            row = {'kind': 'file' if stat.S_ISREG(info.st_mode) else 'refused', 'identity': identity(info)}
+            state['entries'][name] = {'status': 'selected', **row}
+            charge_entry(name, row, budget)
+            require(row['kind'] == 'file' and info.st_nlink == 1, 'priority_regular_single_link_required')
+        total = sum(row['identity']['size'] for row in state['entries'].values() if 'identity' in row)
+        require(total <= PRIORITY_BYTES, 'priority_combined_byte_bound')
+        for name, row in state['entries'].items():
+            if row['status'] == 'optional_absent':
+                continue
+            check_time(deadline)
+            digest, copied = copy_file(fd, name, row, output, PurePosixPath('files', PRIORITY_SOURCE, name), deadline,
+                                       output_ids=report['output_directories'])
+            report['files'].append({'source': PRIORITY_SOURCE, 'path': name, 'identity': row['identity'],
+                                    'extent_stream_sha256': digest, 'copied': True, 'output_identity': copied,
+                                    'priority_diagnostic': True})
+            row['status'] = 'copied'
+        require(identity(os.fstat(fd)) == state['root_identity'], 'priority_source_root_changed')
+
+
+def verify_priority(root, deadline, report):
+    """Re-anchor originals even when the full inventory failed before copying."""
+    state = report['priority_diagnostics']
+    if 'root_identity' not in state:
+        return
+    with directory(root) as fd:
+        check_time(deadline)
+        require(identity(os.fstat(fd)) == state['root_identity'], 'priority_source_root_changed')
+        for name, row in state['entries'].items():
+            check_time(deadline)
+            if row['status'] == 'optional_absent':
+                try:
+                    os.stat(name, dir_fd=fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                raise EvidenceError('priority_absent_file_appeared')
+            require(row['kind'] == 'file' and row['identity']['nlink'] == 1, 'priority_regular_single_link_required')
+            with regular(fd, name, row['identity']):
+                pass
+        require(identity(os.fstat(fd)) == state['root_identity'], 'priority_source_root_changed')
+
+
+def priority_path(label, name):
+    return label == PRIORITY_SOURCE and any(name == path or name.startswith(path + '/') for path in PRIORITY_FILES)
+
+
+def reuse_priority(name, row, output, report):
+    """An earlier copy is reusable only with the exact original and output inode."""
+    copied = next((item for item in report['files'] if item.get('priority_diagnostic') and item['path'] == name), None)
+    require(copied is not None and row['kind'] == 'file' and row['identity'] == copied['identity'],
+            'priority_diagnostic_not_preserved_or_changed')
+    with output_directory(output, identities=report['output_directories']) as fd:
+        with regular(fd, str(PurePosixPath('files', PRIORITY_SOURCE, name)), copied['output_identity']):
+            pass
+
+
 def prepare_source(label, root, output, budget, deadline, report):
     with directory(root) as fd:
         private_directory(fd)
@@ -324,7 +403,9 @@ def prepare_source(label, root, output, budget, deadline, report):
         for name, row in entries.items():
             check_time(deadline)
             try:
-                if row['kind'] == 'symlink':
+                if priority_path(label, name):
+                    reuse_priority(name, row, output, report)
+                elif row['kind'] == 'symlink':
                     report['links'].append({'source': label, **link_record(name, row, root, entries, mappings)})
                 elif row['kind'] == 'file':
                     links = inodes[(row['identity']['dev'], row['identity']['ino'])]
@@ -384,6 +465,16 @@ def prepare(sources, output):
     report['output_directories'] = output_ids
     started = write_json(output / 'PREPARATION_STARTED.json', {'schema': 1, 'complete': False,
                          'originals_modified': False, 'meaning': 'only COMPLETE.json confirms a finished preparation'}, output_ids)
+    if PRIORITY_SOURCE in sources:
+        report['priority_diagnostics'] = {'source': PRIORITY_SOURCE, 'fixed_paths': list(PRIORITY_FILES),
+                                          'combined_byte_limit': PRIORITY_BYTES, 'entries': {},
+                                          'meaning': 'partial diagnostics; full inventory is still required'}
+        try:
+            prepare_priority(sources[PRIORITY_SOURCE], output, budget, deadline, report)
+        except (OSError, ValueError) as exc:
+            report['errors'].append({'source': PRIORITY_SOURCE, 'phase': 'priority_diagnostics',
+                                     'error': type(exc).__name__,
+                                     'code': str(exc) if isinstance(exc, EvidenceError) else 'priority_filesystem_error'})
     for label, root in sources.items():
         try:
             prepare_source(label, root, output, budget, deadline, report)
@@ -397,6 +488,13 @@ def prepare(sources, output):
     except (OSError, ValueError) as exc:
         report['errors'].append({'error': type(exc).__name__,
                                  'code': str(exc) if isinstance(exc, EvidenceError) else 'output_verification_failed'})
+    if PRIORITY_SOURCE in sources:
+        try:
+            verify_priority(sources[PRIORITY_SOURCE], deadline, report)
+        except (OSError, ValueError) as exc:
+            report['errors'].append({'source': PRIORITY_SOURCE, 'phase': 'priority_final_verification',
+                                     'error': type(exc).__name__,
+                                     'code': str(exc) if isinstance(exc, EvidenceError) else 'priority_filesystem_error'})
     report['complete'] = not report['errors']
     write_json(output / ('COMPLETE.json' if report['complete'] else 'STOP.json'), report, output_ids)
     return report
