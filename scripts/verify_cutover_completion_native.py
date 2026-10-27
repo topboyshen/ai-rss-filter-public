@@ -7,6 +7,8 @@ network, Docker socket or production mount. Failures keep original artifacts.
 from __future__ import annotations
 
 import argparse
+import ast
+from collections import Counter
 import hashlib
 import importlib.util
 import json
@@ -81,9 +83,27 @@ def confirm_fixture_storage(fixtures, evidence_root, initial, digest):
 
 class NativeDiagnostics:
     """Bounded phase timing only; no parametrized values or failure text."""
-    def __init__(self):
-        self.passed = self.failed = self.skipped = self.started = 0
+    def __init__(self, expected_files=None):
+        self.passed = self.failed = self.skipped = self.started = self.finished = 0
         self.origin = time.monotonic()
+        self.expected_files = tuple(expected_files) if expected_files is not None else None
+        self.collection_verified = False
+        self.collected = 0
+        self.collection_sha256 = None
+
+    def pytest_collection_finish(self, session):
+        if self.expected_files is not None:
+            paths = {str(Path(item.path).resolve().relative_to(Path.cwd().resolve())) for item in session.items}
+            if paths != set(self.expected_files):
+                raise ValueError("actual native collection does not match the fixed group")
+        self.collected = len(session.items)
+        self.collection_sha256 = hashlib.sha256("\n".join(item.nodeid for item in session.items).encode()).hexdigest()
+        self.collection_verified = self.collected > 0
+
+    def complete(self):
+        return (self.collection_verified and self.collected > 0
+                and self.passed == self.started == self.finished == self.collected
+                and not self.failed and not self.skipped)
 
     def emit(self, nodeid, phase, **fields):
         if self.started > 2000:
@@ -109,6 +129,7 @@ class NativeDiagnostics:
         self.emit(report.nodeid, report.when, duration=round(report.duration, 6))
 
     def pytest_runtest_logfinish(self, nodeid, location):
+        self.finished += 1
         self.emit(nodeid, "end")
 
 
@@ -154,6 +175,7 @@ TESTS = ("tests/test_independent_drain_inventory.py", "tests/test_frozen_cutover
          "tests/test_production_sender_bootstrap_native.py",
          "tests/test_production_sender_native_bridge.py",
          "tests/test_sender_external_postgres_identity.py")
+TEST_GROUPS = (("foundation", TESTS[:22]), ("activation", TESTS[22:34]), ("adapters", TESTS[34:]))
 MOUNTS = ("scripts", "tests", "services", "routes", "core", "db", "utils", "workers", "modules",
           "templates", "app.py", "worker_main.py", "sse_engine.py", "logging_bootstrap.py",
           "scoring_provenance.py", "scoring_explanation.py", "config.yaml", "docker-compose.yml",
@@ -169,51 +191,63 @@ fixtures = pathlib.Path(tempfile.mkdtemp(prefix='cutover-synthetic-', dir=str(fi
 os.environ['AI_FILTER_CUTOVER_EVIDENCE_DIR'] = str(fixtures)
 os.environ['AI_FILTER_HANDOFF_EVIDENCE_DIR'] = str(fixtures)
 initial, mapping_sha256 = retain_fixture_storage(fixtures, pathlib.Path('/evidence'))
-summary = NativeDiagnostics()
+frozen_test_files = ('tests/test_independent_drain_inventory.py',
+ 'tests/test_frozen_cutover.py',
+ 'tests/test_handoff_runtime_adapter.py',
+ 'tests/test_controlled_startup.py',
+ 'tests/test_frozen_cutover_actual_startup.py',
+ 'tests/test_miniflux_handoff_adapter.py',
+ 'tests/test_miniflux_host_joint_native.py',
+ 'tests/test_durable_handoff_crash_diagnostics.py',
+ 'tests/test_durable_handoff_cutover.py',
+ 'tests/test_production_migration.py',
+ 'tests/test_production_startup.py',
+ 'tests/test_production_startup_native.py',
+ 'tests/test_production_sender_driver.py',
+ 'tests/test_sender_drain_contract.py',
+ 'tests/test_sender_pg_deadlines.py',
+ 'tests/test_production_startup_pg_fixture.py',
+ 'tests/test_receiver_drain_transfer.py',
+ 'tests/test_receiver_drain_driver.py',
+ 'tests/test_takeover_readonly_preflight.py',
+ 'tests/test_joint_drain_controller.py',
+ 'tests/test_receiver_drain_fixture_runtime.py',
+ 'tests/test_sender_receiver_joint_native.py',
+ 'tests/test_production_activation.py',
+ 'tests/test_production_initial_fence.py',
+ 'tests/test_production_initial_candidates.py',
+ 'tests/test_production_initial_migration.py',
+ 'tests/test_production_container_lifecycle.py',
+ 'tests/test_production_create_scope.py',
+ 'tests/test_production_active_verification.py',
+ 'tests/test_release_container_lifecycle.py',
+ 'tests/test_miniflux_activation_adapter.py',
+ 'tests/test_sender_activation_driver.py',
+ 'tests/test_production_activation_native.py',
+ 'tests/test_production_release_lock.py',
+ 'tests/test_production_admission_lifecycle.py',
+ 'tests/test_production_admission_supervisor.py',
+ 'tests/test_production_admission_watchdog.py',
+ 'tests/test_private_release_control_subpaths.py',
+ 'tests/test_production_legacy_mount_fixture.py',
+ 'tests/test_production_legacy_takeover.py',
+ 'tests/test_sender_namespace_http.py',
+ 'tests/test_controlled_production_release.py',
+ 'tests/test_controlled_release_finalize.py',
+ 'tests/test_controlled_release_shell.py',
+ 'tests/test_production_release_adapter_workflow_paths.py',
+ 'tests/test_production_gateway_switch.py',
+ 'tests/test_production_gateway_native.py',
+ 'tests/test_production_namespace_native.py',
+ 'tests/test_production_admission_image_sources.py',
+ 'tests/test_production_admission_environment.py',
+ 'tests/test_production_sender_bootstrap.py',
+ 'tests/test_production_sender_bootstrap_native.py',
+ 'tests/test_production_sender_native_bridge.py',
+ 'tests/test_sender_external_postgres_identity.py')
+summary = NativeDiagnostics(frozen_test_files)
 try:
-    code = pytest.main(['-q', '-o', 'addopts=', '-o', 'faulthandler_timeout=30', '-p', 'no:cacheprovider', '--basetemp=' + str(fixtures / 'pytest'),
-        'tests/test_independent_drain_inventory.py', 'tests/test_frozen_cutover.py',
-        'tests/test_handoff_runtime_adapter.py', 'tests/test_controlled_startup.py',
-        'tests/test_frozen_cutover_actual_startup.py', 'tests/test_miniflux_handoff_adapter.py',
-        'tests/test_miniflux_host_joint_native.py', 'tests/test_durable_handoff_crash_diagnostics.py',
-        'tests/test_durable_handoff_cutover.py', 'tests/test_production_migration.py',
-        'tests/test_production_startup.py', 'tests/test_production_startup_native.py',
-        'tests/test_production_sender_driver.py', 'tests/test_sender_drain_contract.py',
-        'tests/test_sender_pg_deadlines.py', 'tests/test_production_startup_pg_fixture.py',
-        'tests/test_receiver_drain_transfer.py', 'tests/test_receiver_drain_driver.py',
-        'tests/test_takeover_readonly_preflight.py', 'tests/test_joint_drain_controller.py',
-        'tests/test_receiver_drain_fixture_runtime.py', 'tests/test_sender_receiver_joint_native.py',
-        'tests/test_production_activation.py',
-        'tests/test_production_initial_fence.py',
-        'tests/test_production_initial_candidates.py', 'tests/test_production_initial_migration.py',
-        'tests/test_production_container_lifecycle.py',
-        'tests/test_production_create_scope.py',
-        'tests/test_production_active_verification.py',
-        'tests/test_release_container_lifecycle.py',
-        'tests/test_miniflux_activation_adapter.py',
-        'tests/test_sender_activation_driver.py',
-        'tests/test_production_activation_native.py',
-        'tests/test_production_release_lock.py',
-        'tests/test_production_admission_lifecycle.py',
-        'tests/test_production_admission_supervisor.py',
-        'tests/test_production_admission_watchdog.py',
-        'tests/test_private_release_control_subpaths.py',
-        'tests/test_production_legacy_mount_fixture.py',
-        'tests/test_production_legacy_takeover.py',
-        'tests/test_sender_namespace_http.py',
-        'tests/test_controlled_production_release.py',
-        'tests/test_controlled_release_finalize.py',
-        'tests/test_controlled_release_shell.py',
-        'tests/test_production_release_adapter_workflow_paths.py',
-        'tests/test_production_gateway_switch.py',
-        'tests/test_production_gateway_native.py',
-        'tests/test_production_namespace_native.py',
-        'tests/test_production_admission_image_sources.py',
-        'tests/test_production_admission_environment.py',
-        'tests/test_production_sender_bootstrap.py',
-        'tests/test_production_sender_bootstrap_native.py',
-        'tests/test_production_sender_native_bridge.py',
-        'tests/test_sender_external_postgres_identity.py'], plugins=[summary])
+    code = pytest.main(['-q', '-o', 'addopts=', '-o', 'faulthandler_timeout=30', '-p', 'no:cacheprovider', '--basetemp=' + str(fixtures / 'pytest')] + list(frozen_test_files), plugins=[summary])
 finally:
     # This exact private subtree is already the evidence bind, so preserve
     # original inodes in place, including sparse files and failure originals.
@@ -221,8 +255,10 @@ finally:
     confirm_fixture_storage(fixtures, pathlib.Path('/evidence'), initial, mapping_sha256)
 peak = pathlib.Path('/sys/fs/cgroup/memory.peak')
 events = pathlib.Path('/sys/fs/cgroup/memory.events')
-ok = code == 0 and summary.passed >= 25 and not summary.failed and not summary.skipped
+ok = code == 0 and summary.passed >= 25 and not summary.failed and not summary.skipped and summary.complete()
 print(json.dumps({'status':'passed' if ok else 'failed', 'tests_run':summary.passed,
+    'collected':summary.collected,'started':summary.started,'finished':summary.finished,'collection_verified':summary.collection_verified,
+    'collection_sha256':summary.collection_sha256,'selected_files':frozen_test_files,
     'failures':summary.failed,'errors':int(code not in (0,1)), 'skipped':summary.skipped,
     'memory_peak_bytes':int(peak.read_text()) if peak.exists() else None,
     'memory_events':events.read_text() if events.exists() else None,
@@ -232,7 +268,31 @@ sys.exit(0 if ok else 1)
 '''
 
 
+def validate_groups():
+    names = [name for name, _files in TEST_GROUPS]
+    selected = [path for _name, files in TEST_GROUPS for path in files]
+    if names != ["foundation", "activation", "adapters"] or any(not files for _name, files in TEST_GROUPS):
+        raise ValueError("all three fixed native groups are required")
+    if Counter(selected) != Counter(TESTS) or any(count != 1 for count in Counter(selected).values()):
+        raise ValueError("fixed native groups omit or duplicate tests")
+
+
+def native_test_program(group_name):
+    validate_groups()
+    selected = dict(TEST_GROUPS).get(group_name)
+    if selected is None:
+        raise ValueError("unknown fixed native group")
+    tree = ast.parse(CONTAINER_TEST)
+    assignments = [node for node in tree.body if isinstance(node, ast.Assign)
+                   and any(isinstance(target, ast.Name) and target.id == "frozen_test_files" for target in node.targets)]
+    if len(assignments) != 1:
+        raise ValueError("native collection binding is ambiguous")
+    assignments[0].value = ast.Tuple(elts=[ast.Constant(path) for path in selected], ctx=ast.Load())
+    return ast.unparse(ast.fix_missing_locations(tree)) + "\n"
+
+
 def run(repo, output):
+    validate_groups()
     if platform.system() != "Linux" or platform.machine() != "x86_64":
         raise ValueError("native Linux AMD64 required; do not use emulation")
     base = base_runner()
@@ -255,8 +315,16 @@ def run(repo, output):
     image = json.loads(base.checked(base.DOCKER + ["image", "inspect", tag], output / "test-image"))[0]
     base.save(output / "TEST_IMAGE.json", {key: image.get(key) for key in ("Id", "Architecture", "Os", "RepoTags")})
     base.READONLY_MOUNTS = MOUNTS
-    base.run(repo, output / "native", files=files, container_test=CONTAINER_TEST, prepared_image=image["Id"], disk_fixtures=True)
+    programs = {name: native_test_program(name) for name, _selected in TEST_GROUPS}
+    base.save(output / "TEST_GROUPS.json", {"groups": dict(TEST_GROUPS), "complete_suite_required": True,
+        "per_group_seconds": 180, "memory": base.MEMORY, "pids": base.PIDS,
+        "program_sha256": {name: hashlib.sha256(program.encode()).hexdigest() for name, program in programs.items()}})
+    for name, _selected in TEST_GROUPS:
+        base.run(repo, output / ("native-" + name), files=files, container_test=programs[name],
+                 prepared_image=image["Id"], disk_fixtures=True)
     inspect_actual_runtime(base, repo, output / "actual-runtime", image["Id"])
+    base.save(output / "GROUPS_RESULT.json", {"status": "all_fixed_groups_and_runtime_passed",
+              "groups": [name for name, _selected in TEST_GROUPS], "production_access": False, "model_calls": 0})
 
 
 def inspect_actual_runtime(base, repo, output, image_id):

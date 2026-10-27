@@ -46,7 +46,18 @@ class CompletionNativeGuards(unittest.TestCase):
                     "tests/test_release_container_lifecycle.py",
                     "tests/test_miniflux_activation_adapter.py",
                     "tests/test_sender_activation_driver.py",
-                    "tests/test_production_activation_native.py"}
+                    "tests/test_production_activation_native.py",
+                    "tests/test_production_release_lock.py", "tests/test_production_admission_lifecycle.py",
+                    "tests/test_production_admission_supervisor.py", "tests/test_production_admission_watchdog.py",
+                    "tests/test_private_release_control_subpaths.py", "tests/test_production_legacy_mount_fixture.py",
+                    "tests/test_production_legacy_takeover.py", "tests/test_sender_namespace_http.py",
+                    "tests/test_controlled_production_release.py", "tests/test_controlled_release_finalize.py",
+                    "tests/test_controlled_release_shell.py", "tests/test_production_release_adapter_workflow_paths.py",
+                    "tests/test_production_gateway_switch.py", "tests/test_production_gateway_native.py",
+                    "tests/test_production_namespace_native.py", "tests/test_production_admission_image_sources.py",
+                    "tests/test_production_admission_environment.py", "tests/test_production_sender_bootstrap.py",
+                    "tests/test_production_sender_bootstrap_native.py", "tests/test_production_sender_native_bridge.py",
+                    "tests/test_sender_external_postgres_identity.py"}
         actual = {node.value for node in ast.walk(ast.parse(runner.CONTAINER_TEST))
                   if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.startswith("tests/")}
         self.assertEqual(set(runner.TESTS), expected)
@@ -275,3 +286,106 @@ def test_setup_capture(capsys, setup_output):
     phases = [json.loads(line[line.index("{"):])["native_test"] for line in result.stdout.splitlines()
               if '"native_test":' in line]
     assert phases == ["start", "setup", "call", "teardown", "end"] * 3
+
+
+def test_fixed_partition_keeps_every_file_once_and_programs_bind_collection():
+    from collections import Counter
+    runner.validate_groups()
+    assert [(name, len(files)) for name, files in runner.TEST_GROUPS] == [
+        ("foundation", 22), ("activation", 12), ("adapters", 20)]
+    selected = []
+    for name, files in runner.TEST_GROUPS:
+        program = runner.native_test_program(name)
+        actual = [node.value for node in ast.walk(ast.parse(program)) if isinstance(node, ast.Constant)
+                  and isinstance(node.value, str) and node.value.startswith("tests/")]
+        assert Counter(actual) == Counter(files)
+        assert "collection_verified" in program and "collection_sha256" in program
+        assert "NativeDiagnostics(frozen_test_files)" in program
+        assert "not summary.skipped" in program
+        selected.extend(actual)
+    assert Counter(selected) == Counter(runner.TESTS)
+    with pytest.raises(ValueError, match="unknown"):
+        runner.native_test_program("custom")
+
+
+@pytest.mark.parametrize("drift", ["missing", "duplicate", "name", "empty"])
+def test_partition_drift_stops_before_any_docker_or_build(monkeypatch, tmp_path, drift):
+    groups = list(runner.TEST_GROUPS)
+    name, files = groups[0]
+    if drift == "missing":
+        groups[0] = name, files[1:]
+    elif drift == "duplicate":
+        groups[0] = name, files + (files[0],)
+    elif drift == "name":
+        groups[0] = "custom", files
+    else:
+        groups[0] = name, ()
+    monkeypatch.setattr(runner, "TEST_GROUPS", tuple(groups))
+    with patch.object(runner, "base_runner") as docker:
+        with pytest.raises(ValueError, match="fixed native groups"):
+            runner.run(ROOT, tmp_path / "evidence")
+        docker.assert_not_called()
+
+
+def test_actual_collection_is_hashed_without_parameter_disclosure(monkeypatch, tmp_path, capsys):
+    import hashlib
+    monkeypatch.chdir(tmp_path)
+    item = SimpleNamespace(path=tmp_path / "tests/test_fixed.py", nodeid="tests/test_fixed.py::test_one[PRIVATE_BODY]")
+    summary = runner.NativeDiagnostics(("tests/test_fixed.py",))
+    summary.pytest_collection_finish(SimpleNamespace(items=[item]))
+    assert summary.collection_verified and summary.collected == 1
+    assert summary.collection_sha256 == hashlib.sha256(item.nodeid.encode()).hexdigest()
+    assert capsys.readouterr().out == ""
+    with pytest.raises(ValueError, match="actual native collection"):
+        runner.NativeDiagnostics(("tests/test_other.py",)).pytest_collection_finish(SimpleNamespace(items=[item]))
+    summary = runner.NativeDiagnostics(("tests/test_fixed.py",))
+    with pytest.raises(ValueError, match="actual native collection"):
+        summary.pytest_collection_finish(SimpleNamespace(items=[]))
+    assert not summary.collection_verified
+
+
+@pytest.mark.parametrize("drift", [None, "collection_verified", "collected", "passed", "started", "finished", "failed", "skipped"])
+def test_native_success_requires_every_collected_case_to_finish(drift):
+    summary = runner.NativeDiagnostics()
+    summary.collection_verified = True
+    summary.collected = summary.passed = summary.started = summary.finished = 30
+    if drift == "collection_verified":
+        summary.collection_verified = False
+    elif drift in {"failed", "skipped"}:
+        setattr(summary, drift, 1)
+    elif drift:
+        setattr(summary, drift, 29)
+    assert summary.complete() is (drift is None)
+    assert "summary.complete()" in runner.CONTAINER_TEST
+
+
+@pytest.mark.parametrize("failed_group", [None, "foundation", "activation", "adapters"])
+def test_all_groups_required_and_first_failure_stops_later_stages(monkeypatch, tmp_path, failed_group):
+    calls, saved = [], []
+    def invoke(_repo, output, **kwargs):
+        name = output.name.removeprefix("native-")
+        calls.append(name)
+        assert kwargs["prepared_image"] == "sha256:synthetic" and kwargs["disk_fixtures"] is True
+        assert kwargs["container_test"] == runner.native_test_program(name)
+        if name == failed_group:
+            raise ValueError("original synthetic group failure")
+    base = SimpleNamespace(DOCKER=["docker"], MEMORY=768 * 1024**2, PIDS=256, run=invoke,
+        save=lambda path, value: saved.append((path.name, value)),
+        checked=lambda *_args, **_kwargs: '[{"Id":"sha256:synthetic"}]')
+    monkeypatch.setattr(runner.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(runner.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(runner, "base_runner", lambda: base)
+    monkeypatch.setattr(runner.subprocess, "check_output", lambda *_args, **_kwargs: b"")
+    monkeypatch.setattr(runner, "inspect_actual_runtime", lambda *_args: calls.append("runtime"))
+    if failed_group is None:
+        runner.run(ROOT, tmp_path / "evidence")
+        assert calls == ["foundation", "activation", "adapters", "runtime"]
+        assert saved[-1][0] == "GROUPS_RESULT.json"
+    else:
+        with pytest.raises(ValueError, match="original synthetic group failure"):
+            runner.run(ROOT, tmp_path / "evidence")
+        names = [name for name, _files in runner.TEST_GROUPS]
+        assert calls == names[:names.index(failed_group) + 1]
+        assert not any(name == "GROUPS_RESULT.json" for name, _value in saved)
+    policy = next(value for name, value in saved if name == "TEST_GROUPS.json")
+    assert policy["per_group_seconds"] == 180 and policy["memory"] == 768 * 1024**2 and policy["pids"] == 256
