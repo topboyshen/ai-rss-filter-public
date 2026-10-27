@@ -621,10 +621,11 @@ def probe_environment_file(directory, environment):
         Path(name).unlink(missing_ok=True)
 
 
-def image_probe(contract, directory, digest):
+def image_probe(contract, directory, digest, *, runner=None):
+    runner = run if runner is None else runner
     require(re.fullmatch(r"sha256:[0-9a-f]{64}", digest), "invalid image digest")
     manifest = json.loads(private_file(directory / "compose.json", sealed=True)[0])
-    info = json.loads(run(["docker", "image", "inspect", digest]))
+    info = json.loads(runner(["docker", "image", "inspect", digest]))
     require(len(info) == 1 and info[0]["Id"] == digest, "image probe identity mismatch")
     defaults = info[0]["Config"]
     values = environment_values(private_file(directory / "environment", sealed=True)[0])
@@ -643,7 +644,7 @@ def image_probe(contract, directory, digest):
         groups = [item for group in supplementary_groups(service) for item in ("--group-add", group)]
         workdir = working_directory(service, defaults)
         with probe_environment_file(directory, role_environment(service, defaults, values)) as environment:
-            probe = json.loads(run(["docker", "run", "--rm", "--network", "none", "--read-only", "--cap-drop", "ALL",
+            probe = json.loads(runner(["docker", "run", "--rm", "--network", "none", "--read-only", "--cap-drop", "ALL",
                                    "--user", user, *groups, "--workdir", workdir, "--security-opt", "no-new-privileges",
                                    "--memory", "768m", "--pids-limit", "256", "--env-file", environment,
                                    "--mount", f"type=bind,src={directory / 'runtime.yaml'},dst=/app/config.yaml,readonly", *mounts,

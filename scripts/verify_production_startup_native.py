@@ -124,7 +124,8 @@ def scenario(root, workspace, workers, raw_dsn, miniflux_source, stage, report):
         contract, _manifest, contract_sha = private.load(sealed, root, require_fresh=True)
         stage(f"n{workers}_build_actual_application_image")
         digest = build_candidate(root, p["directory"], p["source"], "ai-filter-startup-native:" + p["project"], contract, contract_sha)
-        private.image_probe(contract, sealed.parent, digest)
+        stage(f"n{workers}_probe_actual_image_configuration")
+        probe_candidate(contract, sealed.parent, digest, p["directory"])
         permit = fixture.migration_permit(p, sealed, digest)
         stage(f"n{workers}_create_actual_application_containers")
         private.compose(contract, sealed.parent, digest, ["-f", str(sealed.parent / "compose.json"), "create", "--force-recreate", "--no-build", "--pull", "never"])
@@ -188,15 +189,16 @@ def scenario(root, workspace, workers, raw_dsn, miniflux_source, stage, report):
 
 
 
-def archive_command(args, path, *, seconds=120):
+def archive_command(args, path, *, seconds=120, limit=8 * 1024**2, child_umask=-1):
     """Bound both pipes while retaining original synthetic tool output."""
-    total, limit = 0, 8 * 1024**2
+    total = 0
     deadline = time.monotonic() + seconds
     files = [open(str(path) + suffix, "xb") for suffix in (".stdout", ".stderr")]
     for stream in files:
         os.chmod(stream.name, 0o600)
     try:
-        with subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) as process:
+        with subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+                              umask=child_umask) as process:
             try:
                 with selectors.DefaultSelector() as selector:
                     for pipe, stream in zip((process.stdout, process.stderr), files):
@@ -225,6 +227,26 @@ def archive_command(args, path, *, seconds=120):
         gate._sync_directory(path.parent)
 
 
+def extract_public_source(archive, context, evidence):
+    # The outer workspace remains private. Only clean public Git archive files
+    # need normal image-source modes: Docker COPY makes them root-owned while
+    # the reviewed application UID must still be able to read/execute them.
+    archive_command(["tar", "-xf", str(archive), "--no-same-permissions", "-C", str(context)], evidence, child_umask=0o022)
+
+
+def probe_candidate(contract, directory, digest, workspace):
+    sequence = 0
+    def retained_run(args):
+        nonlocal sequence
+        path = workspace / f"image-probe-{sequence}"
+        sequence += 1
+        # These inputs are synthetic only. Production probing keeps its normal
+        # no-output behavior; this transport retains bounded original stderr.
+        archive_command(args, path, seconds=120, limit=private.MAX_BYTES)
+        return Path(str(path) + ".stdout").read_bytes()
+    private.image_probe(contract, directory, digest, runner=retained_run)
+
+
 def build_candidate(root, workspace, source, image, contract, contract_sha):
     context = workspace / "context"
     context.mkdir(mode=0o700)
@@ -233,7 +255,7 @@ def build_candidate(root, workspace, source, image, contract, contract_sha):
                     workspace / "git-archive")
     archive.chmod(0o600)
     private.require(archive.stat().st_size <= 128 * 1024**2, "synthetic source archive bound exceeded")
-    archive_command(["tar", "-xf", str(archive), "-C", str(context)], workspace / "archive-extract")
+    extract_public_source(archive, context, workspace / "archive-extract")
     labels = {"AI_FILTER_BUILD_VERSION": image, "AI_FILTER_BUILD_GIT_SHA": source["source_sha"],
               "AI_FILTER_BUILD_SOURCE_ID": source["source_sha"] + ":clean", "AI_FILTER_BUILD_MANIFEST_SHA": contract["files"]["compose.json"],
               "AI_FILTER_BUILD_CONFIG_SHA": source["example_config_sha256"], "AI_FILTER_PRIVATE_RELEASE_SHA": contract_sha,

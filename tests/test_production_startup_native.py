@@ -1,8 +1,10 @@
 """Bounded native orchestration tests; real Docker proof is the hosted job."""
 import json
+import io
 import os
 from pathlib import Path
 import sys
+import tarfile
 
 import pytest
 
@@ -24,6 +26,65 @@ def test_failed_command_keeps_original_failure_bytes(tmp_path):
     with pytest.raises(private.ContractError):
         native.archive_command([sys.executable, "-c", "import sys;print('failure-original',file=sys.stderr);sys.exit(19)"], path)
     assert Path(str(path) + ".stderr").read_bytes() == b"failure-original\n"
+
+
+def test_public_archive_modes_survive_private_outer_umask(tmp_path):
+    archive = tmp_path / "public.tar"
+    with tarfile.open(archive, "w") as output:
+        directory = tarfile.TarInfo("core")
+        directory.type, directory.mode = tarfile.DIRTYPE, 0o775
+        output.addfile(directory)
+        source = tarfile.TarInfo("core/config.py")
+        data = b"synthetic_public_source = True\n"
+        source.size, source.mode = len(data), 0o664
+        output.addfile(source, io.BytesIO(data))
+        executable = tarfile.TarInfo("start.sh")
+        executable.size, executable.mode = 0, 0o775
+        output.addfile(executable, io.BytesIO())
+    archive.chmod(0o600)
+    original, repaired = tmp_path / "original", tmp_path / "repaired"
+    original.mkdir(mode=0o700)
+    repaired.mkdir(mode=0o700)
+    previous = os.umask(0o077)
+    try:
+        native.archive_command(["tar", "-xf", str(archive), "--no-same-permissions", "-C", str(original)], tmp_path / "original-extract")
+        native.extract_public_source(archive, repaired, tmp_path / "fixed-extract")
+        current = os.umask(0o077)
+        assert current == 0o077  # Only the extraction child changes umask.
+    finally:
+        os.umask(previous)
+    assert (original / "core/config.py").stat().st_mode & 0o777 == 0o600
+    assert (original / "core").stat().st_mode & 0o777 == 0o700
+    assert (repaired / "core/config.py").stat().st_mode & 0o777 == 0o644
+    assert (repaired / "core").stat().st_mode & 0o777 == 0o755
+    assert (repaired / "start.sh").stat().st_mode & 0o777 == 0o755
+    assert (repaired / "core/config.py").read_bytes() == data
+    assert repaired.stat().st_mode & 0o777 == 0o700
+    assert archive.stat().st_mode & 0o777 == 0o600
+    assert (tmp_path / "fixed-extract.stderr").stat().st_mode & 0o777 == 0o600
+
+
+def test_image_probe_failure_retains_original_stderr_with_private_bound(tmp_path, monkeypatch):
+    def probe(contract, directory, digest, *, runner):
+        runner([sys.executable, "-c", "import sys;print('synthetic-probe-failure',file=sys.stderr);sys.exit(17)"])
+    monkeypatch.setattr(private, "image_probe", probe)
+    with pytest.raises(private.ContractError):
+        native.probe_candidate({}, tmp_path, "sha256:" + "a" * 64, tmp_path)
+    assert (tmp_path / "image-probe-0.stderr").read_bytes() == b"synthetic-probe-failure\n"
+    assert (tmp_path / "image-probe-0.stderr").stat().st_mode & 0o777 == 0o600
+
+
+def test_image_probe_transport_preserves_original_time_and_byte_limits(tmp_path, monkeypatch):
+    calls = []
+    def archive(args, path, **kwargs):
+        calls.append(kwargs)
+        Path(str(path) + ".stdout").write_bytes(b"synthetic-output")
+    def probe(contract, directory, digest, *, runner):
+        assert runner(["synthetic-command"]) == b"synthetic-output"
+    monkeypatch.setattr(private, "image_probe", probe)
+    monkeypatch.setattr(native, "archive_command", archive)
+    native.probe_candidate({}, tmp_path, "sha256:" + "a" * 64, tmp_path)
+    assert calls == [{"seconds": 120, "limit": private.MAX_BYTES}]
 
 
 def test_command_deadline_is_bounded_and_keeps_early_bytes(tmp_path):
