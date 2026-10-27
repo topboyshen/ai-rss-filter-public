@@ -19,6 +19,7 @@ import re
 import shutil
 import stat
 import subprocess
+import threading
 import time
 import uuid
 
@@ -168,6 +169,226 @@ class NativeDiagnostics:
         self.emit(nodeid, "end")
 
 
+class NativeShortPaths:
+    """Private per-case directories with a durable, retained original-nodeid index."""
+    MAX_CASES = 2000
+    MAX_BYTES = 1024 * 1024
+
+    def __init__(self, fixtures, summary):
+        self.fixtures, self.summary = Path(fixtures), summary
+        self.root_identity = self.directory_identity(self.fixtures)
+        self.base = self.fixtures / "p"
+        self.path = self.fixtures / "TMP_PATH_MAP.jsonl"
+        self.root_fd = os.open(self.fixtures, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            if self.directory_identity(self.root_fd) != self.root_identity:
+                raise ValueError("native temporary fixture root changed")
+            for name in (self.base.name, self.path.name):
+                try:
+                    os.stat(name, dir_fd=self.root_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                raise ValueError("native temporary mapping requires a new retained base")
+        except BaseException:
+            os.close(self.root_fd)
+            raise
+        self.lock = threading.Lock()
+        self.fd, self.raw, self.used, self.collection = None, b"", {}, ()
+        self.base_identity = None
+        self.failed = False
+        try:
+            self.fd = os.open(self.path.name, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                              0o600, dir_fd=self.root_fd)
+            self.map_identity = self.file_identity(os.fstat(self.fd))
+            os.fsync(self.fd)
+            os.fsync(self.root_fd)
+            self.check_map()
+        except BaseException:
+            self.close()
+            raise
+
+    @staticmethod
+    def directory_identity(path):
+        info = os.fstat(path) if isinstance(path, int) else path.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+            raise ValueError("native temporary directory identity is unsafe")
+        return {key: getattr(info, "st_" + key) for key in ("dev", "ino", "uid", "mode")}
+
+    def bind_collection(self, session):
+        self.collection = tuple(item.nodeid for item in session.items)
+        if not 0 < len(self.collection) <= self.MAX_CASES or len(set(self.collection)) != len(self.collection):
+            raise ValueError("native temporary directory collection is invalid")
+
+    def check_roots(self):
+        if (self.directory_identity(self.fixtures) != self.root_identity
+                or self.directory_identity(self.root_fd) != self.root_identity):
+            raise ValueError("native temporary fixture root changed")
+        if self.base_identity is not None and self.directory_identity(self.base) != self.base_identity:
+            raise ValueError("native temporary base changed")
+
+    def verified_collection(self):
+        digest = hashlib.sha256("\n".join(self.collection).encode()).hexdigest()
+        if not self.collection or not self.summary.collection_verified or digest != self.summary.collection_sha256:
+            raise ValueError("native temporary collection is not independently verified")
+
+    def verify_map_binding(self):
+        self.check_roots()
+        self.verified_collection()
+        self.check_map()
+
+    def header(self):
+        return {"schema": 1, "kind": "collection", "collection_sha256": self.summary.collection_sha256,
+                "collection_count": len(self.collection), "base_identity": self.base_identity}
+
+    def initialize(self, factory):
+        if self.base_identity is not None:
+            return
+        if self.directory_identity(self.fixtures) != self.root_identity:
+            raise ValueError("native temporary fixture root changed")
+        if self.base.exists() or self.base.is_symlink():
+            self.directory_identity(self.base)
+        if factory.getbasetemp() != self.base:
+            raise ValueError("native temporary factory base differs")
+        self.base_identity = self.directory_identity(self.base)
+        self.verify_map_binding()
+
+    @staticmethod
+    def file_identity(info):
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) != 0o600):
+            raise ValueError("native temporary mapping identity is unsafe")
+        return {key: getattr(info, "st_" + key) for key in ("dev", "ino", "uid", "mode")}
+
+    def check_map(self):
+        self.check_roots()
+        if (self.file_identity(os.stat(self.path.name, dir_fd=self.root_fd, follow_symlinks=False)) != self.map_identity
+                or self.file_identity(os.fstat(self.fd)) != self.map_identity
+                or os.fstat(self.fd).st_size != len(self.raw)
+                or os.pread(self.fd, len(self.raw) + 1, 0) != self.raw):
+            raise ValueError("native temporary mapping changed or has an incomplete tail")
+
+    def append(self, value):
+        self.check_map()
+        row = {**value, "previous_sha256": hashlib.sha256(self.raw).hexdigest()}
+        raw = json.dumps(row, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        if len(self.raw) + len(raw) > self.MAX_BYTES:
+            raise ValueError("native temporary mapping byte bound reached")
+        if os.write(self.fd, raw) != len(raw):
+            raise OSError("native temporary mapping short write")
+        os.fsync(self.fd)
+        os.fsync(self.root_fd)
+        self.raw += raw
+        self.check_map()
+
+    def allocate(self, nodeid, factory):
+        import fcntl
+        with self.lock:
+            try:
+                if self.failed or nodeid not in self.collection or nodeid in self.used:
+                    raise ValueError("native temporary case is unknown, reused or already stopped")
+                self.initialize(factory)
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                try:
+                    if not self.raw:
+                        self.append(self.header())
+                    self.check_map()
+                    path = factory.mktemp("t")
+                    if path.parent != self.base or re.fullmatch(r"t[0-9]+", path.name) is None:
+                        raise ValueError("native temporary allocation is outside its base")
+                    identity = self.directory_identity(path)
+                    if any(row["identity"] == identity for row in self.used.values()):
+                        raise ValueError("native temporary directory is shared")
+                    base_fd = os.open(self.base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                    try:
+                        if self.directory_identity(base_fd) != self.base_identity:
+                            raise ValueError("native temporary base changed before directory sync")
+                        os.fsync(base_fd)
+                    finally:
+                        os.close(base_fd)
+                    row = {"kind": "case", "sequence": len(self.used), "nodeid": nodeid,
+                           "relative_path": str(path.relative_to(self.fixtures)), "identity": identity}
+                    self.append(row)
+                    if self.directory_identity(path) != identity:
+                        raise ValueError("native temporary case changed before use")
+                    self.used[nodeid] = row
+                    return path
+                finally:
+                    fcntl.flock(self.fd, fcntl.LOCK_UN)
+            except BaseException:
+                self.failed = True
+                raise
+
+    def confirm(self):
+        import fcntl
+        with self.lock:
+            if self.failed or self.fd is None or not set(self.used).issubset(self.collection):
+                raise ValueError("native temporary mapping is incomplete or stopped")
+            self.verify_map_binding()
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                if not self.raw:
+                    self.append(self.header())
+                self.check_map()
+                rows = [json.loads(line) for line in self.raw.splitlines()][1:]
+                payloads = [{key: value for key, value in row.items() if key != "previous_sha256"} for row in rows]
+                if payloads != list(self.used.values()):
+                    raise ValueError("native temporary mapping allocation count differs")
+                for row in self.used.values():
+                    if self.directory_identity(self.fixtures / row["relative_path"]) != row["identity"]:
+                        raise ValueError("native temporary case directory changed")
+                digest = hashlib.sha256(self.raw).hexdigest()
+                self.write_final({
+                    "schema": 1, "mapping_sha256": digest, "allocated_case_count": len(self.used),
+                    "collection_count": len(self.collection),
+                    "collection_sha256": self.summary.collection_sha256, "identities_reconfirmed": True})
+                self.check_map()
+                return digest
+            finally:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+
+    def write_final(self, value):
+        raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+        self.check_map()
+        fd = os.open("TMP_PATH_MAP_FINAL.json", os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600, dir_fd=self.root_fd)
+        try:
+            self.file_identity(os.fstat(fd))
+            if os.write(fd, raw) != len(raw):
+                raise OSError("native temporary final mapping short write")
+            os.fsync(fd)
+            os.fsync(self.root_fd)
+            if os.pread(fd, len(raw) + 1, 0) != raw:
+                raise ValueError("native temporary final mapping readback differs")
+        finally:
+            os.close(fd)
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+        if self.root_fd is not None:
+            os.close(self.root_fd)
+            self.root_fd = None
+
+
+def native_short_path_plugin(owner):
+    # Imported only in the pytest container; the host runner needs no pytest dependency.
+    import pytest
+
+    class Plugin:
+        def pytest_collection_finish(self, session):
+            owner.bind_collection(session)
+
+        @pytest.fixture
+        def tmp_path(self, request, tmp_path_factory):
+            try:
+                return owner.allocate(request.node.nodeid, tmp_path_factory)
+            except Exception as error:
+                pytest.exit("native temporary mapping STOP: " + type(error).__name__, returncode=1)
+
+    return Plugin()
+
+
 TESTS = ("tests/test_independent_drain_inventory.py", "tests/test_frozen_cutover.py",
          "tests/test_handoff_runtime_adapter.py", "tests/test_controlled_startup.py",
          "tests/test_frozen_cutover_actual_startup.py", "tests/test_miniflux_handoff_adapter.py",
@@ -220,7 +441,7 @@ MOUNTS = ("scripts", "tests", "services", "routes", "core", "db", "utils", "work
           "Dockerfile", "requirements-prod.txt", "start.sh")
 CONTAINER_TEST = r'''
 import json, os, pathlib, platform, sys, tempfile, pytest
-from scripts.verify_cutover_completion_native import NativeDiagnostics, retain_fixture_storage, confirm_fixture_storage, verify_git_fixture
+from scripts.verify_cutover_completion_native import NativeDiagnostics, NativeShortPaths, native_short_path_plugin, retain_fixture_storage, confirm_fixture_storage, verify_git_fixture
 assert platform.system() == 'Linux' and platform.machine() == 'x86_64'
 fixture_mount = pathlib.Path('/tmp/cutover-fixtures')
 assert fixture_mount.samefile('/evidence/disk-fixtures')
@@ -287,19 +508,25 @@ frozen_test_files = ('tests/test_independent_drain_inventory.py',
  'tests/test_production_sender_native_bridge.py',
  'tests/test_sender_external_postgres_identity.py')
 summary = NativeDiagnostics(frozen_test_files)
+short_paths = NativeShortPaths(fixtures, summary)
 try:
-    code = pytest.main(['-q', '-o', 'addopts=', '-o', 'faulthandler_timeout=30', '-p', 'no:cacheprovider', '--basetemp=' + str(fixtures / 'p')] + list(frozen_test_files), plugins=[summary])
+    code = pytest.main(['-q', '-o', 'addopts=', '-o', 'faulthandler_timeout=30', '-p', 'no:cacheprovider', '--basetemp=' + str(fixtures / 'p')] + list(frozen_test_files), plugins=[summary, native_short_path_plugin(short_paths)])
 finally:
     # This exact private subtree is already the evidence bind, so preserve
     # original inodes in place, including sparse files and failure originals.
     # Its container path remains under /tmp; the isolation guard is unchanged.
     confirm_fixture_storage(fixtures, pathlib.Path('/evidence'), initial, mapping_sha256)
+    try:
+        short_path_mapping_sha256 = short_paths.confirm()
+    finally:
+        short_paths.close()
 peak = pathlib.Path('/sys/fs/cgroup/memory.peak')
 events = pathlib.Path('/sys/fs/cgroup/memory.events')
 ok = code == 0 and summary.passed >= 25 and not summary.failed and not summary.skipped and summary.complete()
 print(json.dumps({'status':'passed' if ok else 'failed', 'tests_run':summary.passed,
     'collected':summary.collected,'started':summary.started,'finished':summary.finished,'collection_verified':summary.collection_verified,
     'collection_sha256':summary.collection_sha256,'selected_files':frozen_test_files,
+    'tmp_path_mapping_sha256':short_path_mapping_sha256,
     'subtests_passed':summary.subtests_passed,'subtests_failed':summary.subtests_failed,'subtests_skipped':summary.subtests_skipped,
     'failures':summary.failed,'errors':int(code not in (0,1)), 'skipped':summary.skipped,
     'memory_peak_bytes':int(peak.read_text()) if peak.exists() else None,

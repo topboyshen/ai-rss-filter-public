@@ -10,6 +10,7 @@ import argparse
 import base64
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -123,8 +124,12 @@ def seed132(harness):
     harness.command(["pull", "--platform=linux/amd64", reference])
     image = json.loads(harness.command(["image", "inspect", reference]))[0]
     image_checks(image, reference)
+    config = image.get("Config")
+    gate._require(isinstance(config, dict) and "Entrypoint" in config and config["Entrypoint"] is None
+                  and config.get("Cmd") == ["/usr/bin/miniflux"], "fixed upstream executable configuration differs")
     dsn = f"postgres://synthetic:{harness.password}@pg:5432/synthetic_pause?sslmode=disable"
-    harness.launch("seed131", image["Id"], ["--read-only", "--cap-drop=ALL", "-e", "DATABASE_URL=" + dsn], ["-migrate"])
+    harness.launch("seed131", image["Id"], ["--read-only", "--cap-drop=ALL", "-e", "DATABASE_URL=" + dsn],
+                   ["/usr/bin/miniflux", "-migrate"])
     code = harness.command(["wait", harness.names["seed131"]], timeout=30).strip()
     gate._require(code == "0" and harness.sql("SELECT version FROM schema_version;").strip() == "131",
                   "actual upstream synthetic schema131 required")
@@ -133,6 +138,7 @@ def seed132(harness):
                 + " UPDATE schema_version SET version='132' WHERE version='131'; COMMIT;")
     gate._require(harness.sql("SELECT version FROM schema_version;").strip() == "132", "actual132 transaction failed")
     _save(harness.output / "SEED132.json", {"upstream_image": image["Id"], "upstream_reference": reference,
+        "upstream_entrypoint": config["Entrypoint"], "upstream_cmd": config["Cmd"],
         "seed_container_id": json.loads(harness.command(["inspect", harness.names["seed131"]]))[0]["Id"],
         "prior_schema": 131, "schema": 132, "actual_sql_source_sha256": source_hash,
         "sql_sha256": hashlib.sha256(sql.encode()).hexdigest(), "marker_and_sql_same_transaction": True,
@@ -381,11 +387,91 @@ def preserve_owned(harness, role):
         if row["State"]["Running"]:
             harness.sample_memory(role, "final")
     except BaseException as error:
-        errors.append({"stage": role + ":observation", "type": type(error).__name__})
+        errors.append({"stage": role + ":observation", "type": type(error).__name__, **_command_reference(harness, error)})
     if row["State"]["Running"]:
         harness.command(["kill", "--signal", "TERM", row["Id"]], final=True)
         harness.command(["wait", row["Id"]], timeout=8, final=True)
     return errors
+
+
+def _command_reference(harness, error):
+    """Only the actual command failure frame can name a retained original."""
+    frame = error.__traceback__
+    while frame is not None and frame.tb_next is not None:
+        frame = frame.tb_next
+    if type(error) is not RuntimeError or frame is None or frame.tb_frame.f_code is not Harness.command.__code__:
+        return {}
+    local = frame.tb_frame.f_locals
+    sequence = harness.sequence
+    if (local.get("self") is not harness or type(sequence) is not int or not 1 <= sequence <= 9999
+            or local.get("path") != harness.output / f"command-{sequence:04d}.json"
+            or "rc" not in local or local["rc"] == 0):
+        return {}
+    return {"command_sequence": sequence}
+
+
+def _command_error_class(stderr, rc):
+    if rc is None:
+        return "result_unknown"
+    if len(stderr.encode()) > 65536 or not stderr:
+        return "unclassified"
+    first = stderr.splitlines()[0]
+    if first == "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?":
+        return "daemon_unreachable"
+    prefix = "docker: Error response from daemon: "
+    if not first.startswith(prefix):
+        return "unclassified"
+    value = first[len(prefix):]
+    if re.fullmatch(r'[^\r\n]{0,2048}exec: "[^"\r\n]{1,256}": executable file not found in \$PATH(?:: unknown)?\.?', value):
+        return "container_executable_not_found"
+    if re.fullmatch(r"No such image: sha256:[0-9a-f]{64}\.?", value):
+        return "image_absent"
+    if re.fullmatch(r'Conflict\. The container name "/[a-zA-Z0-9_.-]{1,128}" is already in use by container "[0-9a-f]{64}"\..{0,512}', value):
+        return "container_name_conflict"
+    return "unclassified"
+
+
+def _command_summary(fd, sequence, budget):
+    name = f"command-{sequence:04d}.json"
+    original, raw = export._export_file(fd, name, budget)
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            gate._require(key not in value, "ambiguous retained command JSON")
+            value[key] = item
+        return value
+    value = json.loads(raw, object_pairs_hook=unique)
+    gate._require(isinstance(value, dict) and set(value) == {"argv", "rc", "stdin_sha256", "elapsed_seconds", "utc", "stdout", "stderr"},
+                  "exact retained command record required")
+    argv, rc, elapsed, stderr = value["argv"], value["rc"], value["elapsed_seconds"], value["stderr"]
+    gate._require(isinstance(argv, list) and 4 <= len(argv) <= 128 and all(isinstance(arg, str) for arg in argv)
+                  and argv[:3] == ["docker", "--host", "unix:///var/run/docker.sock"], "fixed Docker command prefix required")
+    gate._require(rc is None or (type(rc) is int and -255 <= rc <= 255 and rc != 0), "failed or unknown command result required")
+    gate._require(type(elapsed) in {int, float} and math.isfinite(elapsed) and elapsed >= 0
+                  and isinstance(stderr, str) and isinstance(value["stdout"], str), "bounded command result fields required")
+    operations = {"run", "pull", "inspect", "wait", "kill", "logs", "exec", "start", "stop"}
+    operation = argv[3] if argv[3] in operations else "unclassified"
+    if argv[3:5] in (["image", "inspect"], ["network", "create"], ["network", "inspect"]):
+        operation = ".".join(argv[3:5])
+    return {"command_sequence": sequence, "operation": operation, "rc": rc, "elapsed_seconds": elapsed,
+            "original_record_sha256": original["sha256"], "retained_stderr_sha256": hashlib.sha256(stderr.encode()).hexdigest(),
+            "stderr_bytes": len(stderr.encode()), "error_class": _command_error_class(stderr, rc), "execution_proof": False}
+
+
+def _command_summaries(fd, files, budget):
+    result = files["RESULT.json"]["content"]
+    failure = files.get("FAILURE.json", {}).get("content")
+    rows = [failure, result.get("failure"), *result.get("errors", [])]
+    sequences = set()
+    for row in rows:
+        if isinstance(row, dict) and "command_sequence" in row:
+            sequence = row["command_sequence"]
+            gate._require(type(sequence) is int and 1 <= sequence <= 9999, "bounded command sequence required")
+            sequences.add(sequence)
+    gate._require(len(sequences) <= 8, "command diagnostic count bound exceeded")
+    summaries = [_command_summary(fd, sequence, budget) for sequence in sorted(sequences)]
+    gate._require(len(gate._encoded(summaries)) <= 8192, "command diagnostic output bound exceeded")
+    return summaries
 
 
 def execute(repo, source, image_id, binary, output, build_evidence):
@@ -409,6 +495,7 @@ def execute(repo, source, image_id, binary, output, build_evidence):
     except BaseException as error:
         import traceback
         failure = {"type": type(error).__name__, "message_sha256": hashlib.sha256(str(error).encode()).hexdigest(),
+            **_command_reference(harness, error),
             "locations": [{"file": Path(row.filename).name, "function": row.name, "line": row.lineno}
                           for row in traceback.extract_tb(error.__traceback__) if Path(row.filename).resolve().is_relative_to(repo)]}
         _save(output / "FAILURE.json", failure)
@@ -419,13 +506,13 @@ def execute(repo, source, image_id, binary, output, build_evidence):
                 harness.command(["exec", harness.names["pg"], "pg_dump", "-U", "synthetic", "-d", "synthetic_pause"],
                                 timeout=15, final=True)
             except BaseException as error:
-                errors.append({"stage": "postgres_dump", "type": type(error).__name__})
+                errors.append({"stage": "postgres_dump", "type": type(error).__name__, **_command_reference(harness, error)})
         # Preserve owned synthetic containers; no KILL fallback or deletion.
         for role in reversed(harness.created):
             try:
                 errors.extend(preserve_owned(harness, role))
             except BaseException as error:
-                errors.append({"stage": role, "type": type(error).__name__})
+                errors.append({"stage": role, "type": type(error).__name__, **_command_reference(harness, error)})
         if daemon is not None:
             daemon.terminate()
             try:
@@ -453,8 +540,10 @@ def safe_export(root):
                 continue
             record["content"] = json.loads(raw)
             packet["files"][name] = record
+        gate._require("RESULT.json" in packet["files"], "bounded complete result export required")
+        packet["command_failures"] = _command_summaries(fd, packet["files"], budget)
         gate._require(export._metadata(os.fstat(fd)) == before, "root originals changed during safe export")
-        gate._require("RESULT.json" in packet["files"] and len(gate._encoded(packet)) <= 256 * 1024,
+        gate._require(len(gate._encoded(packet)) <= 256 * 1024,
                       "bounded complete result export required")
         return packet
     finally:

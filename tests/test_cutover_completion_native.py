@@ -1,11 +1,14 @@
 """Resource/evidence runner guards; these unit checks are not native proof."""
 import importlib.util
 import ast
+from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -549,3 +552,338 @@ def test_all_groups_required_and_first_failure_stops_later_stages(monkeypatch, t
         assert not any(name == "GROUPS_RESULT.json" for name, _value in saved)
     policy = next(value for name, value in saved if name == "TEST_GROUPS.json")
     assert policy["per_group_seconds"] == 180 and policy["memory"] == 768 * 1024**2 and policy["pids"] == 256
+
+
+def short_path_case(tmp_path, nodeids):
+    from _pytest.tmpdir import TempPathFactory
+    fixtures = tmp_path / "retained"
+    fixtures.mkdir(mode=0o700)
+    summary = runner.NativeDiagnostics()
+    summary.collection_verified = True
+    summary.collection_sha256 = hashlib.sha256("\n".join(nodeids).encode()).hexdigest()
+    owner = runner.NativeShortPaths(fixtures, summary)
+    owner.bind_collection(SimpleNamespace(items=[SimpleNamespace(nodeid=name) for name in nodeids]))
+    factory = TempPathFactory(fixtures / "p", 3, "all", lambda *args: None, _ispytest=True)
+    return owner, factory
+
+
+def mapping_rows(owner):
+    raw = owner.path.read_bytes()
+    previous, rows = b"", []
+    for line in raw.splitlines(keepends=True):
+        row = json.loads(line)
+        assert line.endswith(b"\n") and row["previous_sha256"] == hashlib.sha256(previous).hexdigest()
+        rows.append(row)
+        previous += line
+    assert previous == raw
+    return rows
+
+
+def test_short_paths_concurrent_cases_are_private_and_keep_full_nodeids(tmp_path):
+    names = [f"nested/test_same.py::Class{i}::test_same[参数{i}]" for i in range(12)]
+    owner, factory = short_path_case(tmp_path, names)
+    try:
+        with ThreadPoolExecutor(max_workers=6) as workers:
+            paths = list(workers.map(lambda name: owner.allocate(name, factory), names))
+        assert len(set(paths)) == len(names)
+        assert len({path.stat().st_ino for path in paths}) == len(names)
+        for index, path in enumerate(paths):
+            assert re.fullmatch(r"t[0-9]+", path.name) and stat.S_IMODE(path.stat().st_mode) == 0o700
+            (path / "original.txt").write_text(str(index))
+        rows = mapping_rows(owner)
+        assert set(row["nodeid"] for row in rows[1:]) == set(names)
+        assert [row["sequence"] for row in rows[1:]] == list(range(len(names)))
+        assert owner.path.stat().st_nlink == 1 and stat.S_IMODE(owner.path.stat().st_mode) == 0o600
+        links = [path for path in owner.base.iterdir() if path.is_symlink()]
+        assert len(links) == 1 and links[0].name == "tcurrent"
+        assert os.readlink(links[0]) in {str(path) for path in paths}
+        digest = owner.confirm()
+        assert digest == hashlib.sha256(owner.path.read_bytes()).hexdigest()
+        assert [int((path / "original.txt").read_text()) for path in paths] == list(range(len(names)))
+    finally:
+        owner.close()
+
+
+@pytest.mark.parametrize("phase", ["short_write", "file_sync", "base_sync", "parent_sync"])
+def test_mapping_failure_preserves_partial_and_never_reuses_or_cleans(tmp_path, monkeypatch, phase):
+    owner, factory = short_path_case(tmp_path, ["first", "second"])
+    try:
+        first = owner.allocate("first", factory)
+        original = first / "original.bin"
+        original.write_bytes(b"retained original")
+        old_mapping = owner.path.read_bytes()
+        real_write, real_sync = os.write, os.fsync
+
+        def write(fd, data):
+            if phase == "short_write" and fd == owner.fd:
+                return real_write(fd, data[:-1])
+            return real_write(fd, data)
+
+        def sync(fd):
+            info = os.fstat(fd)
+            target = {"file_sync": owner.map_identity, "base_sync": owner.base_identity,
+                      "parent_sync": owner.root_identity}.get(phase)
+            if target and (info.st_dev, info.st_ino) == (target["dev"], target["ino"]):
+                raise OSError("injected mapping sync failure")
+            return real_sync(fd)
+
+        monkeypatch.setattr(runner.os, "write", write)
+        monkeypatch.setattr(runner.os, "fsync", sync)
+        with pytest.raises(OSError):
+            owner.allocate("second", factory)
+        assert owner.failed and original.read_bytes() == b"retained original"
+        assert owner.path.read_bytes().startswith(old_mapping)
+        assert len([p for p in owner.base.iterdir() if p.is_dir() and not p.is_symlink()]) == 2
+        with pytest.raises(ValueError, match="stopped"):
+            owner.allocate("second", factory)
+        with pytest.raises(ValueError, match="incomplete or stopped"):
+            owner.confirm()
+        assert not (owner.fixtures / "TMP_PATH_MAP_FINAL.json").exists()
+    finally:
+        owner.close()
+
+
+@pytest.mark.parametrize("drift", ["tail", "replace", "symlink", "hardlink", "case_symlink", "base_symlink"])
+def test_short_mapping_drift_is_rejected_without_following_or_removing_originals(tmp_path, drift):
+    owner, factory = short_path_case(tmp_path, ["first", "second"])
+    try:
+        path = owner.allocate("first", factory)
+        (path / "original").write_bytes(b"unchanged")
+        outside = tmp_path / "outside"
+        outside.mkdir(mode=0o700)
+        (outside / "sentinel").write_bytes(b"outside")
+        if drift == "tail":
+            with owner.path.open("ab") as stream:
+                stream.write(b'{"broken"')
+        elif drift in {"replace", "symlink"}:
+            retained = owner.path.with_suffix(".original")
+            owner.path.rename(retained)
+            if drift == "replace":
+                owner.path.write_bytes(retained.read_bytes())
+                owner.path.chmod(0o600)
+            else:
+                owner.path.symlink_to(outside / "sentinel")
+        elif drift == "hardlink":
+            os.link(owner.path, owner.path.with_suffix(".second-link"))
+        elif drift == "case_symlink":
+            path.rename(path.with_name("retained-original"))
+            path.symlink_to(outside, target_is_directory=True)
+        else:
+            owner.base.rename(owner.base.with_name("retained-base"))
+            owner.base.symlink_to(outside, target_is_directory=True)
+        if drift == "case_symlink":
+            owner.allocate("second", factory)
+            with pytest.raises(ValueError, match="unsafe"):
+                owner.confirm()
+        else:
+            with pytest.raises(ValueError):
+                owner.allocate("second", factory)
+        assert (outside / "sentinel").read_bytes() == b"outside"
+        assert sorted(p.name for p in outside.iterdir()) == ["sentinel"]
+        assert not (owner.fixtures / "TMP_PATH_MAP_FINAL.json").exists()
+    finally:
+        owner.close()
+
+
+def test_short_paths_reject_reinitialization_and_initial_symlink_without_cleanup(tmp_path):
+    owner, factory = short_path_case(tmp_path, ["first"])
+    try:
+        path = owner.allocate("first", factory)
+        (path / "original").write_text("kept")
+        with pytest.raises(ValueError, match="new retained base"):
+            runner.NativeShortPaths(owner.fixtures, owner.summary)
+        link = tmp_path / "link"
+        link.symlink_to(owner.fixtures, target_is_directory=True)
+        with pytest.raises(ValueError, match="unsafe"):
+            runner.NativeShortPaths(link, owner.summary)
+        assert (path / "original").read_text() == "kept"
+    finally:
+        owner.close()
+
+
+def test_short_mapping_budgets_fail_without_granting_a_case(tmp_path):
+    owner, factory = short_path_case(tmp_path, ["first"])
+    try:
+        owner.MAX_BYTES = 1
+        with pytest.raises(ValueError, match="byte bound"):
+            owner.allocate("first", factory)
+        assert not owner.used and owner.path.read_bytes() == b""
+        assert not (owner.fixtures / "TMP_PATH_MAP_FINAL.json").exists()
+        with pytest.raises(ValueError, match="collection is invalid"):
+            owner.bind_collection(SimpleNamespace(items=[SimpleNamespace(nodeid=str(i)) for i in range(2001)]))
+    finally:
+        owner.close()
+
+
+def short_plugin_subprocess(tmp_path, *, fail_mapping=False, failing_test=False, source=None):
+    test = tmp_path / "test_same.py"
+    test.write_text(source or "import pytest\nclass TestOne:\n"
+                    " @pytest.mark.parametrize('value', [1, 2])\n"
+                    " def test_same(self, tmp_path, value):\n"
+                    "  (tmp_path / 'original').write_text(str(value))\n"
+                    f"  assert {not failing_test!r}\n"
+                    "class TestTwo:\n def test_same(self, tmp_path):\n"
+                    "  (tmp_path / 'original').write_text('third')\n")
+    fixtures = tmp_path / "retained"
+    fixtures.mkdir(mode=0o700)
+    code = """import json,os,pathlib,sys,pytest
+sys.path.insert(0,sys.argv[1])
+from scripts.verify_cutover_completion_native import NativeDiagnostics, NativeShortPaths, native_short_path_plugin
+root=pathlib.Path(sys.argv[2]); os.chdir(root.parent)
+s=NativeDiagnostics(('test_same.py',)); owner=NativeShortPaths(root,s)
+if sys.argv[3]=='fail': owner.MAX_BYTES=1
+try:
+ result=pytest.main(['-q','-o','addopts=','-p','no:cacheprovider','--rootdir='+str(root.parent),
+                    '--basetemp='+str(root/'p'),'test_same.py'],
+                   plugins=[s,native_short_path_plugin(owner)])
+ if result == 0: owner.confirm()
+ print(json.dumps({'result':result,'allocated':len(owner.used),'complete':s.complete()}))
+finally: owner.close()
+sys.exit(result)
+"""
+    return subprocess.run([sys.executable, "-I", "-B", "-c", code, str(ROOT), str(fixtures),
+                           "fail" if fail_mapping else "pass"], cwd=tmp_path, text=True,
+                          capture_output=True, timeout=15), fixtures
+
+
+@pytest.mark.parametrize("failure", [None, "mapping", "test"])
+def test_real_nested_pytest_short_path_plugin_keeps_originals_and_stops_on_mapping_failure(tmp_path, failure):
+    result, fixtures = short_plugin_subprocess(tmp_path, fail_mapping=failure == "mapping", failing_test=failure == "test")
+    assert result.returncode == (0 if failure is None else 1), result.stdout + result.stderr
+    rows = [json.loads(line) for line in (fixtures / "TMP_PATH_MAP.jsonl").read_bytes().splitlines()]
+    if failure == "mapping":
+        assert "native temporary mapping STOP" in result.stdout + result.stderr
+        assert not rows and not list((fixtures / "p").rglob("original"))
+        assert not (fixtures / "TMP_PATH_MAP_FINAL.json").exists()
+    else:
+        assert len(rows) == 4 and len({row["relative_path"] for row in rows[1:]}) == 3
+        assert {row["nodeid"] for row in rows[1:]} == {
+            "test_same.py::TestOne::test_same[1]", "test_same.py::TestOne::test_same[2]", "test_same.py::TestTwo::test_same"}
+        assert sorted(p.read_text() for p in (fixtures / "p").rglob("original")) == ["1", "2", "third"]
+        assert (fixtures / "TMP_PATH_MAP_FINAL.json").exists() == (failure is None)
+
+
+def test_short_plugin_is_native_only_and_preserves_standard_factory_and_fixed_suite():
+    source = Path(runner.__file__).read_text()
+    assert 'path = factory.mktemp("t")' in source
+    assert 'plugins=[summary, native_short_path_plugin(short_paths)]' in runner.CONTAINER_TEST
+    assert len(runner.TESTS) == 56 and sum(len(files) for _, files in runner.TEST_GROUPS) == 56
+    assert '--basetemp=' in runner.CONTAINER_TEST and 'short_paths.confirm()' in runner.CONTAINER_TEST
+    assert 'native_short_path_plugin' not in (ROOT / "tests/conftest.py").read_text()
+    assert 'mktemp("runtime-image-input")' in (ROOT / "tests/test_production_admission_image_sources.py").read_text()
+
+
+def test_real_mixed_pytest_collection_does_not_create_unrequested_or_skipped_directories(tmp_path):
+    source = """import unittest,pytest
+def test_plain(): pass
+class TestUnit(unittest.TestCase):
+ def test_unit(self): self.assertTrue(True)
+def test_dynamic(request):
+ path=request.getfixturevalue('tmp_path'); (path/'original').write_text('dynamic')
+@pytest.mark.skip(reason='synthetic skip is still not native success')
+def test_skipped(tmp_path): assert False
+"""
+    result, fixtures = short_plugin_subprocess(tmp_path, source=source)
+    assert result.returncode == 0, result.stdout + result.stderr
+    rows = [json.loads(line) for line in (fixtures / "TMP_PATH_MAP.jsonl").read_bytes().splitlines()]
+    assert len(rows) == 2 and rows[0]["collection_count"] == 4
+    assert rows[1]["nodeid"] == "test_same.py::test_dynamic"
+    final = json.loads((fixtures / "TMP_PATH_MAP_FINAL.json").read_text())
+    assert final["collection_count"] == 4 and final["allocated_case_count"] == 1
+    assert '"complete": false' in result.stdout
+    assert "not summary.skipped" in runner.CONTAINER_TEST and "summary.complete()" in runner.CONTAINER_TEST
+    assert len([p for p in (fixtures / "p").iterdir() if p.is_dir() and not p.is_symlink()]) == 1
+
+
+def test_real_collection_without_tmp_path_has_zero_allocations_and_no_data_directory(tmp_path):
+    result, fixtures = short_plugin_subprocess(tmp_path, source="def test_plain(): pass\n")
+    assert result.returncode == 0, result.stdout + result.stderr
+    final = json.loads((fixtures / "TMP_PATH_MAP_FINAL.json").read_text())
+    assert final["collection_count"] == 1 and final["allocated_case_count"] == 0
+    assert not (fixtures / "p").exists()
+
+
+def test_second_mapping_owner_and_external_lock_refuse_before_new_directory(tmp_path):
+    import fcntl
+    owner, factory = short_path_case(tmp_path, ["first", "second"])
+    try:
+        # Even before the first case, another factory cannot reset the original base.
+        with pytest.raises(ValueError, match="new retained base"):
+            runner.NativeShortPaths(owner.fixtures, owner.summary)
+        first = owner.allocate("first", factory)
+        original = owner.path.read_bytes()
+        fd = os.open(owner.path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with pytest.raises(BlockingIOError):
+                owner.allocate("second", factory)
+            assert owner.path.read_bytes() == original and first.exists()
+            assert not (owner.base / "t1").exists()
+        finally:
+            os.close(fd)
+    finally:
+        owner.close()
+
+
+def test_mapping_parent_rename_race_never_creates_or_changes_foreign_files(tmp_path, monkeypatch):
+    fixtures = tmp_path / "fixtures"
+    fixtures.mkdir(mode=0o700)
+    original = tmp_path / "retained-original"
+    real_open = os.open
+
+    def replace_parent(path, flags, mode=0o777, *, dir_fd=None):
+        if path == "TMP_PATH_MAP.jsonl" and dir_fd is not None:
+            fixtures.rename(original)
+            fixtures.mkdir(mode=0o700)
+            (fixtures / "foreign").write_bytes(b"never touched")
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(runner.os, "open", replace_parent)
+    with pytest.raises(ValueError, match="root changed"):
+        runner.NativeShortPaths(fixtures, runner.NativeDiagnostics())
+    assert sorted(p.name for p in fixtures.iterdir()) == ["foreign"]
+    assert (fixtures / "foreign").read_bytes() == b"never touched"
+    assert stat.S_IMODE(fixtures.stat().st_mode) == 0o700
+    assert (original / "TMP_PATH_MAP.jsonl").read_bytes() == b""
+
+
+def test_actual_short_mapping_and_originals_are_included_in_unchanged_collector_budget(tmp_path, monkeypatch):
+    from scripts import prepare_synthetic_evidence as evidence
+    owner, factory = short_path_case(tmp_path, ["nested::same[one]", "nested::same[two]"])
+    try:
+        paths = [owner.allocate(name, factory) for name in owner.collection]
+        for index, path in enumerate(paths):
+            (path / "original").write_bytes(bytes([index]))
+        owner.confirm()
+        before = {str(p.relative_to(owner.fixtures)): (p.lstat().st_ino, p.lstat().st_mode, p.lstat().st_size)
+                  for p in owner.fixtures.rglob("*")}
+        actual_open = os.open
+
+        def no_link_open(path, flags, *args, **kwargs):
+            assert Path(path).name != "tcurrent", "internal alias is metadata only"
+            return actual_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(evidence.os, "open", no_link_open)
+        result = evidence.prepare({"synthetic": owner.fixtures}, tmp_path / "upload")
+        assert result["complete"] and not result["errors"]
+        assert len(result["files"]) == 4 and len(result["links"]) == 1
+        assert result["links"][0]["target_read"] is False
+        copied = tmp_path / "upload/files/synthetic"
+        assert (copied / "TMP_PATH_MAP.jsonl").read_bytes() == owner.path.read_bytes()
+        assert (copied / "TMP_PATH_MAP_FINAL.json").is_file()
+        assert before == {str(p.relative_to(owner.fixtures)): (p.lstat().st_ino, p.lstat().st_mode, p.lstat().st_size)
+                          for p in owner.fixtures.rglob("*")}
+    finally:
+        owner.close()
+
+
+def test_final_mapping_rejects_an_actual_allocation_missing_from_memory(tmp_path):
+    owner, factory = short_path_case(tmp_path, ["first"])
+    try:
+        path = owner.allocate("first", factory)
+        owner.used.clear()
+        with pytest.raises(ValueError, match="allocation count differs"):
+            owner.confirm()
+        assert path.is_dir() and not (owner.fixtures / "TMP_PATH_MAP_FINAL.json").exists()
+    finally:
+        owner.close()

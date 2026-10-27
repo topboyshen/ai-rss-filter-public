@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -175,7 +176,8 @@ def seed_case(tmp_path):
     (repo / "ops/miniflux/pause-source-lock.json").write_text(json.dumps({"patched_files_sha256": {
         "internal/database/webhook_outbox.go": hashlib.sha256(raw).hexdigest()}}))
     reference = native._base_image(repo)
-    image = {"Id": "sha256:" + "a" * 64, "Architecture": "amd64", "Os": "linux", "RepoDigests": [reference]}
+    image = {"Id": "sha256:" + "a" * 64, "Architecture": "amd64", "Os": "linux", "RepoDigests": [reference],
+             "Config": {"Entrypoint": None, "Cmd": ["/usr/bin/miniflux"]}}
     case = SimpleNamespace(repo=repo, source=source, output=output, image=image, reference=reference, sql=sql, events=[], failure=None)
     def command(args, **options):
         case.events.append(("command", args, options))
@@ -208,7 +210,7 @@ def test_seed_prepares_actual_from_digest_once_then_checks_image_before_exact132
     assert p.events[:2] == [("command", ["pull", "--platform=linux/amd64", p.reference], {}),
                             ("command", ["image", "inspect", p.reference], {})]
     assert p.events[2][0] == "launch" and p.events[2][1][0:2] == ("seed131", p.image["Id"])
-    assert p.events[2][1][-1] == ["-migrate"]
+    assert p.events[2][1][-1] == ["/usr/bin/miniflux", "-migrate"]
     assert [event[1] for event in p.events if event[0] == "sql"] == ["SELECT version FROM schema_version;",
         "BEGIN; SET LOCAL statement_timeout='3000ms'; " + p.sql
         + " UPDATE schema_version SET version='132' WHERE version='131'; COMMIT;", "SELECT version FROM schema_version;"]
@@ -218,6 +220,21 @@ def test_seed_prepares_actual_from_digest_once_then_checks_image_before_exact132
     assert record["upstream_reference"] == p.reference and record["upstream_image"] == p.image["Id"]
     assert record["prior_schema"] == 131 and record["schema"] == 132 and record["marker_and_sql_same_transaction"] is True
     assert record["production_compatibility_proven"] is False
+    assert record["upstream_entrypoint"] is None and record["upstream_cmd"] == ["/usr/bin/miniflux"]
+
+
+@pytest.mark.parametrize("config", [None, {}, {"Cmd": ["/usr/bin/miniflux"]},
+    {"Entrypoint": [], "Cmd": ["/usr/bin/miniflux"]},
+    {"Entrypoint": ["/usr/bin/miniflux"], "Cmd": ["/usr/bin/miniflux"]},
+    {"Entrypoint": None, "Cmd": ["/unreviewed/binary"]},
+    {"Entrypoint": None, "Cmd": ["/usr/bin/miniflux", "-migrate"]}])
+def test_seed_rejects_changed_or_missing_actual_executable_config_before_launch(seed_case, config):
+    p = seed_case
+    p.image["Config"] = config
+    with pytest.raises(gate.AdmissionError, match="executable configuration"):
+        native.seed132(p.harness)
+    assert [event[0] for event in p.events] == ["command", "command"]
+    assert not list(p.output.iterdir())
 
 
 @pytest.mark.parametrize("failure", ["pull", "inspect", "architecture", "os", "digest", "image_id"])
@@ -297,6 +314,142 @@ def test_safe_export_selects_only_public_proof_and_keeps_root_originals(tmp_path
 
 def export_metadata(path):
     return native.export._metadata(path.stat())
+
+
+def failed_command(monkeypatch, tmp_path, *, rc=125, stderr=None):
+    root = tmp_path.resolve()
+    root.chmod(0o700)
+    harness = object.__new__(native.Harness)
+    harness.output, harness.sequence, harness.started = root, 0, time.monotonic()
+    harness.phase_deadline, harness.env = None, {}
+    harness.password, harness.token, harness.auth = "SYNTHETIC_PASSWORD", "SYNTHETIC_TOKEN", "SYNTHETIC_AUTH"
+    calls = []
+    stderr = stderr if stderr is not None else ('docker: Error response from daemon: failed to create task: '
+        'OCI runtime create failed: exec: "-migrate": executable file not found in $PATH: unknown.\n')
+    def command(args, **options):
+        calls.append((args, options))
+        if rc is None:
+            raise subprocess.TimeoutExpired(args, 0.1, output="PRIVATE_STDOUT", stderr=stderr)
+        return subprocess.CompletedProcess(args, rc, "PRIVATE_STDOUT", stderr)
+    monkeypatch.setattr(native.subprocess, "run", command)
+    previous = os.umask(0o077)
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            harness.command(["run", "--env", "DATABASE_URL=postgres://PRIVATE_USER:PRIVATE_PASS@private-host/db",
+                             "--mount", "type=bind,src=/private/SECRET_PATH,dst=/app/data", "sha256:" + "a" * 64], timeout=0.1)
+    finally:
+        os.umask(previous)
+    reference = native._command_reference(harness, caught.value)
+    assert reference == {"command_sequence": 1} and len(calls) == 1
+    failure = {"type": "RuntimeError", **reference}
+    native._save(root / "FAILURE.json", failure)
+    native._save(root / "RESULT.json", {"status": "unconfirmed", "failure": failure, "errors": []})
+    return harness, caught.value, calls
+
+
+@pytest.mark.parametrize("rc,category", [(125, "container_executable_not_found"), (None, "result_unknown"), (-15, "container_executable_not_found")])
+def test_actual_command_failure_reference_exports_only_bounded_derivative(monkeypatch, tmp_path, rc, category):
+    harness, error, calls = failed_command(monkeypatch, tmp_path, rc=rc)
+    before = {p.name: (p.read_bytes(), export_metadata(p)) for p in tmp_path.iterdir()}
+    packet = native.safe_export(tmp_path.resolve())
+    assert packet["complete"] is True and packet["originals_modified"] is False
+    summary, = packet["command_failures"]
+    assert summary["command_sequence"] == 1 and summary["operation"] == "run"
+    assert summary["rc"] == rc and summary["error_class"] == category and summary["execution_proof"] is False
+    assert summary["original_record_sha256"] == hashlib.sha256(before["command-0001.json"][0]).hexdigest()
+    original = json.loads(before["command-0001.json"][0])
+    assert summary["retained_stderr_sha256"] == hashlib.sha256(original["stderr"].encode()).hexdigest()
+    assert "PRIVATE_" not in json.dumps(packet) and "SECRET_PATH" not in json.dumps(packet)
+    assert "/private/" not in json.dumps(packet) and "postgres://" not in json.dumps(packet)
+    assert len(calls) == 1 and type(error) is RuntimeError and harness.sequence == 1
+    assert all((p.read_bytes(), export_metadata(p)) == before[p.name] for p in tmp_path.iterdir())
+
+
+def test_spoofed_exception_and_other_harness_cannot_reference_command(monkeypatch, tmp_path):
+    harness, error, _ = failed_command(monkeypatch, tmp_path)
+    assert native._command_reference(SimpleNamespace(sequence=1, output=tmp_path), error) == {}
+    try:
+        raise RuntimeError("isolated command 1 failed rc=125")
+    except RuntimeError as spoof:
+        assert native._command_reference(harness, spoof) == {}
+
+
+@pytest.mark.parametrize("export_fails", [False, True])
+def test_main_command_diagnostic_never_turns_original_failure_into_success(monkeypatch, tmp_path, capsys, export_fails):
+    failed_command(monkeypatch, tmp_path)
+    original = (tmp_path / "command-0001.json").read_bytes()
+    if export_fails:
+        os.link(tmp_path / "command-0001.json", tmp_path / "private-alias")
+    arguments = _fallback_arguments(tmp_path)
+    arguments[arguments.index("--output") + 1] = str(tmp_path)
+    monkeypatch.setattr(native.sys, "argv", ["native", *arguments])
+    monkeypatch.setattr(native, "execute", lambda *_args: {"status": "unconfirmed"})
+    assert native.main() == 3
+    captured = capsys.readouterr()
+    assert not captured.err and "PRIVATE_" not in captured.out and "/private/" not in captured.out
+    packet = json.loads(captured.out)
+    assert packet["status"] == "unconfirmed"
+    if export_fails:
+        assert packet["safe_export_complete"] is False
+    else:
+        assert packet["safe_evidence"]["command_failures"][0]["execution_proof"] is False
+    assert (tmp_path / "command-0001.json").read_bytes() == original
+
+
+@pytest.mark.parametrize("change", ["symlink", "hardlink", "mode", "oversize", "zero_rc", "bool_rc", "nan_elapsed", "duplicate", "bad_prefix"])
+def test_unsafe_or_ambiguous_retained_command_fails_export_without_following(monkeypatch, tmp_path, change):
+    failed_command(monkeypatch, tmp_path)
+    path = tmp_path / "command-0001.json"
+    raw = path.read_bytes()
+    if change == "symlink":
+        path.rename(tmp_path / "private-original")
+        path.symlink_to(tmp_path / "private-original")
+    elif change == "hardlink":
+        os.link(path, tmp_path / "private-alias")
+    elif change == "mode":
+        path.chmod(0o644)
+    elif change == "oversize":
+        with path.open("wb") as stream:
+            stream.truncate(native.export.EXPORT_FILE_BYTES + 1)
+    elif change == "duplicate":
+        path.write_bytes(raw.rstrip()[:-1] + b',"rc":0}')
+    else:
+        value = json.loads(raw)
+        if change == "bad_prefix":
+            value["argv"][0] = "PRIVATE_ARBITRARY_COMMAND"
+        elif change == "nan_elapsed":
+            value["elapsed_seconds"] = float("nan")
+        else:
+            value["rc"] = 0 if change == "zero_rc" else True
+        path.write_text(json.dumps(value))
+    with pytest.raises((gate.AdmissionError, OSError)):
+        native.safe_export(tmp_path.resolve())
+    assert path.exists() and (tmp_path / "RESULT.json").exists()
+
+
+def test_command_diagnostics_share_existing_input_budget_and_bound_count(monkeypatch, tmp_path):
+    failed_command(monkeypatch, tmp_path)
+    total = sum(p.stat().st_size for p in tmp_path.iterdir())
+    with monkeypatch.context() as scope:
+        scope.setattr(native.export, "EXPORT_INPUT_BYTES", total - 1)
+        with pytest.raises(gate.AdmissionError, match="byte budget"):
+            native.safe_export(tmp_path.resolve())
+    result = tmp_path / "RESULT.json"
+    result.write_text(json.dumps({"status": "unconfirmed", "errors": [{"command_sequence": n} for n in range(1, 10)]}))
+    with pytest.raises(gate.AdmissionError, match="count bound"):
+        native.safe_export(tmp_path.resolve())
+
+
+@pytest.mark.parametrize("stderr", ["PRIVATE_MESSAGE exec: \"-migrate\": executable file not found in $PATH",
+    "PRIVATE_TOKEN\nCannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?",
+    "docker: Error response from daemon: PRIVATE_MESSAGE /private/SECRET_PATH https://user:SECRET@host/",
+    "docker: Error response from daemon: " + "x" * 65536])
+def test_unrecognized_sensitive_stderr_stays_hash_only(monkeypatch, tmp_path, stderr):
+    failed_command(monkeypatch, tmp_path, stderr=stderr)
+    summary, = native.safe_export(tmp_path.resolve())["command_failures"]
+    assert summary["error_class"] == "unclassified" and summary["execution_proof"] is False
+    assert "PRIVATE_" not in json.dumps(summary) and "SECRET" not in json.dumps(summary)
+    assert "/private/" not in json.dumps(summary) and "https://" not in json.dumps(summary)
 
 
 @pytest.mark.parametrize("change", ["symlink", "hardlink", "mode", "oversize", "missing_result"])
