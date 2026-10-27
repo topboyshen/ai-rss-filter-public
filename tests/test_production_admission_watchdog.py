@@ -264,7 +264,12 @@ def test_actual_guardian_observes_killed_owned_parent_and_stops_receiver(request
     monkeypatch.setattr(gate, "_boot_identity", lambda: "linux:" + Path("/proc/sys/kernel/random/boot_id").read_text().strip())
     monkeypatch.setattr(watchdog, "process_identity", process_identity)
     from production_admission_environment_support import sealed_inputs
-    context = sealed_inputs(p.root.parent / "actual-child-environment", source_root=watchdog.ROOT)
+    from production_source_fixture_support import isolated_git_source
+    source = isolated_git_source(p.root.parent / "actual-child-source", watchdog.ROOT)
+    monkeypatch.setattr(watchdog, "ROOT", source)
+    monkeypatch.setattr(watchdog, "__file__", str(source / "scripts/production_admission_watchdog.py"))
+    monkeypatch.setattr(watchdog.supervisor, "ROOT", source)
+    context = sealed_inputs(p.root.parent / "actual-child-environment", source_root=source)
     _sealed, environment_permit = context.__enter__()
     request.addfinalizer(lambda: context.__exit__(None, None, None))
     parent = subprocess.Popen([sys.executable, "-I", "-B", "-c", "import time; time.sleep(60)"],
@@ -316,3 +321,28 @@ def test_actual_guardian_observes_killed_owned_parent_and_stops_receiver(request
             if owned is not None and owned.poll() is None:
                 owned.kill()
                 owned.wait(timeout=3)
+
+
+def test_actual_guardian_source_copy_has_real_git_identity_and_rejects_drift(tmp_path, monkeypatch):
+    import subprocess
+    import sys
+    from pathlib import Path
+    from production_admission_environment_support import sealed_inputs
+    from production_source_fixture_support import isolated_git_source
+    source = isolated_git_source(tmp_path / "source", watchdog.ROOT)
+    script = source / "scripts/production_admission_watchdog.py"
+    assert script.read_bytes() == Path(watchdog.__file__).read_bytes()
+    assert not (source / ".git").is_symlink() and (source / ".git").is_dir()
+    assert "__pycache__/" in (source / ".gitignore").read_text()
+    subprocess.run(["git", "-C", str(source), "ls-files", "--error-unmatch", ".gitignore"],
+                   check=True, capture_output=True, timeout=10)
+    with sealed_inputs(tmp_path / "environment", source_root=source) as (_files, permit):
+        monkeypatch.setattr(watchdog.supervisor, "ROOT", source)
+        environment = watchdog.supervisor._sealed_environment(permit)
+        child = subprocess.run([sys.executable, "-I", "-B", str(script), "--help"],
+                               cwd=source, env=environment, capture_output=True, timeout=15)
+        assert child.returncode == 0, child.stderr.decode()
+        assert watchdog.supervisor.private.source_identity(source)["source_sha"] == permit["source"]["revision"]
+        script.write_bytes(script.read_bytes() + b"\n# synthetic source drift\n")
+        with pytest.raises(watchdog.supervisor.private.ContractError, match="clean source"):
+            watchdog.supervisor._sealed_environment(permit)

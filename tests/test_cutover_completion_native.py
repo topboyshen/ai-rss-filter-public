@@ -4,6 +4,8 @@ import ast
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -66,7 +68,7 @@ class CompletionNativeGuards(unittest.TestCase):
         self.assertEqual(len(runner.TESTS), len(expected))
         self.assertEqual(actual, expected)
         for name in ("app.py", "worker_main.py", "core", "db", "services", "config.yaml", "modules",
-                     "ops/miniflux", ".github/workflows", "gunicorn.conf.py"):
+                     "ops/miniflux", ".github/workflows", "gunicorn.conf.py", "Dockerfile", "requirements-prod.txt", "start.sh"):
             self.assertIn(name, runner.MOUNTS)
         self.assertIn("memory.peak", runner.CONTAINER_TEST)
         self.assertIn("memory.events", runner.CONTAINER_TEST)
@@ -238,18 +240,19 @@ def test_diagnostics_bound_phase_times_without_parameter_values(capsys):
     summary.pytest_runtest_logstart(nodeid, ())
     for phase in ("setup", "call", "teardown"):
         summary.pytest_runtest_logreport(SimpleNamespace(nodeid=nodeid, when=phase, duration=0.25,
-                                                       passed=True, failed=False, skipped=False))
+                                                       passed=True, failed=False, skipped=False, outcome="passed"))
     summary.pytest_runtest_logfinish(nodeid, ())
     output = capsys.readouterr().out
     assert "DO_NOT_PRINT" not in output
     rows = [json.loads(line) for line in output.splitlines()]
     assert [row["native_test"] for row in rows] == ["start", "setup", "call", "teardown", "end"]
     assert all(row["function"] == "test_original" and row["file"] == "test_synthetic.py" for row in rows)
+    assert [row["outcome"] for row in rows if "outcome" in row] == ["passed"] * 3
     assert summary.passed == 1 and summary.failed == summary.skipped == 0
     summary.started = 2000
     summary.pytest_runtest_logstart(nodeid, ())
     summary.pytest_runtest_logreport(SimpleNamespace(nodeid=nodeid, when="call", duration=0.25,
-                                                   passed=True, failed=False, skipped=False))
+                                                   passed=True, failed=False, skipped=False, outcome="passed"))
     assert capsys.readouterr().out == "" and summary.passed == 2
     assert "'faulthandler_timeout=30'" in runner.CONTAINER_TEST
     assert 'command(DOCKER + ["start", "-a", name], output / "tests", 180)' in Path(runner.base_runner().__file__).read_text()
@@ -288,6 +291,127 @@ def test_setup_capture(capsys, setup_output):
     phases = [json.loads(line[line.index("{"):])["native_test"] for line in result.stdout.splitlines()
               if '"native_test":' in line]
     assert phases == ["start", "setup", "call", "teardown", "end"] * 3
+
+
+@pytest.mark.parametrize("outcome", ["passed", "failed", "setup_failed"])
+def test_real_nested_pytest_clock_patches_do_not_break_or_hide_reports(tmp_path, outcome):
+    path = tmp_path / "test_native_clock.py"
+    path.write_text("""import time, pytest
+@pytest.fixture
+def exhausted_clock(monkeypatch):
+    values = iter([0, 0, 2])
+    monkeypatch.setattr(time, 'monotonic', lambda: next(values))
+    assert [time.monotonic() for _ in range(3)] == [0, 0, 2]
+    if OUTCOME == 'setup_failed':
+        raise RuntimeError('synthetic setup failure')
+def test_original(exhausted_clock):
+    assert OUTCOME != 'failed', 'synthetic assertion failure'
+""".replace("OUTCOME", repr(outcome)))
+    code = ("import pytest,sys,json; from scripts.verify_cutover_completion_native import NativeDiagnostics; "
+            "s=NativeDiagnostics(); r=pytest.main(['-q','-o','addopts=','-p','no:cacheprovider',sys.argv[1]],plugins=[s]); "
+            "print(json.dumps({'complete':s.complete(),'passed':s.passed,'failed':s.failed,'finished':s.finished}));sys.exit(r)")
+    result = subprocess.run([sys.executable, "-B", "-c", code, str(path)], cwd=ROOT,
+                            capture_output=True, text=True, timeout=20)
+    assert "INTERNALERROR" not in result.stdout + result.stderr
+    assert "StopIteration" not in result.stdout + result.stderr
+    value = json.loads(result.stdout.splitlines()[-1])
+    assert value == {"complete": outcome == "passed", "passed": int(outcome == "passed"),
+                     "failed": int(outcome != "passed"), "finished": 1}
+    assert result.returncode == int(outcome != "passed")
+    reports = [json.loads(line[line.index("{"):]) for line in result.stdout.splitlines() if '"native_test":' in line]
+    assert all(row["elapsed"] >= 0 for row in reports)
+    phase = "setup" if outcome == "setup_failed" else "call"
+    assert [row["outcome"] for row in reports if row["native_test"] == phase] == ["passed" if outcome == "passed" else "failed"]
+
+
+def native_mount_projection(root, mounts):
+    """Only the explicit read-only mount view, without the caller's Git tree."""
+    root.mkdir(mode=0o700)
+    for name in mounts:
+        source, target = ROOT / name, root / name
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if source.is_dir():
+            shutil.copytree(source, target, symlinks=True, ignore=shutil.ignore_patterns("__pycache__"))
+        else:
+            shutil.copyfile(source, target)
+    assert not (root / ".git").exists()
+    return root
+
+
+@pytest.mark.parametrize("missing", [None, "Dockerfile", "requirements-prod.txt", "start.sh"])
+def test_image_source_test_works_in_only_native_mounts_and_each_root_input_is_required(tmp_path, monkeypatch, missing):
+    import test_production_admission_image_sources as image_sources
+    mounts = tuple(name for name in runner.MOUNTS if name != missing)
+    projection = native_mount_projection(tmp_path / "projected", mounts)
+    monkeypatch.setattr(image_sources, "ROOT", projection)
+    image = tmp_path / "image"
+    image.mkdir(mode=0o700)
+    if missing is None:
+        image_sources.test_runtime_controller_hash_matches_from_docker_copy_layout(image)
+    else:
+        with pytest.raises(FileNotFoundError) as error:
+            image_sources.test_runtime_controller_hash_matches_from_docker_copy_layout(image)
+        assert Path(error.value.filename) == projection / missing
+
+
+def check_dependency_image_git(source):
+    assert re.findall(r"\b(git(?:-man)?)=([^\s\\]+)", source) == [
+        ("git", "1:2.47.3-0+deb13u1"), ("git-man", "1:2.47.3-0+deb13u1")]
+    assert 'test "$(git --version)" = "git version 2.47.3"' in source
+    assert "--no-install-recommends" in source
+
+
+@pytest.mark.parametrize("drift", [None, "git", "git-man", "version_check"])
+def test_dependency_image_requires_exact_git_pins_and_native_smoke_before_pytest(drift):
+    source = (ROOT / "ops/isolation/Dockerfile.cutover-completion").read_text()
+    if drift is None:
+        check_dependency_image_git(source)
+    else:
+        changed = (source.replace('test "$(git --version)" = "git version 2.47.3"', "true")
+                   if drift == "version_check" else source.replace(drift + "=1:2.47.3-0+deb13u1", drift))
+        with pytest.raises(AssertionError):
+            check_dependency_image_git(changed)
+    assert runner.CONTAINER_TEST.index("verify_git_fixture(fixtures") < runner.CONTAINER_TEST.index("pytest.main(")
+
+
+def test_git_dependency_smoke_makes_real_private_commit_without_user_config(tmp_path, monkeypatch):
+    fixtures, evidence = fixture_disk(tmp_path)
+    invoke, calls = subprocess.run, []
+    def command(arguments, **options):
+        calls.append((arguments, options))
+        # Only the version transport differs on the developer host. The actual
+        # native helper runs the pinned binary; init/add/commit/status are real.
+        if arguments[-1] == "--version":
+            return SimpleNamespace(stdout="git version 2.47.3\n")
+        return invoke(arguments, **options)
+    monkeypatch.setattr(runner.subprocess, "run", command)
+    runner.verify_git_fixture(fixtures, evidence)
+    record = json.loads((evidence / "GIT_DEPENDENCY.json").read_text())
+    assert record["init_add_commit_status_passed"] and record["remote_operations"] is False
+    assert (fixtures / "git-dependency-smoke/.git/HEAD").is_file()
+    assert len(calls) == 5
+    for arguments, options in calls:
+        assert arguments[:3] == ["/usr/bin/git", "-c", "core.hooksPath=/dev/null"]
+        assert options["check"] is True and options["timeout"] == 3
+        assert options["env"] == {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": str(fixtures / "git-dependency-smoke"),
+                                  "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
+
+
+@pytest.mark.parametrize("failure", ["missing", "version", "commit", "dirty"])
+def test_git_dependency_failure_has_no_success_record(tmp_path, monkeypatch, failure):
+    fixtures, evidence = fixture_disk(tmp_path)
+    def command(arguments, **options):
+        if failure == "missing":
+            raise FileNotFoundError("synthetic git absent")
+        if arguments[-1] == "--version":
+            return SimpleNamespace(stdout="git version " + ("other" if failure == "version" else "2.47.3"))
+        if "commit" in arguments and failure == "commit":
+            raise subprocess.CalledProcessError(1, arguments)
+        return SimpleNamespace(stdout=" M fixture.txt" if "status" in arguments and failure == "dirty" else "")
+    monkeypatch.setattr(runner.subprocess, "run", command)
+    with pytest.raises((FileNotFoundError, ValueError, subprocess.CalledProcessError)):
+        runner.verify_git_fixture(fixtures, evidence)
+    assert not (evidence / "GIT_DEPENDENCY.json").exists()
 
 
 def test_fixed_partition_keeps_every_file_once_and_programs_bind_collection():

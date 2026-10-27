@@ -22,6 +22,8 @@ import subprocess
 import time
 import uuid
 
+_DIAGNOSTIC_MONOTONIC = time.monotonic
+
 
 def base_runner():
     path = Path(__file__).with_name("verify_handoff_operations_native.py")
@@ -81,12 +83,37 @@ def confirm_fixture_storage(fixtures, evidence_root, initial, digest):
                           "test_completion_confirmed": False})
 
 
+def verify_git_fixture(fixtures, evidence_root):
+    """Fail before pytest unless the pinned dependency supports real fixtures."""
+    directory = fixtures / "git-dependency-smoke"
+    directory.mkdir(mode=0o700)
+    environment = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": str(directory),
+                   "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
+    def invoke(arguments):
+        return subprocess.run(["/usr/bin/git", "-c", "core.hooksPath=/dev/null", *arguments],
+            env=environment, capture_output=True, text=True, timeout=3, check=True).stdout.strip()
+    version = invoke(["--version"])
+    if version != "git version 2.47.3":
+        raise ValueError("native fixture Git version differs")
+    invoke(["-C", str(directory), "init", "-q"])
+    original = b"synthetic native dependency proof\n"
+    (directory / "fixture.txt").write_bytes(original)
+    invoke(["-C", str(directory), "add", "fixture.txt"])
+    invoke(["-C", str(directory), "-c", "user.name=Synthetic fixture", "-c", "user.email=fixture@example.invalid",
+            "commit", "-qm", "synthetic dependency proof"])
+    if invoke(["-C", str(directory), "status", "--porcelain=v1"]):
+        raise ValueError("native fixture Git commit is not clean")
+    write_fixture_record(evidence_root / "GIT_DEPENDENCY.json", {
+        "version": version, "init_add_commit_status_passed": True,
+        "fixture_sha256": hashlib.sha256(original).hexdigest(), "remote_operations": False})
+
+
 class NativeDiagnostics:
     """Bounded phase timing only; no parametrized values or failure text."""
     def __init__(self, expected_files=None):
         self.passed = self.failed = self.skipped = self.started = self.finished = 0
         self.subtests_passed = self.subtests_failed = self.subtests_skipped = 0
-        self.origin = time.monotonic()
+        self.origin = _DIAGNOSTIC_MONOTONIC()
         self.expected_files = tuple(expected_files) if expected_files is not None else None
         self.collection_verified = False
         self.collected = 0
@@ -114,7 +141,7 @@ class NativeDiagnostics:
         filename = filename if re.fullmatch(r"test_[A-Za-z0-9_]{1,100}\.py", filename) else "redacted"
         function = function if re.fullmatch(r"test_[A-Za-z0-9_]{1,150}", function) else "redacted"
         print(json.dumps({"native_test": phase, "index": self.started, "file": filename, "function": function,
-              "elapsed": round(time.monotonic() - self.origin, 6), **fields}, sort_keys=True), flush=True)
+              "elapsed": round(_DIAGNOSTIC_MONOTONIC() - self.origin, 6), **fields}, sort_keys=True), flush=True)
 
     def pytest_runtest_logstart(self, nodeid, location):
         self.started += 1
@@ -134,7 +161,7 @@ class NativeDiagnostics:
         if report.skipped:
             self.skipped += 1
             self.subtests_skipped += int(subtest)
-        self.emit(report.nodeid, report.when, duration=round(report.duration, 6), subtest=subtest)
+        self.emit(report.nodeid, report.when, duration=round(report.duration, 6), subtest=subtest, outcome=report.outcome)
 
     def pytest_runtest_logfinish(self, nodeid, location):
         self.finished += 1
@@ -189,10 +216,11 @@ TEST_GROUPS = (("foundation", TESTS[:22]), ("activation", TESTS[22:34]), ("adapt
 MOUNTS = ("scripts", "tests", "services", "routes", "core", "db", "utils", "workers", "modules",
           "templates", "app.py", "worker_main.py", "sse_engine.py", "logging_bootstrap.py",
           "scoring_provenance.py", "scoring_explanation.py", "config.yaml", "docker-compose.yml",
-          "ops/isolation", "ops/miniflux", ".github/workflows", "gunicorn.conf.py")
+          "ops/isolation", "ops/miniflux", ".github/workflows", "gunicorn.conf.py",
+          "Dockerfile", "requirements-prod.txt", "start.sh")
 CONTAINER_TEST = r'''
 import json, os, pathlib, platform, sys, tempfile, pytest
-from scripts.verify_cutover_completion_native import NativeDiagnostics, retain_fixture_storage, confirm_fixture_storage
+from scripts.verify_cutover_completion_native import NativeDiagnostics, retain_fixture_storage, confirm_fixture_storage, verify_git_fixture
 assert platform.system() == 'Linux' and platform.machine() == 'x86_64'
 fixture_mount = pathlib.Path('/tmp/cutover-fixtures')
 assert fixture_mount.samefile('/evidence/disk-fixtures')
@@ -201,6 +229,7 @@ fixtures = pathlib.Path(tempfile.mkdtemp(prefix='cutover-synthetic-', dir=str(fi
 os.environ['AI_FILTER_CUTOVER_EVIDENCE_DIR'] = str(fixtures)
 os.environ['AI_FILTER_HANDOFF_EVIDENCE_DIR'] = str(fixtures)
 initial, mapping_sha256 = retain_fixture_storage(fixtures, pathlib.Path('/evidence'))
+verify_git_fixture(fixtures, pathlib.Path('/evidence'))
 frozen_test_files = ('tests/test_independent_drain_inventory.py',
  'tests/test_frozen_cutover.py',
  'tests/test_handoff_runtime_adapter.py',

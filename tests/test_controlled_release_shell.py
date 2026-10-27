@@ -6,29 +6,66 @@ import sys
 
 import pytest
 
-from test_release_script import release_env, _run_release  # noqa: F401
+import test_release_script as release_helpers
+from production_source_fixture_support import isolated_git_source
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_pending_finalization_blocks_ordinary_release_without_docker(release_env):  # noqa: F811
+@pytest.fixture
+def release_env(tmp_path, monkeypatch):
+    files = ("scripts/release.sh", "scripts/capture_release_diagnostics.py", "scripts/run-release-gate.sh",
+             "Dockerfile", "config.yaml", "docker-compose.yml")
+    source = isolated_git_source(tmp_path / "source", ROOT, files=files)
+    for name, path in {"PROJECT_ROOT": source, "RELEASE_SCRIPT": source / "scripts/release.sh",
+                       "DIAGNOSTICS_HELPER": source / "scripts/capture_release_diagnostics.py",
+                       "RELEASE_GATE_RUNNER": source / "scripts/run-release-gate.sh"}.items():
+        monkeypatch.setattr(release_helpers, name, path)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    fixture = release_helpers.release_env.__wrapped__(runtime)
+    try:
+        yield next(fixture)
+    finally:
+        fixture.close()
+
+
+def test_pending_finalization_blocks_ordinary_release_without_docker(release_env):
     env, log, registry, _manifest = release_env
     marker = registry / "controlled-finalize.pending.json"
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text('{"original_operation":"must-query"}\n')
     marker.chmod(0o600)
     before = log.read_text() if log.exists() else ""
-    result = _run_release(env, "verify", "my-ai-filter:2026.10.27.999")
+    result = release_helpers._run_release(env, "verify", "my-ai-filter:2026.10.27.999")
     assert result.returncode == 8 and "query its original operation" in result.stderr
     assert (log.read_text() if log.exists() else "") == before
     assert marker.read_text() == '{"original_operation":"must-query"}\n'
 
 
-def test_controlled_check_requires_private_contract_and_inherited_lock(release_env):  # noqa: F811
+def test_controlled_check_requires_private_contract_and_inherited_lock(release_env):
     env, _log, _registry, _manifest = release_env
-    result = _run_release(env, "controlled-check", "my-ai-filter:synthetic", "a" * 64, "fresh",
-                          "my-ai-filter:old", "sha256:" + "b" * 64, "c" * 64, "preflight")
+    result = release_helpers._run_release(env, "controlled-check", "my-ai-filter:synthetic", "a" * 64, "fresh",
+                                         "my-ai-filter:old", "sha256:" + "b" * 64, "c" * 64, "preflight")
     assert result.returncode == 8
+
+
+def test_release_fixture_uses_private_real_git_source_and_never_the_mount(release_env, tmp_path):
+    env, _log, registry, _manifest = release_env
+    source = release_helpers.PROJECT_ROOT
+    assert source == tmp_path / "source" and source != ROOT
+    assert source.stat().st_mode & 0o777 == 0o700 and registry.is_relative_to(tmp_path / "runtime")
+    head = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+    assert len(head) == 40 and (Path(env["RELEASE_TEST_ATTESTATION_DIR"]) / (head + ".state")).is_file()
+    for name in ("release.sh", "run-release-gate.sh", "capture_release_diagnostics.py"):
+        assert (source / "scripts" / name).read_bytes() == (ROOT / "scripts" / name).read_bytes()
+    assert all(path.stat().st_mode & 0o777 == 0o600 for path in (source / "secrets").iterdir())
+    env = {key: value for key, value in env.items() if not key.startswith("RELEASE_DIRTY_TREE_")
+           and key != "RELEASE_ALLOW_DIRTY_TREE"}
+    (source / "config.yaml").write_bytes((source / "config.yaml").read_bytes() + b"\n# synthetic source drift\n")
+    result = release_helpers._run_release(env, "deploy", "my-ai-filter:2026.10.27.999")
+    assert result.returncode == 7 and "dirty" in result.stderr.lower()
+    assert not _log.exists()
 
 
 def _check_case(tmp_path):

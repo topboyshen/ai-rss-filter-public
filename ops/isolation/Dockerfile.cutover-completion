@@ -1,5 +1,12 @@
 # Disposable CI dependency image, never an application/release image or .126.
 FROM python:3.11.17-slim-trixie@sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e5767af9ea65f6ce
+# Sealed-source fixtures create real private Git repositories. Keep this test
+# dependency explicit and fixed; it is not added to the application image.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      git=1:2.47.3-0+deb13u1 git-man=1:2.47.3-0+deb13u1 \
+ && test "$(git --version)" = "git version 2.47.3" \
+ && rm -rf /var/lib/apt/lists/*
 COPY requirements-prod.txt requirements.txt /dependencies/
 RUN python -m pip install --no-cache-dir --only-binary=:all: -r /dependencies/requirements.txt
 WORKDIR /work
