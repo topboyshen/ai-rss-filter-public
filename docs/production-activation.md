@@ -63,7 +63,11 @@ inflight 或未知 lease 仍然阻止把它当成已排空。
    journal 同 SQLite 事务；PG 与 SQLite 不是跨库原子事务。提交后锁失联保留已提交证据并停止，
    不重复迁移，也不把未知结果说成回滚成功。
 3. `production_container_lifecycle.create` 写入 intent 后，只执行一次受控 Compose
-   `create --no-recreate --no-build --pull never --no-deps`。对实际新建、未启动的精确容器 ID
+   `create --no-recreate --no-build --pull never`，并明确只选择两个候选服务。受控 manifest 的全部服务
+   必须通过单例、无依赖的字段许可清单；依赖、共享命名空间、provider、生命周期钩子及未知字段在
+   写入 create intent 前即被拒绝。这里不使用 [Compose `create` 选项](https://docs.docker.com/reference/cli/docker/compose/create/)
+   中未提供的 `--no-deps`；原生验证另保存实际 CLI 版本、帮助和参数解析结果。
+   对实际新建、未启动的精确容器 ID
    授权 descriptor 和每个 slot 的 grant。只有完整 `created_granted` 原件才允许后续 start。
 4. `start` 先保存固定 ID 的 start intent，再调用一次 `docker start`。`query` 复核实际进程、
    owner lease、slot 和容器，确认全部 `closed_initialized`。此时普通业务尚未开放。

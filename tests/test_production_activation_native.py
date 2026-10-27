@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import hashlib
+import ast
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -244,3 +247,73 @@ def test_empty_receipt_preparation_refuses_retained_work_or_unsafe_storage(tmp_p
     finally:
         if fd is not None:
             os.close(fd)
+
+
+@pytest.mark.parametrize("failure", [None, "missing_plugin", "network_failure", "timeout", "accepted"])
+def test_compose_parser_evidence_is_static_and_distinguishes_other_failures(tmp_path, failure):
+    calls = []
+    harness = object.__new__(native.ActivationHarness)
+    harness.output, harness.sequence = tmp_path, 0
+    def command(args):
+        calls.append(args)
+        harness.sequence += 1
+        if args == ["compose", "version"]:
+            return {"rc": 0, "stdout": "docker help" if failure == "missing_plugin" else "Docker Compose version v2.38.2\n"}
+        if args == ["compose", "create", "--help"]:
+            return {"rc": 0, "stdout": "Usage: docker compose create --no-recreate --no-build --pull"}
+        assert args == ["compose", "create", "--no-deps", "--help"]
+        record = {"rc": 1, "stderr": "unknown flag: --no-deps\n"}
+        if failure == "network_failure":
+            record["stderr"] = "cannot connect to Docker daemon"
+        elif failure == "timeout":
+            record["rc"] = None
+        elif failure == "accepted":
+            record.update(rc=0, stderr="")
+        gate._write(tmp_path / f"command-{harness.sequence:04d}.json", record)
+        return record
+    harness.compose_parser_command = command
+    if failure:
+        with pytest.raises(gate.AdmissionError):
+            harness.compose_parser_evidence()
+        assert not (tmp_path / "COMPOSE_PARSER.json").exists()
+    else:
+        harness.compose_parser_evidence()
+        result = gate._read(tmp_path / "COMPOSE_PARSER.json")
+        assert result["create_no_deps_rejected"] is True and result["daemon_mutation"] is False
+        assert len(calls) == 3
+    assert all(args[:1] == ["compose"] for args in calls)
+
+
+def test_actual_compose_parser_checks_run_before_network_or_container_mutation():
+    source = Path(native.__file__).read_text()
+    execute = next(node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef) and node.name == "execute")
+    calls = [node.func.attr for node in ast.walk(execute) if isinstance(node, ast.Call)
+             and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name)
+             and node.func.value.id == "harness"]
+    assert calls.index("compose_parser_evidence") < calls.index("prepare") < calls.index("redis")
+
+
+@pytest.mark.parametrize("oversize", [False, True])
+def test_parser_capture_has_real_process_output_bound_and_retains_original(tmp_path, monkeypatch, oversize):
+    harness = object.__new__(native.ActivationHarness)
+    harness.output, harness.sequence, harness.env = tmp_path, 0, dict(os.environ)
+    original = subprocess.Popen
+    def process(args, **kwargs):
+        assert args == ["docker", "--host", "unix:///var/run/docker.sock", "compose", "version"]
+        code = ("import sys;sys.stdout.write('x'*70000)" if oversize else
+                "import sys;print('synthetic CLI stdout');print('synthetic CLI stderr',file=sys.stderr);sys.exit(2)")
+        return original([sys.executable, "-c", code], **kwargs)
+    monkeypatch.setattr(native.subprocess, "Popen", process)
+    if oversize:
+        with pytest.raises(gate.AdmissionError, match="output bound"):
+            harness.compose_parser_command(["compose", "version"])
+    else:
+        result = harness.compose_parser_command(["compose", "version"])
+        assert result["rc"] == 2 and result["stdout"] == "synthetic CLI stdout\n"
+        assert result["stderr"] == "synthetic CLI stderr\n"
+    retained = gate._read(tmp_path / "command-0001.json")
+    assert len(retained["stdout"].encode()) + len(retained["stderr"].encode()) <= 8 * 1024
+    assert retained["timeout_seconds"] == 5 and retained["daemon_mutation"] is False
+    with pytest.raises(gate.AdmissionError, match="only static"):
+        harness.compose_parser_command(["compose", "create", "actual-service"])
+    assert harness.sequence == 1

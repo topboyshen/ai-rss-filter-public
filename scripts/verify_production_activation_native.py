@@ -12,6 +12,9 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import selectors
+import signal
+import subprocess
 import sys
 import time
 import traceback
@@ -49,6 +52,63 @@ def require_rejected(function):
 
 class ActivationHarness(Harness):
     sender_role = "miniflux"
+
+    def compose_parser_command(self, args):
+        allowed = (("compose", "version"), ("compose", "create", "--help"),
+                   ("compose", "create", "--no-deps", "--help"))
+        gate._require(tuple(args) in allowed, "only static Compose parser commands permitted")
+        self.sequence += 1
+        path = self.output / f"command-{self.sequence:04d}.json"
+        gate._require(not gate._present(path), "static Compose evidence already exists")
+        command = ["docker", "--host", "unix:///var/run/docker.sock", *args]
+        output, total, code, error = [bytearray(), bytearray()], 0, None, None
+        deadline = time.monotonic() + 5
+        try:
+            with subprocess.Popen(command, env=self.env, stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) as process:
+                try:
+                    with selectors.DefaultSelector() as selector:
+                        for index, pipe in enumerate((process.stdout, process.stderr)):
+                            selector.register(pipe, selectors.EVENT_READ, index)
+                        while selector.get_map():
+                            gate._require(time.monotonic() < deadline, "static Compose parser deadline")
+                            for key, _events in selector.select(min(0.1, max(0, deadline - time.monotonic()))):
+                                chunk = os.read(key.fileobj.fileno(), 4096)
+                                if not chunk:
+                                    selector.unregister(key.fileobj)
+                                    continue
+                                total += len(chunk)
+                                gate._require(total <= 8 * 1024, "static Compose parser output bound")
+                                output[key.data].extend(chunk)
+                        code = process.wait(timeout=max(0.001, deadline - time.monotonic()))
+                finally:
+                    if process.poll() is None:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process.wait()
+        except BaseException as failure:
+            error = type(failure).__name__
+            raise
+        finally:
+            gate._write(path, {"argv": command, "rc": code, "error_type": error,
+                "stdout": output[0].decode(errors="replace"), "stderr": output[1].decode(errors="replace"),
+                "timeout_seconds": 5, "max_output_bytes": 8 * 1024, "daemon_mutation": False})
+        return gate._read(path)
+
+    def compose_parser_evidence(self):
+        """CLI parser only: no manifest, container, network, or daemon mutation."""
+        version = self.compose_parser_command(["compose", "version"])
+        gate._require(version["rc"] == 0 and "Docker Compose version" in version["stdout"], "actual Compose plugin version required")
+        help_record = self.compose_parser_command(["compose", "create", "--help"])
+        gate._require(help_record["rc"] == 0 and all(flag in help_record["stdout"] for flag in ("--no-recreate", "--no-build", "--pull")),
+                      "actual Compose create help required")
+        refusal = self.compose_parser_command(["compose", "create", "--no-deps", "--help"])
+        record_path = self.output / f"command-{self.sequence:04d}.json"
+        gate._require(type(refusal["rc"]) is int and refusal["rc"] != 0
+                      and "unknown flag: --no-deps" in refusal["stderr"],
+                      "unsupported create flag was not rejected by the actual CLI parser")
+        fixture.save(self.output / "COMPOSE_PARSER.json", {"version": version["stdout"].strip(),
+            "create_no_deps_rejected": True, "rejection_record": record_path.name,
+            "daemon_mutation": False, "production_access": False})
 
     def stage(self, name):
         sequence = getattr(self, "stage_sequence", 0) + 1
@@ -318,6 +378,8 @@ def execute(repo, source, image_id, binary, output):
     fixture.save(output / "SOURCE.json", binding)
     failure, evidence_errors = None, []
     try:
+        harness.stage("actual_compose_parser_metadata")
+        harness.compose_parser_evidence()
         harness.stage("bounded_internal_network_and_real_redis")
         harness.prepare()
         harness.redis()

@@ -12,6 +12,34 @@ from services import admission_fence as gate, production_startup_control as star
 from scripts import private_release_contract as private
 
 
+# This narrower entry point creates only two reviewed application services.
+# Compose create has no --no-deps flag. Reject dependency/namespace references,
+# providers, hooks and future unreviewed service fields before any create intent.
+CREATE_SERVICE_FIELDS = frozenset({
+    "image", "command", "entrypoint", "environment", "working_dir", "user", "group_add",
+    "cap_add", "cap_drop", "security_opt", "mem_limit", "memswap_limit", "pids_limit", "cpus",
+    "volumes", "ports", "networks", "network_mode", "secrets", "configs", "healthcheck",
+    "labels", "logging", "restart", "read_only", "tmpfs", "stop_signal", "stop_grace_period",
+    "platform", "deploy", "scale", "profiles",
+})
+
+
+def _create_scope(manifest):
+    """Reject service expansion; existing private validation still runs first."""
+    for service in manifest["services"].values():
+        gate._require(isinstance(service, dict) and set(service) <= CREATE_SERVICE_FIELDS,
+                      "unsupported controlled create service field")
+        deployment = service.get("deploy", {})
+        gate._require(isinstance(deployment, dict) and set(deployment) <= {"replicas"},
+                      "controlled create deployment indirection forbidden")
+        for value in (service.get("scale", 1), deployment.get("replicas", 1)):
+            gate._require(type(value) is int and value == 1, "controlled create requires one exact replica")
+        gate._require(service.get("profiles", []) == []
+                      and isinstance(service.get("profiles", []), list)
+                      and service.get("network_mode", "none") == "none",
+                      "controlled create profiles or namespace references forbidden")
+
+
 def _save(path, value):
     if gate._present(path):
         gate._require(gate._read(path) == value, "lifecycle evidence conflicts")
@@ -119,6 +147,7 @@ def create(session, runtime_root, state, evidence, *, operation_id, paths, web_w
     gate._require(isinstance(paths, dict) and set(paths) == {"database", "config", "freeze", "state"}
                   and all(isinstance(v, str) and Path(v).is_absolute() and v == os.path.normpath(v) for v in paths.values()),
                   "exact normalized runtime path mapping required")
+    _create_scope(manifest)
     _new_operation(evidence)
     roles = _roles(contract, manifest)
     previous = _before_create(contract, manifest, roles)
@@ -128,7 +157,7 @@ def create(session, runtime_root, state, evidence, *, operation_id, paths, web_w
     session.check(active=True)
     private.compose(contract, directory, session.permit["source"]["image_id"],
                     ["-f", str(directory / "compose.json"), "create", "--no-recreate", "--no-build",
-                     "--pull", "never", "--no-deps", *sorted(roles.values())])
+                     "--pull", "never", *sorted(roles.values())])
     session.check(active=True)
     candidates = _project(contract, intent)
     descriptor = startup.authorize(session, runtime_root, operation_id=operation_id,

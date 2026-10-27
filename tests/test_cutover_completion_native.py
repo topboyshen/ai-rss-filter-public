@@ -41,6 +41,7 @@ class CompletionNativeGuards(unittest.TestCase):
                     "tests/test_production_initial_fence.py",
                     "tests/test_production_initial_candidates.py", "tests/test_production_initial_migration.py",
                     "tests/test_production_container_lifecycle.py",
+                    "tests/test_production_create_scope.py",
                     "tests/test_production_active_verification.py",
                     "tests/test_release_container_lifecycle.py",
                     "tests/test_miniflux_activation_adapter.py",

@@ -38,6 +38,8 @@ def setup_lifecycle(prepared, monkeypatch):  # noqa: F811
         command = args[-1]
         calls.append(command)
         assert "--no-recreate" in command and "up" not in command and "--remove-orphans" not in command
+        assert "--no-deps" not in command
+        assert command[-7:] == ["create", "--no-recreate", "--no-build", "--pull", "never", "candidate-api", "candidate-worker"]
         rows.extend([container("3" * 64, "candidate-api", "web", p["permit"]["source"]["image_id"]),
                      container("4" * 64, "candidate-worker", "worker", p["permit"]["source"]["image_id"])])
     monkeypatch.setattr(lifecycle.private, "compose", compose)
