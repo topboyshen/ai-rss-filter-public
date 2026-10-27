@@ -142,6 +142,22 @@ def test_exact_original_roundtrip_and_consumers_are_not_queue_empty(tmp_path):
     assert contract.read_original(root, value["entries"][0]) == body
     assert loaded["control_receipt"]["active_leases"] == 2
     assert loaded["queue_checked"] is loaded["switch_authorized"] is False
+    assert loaded["inventory_summary"]["cleanup_credit"] == 0
+
+
+@pytest.mark.parametrize("credit", [1, -1, False, 0.0, "0", None])
+def test_outbox_cleanup_credit_requires_exact_integer_zero(tmp_path, credit):
+    value, _ = synthetic_manifest(tmp_path)
+    value["inventory_summary"]["cleanup_credit"] = credit
+    with pytest.raises(contract.DrainContractError, match="cannot grant cleanup credit"):
+        contract.validate_manifest(value)
+
+
+def test_outbox_cleanup_credit_cannot_be_omitted(tmp_path):
+    value, _ = synthetic_manifest(tmp_path)
+    del value["inventory_summary"]["cleanup_credit"]
+    with pytest.raises(contract.DrainContractError, match="cannot grant cleanup credit"):
+        contract.validate_manifest(value)
 
 
 @pytest.mark.parametrize(

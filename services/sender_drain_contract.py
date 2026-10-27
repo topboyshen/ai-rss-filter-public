@@ -109,6 +109,8 @@ def validate_sample(value):
     require(isinstance(value, dict) and value.get("coverage") == "outbox_and_legacy_v1"
             and isinstance(value.get("states"), dict) and set(value["states"]) == {"pending", "inflight", "held", "acked"},
             "complete original capacity sample required")
+    require(type(value.get("cleanup_credit")) is int and value["cleanup_credit"] == 0,
+            "outbox originals cannot grant cleanup credit")
     legacy = value.get("legacy")
     require(isinstance(legacy, dict) and legacy.get("forwarding_allowed") is False and legacy.get("cleanup_credit") == 0
             and isinstance(legacy.get("states"), dict) and set(legacy["states"]) == {"held"}, "legacy original boundary differs")
