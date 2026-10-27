@@ -198,28 +198,28 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          mkdir -m 700 "$RUNNER_TEMP/production-activation-build"
+          mkdir -m 700 "$RUNNER_TEMP/production-startup-source/production-activation-build"
           cd "$RUNNER_TEMP/startup-miniflux"
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -p 1 -trimpath \
             -ldflags "-X miniflux.app/v2/internal/version.Version=2.3.2 -X miniflux.app/v2/internal/version.Commit=${GITHUB_SHA}" \
-            -o "$RUNNER_TEMP/production-activation-build/miniflux" . \
-            2>&1 | tee "$RUNNER_TEMP/production-activation-build/BUILD.log"
-          chmod 0755 "$RUNNER_TEMP/production-activation-build/miniflux"
+            -o "$RUNNER_TEMP/production-startup-source/production-activation-build/miniflux" . \
+            2>&1 | tee "$RUNNER_TEMP/production-startup-source/production-activation-build/BUILD.log"
+          chmod 0755 "$RUNNER_TEMP/production-startup-source/production-activation-build/miniflux"
           cd "$GITHUB_WORKSPACE"
           docker --host unix:///var/run/docker.sock build --platform=linux/amd64 --pull=false \
             --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
             -f ops/miniflux/Dockerfile -t "miniflux-activation-isolation:${GITHUB_SHA}" \
-            "$RUNNER_TEMP/production-activation-build" \
-            2>&1 | tee "$RUNNER_TEMP/production-activation-build/IMAGE_BUILD.log"
+            "$RUNNER_TEMP/production-startup-source/production-activation-build" \
+            2>&1 | tee "$RUNNER_TEMP/production-startup-source/production-activation-build/IMAGE_BUILD.log"
           docker --host unix:///var/run/docker.sock image inspect "miniflux-activation-isolation:${GITHUB_SHA}" \
-            > "$RUNNER_TEMP/production-activation-build/IMAGE.json"
+            > "$RUNNER_TEMP/production-startup-source/production-activation-build/IMAGE.json"
           docker --host unix:///var/run/docker.sock pull --platform=linux/amd64 \
             redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
-          image_id="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))[0]["Id"])' "$RUNNER_TEMP/production-activation-build/IMAGE.json")"
+          image_id="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))[0]["Id"])' "$RUNNER_TEMP/production-startup-source/production-activation-build/IMAGE.json")"
           python -I -B scripts/verify_production_activation_native.py \
             --repo . --source "$RUNNER_TEMP/startup-miniflux" \
-            --binary "$RUNNER_TEMP/production-activation-build/miniflux" --image-id "$image_id" \
-            --output "$RUNNER_TEMP/production-activation"
+            --binary "$RUNNER_TEMP/production-startup-source/production-activation-build/miniflux" --image-id "$image_id" \
+            --output "$RUNNER_TEMP/production-startup-source/production-activation"
       - name: Preserve actual synthetic PostgreSQL state on success or failure
         if: always()
         env:
@@ -251,8 +251,6 @@ jobs:
             --source "production-startup=${RUNNER_TEMP}/production-startup" \
             --source "production-startup-postgres=${RUNNER_TEMP}/production-startup-postgres" \
             --source "production-startup-source=${RUNNER_TEMP}/production-startup-source" \
-            --source "production-activation=${RUNNER_TEMP}/production-activation" \
-            --source "production-activation-build=${RUNNER_TEMP}/production-activation-build" \
             --output "${RUNNER_TEMP}/cutover-safe-upload"
 
       - name: Preserve original evidence including failures
