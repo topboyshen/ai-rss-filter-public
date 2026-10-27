@@ -162,6 +162,93 @@ def test_seed_uses_only_exact_locked_original_sql(tmp_path):
         native._sql132(repo, source)
 
 
+@pytest.fixture
+def seed_case(tmp_path):
+    repo, source, output = tmp_path / "repo", tmp_path / "upstream", tmp_path / "evidence"
+    (repo / "ops/miniflux").mkdir(parents=True)
+    (source / "internal/database").mkdir(parents=True)
+    output.mkdir(mode=0o700)
+    (repo / "ops/miniflux/Dockerfile").write_bytes((native.ROOT / "ops/miniflux/Dockerfile").read_bytes())
+    sql = "CREATE TABLE synthetic_exact132(x int);"
+    raw = ('func migration(){ _, err := tx.Exec(`' + sql + '`) }').encode()
+    (source / "internal/database/webhook_outbox.go").write_bytes(raw)
+    (repo / "ops/miniflux/pause-source-lock.json").write_text(json.dumps({"patched_files_sha256": {
+        "internal/database/webhook_outbox.go": hashlib.sha256(raw).hexdigest()}}))
+    reference = native._base_image(repo)
+    image = {"Id": "sha256:" + "a" * 64, "Architecture": "amd64", "Os": "linux", "RepoDigests": [reference]}
+    case = SimpleNamespace(repo=repo, source=source, output=output, image=image, reference=reference, sql=sql, events=[], failure=None)
+    def command(args, **options):
+        case.events.append(("command", args, options))
+        if args[0] == "pull":
+            if case.failure == "pull":
+                raise RuntimeError("synthetic pull failure")
+            return "fixed dependency prepared"
+        if args[:2] == ["image", "inspect"]:
+            if case.failure == "inspect":
+                raise RuntimeError("synthetic inspect failure")
+            return json.dumps([image])
+        if args[0] == "wait":
+            return "0"
+        assert args == ["inspect", "owned-seed131"]
+        return json.dumps([{"Id": "b" * 64}])
+    versions = iter(("131", "132"))
+    def query(statement):
+        case.events.append(("sql", statement))
+        return next(versions) if statement == "SELECT version FROM schema_version;" else ""
+    def launch(*args):
+        case.events.append(("launch", args))
+    case.harness = SimpleNamespace(repo=repo, source=source, output=output, password="synthetic", names={"seed131": "owned-seed131"},
+                                   command=command, sql=query, launch=launch)
+    return case
+
+
+def test_seed_prepares_actual_from_digest_once_then_checks_image_before_exact132_transaction(seed_case):
+    p = seed_case
+    native.seed132(p.harness)
+    assert p.events[:2] == [("command", ["pull", "--platform=linux/amd64", p.reference], {}),
+                            ("command", ["image", "inspect", p.reference], {})]
+    assert p.events[2][0] == "launch" and p.events[2][1][0:2] == ("seed131", p.image["Id"])
+    assert p.events[2][1][-1] == ["-migrate"]
+    assert [event[1] for event in p.events if event[0] == "sql"] == ["SELECT version FROM schema_version;",
+        "BEGIN; SET LOCAL statement_timeout='3000ms'; " + p.sql
+        + " UPDATE schema_version SET version='132' WHERE version='131'; COMMIT;", "SELECT version FROM schema_version;"]
+    assert len([e for e in p.events if e[:1] == ("command",) and e[1][0] == "pull"]) == 1
+    assert native.MAX_SECONDS == 180  # No final/timeout override bypasses command's shared deadline.
+    record = json.loads((p.output / "SEED132.json").read_bytes())
+    assert record["upstream_reference"] == p.reference and record["upstream_image"] == p.image["Id"]
+    assert record["prior_schema"] == 131 and record["schema"] == 132 and record["marker_and_sql_same_transaction"] is True
+    assert record["production_compatibility_proven"] is False
+
+
+@pytest.mark.parametrize("failure", ["pull", "inspect", "architecture", "os", "digest", "image_id"])
+def test_seed_dependency_failure_has_no_retry_launch_or_migration(seed_case, failure):
+    p = seed_case
+    p.failure = failure
+    if failure == "architecture":
+        p.image["Architecture"] = "arm64"
+    elif failure == "os":
+        p.image["Os"] = "other"
+    elif failure == "digest":
+        p.image["RepoDigests"] = ["miniflux/miniflux@sha256:" + "f" * 64]
+    elif failure == "image_id":
+        p.image["Id"] = "truncated"
+    with pytest.raises((RuntimeError, ValueError)):
+        native.seed132(p.harness)
+    expected = [("command", ["pull", "--platform=linux/amd64", p.reference], {})]
+    if failure != "pull":
+        expected.append(("command", ["image", "inspect", p.reference], {}))
+    assert p.events == expected and not list(p.output.iterdir())
+
+
+@pytest.mark.parametrize("source", ["FROM miniflux/miniflux:latest\n", "FROM miniflux/miniflux@sha256:abc\n", ""])
+def test_seed_refuses_unfixed_source_before_dependency_command(seed_case, source):
+    p = seed_case
+    (p.repo / "ops/miniflux/Dockerfile").write_text(source)
+    with pytest.raises(gate.AdmissionError, match="fixed upstream seed image"):
+        native.seed132(p.harness)
+    assert not p.events and not list(p.output.iterdir())
+
+
 def test_bootstrap_plan_consumes_real_build_and_no_dummy_mount(records, monkeypatch):
     p = records
     directory = p.root.parent / "inputs"

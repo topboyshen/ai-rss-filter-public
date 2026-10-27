@@ -288,7 +288,7 @@ frozen_test_files = ('tests/test_independent_drain_inventory.py',
  'tests/test_sender_external_postgres_identity.py')
 summary = NativeDiagnostics(frozen_test_files)
 try:
-    code = pytest.main(['-q', '-o', 'addopts=', '-o', 'faulthandler_timeout=30', '-p', 'no:cacheprovider', '--basetemp=' + str(fixtures / 'pytest')] + list(frozen_test_files), plugins=[summary])
+    code = pytest.main(['-q', '-o', 'addopts=', '-o', 'faulthandler_timeout=30', '-p', 'no:cacheprovider', '--basetemp=' + str(fixtures / 'p')] + list(frozen_test_files), plugins=[summary])
 finally:
     # This exact private subtree is already the evidence bind, so preserve
     # original inodes in place, including sparse files and failure originals.

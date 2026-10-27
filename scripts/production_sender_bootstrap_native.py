@@ -118,6 +118,9 @@ def _base_image(repo):
 def seed132(harness):
     """Actual fixed upstream131 followed by the exact locked132 transaction."""
     reference = _base_image(harness.repo)
+    # BuildKit FROM resolution does not prove this Engine reference exists.
+    # One explicit preparation stays inside command's original shared deadline.
+    harness.command(["pull", "--platform=linux/amd64", reference])
     image = json.loads(harness.command(["image", "inspect", reference]))[0]
     image_checks(image, reference)
     dsn = f"postgres://synthetic:{harness.password}@pg:5432/synthetic_pause?sslmode=disable"
