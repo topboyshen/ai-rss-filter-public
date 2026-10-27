@@ -311,6 +311,7 @@ class LockedMigration:
         publication = inventory._publication(reader, self.path, spec["identities"]["database"])
         reader.tick()
         actual = {**self.inventory, "counts": counts, "journal": states, "receiver": receiver, "publication": publication,
+                  "sender": getattr(self.sender, "latest_snapshot", self.sender.snapshot),
                   "files_inspected": reader.files, "bytes_read": reader.bytes,
                   "evidence_sha256": hashlib.sha256(inventory.json.dumps(reader.fingerprints, sort_keys=True).encode()).hexdigest()}
         gate._require(inventory_fingerprint(actual) == self.permit["inventory_sha256"], "retained inventory changed")
@@ -520,4 +521,5 @@ def inventory_fingerprint(value):
     # identity. A committed migration or an unrelated log must not prevent
     # querying the original operation after an ACK was lost.
     receiver = {key: item for key, item in value["receiver"].items() if key != "physical_free_bytes"}
-    return gate._hash({**value, "receiver": receiver})
+    from scripts.sender_drain_inventory import stable_inventory
+    return gate._hash({**value, "receiver": receiver, "sender": stable_inventory(value["sender"])})

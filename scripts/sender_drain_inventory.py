@@ -19,6 +19,16 @@ ROWS_SQL = """SELECT delivery_id,body_sha256,body,target_url,signature,contract,
  FROM webhook_outbox WHERE state IN ('pending','inflight') ORDER BY delivery_id LIMIT 5001"""
 
 
+def stable_inventory(value):
+    """Identity projection only; retain the actual age diagnostic in reports.
+
+    ACKs can cross seven days while every protocol lock remains held. This
+    diagnostic never grants cleanup credit or permission to remove originals.
+    All other keys, including bytes, states, held rows and credit, stay bound.
+    """
+    return {key: item for key, item in value.items() if key != "acked_at_least_7_days"}
+
+
 
 class _TimedCursor:
     """Every SQL command shares the original wall deadline and <=3s SQL cap."""
@@ -233,7 +243,7 @@ class FrozenPostgres:
         require(all(isinstance(v, str) and HEX64.fullmatch(v) for v in (operation, manifest)), "exact closed gate identity required")
         self.reader, self.operation, self.manifest = reader, operation, manifest
         self.connection = None
-        self.snapshot = self.lock_identity = None
+        self.snapshot = self.latest_snapshot = self.lock_identity = None
 
     def __enter__(self):
         import psycopg
@@ -293,7 +303,8 @@ class FrozenPostgres:
             require(cursor.fetchone() == (self.lock_identity["backend_pid"],2), "sender PG lock ownership lost")
         current = self.reader.snapshot(deadline=deadline)
         self._closed(current)
-        require(current == self.snapshot, "frozen sender inventory changed under locks")
+        require(stable_inventory(current) == stable_inventory(self.snapshot), "frozen sender inventory changed under locks")
+        self.latest_snapshot = current
         return self.lock_identity
 
     def __exit__(self, exc_type, exc, tb):

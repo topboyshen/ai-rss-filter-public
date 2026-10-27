@@ -491,3 +491,31 @@ def test_free_space_drop_during_step_rolls_back_but_does_not_block_exact_query(p
     with migration.locked_session(p["root"], p["permit"]) as recovered:
         result = recovered.query_migration(p["permit"]["operation_id"])
     assert result["status"] == "migration_uncertain" and result["completed_steps"] == []
+
+
+def test_exact_migration_query_survives_sender_ack_age_boundary(prepared, monkeypatch):
+    p = prepared
+    p["sender"].snapshot["acked_at_least_7_days"] = 0
+    with migration.locked_session(p["root"], p["permit"]) as session:
+        session.authorize()
+        receipt = session.migrate()
+    p["sender"].snapshot["acked_at_least_7_days"] = 1
+    monkeypatch.setattr(steps, "apply_step", lambda *_a, **_k: pytest.fail("age boundary replayed a migration"))
+    with migration.locked_session(p["root"], p["permit"]) as resumed:
+        assert resumed.inventory["sender"]["acked_at_least_7_days"] == 1
+        assert resumed.inventory["sender"]["cleanup_credit"] == 0
+        assert resumed.query_migration(p["permit"]["operation_id"]) == receipt
+
+
+@pytest.mark.parametrize("change", [lambda s:s.update(rows=2,outbox_rows=2,states={"pending":0,"inflight":0,"held":0,"acked":2}),
+    lambda s:s.update(charged_bytes=s["charged_bytes"]+1,outbox_charged_bytes=s["outbox_charged_bytes"]+1),
+    lambda s:s.update(max_attempts=s["max_attempts"]+1)])
+def test_true_sender_inventory_change_still_blocks_original_migration_query(prepared, change):
+    p = prepared
+    with migration.locked_session(p["root"], p["permit"]) as session:
+        session.authorize()
+        session.migrate()
+    change(p["sender"].snapshot)
+    with pytest.raises(gate.AdmissionError, match="inventory differs"):
+        with migration.locked_session(p["root"], p["permit"]):
+            pytest.fail("actual retained data drift accepted")

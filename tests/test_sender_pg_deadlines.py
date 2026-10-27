@@ -1,6 +1,7 @@
 """Shared SQL deadline and expired recovery budget guards; no real PG here."""
 
 import pytest
+from copy import deepcopy
 
 from scripts import sender_drain_inventory as inventory
 from scripts.durable_handoff_cutover import CutoverError
@@ -68,3 +69,21 @@ def test_closed_state_alone_does_not_prove_confirmed_pause(row):
             return row
     with pytest.raises(CutoverError, match="pause operation"):
         held._confirmed_operation(Cursor())
+
+
+def test_ack_age_boundary_is_diagnostic_and_original_observations_survive():
+    old = {"rows":1,"acked_at_least_7_days":0,"cleanup_credit":0,"states":{"acked":1,"held":0},"raw_sha256":"a"*64}
+    new = {**old,"acked_at_least_7_days":1}
+    assert inventory.stable_inventory(old) == inventory.stable_inventory(new)
+    assert old["acked_at_least_7_days"] == 0 and new["acked_at_least_7_days"] == 1
+    assert inventory.stable_inventory(new)["cleanup_credit"] == 0
+
+
+@pytest.mark.parametrize("change", [lambda v:v.update(rows=0), lambda v:v.update(cleanup_credit=1),
+    lambda v:v["states"].update(acked=0,held=1), lambda v:v.update(raw_sha256="b"*64)])
+def test_actual_inventory_fields_are_not_exempted_by_age_projection(change):
+    old = {"rows":1,"acked_at_least_7_days":0,"cleanup_credit":0,"states":{"acked":1,"held":0},"raw_sha256":"a"*64}
+    new = deepcopy(old)
+    new["acked_at_least_7_days"] = 1
+    change(new)
+    assert inventory.stable_inventory(old) != inventory.stable_inventory(new)

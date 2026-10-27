@@ -182,3 +182,33 @@ def test_actual_closed_state_with_pending_marker_cannot_grant_frozen_context(act
             pytest.fail("unconfirmed marker granted a frozen context")
     assert connection.execute("SELECT status FROM handoff_operations WHERE operation_id=%s", (operation,)).fetchone() == ("pending",)
     phase("pending_marker_retained_no_confirmation_no_frozen_context")
+
+
+def test_actual_clock_crosses_ack_age_boundary_without_changing_frozen_identity(actual):
+    import time
+    connection, reader, binding, _, _, body = actual
+    operation = close_fixture(connection, binding)
+    connection.execute("UPDATE webhook_outbox SET acked_at=clock_timestamp()-interval '7 days'+interval '5 seconds'")
+    phase("before_actual_ack_age_boundary_no_row_mutations_inside_locks")
+    with reader.locked(operation, binding["manifest"]) as held:
+        assert held.snapshot["acked_at_least_7_days"] == 0
+        time.sleep(5.05)
+        held.check()
+        assert held.snapshot["acked_at_least_7_days"] == 0
+        assert held.latest_snapshot["acked_at_least_7_days"] == 1
+        assert held.latest_snapshot["cleanup_credit"] == 0
+        assert bytes(connection.execute("SELECT body FROM webhook_outbox").fetchone()[0]) == body
+    assert connection.execute("SELECT count(*) FROM webhook_outbox").fetchone()[0] == 1
+    phase("ack_age_diagnostic_changed_original_bytes_and_locks_retained_no_cleanup")
+
+
+def test_actual_retained_attempt_change_under_locks_still_fails(actual):
+    connection, reader, binding, _, _, body = actual
+    operation = close_fixture(connection, binding)
+    phase("before_actual_retained_attempt_drift")
+    with pytest.raises(Exception, match="inventory changed"):
+        with reader.locked(operation, binding["manifest"]) as held:
+            connection.execute("UPDATE webhook_outbox SET attempts=attempts+1")
+            held.check()
+    assert bytes(connection.execute("SELECT body FROM webhook_outbox").fetchone()[0]) == body
+    phase("real_attempt_change_rejected_original_retained_no_cleanup")
