@@ -160,6 +160,15 @@ def test_outbox_cleanup_credit_cannot_be_omitted(tmp_path):
         contract.validate_manifest(value)
 
 
+@pytest.mark.parametrize("version", ["134", "0134", "134 ", "", 133, 135, 134.0, True, None])
+def test_identity_contract_still_requires_exact_integer_134(tmp_path, version):
+    value, _ = synthetic_manifest(tmp_path)
+    identity = value["postgres_identity"]
+    identity["schema_version"] = version
+    with pytest.raises(contract.DrainContractError, match="schema 134 required"):
+        contract.validate_identity(identity)
+
+
 @pytest.mark.parametrize(
     "change",
     [

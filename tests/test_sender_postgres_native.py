@@ -90,6 +90,24 @@ def test_actual_readonly_bundle_preserves_exact_body_and_pg_identity(actual, tmp
     assert before == {p.name: p.read_bytes() for p in bundle.iterdir()}
 
 
+def test_actual_text_schema_marker_accepts_only_canonical_supported_version(actual):
+    connection, reader, _, _, _, _ = actual
+    assert connection.execute("SELECT version,pg_typeof(version)::text FROM schema_version").fetchone() == ("134", "text")
+    assert reader.snapshot()["database_identity"]["schema_version"] == 134
+    phase("actual_miniflux_text_schema_134_bound_without_permissive_cast")
+    for value in ("", "0134", "+134", " 134", "134 ", "134.0", "true", "false", "133", "135", "１３４"):
+        connection.execute("UPDATE schema_version SET version=%s", (value,))
+        identity = dict(zip(inventory.IDENTITY_KEYS, connection.execute(inventory.IDENTITY_SQL).fetchone()))
+        with pytest.raises(contract.DrainContractError, match="schema 134 required"):
+            contract.validate_identity(identity)
+        with pytest.raises(Exception, match="PostgreSQL identity changed"):
+            reader.snapshot()
+        assert connection.execute("SELECT version FROM schema_version").fetchone() == (value,)
+    connection.execute("UPDATE schema_version SET version='134'")
+    assert reader.snapshot()["database_identity"]["schema_version"] == 134
+    phase("unsupported_noncanonical_text_markers_rejected_without_rewrite")
+
+
 def close_fixture(connection, binding):
     schema = connection.execute("SELECT current_schema()").fetchone()[0]
     return close_seeded(connection, {"manifest": binding["manifest"], "generation": 3,

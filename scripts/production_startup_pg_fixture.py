@@ -68,7 +68,7 @@ def create_fixture(raw_dsn, miniflux_source):
         connection.execute("SET statement_timeout='3000ms'")
         for statement in statements:
             connection.execute(statement)
-        connection.execute("CREATE TABLE schema_version(version integer); INSERT INTO schema_version VALUES(134)")
+        connection.execute("CREATE TABLE schema_version(version text not null); INSERT INTO schema_version VALUES('134')")
         value = {"dsn": dsn, "schema": schema, "manifest": "5" * 64, "initial_operation_id": "8" * 64,
                  "stop_operation_id": "9" * 64, "generation": 3}
         connection.execute("INSERT INTO handoff_state VALUES(1,%s,3,'draining',%s)",

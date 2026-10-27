@@ -12,9 +12,11 @@ from scripts import observe_handoff_capacity as capacity
 from services.sender_drain_contract import (IDENTITY_KEYS, MAX_BODY_BYTES, MAX_MANIFEST_BYTES,
     source_sha256, validate_identity, validate_stop_receipt, validate_entry, validate_manifest, validate_binding)
 
+# Miniflux stores version as text. Normalize only the exact supported ASCII
+# marker, without trim/cast coercion of malformed or future versions.
 IDENTITY_SQL = capacity.PG_IDENTITY_SQL + """, 'handoff_state'::regclass::oid::bigint,
  'handoff_operations'::regclass::oid::bigint, 'handoff_leases'::regclass::oid::bigint,
- (SELECT version FROM schema_version), current_user, session_user"""
+ (SELECT CASE WHEN version COLLATE "C" = '134' THEN 134 ELSE NULL END FROM schema_version), current_user, session_user"""
 ROWS_SQL = """SELECT delivery_id,body_sha256,body,target_url,signature,contract,user_id,feed_id,entry_id,state,attempts
  FROM webhook_outbox WHERE state IN ('pending','inflight') ORDER BY delivery_id LIMIT 5001"""
 
