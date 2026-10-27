@@ -49,6 +49,31 @@ def write_fixture_record(path, value):
     return hashlib.sha256(raw).hexdigest()
 
 
+def create_fixture_storage(mount):
+    """Create one new short root in an already-owned per-group evidence mount."""
+    mount = Path(mount)
+    identity = NativeShortPaths.directory_identity(mount)
+    parent = os.open(mount, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        if NativeShortPaths.directory_identity(parent) != identity:
+            raise ValueError("native fixture mount changed before creation")
+        os.mkdir("s", mode=0o700, dir_fd=parent)
+        child = os.open("s", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        try:
+            created = NativeShortPaths.directory_identity(child)
+            os.fsync(child)
+            os.fsync(parent)
+            if (NativeShortPaths.directory_identity(mount) != identity
+                    or NativeShortPaths.directory_identity(parent) != identity
+                    or NativeShortPaths.directory_identity(mount / "s") != created):
+                raise ValueError("native fixture mount or new root changed")
+        finally:
+            os.close(child)
+        return mount / "s"
+    finally:
+        os.close(parent)
+
+
 def fixture_storage_identity(fixtures, evidence_root):
     evidence_path = evidence_root / "disk-fixtures" / fixtures.name
     assert fixtures.samefile(evidence_path)
@@ -56,8 +81,11 @@ def fixture_storage_identity(fixtures, evidence_root):
         info = path.lstat()
         assert stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o700
     info = fixtures.lstat()
-    return {"container_path": str(fixtures), "evidence_relative_path": "disk-fixtures/" + fixtures.name,
-            "device": info.st_dev, "inode": info.st_ino, "retained_in_place": True, "root_tmpfs_bytes": 134217728}
+    value = {"container_path": str(fixtures), "evidence_relative_path": "disk-fixtures/" + fixtures.name,
+             "device": info.st_dev, "inode": info.st_ino, "retained_in_place": True, "root_tmpfs_bytes": 134217728}
+    if fixtures.name == "s":
+        value["layout_version"] = 2
+    return value
 
 
 def retain_fixture_storage(fixtures, evidence_root):
@@ -195,6 +223,7 @@ class NativeShortPaths:
         self.lock = threading.Lock()
         self.fd, self.raw, self.used, self.collection = None, b"", {}, ()
         self.base_identity = None
+        self.factory = None
         self.failed = False
         try:
             self.fd = os.open(self.path.name, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
@@ -241,15 +270,34 @@ class NativeShortPaths:
                 "collection_count": len(self.collection), "base_identity": self.base_identity}
 
     def initialize(self, factory):
-        if self.base_identity is not None:
-            return
-        if self.directory_identity(self.fixtures) != self.root_identity:
-            raise ValueError("native temporary fixture root changed")
-        if self.base.exists() or self.base.is_symlink():
-            self.directory_identity(self.base)
-        if factory.getbasetemp() != self.base:
-            raise ValueError("native temporary factory base differs")
-        self.base_identity = self.directory_identity(self.base)
+        from _pytest.tmpdir import TempPathFactory
+        self.check_roots()
+        self.verified_collection()
+        if type(factory) is not TempPathFactory or factory._given_basetemp != self.base:
+            raise ValueError("native temporary factory base or type differs")
+        if self.factory is not None and factory is not self.factory:
+            raise ValueError("native temporary factory instance changed")
+        try:
+            info = os.stat(self.base.name, dir_fd=self.root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            info = None
+        cached = factory._basetemp
+        if cached is None:
+            # pytest deletes an existing given basetemp before first binding it.
+            # A later-created original must never enter that deletion branch.
+            if info is not None or self.base_identity is not None:
+                raise ValueError("unbound native factory cannot adopt an existing base")
+            actual = factory.getbasetemp()
+        else:
+            if cached != self.base or info is None:
+                raise ValueError("native temporary cached base differs or is missing")
+            actual = cached
+        if actual != self.base or factory._basetemp != self.base:
+            raise ValueError("native temporary factory binding differs")
+        identity = self.directory_identity(self.base)
+        if self.base_identity is not None and identity != self.base_identity:
+            raise ValueError("native temporary bound base identity changed")
+        self.base_identity, self.factory = identity, factory
         self.verify_map_binding()
 
     @staticmethod
@@ -440,13 +488,13 @@ MOUNTS = ("scripts", "tests", "services", "routes", "core", "db", "utils", "work
           "ops/isolation", "ops/miniflux", ".github/workflows", "gunicorn.conf.py",
           "Dockerfile", "requirements-prod.txt", "start.sh")
 CONTAINER_TEST = r'''
-import json, os, pathlib, platform, sys, tempfile, pytest
-from scripts.verify_cutover_completion_native import NativeDiagnostics, NativeShortPaths, native_short_path_plugin, retain_fixture_storage, confirm_fixture_storage, verify_git_fixture
+import json, os, pathlib, platform, sys, pytest
+from scripts.verify_cutover_completion_native import NativeDiagnostics, NativeShortPaths, native_short_path_plugin, create_fixture_storage, retain_fixture_storage, confirm_fixture_storage, verify_git_fixture
 assert platform.system() == 'Linux' and platform.machine() == 'x86_64'
 fixture_mount = pathlib.Path('/tmp/cutover-fixtures')
 assert fixture_mount.samefile('/evidence/disk-fixtures')
 assert fixture_mount.stat().st_uid == os.getuid() and fixture_mount.stat().st_mode & 0o777 == 0o700
-fixtures = pathlib.Path(tempfile.mkdtemp(prefix='cutover-synthetic-', dir=str(fixture_mount)))
+fixtures = create_fixture_storage(fixture_mount)
 os.environ['AI_FILTER_CUTOVER_EVIDENCE_DIR'] = str(fixtures)
 os.environ['AI_FILTER_HANDOFF_EVIDENCE_DIR'] = str(fixtures)
 initial, mapping_sha256 = retain_fixture_storage(fixtures, pathlib.Path('/evidence'))

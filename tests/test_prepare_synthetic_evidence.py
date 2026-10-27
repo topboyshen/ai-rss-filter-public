@@ -118,9 +118,9 @@ def test_sparse_fallback_has_bounded_zero_chunks(tmp_path, monkeypatch):
     assert writes == [(3, 3 * evidence.CHUNK)]
 
 
-def native_fixture(root, group, suffix='exact'):
+def native_fixture(root, group, suffix='exact', *, version=None):
     native = root / group / 'fixtures'
-    basename = 'cutover-synthetic-' + suffix
+    basename = 's' if version == 2 else 'cutover-synthetic-' + suffix
     source = native / 'disk-fixtures' / basename
     source.mkdir(parents=True)
     (source / 'plain').write_bytes(group.encode())
@@ -130,8 +130,109 @@ def native_fixture(root, group, suffix='exact'):
     storage = {'container_path': logical, 'evidence_relative_path': 'disk-fixtures/' + basename, 'device': info.st_dev,
                'inode': info.st_ino, 'retained_in_place': True, 'root_tmpfs_bytes': 134217728}
     mapping = native / 'FIXTURE_STORAGE.json'
+    if version is not None:
+        storage['layout_version'] = version
+        for path in (root / group, native, native / 'disk-fixtures', source):
+            path.chmod(0o700)
     mapping.write_text(json.dumps(storage))
+    if version is not None:
+        mapping.chmod(0o600)
     return source, mapping, storage
+
+
+def test_v2_three_groups_keep_same_short_container_path_distinct_originals_and_nodeids(tmp_path, monkeypatch):
+    root, output = fixture(tmp_path)
+    groups = ('native-foundation', 'native-activation', 'native-adapters')
+    for group in groups:
+        source, _mapping, _storage = native_fixture(root, group, version=2)
+        (source / 'TMP_PATH_MAP.jsonl').write_text(json.dumps({'nodeid': group + '::test_full_name[original]'}))
+    before = originals(root)
+    actual = evidence.os.open
+    def no_link_read(path, *args, **kwargs):
+        assert str(path) != 'alias', 'container alias must remain metadata only'
+        return actual(path, *args, **kwargs)
+    monkeypatch.setattr(evidence.os, 'open', no_link_read)
+    result = evidence.prepare({'cutover-completion': root}, output)
+    assert result['complete'] and len(result['links']) == 3 and originals(root) == before
+    for row in result['links']:
+        group = row['path'].split('/')[0]
+        assert row['target_relative_path'] == group + '/fixtures/disk-fixtures/s/plain'
+        assert row['target_read'] is False
+        copied = output / 'files/cutover-completion' / group / 'fixtures/disk-fixtures/s'
+        assert (copied / 'plain').read_bytes() == group.encode()
+        assert json.loads((copied / 'TMP_PATH_MAP.jsonl').read_text())['nodeid'] == group + '::test_full_name[original]'
+    assert evidence.MAX_METADATA == 8 * 1024**2
+    assert evidence.NATIVE_GROUPS == ('native', 'native-foundation', 'native-activation', 'native-adapters')
+
+
+@pytest.mark.parametrize('key,value', [
+    ('layout_version', None), ('layout_version', 1), ('layout_version', True), ('layout_version', 2.0),
+    ('layout_version', '2'), ('layout_version', 3), ('extra', 'unreviewed'),
+    ('container_path', '/tmp/cutover-fixtures/s/nested'), ('container_path', '/tmp/cutover-fixtures/other'),
+    ('container_path', '/tmp/cutover-fixtures/cutover-synthetic-old'),
+    ('evidence_relative_path', 'disk-fixtures/s/nested'), ('inode', 0)])
+def test_v2_unknown_versions_mixed_layouts_and_identity_fail_closed(tmp_path, key, value):
+    root, output = fixture(tmp_path)
+    _source, mapping, storage = native_fixture(root, 'native-foundation', version=2)
+    if value is None:
+        del storage[key]
+    else:
+        storage[key] = value
+    mapping.write_text(json.dumps(storage))
+    before = originals(root)
+    result = evidence.prepare({'cutover-completion': root}, output)
+    assert not result['complete'] and any(x['code'] == 'invalid_native_mapping' for x in result['errors'])
+    assert not result['links'] and originals(root) == before
+
+
+@pytest.mark.parametrize('level', ['group', 'fixtures', 'disk', 'leaf', 'mapping'])
+def test_v2_requires_private_modes_for_each_exact_mapping_ancestor(tmp_path, level):
+    root, output = fixture(tmp_path)
+    source, mapping, _storage = native_fixture(root, 'native-foundation', version=2)
+    paths = {'group': source.parents[2], 'fixtures': source.parents[1], 'disk': source.parent,
+             'leaf': source, 'mapping': mapping}
+    paths[level].chmod(0o644 if level == 'mapping' else 0o755)
+    before = originals(root)
+    result = evidence.prepare({'cutover-completion': root}, output)
+    assert not result['complete'] and not result['links'] and originals(root) == before
+
+
+@pytest.mark.parametrize('target', ['outside', 'other_group', 'parent', 'unknown_container'])
+def test_v2_never_reads_or_accepts_external_or_cross_group_link_targets(tmp_path, monkeypatch, target):
+    root, output = fixture(tmp_path)
+    source, _mapping, _storage = native_fixture(root, 'native-foundation', version=2)
+    second, _mapping, _storage = native_fixture(root, 'native-activation', version=2)
+    outside = tmp_path / 'outside'
+    outside.write_bytes(b'never read')
+    (source / 'alias').unlink()
+    destinations = {'outside': str(outside), 'other_group': str(second / 'plain'),
+                    'parent': '../plain', 'unknown_container': '/tmp/cutover-fixtures/other/plain'}
+    (source / 'alias').symlink_to(destinations[target])
+    actual = evidence.os.open
+    def no_target(path, *args, **kwargs):
+        assert str(path) not in ('alias', str(outside))
+        return actual(path, *args, **kwargs)
+    monkeypatch.setattr(evidence.os, 'open', no_target)
+    before = originals(root)
+    result = evidence.prepare({'cutover-completion': root}, output)
+    assert not result['complete'] and originals(root) == before
+    assert not any(x['path'].startswith('native-foundation/') for x in result['links'])
+
+
+def test_v2_short_name_reduces_actual_scan_metadata_without_omitting_entries(tmp_path):
+    inventories = []
+    for version in (None, 2):
+        root = tmp_path / str(version)
+        root.mkdir(mode=0o700)
+        native_fixture(root, 'native-foundation', '12345678', version=version)
+        budget = {'entries': 0, 'bytes': 0, 'metadata': 0}
+        with evidence.directory(root) as fd:
+            entries = evidence.scan(fd, budget, float('inf'))
+        inventories.append((entries, budget))
+    old, new = inventories
+    assert len(old[0]) == len(new[0]) and old[1]['entries'] == new[1]['entries']
+    assert new[1]['metadata'] < old[1]['metadata']
+    assert evidence.MAX_METADATA == 8388608
 
 
 @pytest.mark.parametrize('group', ['native', 'native-foundation', 'native-activation', 'native-adapters'])

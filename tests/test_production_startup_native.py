@@ -349,3 +349,403 @@ def test_review_strategy_uses_actual_loader_derived_version(tmp_path, monkeypatc
     fixture.seal_inputs(tmp_path, {"source": {}, "manifest": manifest, "config": path, "directory": tmp_path,
         "paths": paths, "project": "synthetic", "manifest_path": manifest_path, "environment": environment, "strategy": actual})
     assert observed == [actual]
+
+
+@pytest.fixture(scope="module")
+def public_repository(tmp_path_factory):
+    import subprocess
+    repo = tmp_path_factory.mktemp("shared-public-git")
+    (repo / "core").mkdir()
+    for name, raw in {"config.yaml": b"feeds: []\n", "docker-compose.yml": b"services: {}\n",
+                      "Dockerfile": b"FROM synthetic@sha256:" + b"a" * 64 + b"\n",
+                      "core/public.py": b"public = True\n", "start.sh": b"#!/bin/sh\nexit 0\n"}.items():
+        (repo / name).write_bytes(raw)
+    (repo / "start.sh").chmod(0o755)
+    for args in (("init", "-q"), ("add", "."), ("-c", "user.name=Synthetic", "-c", "user.email=synthetic@example.invalid",
+                                               "commit", "-qm", "synthetic public source")):
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+    return repo, private.source_identity(repo)
+
+
+@pytest.fixture
+def shared_source(public_repository, tmp_path):
+    repo, source = public_repository
+    shared = native.SharedPublicSource(repo, tmp_path / "s", source)
+    try:
+        yield repo, source, shared
+    finally:
+        shared.close()
+
+
+def synthetic_contract(number):
+    return {"files": {"compose.json": str(number) * 64, "runtime.yaml": str(number + 4) * 64}}
+
+
+def fake_candidate_docker(monkeypatch):
+    """Only Docker is doubled; Git archive, extraction and complete-tree IO are real."""
+    original_archive, original_run = native.archive_command, private.run
+    builds, inspected = [], []
+    def archive(args, path, **options):
+        if args[:2] != ["docker", "build"]:
+            return original_archive(args, path, **options)
+        builds.append((args, options))
+        native.save(Path(str(path) + ".stdout"), b"synthetic build stdout\n")
+        native.save(Path(str(path) + ".stderr"), b"synthetic build stderr\n")
+    def run(args, **kwargs):
+        if args[:3] != ["docker", "image", "inspect"]:
+            return original_run(args, **kwargs)
+        inspected.append(args[-1])
+        build_args = builds[-1][0]
+        values = dict(build_args[index + 1].split("=", 1) for index, value in enumerate(build_args) if value == "--build-arg")
+        labels = {"io.ai-filter.private-release.sha256": values["AI_FILTER_PRIVATE_RELEASE_SHA"],
+                  "io.ai-filter.runtime-config.sha256": values["AI_FILTER_RUNTIME_CONFIG_SHA"],
+                  "io.ai-filter.config.sha256": values["AI_FILTER_BUILD_CONFIG_SHA"],
+                  "org.opencontainers.image.revision": values["AI_FILTER_BUILD_GIT_SHA"]}
+        return json.dumps([{"Id": "sha256:" + str(len(builds)) * 64, "Config": {"Labels": labels}}]).encode()
+    monkeypatch.setattr(native, "archive_command", archive)
+    monkeypatch.setattr(private, "run", run)
+    return builds, inspected
+
+
+def test_four_independent_builds_share_exact_public_bytes_without_mode_changes(shared_source, tmp_path, monkeypatch):
+    repo, source, shared = shared_source
+    builds, inspected = fake_candidate_docker(monkeypatch)
+    baseline = native._source_tree(shared.fds[2])
+    for number in range(1, 5):
+        workspace = tmp_path / f"n{number}"
+        workspace.mkdir(mode=0o700)
+        digest = native.build_candidate(repo, workspace, source, f"synthetic:{number}", synthetic_contract(number),
+                                        "c" * 64, shared_source=shared)
+        assert digest == "sha256:" + str(number) * 64
+        assert json.loads((workspace / "shared-source-before.json").read_bytes()) == shared.reference
+        assert json.loads((workspace / "shared-source-after.json").read_bytes()) == shared.reference
+        assert (workspace / "image-inspect.json").is_file()
+        assert (workspace / "application-build.stdout").read_bytes() == b"synthetic build stdout\n"
+        assert (workspace / "application-build.stderr").read_bytes() == b"synthetic build stderr\n"
+        assert not (workspace / "context").exists() and not (workspace / "source.tar").exists()
+    assert len(builds) == len(inspected) == 4
+    assert [item[0][item[0].index("--tag") + 1] for item in builds] == [f"synthetic:{n}" for n in range(1, 5)]
+    for number, (args, options) in enumerate(builds, 1):
+        assert args[-1] == str(shared.context) and options == {"seconds": 600}
+        assert f"AI_FILTER_BUILD_MANIFEST_SHA={str(number) * 64}" in args
+        assert f"AI_FILTER_RUNTIME_CONFIG_SHA={str(number + 4) * 64}" in args
+    assert native._source_tree(shared.fds[2]) == baseline
+    assert (shared.context / "core/public.py").stat().st_mode & 0o777 == 0o644
+    assert (shared.context / "start.sh").stat().st_mode & 0o777 == 0o755
+    assert (shared.context / "core").stat().st_mode & 0o777 == 0o755
+    assert shared.context.stat().st_mode & 0o777 == 0o700
+    assert len(list(tmp_path.rglob("source.tar"))) == 1
+    assert {path.name for path in shared.directory.iterdir()} == {
+        "source.tar", "context", "SOURCE.json", "git-archive.stdout", "git-archive.stderr", "archive-extract.stdout", "archive-extract.stderr"}
+
+
+@pytest.mark.parametrize("change", ["bytes", "same_bytes_replacement", "add", "delete", "mode", "symlink", "hardlink",
+                                   "directory", "context", "archive_bytes", "archive_replacement", "archive_link", "parent"])
+def test_shared_public_source_rejects_actual_tree_or_archive_drift_before_build(shared_source, tmp_path, monkeypatch, change):
+    repo, source, shared = shared_source
+    builds, inspected = fake_candidate_docker(monkeypatch)
+    target = shared.context / "core/public.py"
+    original = target.read_bytes()
+    if change == "bytes":
+        target.write_bytes(b"tampered True\n")
+    elif change == "same_bytes_replacement":
+        target.unlink()
+        target.write_bytes(original)
+    elif change == "add":
+        (shared.context / "new").write_bytes(b"added")
+    elif change == "delete":
+        target.unlink()
+    elif change == "mode":
+        target.chmod(0o600)
+    elif change in ("symlink", "hardlink"):
+        target.unlink()
+        external = tmp_path / "external-original"
+        external.write_bytes(original)
+        getattr(os, "symlink" if change == "symlink" else "link")(external, target)
+    elif change in ("directory", "context", "parent"):
+        selected = {"directory": shared.context / "core", "context": shared.context, "parent": shared.directory}[change]
+        selected.rename(tmp_path / "retained-original")
+        selected.mkdir(mode=0o700)
+    elif change == "archive_bytes":
+        with (shared.directory / "source.tar").open("r+b") as handle:
+            handle.write(b"changed")
+    else:
+        archive = shared.directory / "source.tar"
+        original_archive = archive.read_bytes()
+        archive.rename(tmp_path / "retained-archive")
+        if change == "archive_link":
+            archive.symlink_to(tmp_path / "retained-archive")
+        else:
+            archive.write_bytes(original_archive)
+            archive.chmod(0o600)
+    workspace = tmp_path / "n1"
+    workspace.mkdir(mode=0o700)
+    with pytest.raises((private.ContractError, FileNotFoundError)):
+        native.build_candidate(repo, workspace, source, "synthetic:1", synthetic_contract(1), "c" * 64, shared_source=shared)
+    assert builds == inspected == [] and not (workspace / "shared-source-after.json").exists()
+    assert (repo / "core/public.py").read_bytes() == original
+
+
+@pytest.mark.parametrize("original_failure", [False, True])
+def test_shared_source_post_build_drift_stops_before_inspect_and_keeps_original_failure(shared_source, tmp_path, monkeypatch, original_failure):
+    repo, source, shared = shared_source
+    builds, inspected = fake_candidate_docker(monkeypatch)
+    original_archive = native.archive_command
+    error = RuntimeError("original synthetic Docker failure")
+    def archive(args, path, **kwargs):
+        original_archive(args, path, **kwargs)
+        (shared.context / "core/public.py").write_bytes(b"changed during build")
+        if original_failure:
+            raise error
+    monkeypatch.setattr(native, "archive_command", archive)
+    workspace = tmp_path / "n1"
+    workspace.mkdir(mode=0o700)
+    with pytest.raises(RuntimeError if original_failure else private.ContractError) as raised:
+        native.build_candidate(repo, workspace, source, "synthetic:1", synthetic_contract(1), "c" * 64, shared_source=shared)
+    if original_failure:
+        assert raised.value is error and isinstance(error.__cause__, private.ContractError)
+    assert len(builds) == 1 and inspected == []
+    assert (workspace / "application-build.stdout").read_bytes() == b"synthetic build stdout\n"
+    assert (workspace / "application-build.stderr").read_bytes() == b"synthetic build stderr\n"
+    assert not (workspace / "shared-source-after.json").exists()
+    assert (shared.directory / "source.tar").is_file() and (shared.context / "core/public.py").is_file()
+
+
+def test_shared_source_does_not_trust_rewritten_inventory_json(shared_source):
+    repo, source, shared = shared_source
+    (shared.context / "core/public.py").write_bytes(b"not Git public bytes")
+    native.save(shared.directory / "SOURCE.json", {"source": source, "tree": native._source_tree(shared.fds[2])})
+    with pytest.raises(private.ContractError, match="content changed"):
+        shared.check(repo, source)
+
+
+def test_shared_source_rejects_wrong_source_and_dirty_original_tree(shared_source):
+    repo, source, shared = shared_source
+    with pytest.raises(private.ContractError, match="identity differs"):
+        shared.check(repo, {**source, "source_sha": "f" * 40})
+    original = (repo / "core/public.py").read_bytes()
+    try:
+        (repo / "core/public.py").write_bytes(b"dirty working source")
+        with pytest.raises(private.ContractError, match="clean source"):
+            shared.check(repo, source)
+    finally:
+        (repo / "core/public.py").write_bytes(original)
+    assert private.source_identity(repo) == source
+
+
+@pytest.mark.parametrize("change", ["bytes", "missing", "extra", "link"])
+def test_extraction_is_matched_against_actual_complete_archive(public_repository, tmp_path, monkeypatch, change):
+    repo, source = public_repository
+    extract = native.extract_public_source
+    def changed(archive, context, evidence):
+        extract(archive, context, evidence)
+        path = context / "core/public.py"
+        if change == "bytes":
+            path.write_bytes(b"wrong extracted bytes")
+        elif change == "missing":
+            path.unlink()
+        elif change == "extra":
+            (context / "extra").write_bytes(b"extra")
+        else:
+            path.unlink()
+            path.symlink_to(repo / "core/public.py")
+    monkeypatch.setattr(native, "extract_public_source", changed)
+    with pytest.raises(private.ContractError):
+        native.SharedPublicSource(repo, tmp_path / "s", source)
+    assert (tmp_path / "s/source.tar").is_file() and (tmp_path / "s/archive-extract.stdout").is_file()
+
+
+@pytest.mark.parametrize("kind", ["symlink", "hardlink", "traversal", "duplicate", "fifo"])
+def test_shared_source_rejects_unsafe_archive_before_any_extraction(tmp_path, kind):
+    archive_path = tmp_path / "bad.tar"
+    with tarfile.open(archive_path, "w") as archive:
+        item = tarfile.TarInfo("../outside" if kind == "traversal" else "public.py")
+        if kind in ("symlink", "hardlink"):
+            item.type = tarfile.SYMTYPE if kind == "symlink" else tarfile.LNKTYPE
+            item.linkname = "/outside"
+        elif kind == "fifo":
+            item.type = tarfile.FIFOTYPE
+        archive.addfile(item)
+        if kind == "duplicate":
+            archive.addfile(item)
+    with archive_path.open("rb") as handle, pytest.raises(private.ContractError):
+        native._archive_content(handle.fileno())
+    assert not (tmp_path / "outside").exists()
+
+
+def test_existing_oneoff_builder_keeps_its_own_context_and_original_modes(public_repository, tmp_path, monkeypatch):
+    repo, source = public_repository
+    builds, inspected = fake_candidate_docker(monkeypatch)
+    workspace = tmp_path / "oneoff"
+    workspace.mkdir(mode=0o700)
+    native.build_candidate(repo, workspace, source, "synthetic:1", synthetic_contract(1), "c" * 64)
+    assert len(builds) == len(inspected) == 1
+    assert builds[0][0][-1] == str(workspace / "context")
+    assert (workspace / "source.tar").is_file() and not (workspace / "shared-source-before.json").exists()
+    assert (workspace / "context/start.sh").stat().st_mode & 0o777 == 0o755
+
+
+def test_execute_preserves_four_worker_scenarios_and_one_checked_source(public_repository, tmp_path, monkeypatch):
+    repo, source = public_repository
+    original_run, original_archive = private.run, native.archive_command
+    monkeypatch.setattr(native.sys, "platform", "linux")
+    def run(args, **kwargs):
+        return b"amd64\n" if args[:2] == ["docker", "info"] else original_run(args, **kwargs)
+    def archive(args, path, **kwargs):
+        if args[:2] == ["docker", "pull"]:
+            assert kwargs == {"seconds": 180}
+            return
+        return original_archive(args, path, **kwargs)
+    calls = []
+    def scenario(root, workspace, workers, dsn, miniflux, stage, report, shared):
+        calls.append((workers, shared, shared.check(root, source)))
+    monkeypatch.setattr(private, "run", run)
+    monkeypatch.setattr(native, "archive_command", archive)
+    monkeypatch.setattr(native, "scenario", scenario)
+    dsn = tmp_path / "dsn.json"
+    native.save(dsn, {"dsn": "synthetic-no-connection"})
+    native.execute(repo, tmp_path / "output", dsn, tmp_path / "unused-miniflux")
+    assert [row[0] for row in calls] == [1, 2, 3, 4]
+    assert len({id(row[1]) for row in calls}) == 1 and all(row[2] == calls[0][2] for row in calls)
+    assert calls[0][1].fds == []
+    report = json.loads((tmp_path / "output/report.json").read_bytes())
+    assert report["status"] == "passed" and report["shared_public_source"] == calls[0][2]
+
+
+@pytest.mark.parametrize("limit", ["entries", "bytes"])
+def test_shared_source_scan_bounds_fail_closed_without_deleting_originals(shared_source, monkeypatch, limit):
+    repo, source, shared = shared_source
+    original = (shared.directory / "source.tar").read_bytes()
+    monkeypatch.setattr(native, "SOURCE_ENTRIES" if limit == "entries" else "SOURCE_BYTES", 2)
+    with pytest.raises(private.ContractError, match="bound exceeded"):
+        shared.check(repo, source)
+    assert (shared.directory / "source.tar").read_bytes() == original
+    assert (shared.context / "core/public.py").read_bytes() == b"public = True\n"
+
+
+def test_source_scan_detects_same_file_mutation_while_reading(shared_source, monkeypatch):
+    _repo, _source, shared = shared_source
+    target = shared.context / "core/public.py"
+    identity = target.stat().st_ino
+    original_read = os.read
+    changed = []
+    def read(fd, count):
+        value = original_read(fd, count)
+        if value and os.fstat(fd).st_ino == identity and not changed:
+            changed.append(True)
+            target.write_bytes(b"public = False\n")
+        return value
+    monkeypatch.setattr(os, "read", read)
+    with pytest.raises(private.ContractError, match="changed during read"):
+        native._source_tree(shared.fds[2])
+    assert changed == [True] and target.read_bytes() == b"public = False\n"
+
+
+def test_shared_source_requires_private_direct_parent_before_archive(public_repository, tmp_path, monkeypatch):
+    repo, source = public_repository
+    parent = tmp_path / "shared"
+    parent.mkdir(mode=0o755)
+    parent.chmod(0o755)
+    calls = []
+    monkeypatch.setattr(native, "archive_command", lambda *args, **kwargs: calls.append(args))
+    with pytest.raises(private.ContractError, match="parent must be private"):
+        native.SharedPublicSource(repo, parent / "s", source)
+    assert calls == [] and list(parent.iterdir()) == []
+    parent.chmod(0o700)
+    alias = tmp_path / "alias"
+    alias.symlink_to(parent, target_is_directory=True)
+    with pytest.raises(private.ContractError, match="parent must be private"):
+        native.SharedPublicSource(repo, alias / "s", source)
+    assert calls == [] and list(parent.iterdir()) == []
+
+
+def test_failed_build_with_valid_context_retains_error_and_checked_after_record(shared_source, tmp_path, monkeypatch):
+    repo, source, shared = shared_source
+    builds, inspected = fake_candidate_docker(monkeypatch)
+    original_archive = native.archive_command
+    error = RuntimeError("exact synthetic Docker error")
+    def archive(args, path, **kwargs):
+        original_archive(args, path, **kwargs)
+        raise error
+    monkeypatch.setattr(native, "archive_command", archive)
+    workspace = tmp_path / "n1"
+    workspace.mkdir(mode=0o700)
+    with pytest.raises(RuntimeError) as raised:
+        native.build_candidate(repo, workspace, source, "synthetic:1", synthetic_contract(1), "c" * 64, shared_source=shared)
+    assert raised.value is error and error.__cause__ is None
+    assert len(builds) == 1 and inspected == []
+    assert json.loads((workspace / "shared-source-after.json").read_bytes()) == shared.reference
+    assert (workspace / "application-build.stderr").read_bytes() == b"synthetic build stderr\n"
+
+
+@pytest.mark.parametrize("replacement", ["symlink", "directory"])
+def test_shared_source_rejects_outer_parent_replacement_without_changing_original_tree(public_repository, tmp_path, replacement):
+    repo, source = public_repository
+    parent = tmp_path / "workspace"
+    parent.mkdir(mode=0o700)
+    shared = native.SharedPublicSource(repo, parent / "s", source)
+    original = native._source_tree(shared.fds[2])
+    retained = tmp_path / "retained-workspace"
+    parent.rename(retained)
+    if replacement == "symlink":
+        parent.symlink_to(retained, target_is_directory=True)
+    else:
+        parent.mkdir(mode=0o700)
+    try:
+        with pytest.raises(private.ContractError, match="parent"):
+            shared.check(repo, source)
+        assert native._source_tree(shared.fds[2]) == original
+        assert (retained / "s/source.tar").is_file()
+    finally:
+        shared.close()
+
+
+def test_tree_entry_bound_stops_streaming_scandir_before_consuming_remaining_entries(shared_source, monkeypatch):
+    _repo, _source, shared = shared_source
+    original = os.scandir
+    consumed = []
+    class BoundedEntries:
+        def __init__(self, fd):
+            self.iterator = original(fd)
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            self.iterator.close()
+        def __iter__(self):
+            return self
+        def __next__(self):
+            assert len(consumed) < 2, "scanner consumed entries beyond its first over-bound entry"
+            entry = next(self.iterator)
+            consumed.append(entry.name)
+            return entry
+    monkeypatch.setattr(os, "scandir", BoundedEntries)
+    monkeypatch.setattr(native, "SOURCE_ENTRIES", 2)
+    with pytest.raises(private.ContractError, match="entry bound"):
+        native._source_tree(shared.fds[2])
+    assert len(consumed) == 2
+    assert (shared.context / "core/public.py").read_bytes() == b"public = True\n"
+
+
+@pytest.mark.parametrize("depth", [0, 1])
+def test_tree_count_bound_includes_root_and_nested_directories(tmp_path, monkeypatch, depth):
+    assert native.SOURCE_ENTRIES == 4096
+    root = tmp_path / "tree"
+    root.mkdir(mode=0o700)
+    leaf = root
+    if depth:
+        leaf = root / "child"
+        leaf.mkdir(mode=0o700)
+    for name in ("one", "two"):
+        (leaf / name).write_bytes(b"retained public bytes")
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        original = native._source_tree(fd)
+        assert len(original) == 3 + depth
+        monkeypatch.setattr(native, "SOURCE_ENTRIES", len(original))
+        assert native._source_tree(fd) == original
+        monkeypatch.setattr(native, "SOURCE_ENTRIES", len(original) - 1)
+        with pytest.raises(private.ContractError, match="entry bound"):
+            native._source_tree(fd)
+        assert all((leaf / name).read_bytes() == b"retained public bytes" for name in ("one", "two"))
+    finally:
+        os.close(fd)

@@ -221,6 +221,23 @@ def copy_file(fd, name, row, root, relative, deadline, *, output_ids=None):
             os.close(output)
 
 
+def native_short_directory(fd, name, entries):
+    """Recheck each fixed v2 ancestor through held descriptors, without aliases."""
+    current = os.dup(fd)
+    try:
+        parts = PurePosixPath(name).parts
+        for index, part in enumerate(parts):
+            child = os.open(part, NOFOLLOW | os.O_DIRECTORY, dir_fd=current)
+            os.close(current)
+            current = child
+            row = entries.get('/'.join(parts[:index + 1]), {})
+            require(row.get('kind') == 'directory' and identity(os.fstat(current)) == row['identity'],
+                    'native_mapping_identity_mismatch')
+            private_directory(current)
+    finally:
+        os.close(current)
+
+
 def native_mapping(fd, entries, group):
     """Only the actual retained native fixture mount has a container alias."""
     require(group in NATIVE_GROUPS, 'unknown_native_group')
@@ -235,20 +252,30 @@ def native_mapping(fd, entries, group):
         return dict(pairs)
     with regular(fd, name, row['identity']) as source:
         value = json.loads(os.read(source, 8193), object_pairs_hook=unique)
+        mapping_uid = os.fstat(source).st_uid
     expected = {'container_path', 'evidence_relative_path', 'device', 'inode',
                 'retained_in_place', 'root_tmpfs_bytes'}
+    short_layout = isinstance(value, dict) and 'layout_version' in value
+    if short_layout:
+        require(type(value['layout_version']) is int and value['layout_version'] == 2, 'invalid_native_mapping')
+        require(mapping_uid == os.geteuid() and stat.S_IMODE(row['identity']['mode']) == 0o600,
+                'invalid_native_mapping')
+        expected.add('layout_version')
     require(isinstance(value, dict) and set(value) == expected and value['retained_in_place'] is True
             and type(value['root_tmpfs_bytes']) is int and value['root_tmpfs_bytes'] == 134217728
             and type(value['device']) is int and type(value['inode']) is int, 'invalid_native_mapping')
     logical = value['container_path']
-    require(isinstance(logical, str)
-            and re.fullmatch(r'/tmp/cutover-fixtures/cutover-synthetic-[A-Za-z0-9_-]+', logical), 'invalid_native_mapping')
+    require(isinstance(logical, str) and (
+        logical == '/tmp/cutover-fixtures/s' if short_layout else
+        re.fullmatch(r'/tmp/cutover-fixtures/cutover-synthetic-[A-Za-z0-9_-]+', logical)), 'invalid_native_mapping')
     relative = 'disk-fixtures/' + PurePosixPath(logical).name
     require(value['evidence_relative_path'] == relative, 'invalid_native_mapping')
     actual = group + '/fixtures/' + relative
     info = entries.get(actual, {})
     require(info.get('kind') == 'directory' and info['identity']['dev'] == value['device']
             and info['identity']['ino'] == value['inode'], 'native_mapping_identity_mismatch')
+    if short_layout:
+        native_short_directory(fd, actual, entries)
     return logical, actual
 
 

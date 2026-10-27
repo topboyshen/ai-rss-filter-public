@@ -1,4 +1,5 @@
 """Offline actual validators with bounded Docker/PG transport doubles."""
+import ast
 from copy import deepcopy
 import hashlib
 import io
@@ -13,6 +14,122 @@ import pytest
 from scripts import production_sender_bootstrap as bootstrap
 from services import admission_fence as gate
 from scripts.production_legacy_takeover import LegacyTakeover
+
+
+def dockerfile_execution_contract(source):
+    """Strict current single-stage source check, not a Docker build simulator."""
+    instructions = [line.strip().split(None, 1) for line in source.splitlines()
+                    if line.strip() and not line.lstrip().startswith("#")]
+    assert all(len(row) == 2 and "\\" not in row[1] for row in instructions)
+    assert instructions[0][0] == "FROM" and sum(row[0] == "FROM" for row in instructions) == 1
+    values = {}
+    for opcode, field in (("ENTRYPOINT", "Entrypoint"), ("CMD", "Cmd")):
+        matches = [raw for name, raw in instructions if name == opcode]
+        assert len(matches) == 1, "ambiguous or inherited executable defaults"
+        value = json.loads(matches[0])
+        assert isinstance(value, list) and all(isinstance(item, str) for item in value), "exec-form vector required"
+        values[field] = value
+    return values
+
+
+def candidate_launches(source):
+    calls = [node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.Call)
+             and isinstance(node.func, ast.Attribute) and node.func.attr == "launch" and len(node.args) >= 2
+             and isinstance(node.args[1], ast.Attribute) and node.args[1].attr == "image_id"]
+    for call in calls:
+        assert len(call.args) == 3 and not call.keywords, "candidate must inherit reviewed image execution defaults"
+    return calls
+
+
+def test_candidate_dockerfile_defaults_feed_actual_bootstrap_manifest_validator(prepared):
+    p = prepared
+    source = (bootstrap.ROOT / "ops/miniflux/Dockerfile").read_text()
+    actual_source_contract = dockerfile_execution_contract(source)
+    p.image["Config"].update(actual_source_contract)
+    bootstrap._manifest(p.plan, gate._encoded(p.manifest), {})
+    assert actual_source_contract["Entrypoint"] + actual_source_contract["Cmd"] == ["/usr/bin/miniflux"]
+    assert "command" not in p.service and "entrypoint" not in p.service
+    assert "command" not in bootstrap.SERVICE_KEYS and "entrypoint" not in bootstrap.SERVICE_KEYS
+    assert all(call[0] != "compose" for call in p.calls)
+
+
+@pytest.mark.parametrize("entrypoint,cmd", [(None, ["/usr/bin/miniflux"]), ([], ["/usr/bin/miniflux"]),
+    (["/usr/bin/miniflux"], ["/usr/bin/miniflux"]), (["/usr/bin/miniflux"], ["-migrate"]),
+    (["/bin/sh", "-c"], []), (["/usr/bin/miniflux", "--unexpected"], [])])
+def test_actual_bootstrap_validator_rejects_inherited_or_duplicate_binary_defaults(prepared, entrypoint, cmd):
+    p = prepared
+    p.image["Config"].update(Entrypoint=entrypoint, Cmd=cmd)
+    with pytest.raises(gate.AdmissionError, match="locked sender binary entrypoint required"):
+        bootstrap._manifest(p.plan, gate._encoded(p.manifest), {})
+    assert not any(call[0] in {"compose", "start"} for call in p.calls)
+
+
+@pytest.mark.parametrize("change", ["missing_entrypoint", "missing_cmd", "duplicate_entrypoint", "duplicate_cmd", "second_stage", "shell_entrypoint"])
+def test_source_contract_check_refuses_ambiguous_or_unmodelled_dockerfile(change):
+    source = (bootstrap.ROOT / "ops/miniflux/Dockerfile").read_text()
+    if change == "missing_entrypoint":
+        source = source.replace('ENTRYPOINT ["/usr/bin/miniflux"]\n', '')
+    elif change == "missing_cmd":
+        source = source.replace('CMD []\n', '')
+    elif change == "shell_entrypoint":
+        source = source.replace('ENTRYPOINT ["/usr/bin/miniflux"]', 'ENTRYPOINT /usr/bin/miniflux')
+    else:
+        source += {"duplicate_entrypoint": 'ENTRYPOINT ["/unreviewed/binary"]\n',
+                   "duplicate_cmd": 'CMD ["/usr/bin/miniflux"]\n', "second_stage": 'FROM scratch\n'}[change]
+    with pytest.raises((AssertionError, ValueError)):
+        dockerfile_execution_contract(source)
+
+
+def test_all_candidate_harness_calls_inherit_defaults_and_seed_is_a_separate_image():
+    names = ("verify_miniflux_pause_native.py", "verify_sender_receiver_joint_native.py",
+             "verify_production_activation_native.py", "production_sender_bootstrap_native.py")
+    counts = {name: len(candidate_launches((bootstrap.ROOT / "scripts" / name).read_text())) for name in names}
+    assert counts == {name: int(name == "verify_miniflux_pause_native.py") for name in names}
+    for name, child in (("verify_sender_receiver_joint_native.py", "Joint"),
+                        ("verify_production_activation_native.py", "ActivationHarness")):
+        tree = ast.parse((bootstrap.ROOT / "scripts" / name).read_text())
+        cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == child)
+        assert [node.id for node in cls.bases] == ["Harness"]
+        assert not any(isinstance(node, ast.FunctionDef) and node.name == "launch_sender" for node in cls.body)
+    tree = ast.parse((bootstrap.ROOT / "scripts/production_sender_bootstrap_native.py").read_text())
+    seed = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "seed132")
+    launch, = [node for node in ast.walk(seed) if isinstance(node, ast.Call)
+               and isinstance(node.func, ast.Attribute) and node.func.attr == "launch"]
+    assert ast.literal_eval(launch.args[0]) == "seed131" and isinstance(launch.args[1], ast.Subscript)
+    assert ast.literal_eval(launch.args[1].slice) == "Id"
+    assert ast.literal_eval(launch.args[3]) == ["/usr/bin/miniflux", "-migrate"]
+
+
+@pytest.mark.parametrize("call", [
+    'self.launch("sender", self.image_id, [], ["/usr/bin/miniflux"])',
+    'self.launch("sender", self.image_id, [], command=["/usr/bin/miniflux"])'])
+def test_candidate_callsite_guard_rejects_binary_override_that_would_duplicate_entrypoint(call):
+    with pytest.raises(AssertionError, match="inherit reviewed image"):
+        candidate_launches(call)
+
+
+def test_actual_common_candidate_launch_builder_does_not_append_binary_or_arguments():
+    from scripts.verify_miniflux_pause_native import Harness
+    class CapturedRun(Exception):
+        pass
+    harness = object.__new__(Harness)
+    harness.prefix, harness.owner, harness.network = "synthetic", "a" * 32, "synthetic-internal"
+    harness.names, harness.images, harness.created = {}, {}, []
+    commands = []
+    def capture(argv):
+        commands.append(argv)
+        raise CapturedRun
+    harness.command = capture
+    image_id = "sha256:" + "b" * 64
+    with pytest.raises(CapturedRun):
+        harness.launch("sender", image_id, ["--read-only", "--cap-drop=ALL"])
+    command, = commands
+    assert command[0] == "run" and command[-1] == image_id
+    assert "/usr/bin/miniflux" not in command
+    assert command[command.index("--memory") + 1] == str(768 * 1024**2)
+    assert command[command.index("--pids-limit") + 1] == "256"
+    config = dockerfile_execution_contract((bootstrap.ROOT / "ops/miniflux/Dockerfile").read_text())
+    assert config["Entrypoint"] + config["Cmd"] == ["/usr/bin/miniflux"]
 
 
 def sha(raw):

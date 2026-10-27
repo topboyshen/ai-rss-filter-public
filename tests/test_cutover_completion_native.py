@@ -167,6 +167,101 @@ def fixture_disk(tmp_path):
     return fixtures, evidence
 
 
+def test_v2_storage_is_new_private_synced_and_keeps_full_nodeid_mapping(tmp_path, monkeypatch):
+    from _pytest.tmpdir import TempPathFactory
+    evidence = tmp_path / "evidence"
+    evidence.mkdir(mode=0o700)
+    mount = evidence / "disk-fixtures"
+    mount.mkdir(mode=0o700)
+    synced, actual = [], os.fsync
+    def sync(fd):
+        synced.append(os.fstat(fd).st_ino)
+        actual(fd)
+    monkeypatch.setattr(runner.os, "fsync", sync)
+    fixtures = runner.create_fixture_storage(mount)
+    assert fixtures.name == "s" and stat.S_IMODE(fixtures.stat().st_mode) == 0o700
+    assert synced == [fixtures.stat().st_ino, mount.stat().st_ino]
+    value, digest = runner.retain_fixture_storage(fixtures, evidence)
+    assert value["layout_version"] == 2 and value["evidence_relative_path"] == "disk-fixtures/s"
+    summary = runner.NativeDiagnostics()
+    nodeid = "tests/test_original.py::TestOriginal::test_long_original[参数]"
+    summary.collection_verified, summary.collection_sha256 = True, hashlib.sha256(nodeid.encode()).hexdigest()
+    owner = runner.NativeShortPaths(fixtures, summary)
+    owner.bind_collection(SimpleNamespace(items=[SimpleNamespace(nodeid=nodeid)]))
+    try:
+        factory = TempPathFactory(fixtures / "p", 3, "all", lambda *args: None, _ispytest=True)
+        path = owner.allocate(nodeid, factory)
+        original = path / "original"
+        original.write_bytes(b"full original")
+        before = original.stat()
+        owner.confirm()
+        assert mapping_rows(owner)[1]["nodeid"] == nodeid and original.stat() == before
+        runner.confirm_fixture_storage(fixtures, evidence, value, digest)
+        assert original.read_bytes() == b"full original"
+    finally:
+        owner.close()
+    assert "fixtures = create_fixture_storage(fixture_mount)" in runner.CONTAINER_TEST
+
+
+@pytest.mark.parametrize("existing", ["directory", "file", "symlink", "dangling"])
+def test_v2_creation_refuses_existing_objects_without_reuse_or_cleanup(tmp_path, existing):
+    mount = tmp_path / "mount"
+    mount.mkdir(mode=0o700)
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o700)
+    original = outside / "original"
+    original.write_bytes(b"retain old evidence")
+    child = mount / "s"
+    if existing == "directory":
+        child.mkdir(mode=0o700)
+        (child / "original").write_bytes(b"retained directory")
+    elif existing == "file":
+        child.write_bytes(b"retained file")
+    else:
+        child.symlink_to(outside if existing == "symlink" else outside / "missing")
+    before, outside_before = child.lstat(), original.stat()
+    with pytest.raises(FileExistsError):
+        runner.create_fixture_storage(mount)
+    assert child.lstat() == before and original.stat() == outside_before
+    assert original.read_bytes() == b"retain old evidence"
+
+
+@pytest.mark.parametrize("phase", ["child", "parent"])
+def test_v2_creation_sync_failure_preserves_new_root_and_refuses_retry(tmp_path, monkeypatch, phase):
+    mount = tmp_path / "mount"
+    mount.mkdir(mode=0o700)
+    real_sync = os.fsync
+    def fail(fd):
+        is_parent = os.fstat(fd).st_ino == mount.stat().st_ino
+        if is_parent == (phase == "parent"):
+            raise OSError("synthetic storage sync failure")
+        real_sync(fd)
+    monkeypatch.setattr(runner.os, "fsync", fail)
+    with pytest.raises(OSError, match="sync failure"):
+        runner.create_fixture_storage(mount)
+    before = (mount / "s").stat()
+    with pytest.raises(FileExistsError):
+        runner.create_fixture_storage(mount)
+    assert (mount / "s").stat() == before
+
+
+def test_v2_mount_replacement_does_not_create_in_foreign_directory(tmp_path, monkeypatch):
+    mount, retained = tmp_path / "mount", tmp_path / "retained"
+    mount.mkdir(mode=0o700)
+    actual = os.mkdir
+    def replace(name, mode=0o777, *, dir_fd=None):
+        if name == "s" and dir_fd is not None:
+            mount.rename(retained)
+            actual(mount, mode=0o700)
+            (mount / "foreign").write_bytes(b"unchanged")
+        return actual(name, mode, dir_fd=dir_fd)
+    monkeypatch.setattr(runner.os, "mkdir", replace)
+    with pytest.raises(ValueError, match="changed"):
+        runner.create_fixture_storage(mount)
+    assert (retained / "s").is_dir() and sorted(p.name for p in mount.iterdir()) == ["foreign"]
+    assert (mount / "foreign").read_bytes() == b"unchanged"
+
+
 def test_mapping_is_durable_before_tests_and_final_is_separate(tmp_path, monkeypatch):
     fixtures, evidence = fixture_disk(tmp_path)
     original, synced = os.fsync, []
@@ -887,3 +982,140 @@ def test_final_mapping_rejects_an_actual_allocation_missing_from_memory(tmp_path
         assert path.is_dir() and not (owner.fixtures / "TMP_PATH_MAP_FINAL.json").exists()
     finally:
         owner.close()
+
+
+@pytest.mark.parametrize("existing", ["directory", "file", "symlink", "dangling"])
+def test_unbound_factory_never_deletes_a_base_created_after_owner_constructor(tmp_path, monkeypatch, existing):
+    owner, factory = short_path_case(tmp_path, ["first"])
+    target = tmp_path / "outside-original"
+    target.mkdir(mode=0o700)
+    original = target / "original.bin"
+    original.write_bytes(b"preserve exact original")
+    if existing == "directory":
+        owner.base.mkdir(mode=0o700)
+        original = owner.base / "original.bin"
+        original.write_bytes(b"preserve exact original")
+    elif existing == "file":
+        owner.base.write_bytes(b"preserve exact base file")
+    else:
+        owner.base.symlink_to(target if existing == "symlink" else target / "absent", target_is_directory=True)
+    before = owner.base.lstat()
+    original_before = original.stat()
+
+    def forbidden_getbasetemp():
+        pytest.fail("unbound factory must not enter pytest's deleting getbasetemp")
+
+    monkeypatch.setattr(factory, "getbasetemp", forbidden_getbasetemp)
+    try:
+        assert factory._basetemp is None
+        with pytest.raises(ValueError, match="unbound native factory"):
+            owner.allocate("first", factory)
+        assert owner.failed and factory._basetemp is None and not owner.used
+        assert owner.base.lstat() == before and original.stat() == original_before
+        assert original.read_bytes() == b"preserve exact original"
+        assert owner.path.read_bytes() == b"" and not (owner.fixtures / "TMP_PATH_MAP_FINAL.json").exists()
+        with pytest.raises(ValueError, match="stopped"):
+            owner.allocate("first", factory)
+    finally:
+        owner.close()
+
+
+@pytest.mark.parametrize("change", ["reset", "uncached_replacement", "cached_replacement"])
+def test_bound_factory_reset_or_replacement_cannot_delete_already_used_originals(tmp_path, monkeypatch, change):
+    from _pytest.tmpdir import TempPathFactory
+    owner, factory = short_path_case(tmp_path, ["first", "second"])
+    try:
+        first = owner.allocate("first", factory)
+        original = first / "original.bin"
+        original.write_bytes(b"retained original")
+        before, mapping = original.stat(), owner.path.read_bytes()
+        if change == "reset":
+            factory._basetemp = None
+            expected = "unbound native factory"
+        else:
+            factory = TempPathFactory(owner.base, 3, "all", lambda *args: None,
+                                      basetemp=owner.base if change == "cached_replacement" else None, _ispytest=True)
+            expected = "factory instance changed"
+
+        def forbidden_getbasetemp():
+            pytest.fail("reset/replacement factory must never remove the existing base")
+
+        monkeypatch.setattr(factory, "getbasetemp", forbidden_getbasetemp)
+        with pytest.raises(ValueError, match=expected):
+            owner.allocate("second", factory)
+        assert owner.failed and original.stat() == before and original.read_bytes() == b"retained original"
+        assert owner.path.read_bytes() == mapping and not (owner.base / "t1").exists()
+    finally:
+        owner.close()
+
+
+@pytest.mark.parametrize("alias_kind", ["given", "cached", "missing_cached"])
+def test_actual_factory_alias_or_missing_cache_refuses_before_any_original_mutation(tmp_path, alias_kind):
+    from _pytest.tmpdir import TempPathFactory
+    owner, factory = short_path_case(tmp_path, ["first"])
+    try:
+        factory.getbasetemp()
+        original = owner.base / "original.bin"
+        original.write_bytes(b"retained original")
+        alias = tmp_path / "base-alias"
+        alias.symlink_to(owner.base, target_is_directory=True)
+        if alias_kind == "given":
+            factory = TempPathFactory(alias, 3, "all", lambda *args: None, _ispytest=True)
+        elif alias_kind == "cached":
+            factory = TempPathFactory(owner.base, 3, "all", lambda *args: None, basetemp=alias, _ispytest=True)
+        else:
+            retained = owner.base.with_name("retained-original-base")
+            owner.base.rename(retained)
+            original = retained / "original.bin"
+        before = original.stat()
+        with pytest.raises(ValueError, match="factory base or type|cached base"):
+            owner.allocate("first", factory)
+        assert owner.failed and original.stat() == before and original.read_bytes() == b"retained original"
+        assert owner.path.read_bytes() == b"" and not owner.used
+        if alias_kind == "missing_cached":
+            assert not owner.base.exists()
+    finally:
+        owner.close()
+
+
+def test_real_module_fixture_cached_factory_keeps_its_originals_and_standard_paths(tmp_path):
+    source = """import pytest
+@pytest.fixture(scope='module')
+def module_original(tmp_path_factory):
+ root=tmp_path_factory.mktemp('module-original')
+ (root/'original').write_text('module original')
+ return root
+def test_first(module_original, tmp_path):
+ assert (module_original/'original').read_text()=='module original'
+ (tmp_path/'original').write_text('first')
+def test_second(module_original, tmp_path):
+ assert (module_original/'original').read_text()=='module original'
+ (tmp_path/'original').write_text('second')
+"""
+    result, fixtures = short_plugin_subprocess(tmp_path, source=source)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (fixtures / "p/module-original0/original").read_text() == "module original"
+    assert (fixtures / "p/t0/original").read_text() == "first"
+    assert (fixtures / "p/t1/original").read_text() == "second"
+    final = json.loads((fixtures / "TMP_PATH_MAP_FINAL.json").read_text())
+    assert final["collection_count"] == final["allocated_case_count"] == 2
+
+
+def test_real_constructor_to_unbound_fixture_gap_stops_pytest_without_deleting_original(tmp_path):
+    source = """import pathlib,pytest
+@pytest.fixture(scope='session',autouse=True)
+def late_original(request):
+ root=request.config._tmp_path_factory._given_basetemp
+ root.mkdir(mode=0o700)
+ (root/'original.bin').write_bytes(b'late original retained')
+def test_first(tmp_path):
+ raise AssertionError('must stop before this body')
+def test_second():
+ pathlib.Path('should-not-run').write_text('unexpected')
+"""
+    result, fixtures = short_plugin_subprocess(tmp_path, source=source)
+    assert result.returncode == 1 and "native temporary mapping STOP" in result.stdout + result.stderr
+    assert (fixtures / "p/original.bin").read_bytes() == b"late original retained"
+    assert not (fixtures / "p/t0").exists() and not (tmp_path / "should-not-run").exists()
+    assert (fixtures / "TMP_PATH_MAP.jsonl").read_bytes() == b""
+    assert not (fixtures / "TMP_PATH_MAP_FINAL.json").exists()

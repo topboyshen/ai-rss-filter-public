@@ -16,9 +16,10 @@ import selectors
 import signal
 import shutil
 import stat
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import subprocess
 import sys
+import tarfile
 import time
 import traceback
 
@@ -292,7 +293,7 @@ def replace_worker(session, p, contract, sealed, digest, old):
     wait_for_slots(session, p, ["worker-1"], attempts={"worker-1": 1})
 
 
-def scenario(root, workspace, workers, raw_dsn, miniflux_source, stage, report):
+def scenario(root, workspace, workers, raw_dsn, miniflux_source, stage, report, shared_source):
     stage(f"n{workers}_prepare_disk_and_actual_pg")
     p = fixture.prepare(workspace / f"n{workers}", private.source_identity(root), workers, raw_dsn, miniflux_source)
     sealed, digest = None, None
@@ -301,7 +302,7 @@ def scenario(root, workspace, workers, raw_dsn, miniflux_source, stage, report):
         sealed = fixture.seal_inputs(root, p)
         contract, _manifest, contract_sha = private.load(sealed, root, require_fresh=True)
         stage(f"n{workers}_build_actual_application_image")
-        digest = build_candidate(root, p["directory"], p["source"], "ai-filter-startup-native:" + p["project"], contract, contract_sha)
+        digest = build_candidate(root, p["directory"], p["source"], "ai-filter-startup-native:" + p["project"], contract, contract_sha, shared_source=shared_source)
         stage(f"n{workers}_probe_actual_image_configuration")
         probe_candidate(contract, sealed.parent, digest, p["directory"])
         stage(f"n{workers}_prepare_migration_permit")
@@ -432,6 +433,195 @@ def extract_public_source(archive, context, evidence):
     archive_command(["tar", "-xf", str(archive), "--no-same-permissions", "-C", str(context)], evidence, child_umask=0o022)
 
 
+
+SOURCE_BYTES = 128 * 1024**2
+SOURCE_ENTRIES = 4096
+SOURCE_ID_FIELDS = ("st_dev", "st_ino", "st_uid", "st_gid", "st_mode", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
+
+
+def _source_identity(info):
+    return {name: getattr(info, name) for name in SOURCE_ID_FIELDS}
+
+
+def _source_file(fd):
+    before = os.fstat(fd)
+    private.require(stat.S_ISREG(before.st_mode) and before.st_uid == os.geteuid() and before.st_nlink == 1,
+                    "public source must be an owned unlinked regular file")
+    private.require(before.st_size <= SOURCE_BYTES, "public source file bound exceeded")
+    os.lseek(fd, 0, os.SEEK_SET)
+    digest, total = hashlib.sha256(), 0
+    while chunk := os.read(fd, 1024 * 1024):
+        total += len(chunk)
+        private.require(total <= SOURCE_BYTES, "public source read bound exceeded")
+        digest.update(chunk)
+    private.require(total == before.st_size and _source_identity(os.fstat(fd)) == _source_identity(before),
+                    "public source changed during read")
+    return {"identity": _source_identity(before), "sha256": digest.hexdigest()}
+
+
+def _source_tree(fd):
+    records, total = {}, 0
+    def visit(directory, prefix, depth):
+        nonlocal total
+        before = os.fstat(directory)
+        private.require(depth <= 32 and stat.S_ISDIR(before.st_mode) and before.st_uid == os.geteuid(),
+                        "public source directory identity differs")
+        records[prefix or "."] = {"identity": _source_identity(before), "kind": "directory"}
+        private.require(len(records) <= SOURCE_ENTRIES, "public source entry bound exceeded")
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                private.require(len(records) < SOURCE_ENTRIES, "public source entry bound exceeded")
+                name = entry.name
+                path = prefix + "/" + name if prefix else name
+                info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                private.require(stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode), "public source link or special file rejected")
+                flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                child = os.open(name, flags | (os.O_DIRECTORY if stat.S_ISDIR(info.st_mode) else 0), dir_fd=directory)
+                try:
+                    private.require(_source_identity(os.fstat(child)) == _source_identity(info), "public source entry replaced")
+                    if stat.S_ISDIR(info.st_mode):
+                        visit(child, path, depth + 1)
+                    else:
+                        records[path] = {"kind": "file", **_source_file(child)}
+                        total += info.st_size
+                        private.require(total <= SOURCE_BYTES, "public source tree byte bound exceeded")
+                    private.require(_source_identity(os.stat(name, dir_fd=directory, follow_symlinks=False)) == _source_identity(info),
+                                    "public source path replaced")
+                    private.require(len(records) <= SOURCE_ENTRIES, "public source entry bound exceeded")
+                finally:
+                    os.close(child)
+        private.require(_source_identity(os.fstat(directory)) == _source_identity(before), "public source directory changed")
+    visit(fd, "", 0)
+    return records
+
+
+def _source_content(records):
+    result = {}
+    for name, item in records.items():
+        info = item["identity"]
+        row = {"kind": item["kind"], "mode": stat.S_IMODE(info["st_mode"])}
+        if row["kind"] == "file":
+            row.update(size=info["st_size"], sha256=item["sha256"])
+        result[name] = row
+    return result
+
+
+def _archive_content(fd):
+    expected, total = {}, 0
+    os.lseek(fd, 0, os.SEEK_SET)
+    with os.fdopen(os.dup(fd), "rb") as stream, tarfile.open(fileobj=stream, mode="r:") as archive:
+        for member in archive:
+            name = member.name.rstrip("/")
+            parts = PurePosixPath(name).parts
+            private.require(name and not name.startswith("/") and "\\" not in name and "\x00" not in name
+                            and all(part not in ("", ".", "..") for part in name.split("/")) and len(parts) <= 32,
+                            "public source archive path rejected")
+            private.require(name not in expected and (member.isdir() or member.isfile()), "public source archive link or duplicate rejected")
+            row = {"kind": "directory" if member.isdir() else "file", "mode": member.mode & 0o777 & ~0o022}
+            if member.isfile():
+                total += member.size
+                private.require(0 <= member.size <= SOURCE_BYTES and total <= SOURCE_BYTES, "public source archive expanded bound exceeded")
+                with archive.extractfile(member) as handle:
+                    digest = hashlib.sha256()
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                row.update(size=member.size, sha256=digest.hexdigest())
+            expected[name] = row
+            private.require(len(expected) < SOURCE_ENTRIES, "public source archive entry bound exceeded")
+    return expected
+
+
+class SharedPublicSource:
+    """One private, checked public tree; not kernel-enforced immutability.
+
+    Preserve Git extraction modes, including executable/readable image inputs.
+    Same-UID mutation between a check and Docker's read remains a host trust
+    boundary; the post-build full check rejects all observed changes.
+    """
+
+    def __init__(self, root, workspace, source):
+        self.root, self.directory, self.source = Path(root), Path(workspace), dict(source)
+        self.context = self.directory / "context"
+        self.fds, self.outer_fd = [], None
+        try:
+            private.require(private.source_identity(self.root) == self.source, "shared public source identity differs")
+            outer = self.directory.parent.lstat()
+            private.require(self.directory.parent.resolve() == self.directory.parent and stat.S_ISDIR(outer.st_mode)
+                            and outer.st_uid == os.geteuid() and stat.S_IMODE(outer.st_mode) == 0o700,
+                            "shared public source parent must be private and direct")
+            self.outer_fd = os.open(self.directory.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            self.outer_identity = _source_identity(outer)
+            private.require(_source_identity(os.fstat(self.outer_fd)) == self.outer_identity, "shared public source parent changed")
+            os.mkdir(self.directory.name, mode=0o700, dir_fd=self.outer_fd)
+            parent = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            self.fds.append(parent)
+            self.parent_identity = _source_identity(os.fstat(parent))
+            private.require(self.parent_identity["st_uid"] == os.geteuid() and stat.S_IMODE(self.parent_identity["st_mode"]) == 0o700,
+                            "shared public source directory must be private")
+            archive = self.directory / "source.tar"
+            archive_command(["git", "-C", str(root), "archive", "--format=tar", "--output=" + str(archive), source["source_sha"]],
+                            self.directory / "git-archive")
+            archive.chmod(0o600)
+            archive_fd = os.open("source.tar", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+            self.fds.append(archive_fd)
+            self.archive = _source_file(archive_fd)
+            expected = _archive_content(archive_fd)
+            self.context.mkdir(mode=0o700)
+            extract_public_source(archive, self.context, self.directory / "archive-extract")
+            context_fd = os.open("context", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            self.fds.append(context_fd)
+            self.tree = _source_tree(context_fd)
+            content = _source_content(self.tree)
+            private.require({key: value for key, value in content.items() if key != "."} == expected,
+                            "extracted public source differs from actual archive")
+            self.reference = {"schema": "shared-public-source-v1", "source": self.source, "context": str(self.context),
+                              "archive_sha256": self.archive["sha256"], "tree_sha256": private.sha(private.encoded(content)),
+                              "inventory_sha256": private.sha(private.encoded(self.tree)), "entries": len(self.tree)}
+            save(self.directory / "SOURCE.json", {**self.reference, "archive": self.archive, "tree": self.tree})
+            gate._sync_directory(self.directory)
+            self.check(root, source)
+        except BaseException:
+            self.close()
+            raise
+
+    def _check_parent(self, parent):
+        private.require(self.outer_fd is not None and self.directory.parent.resolve() == self.directory.parent,
+                        "shared public source parent alias rejected")
+        outer = self.directory.parent.lstat()
+        for key in ("st_dev", "st_ino", "st_uid", "st_gid", "st_mode"):
+            private.require(getattr(outer, key) == self.outer_identity[key] == getattr(os.fstat(self.outer_fd), key),
+                            "shared public source parent changed")
+        current = self.directory.lstat()
+        for key in ("st_dev", "st_ino", "st_uid", "st_gid", "st_mode"):
+            private.require(getattr(current, key) == self.parent_identity[key] == getattr(os.fstat(parent), key),
+                            "shared public source directory replaced")
+
+    def check(self, root, source):
+        private.require(Path(root) == self.root and source == self.source and private.source_identity(root) == self.source,
+                        "shared public source identity differs")
+        private.require(len(self.fds) == 3, "shared public source is closed")
+        parent, archive, context = self.fds
+        self._check_parent(parent)
+        for name, fd, expected in (("source.tar", archive, self.archive["identity"]), ("context", context, self.tree["."]["identity"])):
+            private.require(_source_identity(os.stat(name, dir_fd=parent, follow_symlinks=False)) == expected
+                            and _source_identity(os.fstat(fd)) == expected, "shared public source path changed")
+        private.require(_source_file(archive) == self.archive and _source_tree(context) == self.tree, "shared public source content changed")
+        # Recheck the named anchors after walking, including directory replacement.
+        self._check_parent(parent)
+        private.require(_source_identity(os.stat("context", dir_fd=parent, follow_symlinks=False)) == self.tree["."]["identity"]
+                        and _source_identity(os.stat("source.tar", dir_fd=parent, follow_symlinks=False)) == self.archive["identity"],
+                        "shared public source anchor changed during check")
+        return dict(self.reference)
+
+    def close(self):
+        for fd in reversed(self.fds):
+            os.close(fd)
+        self.fds.clear()
+        if self.outer_fd is not None:
+            os.close(self.outer_fd)
+            self.outer_fd = None
+
+
 def probe_candidate(contract, directory, digest, workspace):
     sequence = 0
     def retained_run(args):
@@ -445,7 +635,7 @@ def probe_candidate(contract, directory, digest, workspace):
     private.image_probe(contract, directory, digest, runner=retained_run)
 
 
-def build_candidate(root, workspace, source, image, contract, contract_sha):
+def _oneoff_public_source(root, workspace, source):
     context = workspace / "context"
     context.mkdir(mode=0o700)
     archive = workspace / "source.tar"
@@ -454,6 +644,17 @@ def build_candidate(root, workspace, source, image, contract, contract_sha):
     archive.chmod(0o600)
     private.require(archive.stat().st_size <= 128 * 1024**2, "synthetic source archive bound exceeded")
     extract_public_source(archive, context, workspace / "archive-extract")
+    return context
+
+
+def build_candidate(root, workspace, source, image, contract, contract_sha, *, shared_source=None):
+    if shared_source is None:
+        context = _oneoff_public_source(root, workspace, source)
+    else:
+        private.require(type(shared_source) is SharedPublicSource, "actual shared public source required")
+        reference = shared_source.check(root, source)
+        save(workspace / "shared-source-before.json", reference)
+        context = shared_source.context
     labels = {"AI_FILTER_BUILD_VERSION": image, "AI_FILTER_BUILD_GIT_SHA": source["source_sha"],
               "AI_FILTER_BUILD_SOURCE_ID": source["source_sha"] + ":clean", "AI_FILTER_BUILD_MANIFEST_SHA": contract["files"]["compose.json"],
               "AI_FILTER_BUILD_CONFIG_SHA": source["example_config_sha256"], "AI_FILTER_PRIVATE_RELEASE_SHA": contract_sha,
@@ -461,7 +662,17 @@ def build_candidate(root, workspace, source, image, contract, contract_sha):
     args = ["docker", "build", "--platform", "linux/amd64", "--tag", image]
     for key, value in labels.items():
         args += ["--build-arg", key + "=" + value]
-    archive_command([*args, str(context)], workspace / "application-build", seconds=600)
+    try:
+        archive_command([*args, str(context)], workspace / "application-build", seconds=600)
+    finally:
+        original_failure = sys.exc_info()[1]
+        if shared_source is not None:
+            try:
+                save(workspace / "shared-source-after.json", shared_source.check(root, source))
+            except BaseException as verification_error:
+                if original_failure is not None:
+                    raise original_failure from verification_error
+                raise
     image_info = json.loads(private.run(["docker", "image", "inspect", image]))[0]
     save(workspace / "image-inspect.json", image_info)
     for key, value in {"io.ai-filter.private-release.sha256": contract_sha,
@@ -519,14 +730,17 @@ def execute(root, output, postgres_dsn_file, miniflux_source):
     def stage(name):
         advance_stage(path, report, name)
         print("startup_native_stage=" + name, flush=True)
+    shared_source = None
     try:
         stage("native_architecture_and_pinned_base")
         private.require(private.run(["docker", "info", "--format", "{{.Architecture}}"]).strip() in {b"amd64", b"x86_64"}, "native amd64 required")
         base = next(line.split()[1] for line in (root / "Dockerfile").read_text().splitlines() if line.startswith("FROM "))
         # Separate bounded preparation, preserving the short inspection timeout.
         archive_command(["docker", "pull", base], output / "pinned-base-pull", seconds=180)
+        shared_source = SharedPublicSource(root, workspace / "s", source)
+        report["shared_public_source"] = shared_source.reference
         for workers in range(1, 5):
-            scenario(root, workspace, workers, parsed["dsn"], miniflux_source, stage, report)
+            scenario(root, workspace, workers, parsed["dsn"], miniflux_source, stage, report, shared_source)
         report["events"].append({"stage": report["stage"], "state": "completed", "at_ns": time.time_ns()})
         report["status"] = "passed"
     except BaseException as error:
@@ -537,6 +751,8 @@ def execute(root, output, postgres_dsn_file, miniflux_source):
         report["events"].append({"stage": report.get("stage"), "state": "failed", "at_ns": time.time_ns()})
         raise
     finally:
+        if shared_source is not None:
+            shared_source.close()
         save(path, report)
 
 
