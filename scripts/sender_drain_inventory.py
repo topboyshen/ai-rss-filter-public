@@ -316,5 +316,3 @@ class FrozenPostgres:
         finally:
             self.connection.close()
             self.connection = None
-
-
