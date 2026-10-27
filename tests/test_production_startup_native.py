@@ -29,6 +29,23 @@ def test_failed_command_keeps_original_failure_bytes(tmp_path):
     assert Path(str(path) + ".stderr").read_bytes() == b"failure-original\n"
 
 
+def test_bounded_archive_stdin_is_not_exposed_in_argv_or_evidence(tmp_path):
+    path = tmp_path / "command"
+    native.archive_command([sys.executable, "-I", "-c",
+                            "import sys; x=sys.stdin.buffer.read(); print(len(x)); print('safe',file=sys.stderr)"],
+                           path, stdin_bytes=b"synthetic-stdin-only")
+    assert Path(str(path) + ".stdout").read_bytes() == b"20\n"
+    assert Path(str(path) + ".stderr").read_bytes() == b"safe\n"
+    assert all(b"synthetic-stdin-only" not in file.read_bytes() for file in tmp_path.iterdir())
+
+
+def test_bounded_archive_rejects_large_stdin_before_any_child(tmp_path):
+    with pytest.raises(private.ContractError, match="stdin bound"):
+        native.archive_command([sys.executable, "-c", "raise Exception('must not run')"],
+                               tmp_path / "not-created", stdin_bytes=b"x" * 257)
+    assert not list(tmp_path.iterdir())
+
+
 def test_public_archive_modes_survive_private_outer_umask(tmp_path):
     archive = tmp_path / "public.tar"
     with tarfile.open(archive, "w") as output:

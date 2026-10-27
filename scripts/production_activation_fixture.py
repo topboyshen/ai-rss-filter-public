@@ -40,6 +40,11 @@ def prepare_disk(directory, source, network, previous_image_id, *, workers=2):
     directory.mkdir(mode=0o700)
     paths = {name: directory / name for name in
              ("project", "data", "fence", "spool", "journal", "grants", "slots", "lifecycle")}
+    # The previous synthetic app has the actual legacy *shape*: one data bind.
+    # New control directories are descendants, never preinstalled extra mounts.
+    for name, relative in {"fence": "admission_fence", "slots": "startup_slots",
+                           "spool": "webhook_spool", "journal": "admission_journal"}.items():
+        paths[name] = paths["data"] / relative
     for name, path in paths.items():
         if name != "fence":
             path.mkdir(mode=0o700)
@@ -94,20 +99,18 @@ def manifest_input(paths, project, operation, workers, binding, network):
         service.pop("network_mode")
         service["networks"] = ["isolated"]
         service["environment"].update({"REDIS_URL": "redis://redis:6379/0",
+            "AI_FILTER_DB_PATH": "/app/data/fixture.db",
             "WEBHOOK_SPOOL_DIR": "/app/data/webhook_spool", "AI_FILTER_DASHBOARD_SNAPSHOTS": "0",
             "MINIFLUX_WEBHOOK_SECRET": "${MINIFLUX_WEBHOOK_SECRET:?}"})
-        service["volumes"] += [
-            {"type": "bind", "source": str(paths["spool"]), "target": "/app/data/webhook_spool",
-             "read_only": False, "bind": {"create_host_path": False}},
-            {"type": "bind", "source": str(paths["journal"]), "target": "/app/data/admission_journal",
+        service["volumes"] = [mount for mount in service["volumes"] if mount.get("read_only", False)] + [
+            {"type": "bind", "source": str(paths["data"]), "target": "/app/data",
              "read_only": False, "bind": {"create_host_path": False}}]
     return manifest
 
 
-def seal_inputs(root, p):
-    """Create stopped previous names; lifecycle must retain every exact ID."""
+def previous_manifest(p, base):
+    """No startup/control mounts or protocol env are installed on the old app."""
     previous = deepcopy(p["manifest"])
-    base = next(line.split()[1] for line in (root / "Dockerfile").read_text().splitlines() if line.startswith("FROM "))
     names = {name: "previous-" + name for name in previous["services"]}
     previous["services"] = {names[name]: value for name, value in previous["services"].items()}
     env = private.environment_values(p["environment"].read_bytes())
@@ -115,9 +118,19 @@ def seal_inputs(root, p):
         service["image"] = base
         for key in ("AI_FILTER_API_KEY", "MINIFLUX_WEBHOOK_SECRET"):
             service["environment"][key] = env[key]
+        service["environment"] = {key: value for key, value in service["environment"].items()
+                                  if not key.startswith(("AI_FILTER_PRODUCTION_STARTUP_", "AI_FILTER_ADMISSION_"))}
+        service["volumes"] = [mount for mount in service["volumes"] if mount["source"] != str(p["paths"]["grants"])]
         for mount in service["volumes"]:
             if mount["source"] == private.RUNTIME:
                 mount["source"] = str(p["config"])
+    return previous, names
+
+
+def seal_inputs(root, p):
+    """Create stopped previous names; lifecycle must retain every exact ID."""
+    base = next(line.split()[1] for line in (root / "Dockerfile").read_text().splitlines() if line.startswith("FROM "))
+    previous, names = previous_manifest(p, base)
     old = p["directory"] / "previous.json"
     save(old, previous)
     private.run(["docker", "compose", "--project-name", p["project"], "--project-directory", str(p["paths"]["project"]),
@@ -135,6 +148,10 @@ def seal_inputs(root, p):
         "project": p["project"], "project_directory": str(p["paths"]["project"]), "health_services": ["ai-filter-api"],
         "existing_topology": private.runtime_topology(records),
         "service_mapping": {name: [names[name]] for name in names}, "topology": topology}
+    from scripts.private_control_subpaths import capture
+    control = {kind: capture(p["paths"][path], target, p["paths"]["data"]) for kind, path, target in (
+        ("state", "slots", "/app/data/startup_slots"), ("freeze", "fence", "/app/data/admission_fence"))}
+    review["control_subpaths"] = {name: deepcopy(control) for name in names}
     review_path = p["directory"] / "review.json"
     save(review_path, review)
     p["previous_containers"] = {row["Id"]: row for row in records}

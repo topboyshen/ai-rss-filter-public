@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -111,6 +112,20 @@ def directory_identity(path):
             and not stat.S_IMODE(info.st_mode) & 0o022, "unsafe deployment directory metadata")
     return {"path": str(path), "device": info.st_dev, "inode": info.st_ino,
             "uid": info.st_uid, "mode": stat.S_IMODE(info.st_mode)}
+
+
+def validate_control_subpaths(manifest, review, apps):
+    if "control_subpaths" not in review:
+        return
+    # This helper also runs under `python -I path/to/private_release_contract.py`.
+    # Load only the sibling from this reviewed source, never ambient sys.path.
+    spec = importlib.util.spec_from_file_location("private_control_subpaths", Path(__file__).with_name("private_control_subpaths.py"))
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    try:
+        helper.validate(manifest, review, apps)
+    except (OSError, ValueError, KeyError, TypeError):
+        raise ContractError("reviewed control subpath identity or mapping differs") from None
 
 
 def run(args, *, env=None):
@@ -443,6 +458,7 @@ def validate_manifest(manifest, review, env_values, runtime_path):
     for names in review["service_mapping"].values():
         require(isinstance(names, list) and names and len(set(names)) == len(names)
                 and all(name in review["existing_topology"] for name in names), "invalid reviewed service mapping")
+    validate_control_subpaths(manifest, review, apps)
     require(used_env == set(env_values), "environment references must exactly match private environment")
     # No interpolation in command, mount, label, secret, config, etc. Embedded
     # Nginx dollar variables are allowed only when escaped for Compose.

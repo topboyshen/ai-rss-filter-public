@@ -60,16 +60,23 @@ def _checked_plan(plan):
     return plan
 
 
-def _component(name, item):
+def _component(name, item, *, allow_external_postgres=False):
     keys = {"id", "image", "revision", "started_at", "restart_count", "role", "user", "memory", "pids", "mounts"}
-    require(CONTROL.fullmatch(name) and isinstance(item, dict) and set(item) == keys, "exact component fields required")
+    external = isinstance(item, dict) and "external_postgres" in item
+    require(CONTROL.fullmatch(name) and isinstance(item, dict)
+            and set(item) == keys | ({"external_postgres"} if external else set()), "exact component fields required")
+    require(not external or (allow_external_postgres and item["role"] == "miniflux"), "external PostgreSQL policy scope differs")
     require(HEX64.fullmatch(item["id"]) and re.fullmatch(r"sha256:[0-9a-f]{64}", item["image"])
             and re.fullmatch(r"[0-9a-f]{40}", item["revision"]) and isinstance(item["started_at"], str)
             and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,9})?Z", item["started_at"])
             and _integer(item["restart_count"]) and isinstance(item["role"], str) and item["role"]
             and isinstance(item["user"], str) and re.fullmatch(r"\d+(?::\d+)?", item["user"])
             and _integer(item["memory"], 1, 768 * 1024 * 1024) and _integer(item["pids"], 1, 256), "bad component identity/limits")
-    require(isinstance(item["mounts"], list) and 1 <= len(item["mounts"]) <= 16, "bound shared mounts required")
+    require(isinstance(item["mounts"], list) and (item["mounts"] == [] if external else 1 <= len(item["mounts"]) <= 16),
+            "bound shared mounts required")
+    if external:
+        from services.sender_drain_contract import validate_external_postgres
+        validate_external_postgres(item["external_postgres"])
     for mount in item["mounts"]:
         require(set(mount) == {"Type", "Source", "Destination", "RW"} and mount["Type"] in {"bind", "volume"}
                 and Path(mount["Source"]).is_absolute() and Path(mount["Destination"]).is_absolute()
@@ -145,7 +152,7 @@ def _cron_command(line, wrappers):
     return args[9], args[11]
 
 
-def inspect_binding(rows, expected):
+def inspect_binding(rows, expected, *, allow_external_postgres=False):
     require(isinstance(rows, list) and len(rows) == len(expected), "inspect component count differs")
     observed = {}
     for row in rows:
@@ -165,7 +172,12 @@ def inspect_binding(rows, expected):
                  "started_at": state["StartedAt"], "restart_count": row["RestartCount"], "role": role, "user": raw_user,
                  "memory": row["HostConfig"]["Memory"], "pids": row["HostConfig"]["PidsLimit"],
                  "mounts": [{key: mount[key] for key in ("Type", "Source", "Destination", "RW")} for mount in row["Mounts"]]}
-        _component(name, value)
+        if "external_postgres" in expected[name]:
+            from services.sender_drain_contract import external_postgres_identity
+            require(row["Mounts"] == [] and role == "miniflux" and not env.get("DATABASE_URL_FILE"),
+                    "actual external PostgreSQL mount policy differs")
+            value["external_postgres"] = external_postgres_identity(env.get("DATABASE_URL"), row["HostConfig"].get("ReadonlyRootfs"))
+        _component(name, value, allow_external_postgres=allow_external_postgres)
         value["mounts"] = sorted(value["mounts"], key=lambda m: m["Destination"])
         bound = {**expected[name], "mounts": sorted(expected[name]["mounts"], key=lambda m: m["Destination"])}
         require(value == bound, "actual runtime image/role/mount/limits identity changed")

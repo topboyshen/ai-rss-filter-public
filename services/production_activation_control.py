@@ -299,7 +299,7 @@ def _close_session(session):
 
 
 @contextmanager
-def locked_activation(migration_root, runtime_root, state, *, operation_id):
+def locked_activation(migration_root, runtime_root, state, *, operation_id, release_lock=None):
     session = ReceiverActivationSession(migration_root, runtime_root, state, operation_id=operation_id)
     try:
         for name in migration.LOCK_ORDER[:4]:
@@ -307,7 +307,12 @@ def locked_activation(migration_root, runtime_root, state, *, operation_id):
                 continue
             expected = session.permit["locks"][name]
             gate._require(migration.file_identity(expected["path"]) == expected, "activation lock changed before acquisition")
-            session.shadow.fds.append((name, gate._lock(Path(expected["path"]), True, 0.1)))
+            if name == "release":
+                from services.production_release_lock import acquire_for_phase
+                fd = acquire_for_phase(expected, release_lock)
+            else:
+                fd = gate._lock(Path(expected["path"]), True, 0.1)
+            session.shadow.fds.append((name, fd))
         if not session.opened:
             migration._same_database(session.shadow.path, session.permit["database"])
             for suffix in ("-wal", "-shm"):

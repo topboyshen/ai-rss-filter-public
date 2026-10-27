@@ -24,10 +24,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts import private_release_contract as private, production_activation_fixture as fixture  # noqa: E402
 from scripts import verify_production_startup_native as startup_native  # noqa: E402
+from scripts import production_gateway_native as gateway_native  # noqa: E402
 from scripts.verify_miniflux_pause_native import Harness, CLIENT, image_checks, source_binding, sha  # noqa: E402
 from scripts.miniflux_host_joint_native import component  # noqa: E402
 from scripts.miniflux_handoff_adapter import source_sha256 as bridge_source, CutoverError  # noqa: E402
-from scripts.production_sender_driver import SenderActivationDriver, PostgresReader, sources as sender_sources  # noqa: E402
+from production_sender_driver import SenderActivationDriver, PostgresReader, sources as sender_sources  # noqa: E402
 from scripts.sender_drain_inventory import IDENTITY_SQL, IDENTITY_KEYS  # noqa: E402
 from services import admission_fence as gate  # noqa: E402
 
@@ -240,7 +241,7 @@ def closed_initialization(harness, p):
 
 def create_and_start(session, p):
     from services import production_container_lifecycle as lifecycle
-    paths = {"database": "/app/data/business/fixture.db", "config": "/app/config.yaml",
+    paths = {"database": "/app/data/fixture.db", "config": "/app/config.yaml",
              "freeze": "/app/data/admission_fence", "state": "/app/data/startup_slots"}
     args = (session, p["paths"]["grants"], p["paths"]["slots"], p["paths"]["lifecycle"])
     created = lifecycle.create(*args, operation_id=p["operation"], paths=paths, web_workers=2, threads=4)
@@ -273,11 +274,54 @@ def create_and_start(session, p):
     raise TimeoutError("actual candidate startup did not confirm")
 
 
-def activate(harness, p, driver, migration_root):
+def actual_namespace_transport(harness, p, stopped):
+    """Only this synthetic Go container; the production transport has no sudo."""
+    record = harness.inspect_role("sender")
+    # Root originals stay outside the runner's unprivileged upload inventory.
+    # The fixed helper exports bounded redacted copies with original hashes.
+    original = "/tmp/activation-namespace-original-" + harness.owner
+    args = ["/usr/bin/sudo", "-n", "--", "/usr/bin/python3", "-I", "-B",
+            str(harness.repo / "scripts/production_namespace_native.py"),
+            "--container-id", record["Id"], "--owner", harness.owner,
+            "--image-id", record["Image"], "--manifest", harness.manifest,
+            "--network", harness.network, "--stop-operation", stopped["sender"]["operation_id"],
+            "--evidence-root", original]
+    path = p["directory"] / "NAMESPACE_PROCESS"
+    startup_native.archive_command(args, path, seconds=35, limit=2 * 1024**2,
+        child_umask=0o077, stdin_bytes=json.dumps({"token": harness.token}).encode())
+    result = json.loads(Path(str(path) + ".stdout").read_bytes())
+    gate._require(result["status"] == "passed" and result["namespace_transport"] is True
+                  and result["post_count"] == 1 and result["queue_drained"] is False,
+                  "actual fixed network namespace transport proof missing")
+    fixture.save(p["directory"] / "ACTUAL_NAMESPACE_TRANSPORT.json", result)
+
+
+def finite_native_consumption(harness, p, receiver, driver):
+    from services import production_admission_lifecycle as lifetime
+    from scripts import production_admission_supervisor as supervisor
+    harness.stage("actual_finite_admission_lease")
+    now = int(time.time())
+    policy = {"schema": lifetime.SCHEMA, "operation_id": operation("synthetic-continuation-authority"),
+              "approved_by": "synthetic-native-workflow", "not_before": now - 1, "expires_at": now + 900,
+              "lease_seconds": 300, "renew_before_seconds": 60, "max_renewals": 4,
+              "receiver_stop_records": 127, "receiver_stop_bytes": 7 * 1024**2,
+              "sender_stop_records": 100, "sender_stop_bytes": 7 * 1024**2,
+              "minimum_free_bytes": 64 * 1024**2}
+    authority = lifetime.initialize(receiver, driver, policy)
+    lease = lifetime.query(receiver, driver, operation_id=authority["lease"]["operation_id"])
+    fixture.save(p["directory"] / "ACTUAL_FINITE_LEASE.json", {"authority": authority, "query": lease,
+                 "real_sender_and_receiver": True, "production_access": False})
+    ongoing = supervisor.prepare(receiver, driver)
+    harness.stage("actual_go_to_real_worker_deterministic_consumption")
+    harness.consume_after_open(p, receiver)
+    return ongoing
+
+
+def activate(harness, p, driver, migration_root, native_driver, *, release_lock=None):
     from services.production_activation_control import locked_activation
     from services.production_container_lifecycle import verify_active
     with locked_activation(migration_root, p["paths"]["grants"], p["paths"]["slots"],
-                           operation_id=p["activation_operation"]) as receiver:
+                           operation_id=p["activation_operation"], release_lock=release_lock) as receiver:
         harness.stage("actual_consumer_prepare_while_closed")
         require_rejected(lambda: driver.production_resume(p["closed_operation"], 0, object()))
         require_rejected(receiver.resume)
@@ -300,6 +344,24 @@ def activate(harness, p, driver, migration_root):
         else:
             raise TimeoutError("actual consumer threads did not confirm")
         confirmed = receiver.confirm()
+        harness.stage("actual_fixed_gateway_switch_while_closed")
+        from scripts.production_gateway_switch import GatewaySwitch
+        gateway = GatewaySwitch(receiver, p["gateway_plan"], p["gateway_evidence"])
+        switched = gateway.switch()
+        checked_gateway = gateway.query()
+        fixture.save(p["directory"] / "ACTUAL_GATEWAY.json", {"switch": switched, "query": checked_gateway,
+                     "real_nginx_and_http": True, "production_access": False})
+        from scripts import production_admission_watchdog as watchdog
+        from scripts.controlled_production_release import _actual_child_receipt
+        guardian = watchdog.prepare(receiver, native_driver)
+        p["watchdog_prepared"] = guardian
+        child = watchdog.start(guardian["plan_path"])
+        p["watchdog_child"] = child
+        guardian_root = Path(guardian["plan_path"]).parent
+        ready = _actual_child_receipt(child, lambda: watchdog.query_ready(guardian["plan_path"], child.pid), 8,
+                                      receipt_path=guardian_root / "pulse.json", stop_paths=(guardian_root / "STOP.json",))
+        fixture.save(p["directory"] / "ACTUAL_PREOPEN_GUARDIAN.json", {"plan": guardian, "ready": ready,
+                     "actual_process": True, "transport_scope": "synthetic_loopback_to_owned_go"})
         harness.stage("receiver_resume_and_independent_runtime_verification")
         resumed = receiver.resume()
         verified = verify_active(receiver, p["paths"]["lifecycle"], operation_id=p["operation"])
@@ -317,13 +379,87 @@ def activate(harness, p, driver, migration_root):
         fixture.save(p["directory"] / "ACTIVATION.json", {"prepared": prepared, "confirmed": confirmed,
             "receiver": resumed, "runtime_verified": verified, "sender": sender,
             "sender_resume_post_count": 1, "production_access": False})
-        harness.stage("actual_go_to_real_worker_deterministic_consumption")
-        harness.consume_after_open(p, receiver)
+        ongoing = finite_native_consumption(harness, p, receiver, native_driver)
+        return {"watchdog": guardian, "supervisor": ongoing}
+
+
+def complete_native_supervision(harness, p, active, native_driver, migration_root):
+    from scripts.controlled_production_release import _handoff
+    from services.production_activation_control import locked_activation
+    from services import production_admission_lifecycle as lifetime
+    harness.stage("actual_same_guardian_handoff_and_live_tick")
+    live = _handoff(active)
+    fixture.save(p["directory"] / "ACTUAL_SUPERVISOR_TICK.json", {"tick": live, "same_guardian_pid": True,
+        "actual_go_and_pg": True, "transport_scope": "synthetic_loopback_to_owned_go", "production_access": False})
+    harness.stage("actual_restrictive_stop_without_false_drain")
+    with locked_activation(migration_root, p["paths"]["grants"], p["paths"]["slots"],
+                           operation_id=p["activation_operation"]) as receiver:
+        stopped = lifetime.stop_new(receiver, native_driver, reason_code="operator")
+    gate._require(stopped["status"] == "producers_stopped_drain_pending" and stopped["drained"] is False,
+                  "actual restrictive stop not confirmed")
+    fixture.save(p["directory"] / "ACTUAL_RESTRICTIVE_STOP.json", stopped)
+    child = p["watchdog_child"]
+    gate._require(child.pid == live["owner"]["pid"], "native guardian child differs from actual live owner")
+    status = child.wait(timeout=25)
+    gate._require(status == 0, "actual guardian did not exit after confirmed original controlled stop")
+    fixture.save(p["directory"] / "ACTUAL_GUARDIAN_EXIT.json", {"pid": live["owner"]["pid"], "exit_code": status,
+                 "actual_child_reaped": True, "forced_kill": False})
+    harness.stage("actual_fixed_network_namespace_transport")
+    actual_namespace_transport(harness, p, stopped)
+
+
+def retained_native_phases(harness, p, driver, native_driver, permit, migration_root):
+    from services import production_migration as migration
+    from services.production_activation_control import arm
+    from services.production_release_lock import retained_release_lock
+    with retained_release_lock(permit["locks"]["release"]["path"]) as release_lock:
+        with migration.locked_session(migration_root, permit, release_lock=release_lock) as session:
+            session.authorize()
+            completed = session.migrate()
+            created, started = create_and_start(session, p)
+            web = created["containers"]["web"]
+            gate._require(harness.receiver_http(web, "/refresh")["status"] == 503, "closed receiver performed business")
+            from services.production_admission_lifecycle import source_sha256
+            image_source = harness.command(["exec", web, "python", "-I", "-B", "-c",
+                "import sys;sys.path.insert(0,'/app');"
+                "from services.production_admission_lifecycle import source_sha256;print(source_sha256())"], timeout=5).strip()
+            gate._require(image_source == source_sha256(), "actual runtime continuation source bytes differ")
+            fixture.save(p["directory"] / "ACTUAL_IMAGE_ADMISSION_SOURCES.json", {
+                "container_id": web, "source_sha256": image_source, "actual_image_execution": True,
+                "production_access": False})
+            armed = arm(session, p["paths"]["grants"], p["paths"]["slots"], operation_id=p["activation_operation"])
+            fixture.save(p["directory"] / "CLOSED_LIFECYCLE.json", {"migration": completed, "created": created,
+                "started": started, "armed": armed, "old_container_ids": sorted(p["previous_containers"]),
+                "old_binary_execution_proven": False})
+        return activate(harness, p, driver, migration_root, native_driver, release_lock=release_lock)
+
+
+def abort_native_guardian(p):
+    """Keep the real transport alive until independent restrictive calls finish."""
+    from scripts import production_admission_watchdog as watchdog
+    prepared = p.get("watchdog_prepared")
+    if prepared is None:
+        return
+    try:
+        value = watchdog.abort(prepared["plan_path"])
+    except BaseException as error:
+        value = {"status": "stop_unconfirmed", "error_type": type(error).__name__,
+                 "message_sha256": hashlib.sha256(str(error).encode()).hexdigest()}
+    fixture.save(p["directory"] / "NATIVE_GUARDIAN_FAILURE_STOP.json", value)
+    child = p.get("watchdog_child")
+    if child is not None:
+        try:
+            status = child.wait(timeout=8)
+            exited = {"pid": child.pid, "exit_code": status, "actual_child_reaped": True,
+                      "forced_kill": False, "bridge_still_available": True}
+        except subprocess.TimeoutExpired:
+            exited = {"pid": child.pid, "status": "exit_unconfirmed", "actual_child_reaped": False,
+                      "forced_kill": False, "bridge_still_available": True}
+        fixture.save(p["directory"] / "NATIVE_GUARDIAN_FAILURE_EXIT.json", exited)
 
 
 def scenario(harness, output):
-    from services import production_migration as migration
-    from services.production_activation_control import arm
+    from scripts.production_sender_native_bridge import NativeControlBridge
     harness.stage("never_opened_receiver_disk")
     p = fixture.prepare_disk(output / "receiver", private.source_identity(harness.repo), harness.network, harness.python_id)
     p["activation_operation"] = operation("receiver-activation")
@@ -333,6 +469,7 @@ def scenario(harness, output):
         harness.launch_sender()
         driver = closed_initialization(harness, p)
         harness.stage("retain_old_stopped_containers_and_seal")
+        gateway_native.prepare(harness, p)
         sealed = fixture.seal_inputs(harness.repo, p)
         contract, _manifest, contract_sha = private.load(sealed, harness.repo, require_fresh=True)
         harness.stage("build_exact_application_image")
@@ -342,22 +479,24 @@ def scenario(harness, output):
         startup_native.probe_candidate(contract, sealed.parent, digest, p["directory"])
         harness.stage("bind_exact_migration_permit")
         permit = fixture.migration_permit(p, sealed, digest)
+        gateway_native.bind_plan(p, permit)
         migration_root = p["directory"] / "migration"
         harness.stage("actual_locked_migration_create_grant_start")
-        with migration.locked_session(migration_root, permit) as session:
-            session.authorize()
-            completed = session.migrate()
-            created, started = create_and_start(session, p)
-            web = created["containers"]["web"]
-            gate._require(harness.receiver_http(web, "/refresh")["status"] == 503, "closed receiver performed business")
-            armed = arm(session, p["paths"]["grants"], p["paths"]["slots"], operation_id=p["activation_operation"])
-            fixture.save(p["directory"] / "CLOSED_LIFECYCLE.json", {"migration": completed, "created": created,
-                "started": started, "armed": armed, "old_container_ids": sorted(p["previous_containers"]),
-                "old_binary_execution_proven": False})
-        activate(harness, p, driver, migration_root)
+        token_file = p["directory"] / "synthetic-control-token.json"
+        with NativeControlBridge(harness) as bridge:
+            native_driver = SenderActivationDriver(driver.plan, bridge.transport(token_file), driver.postgres, driver.root)
+            try:
+                active = retained_native_phases(harness, p, driver, native_driver, permit, migration_root)
+                complete_native_supervision(harness, p, active, native_driver, migration_root)
+            except BaseException:
+                abort_native_guardian(p)
+                raise
     finally:
         try:
-            startup_native.preserve_scenario(p)
+            try:
+                gateway_native.preserve(harness, p)
+            finally:
+                startup_native.preserve_scenario(p)
         finally:
             p["anchor"].close()
 

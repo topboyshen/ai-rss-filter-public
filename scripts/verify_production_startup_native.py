@@ -190,17 +190,23 @@ def scenario(root, workspace, workers, raw_dsn, miniflux_source, stage, report):
 
 
 
-def archive_command(args, path, *, seconds=120, limit=8 * 1024**2, child_umask=-1):
+def archive_command(args, path, *, seconds=120, limit=8 * 1024**2, child_umask=-1, stdin_bytes=None):
     """Bound both pipes while retaining original synthetic tool output."""
+    private.require(stdin_bytes is None or (isinstance(stdin_bytes, bytes) and len(stdin_bytes) <= 256),
+                    "fixed synthetic command stdin bound exceeded")
     total = 0
     deadline = time.monotonic() + seconds
     files = [open(str(path) + suffix, "xb") for suffix in (".stdout", ".stderr")]
     for stream in files:
         os.chmod(stream.name, 0o600)
     try:
-        with subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+        with subprocess.Popen(args, stdin=subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
                               umask=child_umask) as process:
             try:
+                if stdin_bytes is not None:
+                    process.stdin.write(stdin_bytes)
+                    process.stdin.close()
                 with selectors.DefaultSelector() as selector:
                     for pipe, stream in zip((process.stdout, process.stderr), files):
                         selector.register(pipe, selectors.EVENT_READ, stream)

@@ -59,6 +59,15 @@ COPY scripts/export_score_gold_candidates.py ./scripts/export_score_gold_candida
 COPY scripts/import_score_gold_labels.py ./scripts/import_score_gold_labels.py
 COPY scripts/score_gold_metrics.py ./scripts/score_gold_metrics.py
 COPY scripts/run_controlled_startup.py ./scripts/run_controlled_startup.py
+# Runtime admission verifies the same sealed host-controller source bytes.
+# These are evidence inputs only: no Docker socket, host namespace or authority
+# is added to the application container.
+COPY scripts/production_sender_driver.py ./scripts/production_sender_driver.py
+COPY scripts/sender_drain_inventory.py ./scripts/sender_drain_inventory.py
+COPY scripts/observe_handoff_capacity.py ./scripts/observe_handoff_capacity.py
+COPY scripts/production_admission_supervisor.py ./scripts/production_admission_supervisor.py
+COPY scripts/production_admission_watchdog.py ./scripts/production_admission_watchdog.py
+COPY scripts/sender_namespace_http.py ./scripts/sender_namespace_http.py
 RUN chmod +x /app/start.sh && python -m py_compile app.py sse_engine.py worker_main.py gunicorn.conf.py scoring_provenance.py scoring_explanation.py core/*.py db/*.py utils/*.py routes/*.py services/*.py workers/*.py modules/*.py scripts/run_event_enrichment.py scripts/run_provenance_shadow.py scripts/export_score_gold_candidates.py scripts/import_score_gold_labels.py scripts/score_gold_metrics.py \
     && python -m py_compile scripts/run_controlled_startup.py \
     && python -c "import scoring_explanation"

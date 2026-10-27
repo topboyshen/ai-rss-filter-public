@@ -87,6 +87,19 @@ def _mount(record, source, target, *, writable):
                   and rows[0]["RW"] is writable, "startup mount differs")
 
 
+def _control_mount(record, mapping, kind, source, target):
+    if mapping is None:
+        _mount(record, source, target, writable=True)
+        return
+    from scripts import private_control_subpaths
+    mounts = [{"type": row["Type"], "source": row["Source"], "target": row["Destination"],
+               "read_only": not row["RW"]} for row in record["Mounts"]]
+    try:
+        private_control_subpaths.verify_actual(mapping, kind, source, target, mounts)
+    except (OSError, ValueError, KeyError, TypeError):
+        gate._require(False, "startup reviewed control subpath differs")
+
+
 
 def _protect_readonly_inputs(record, root, state, config):
     root, state, config = (Path(value).resolve() for value in (root, state, config))
@@ -111,6 +124,8 @@ def verify_container(session, root, state, descriptor, container_id, role, *, ru
     matches = [service for service in manifest["services"].values()
                if service.get("environment", {}).get("AI_FILTER_ROLE") == role]
     gate._require(len(matches) == 1, "startup role must map to exactly one reviewed service")
+    service_name = next(name for name, value in manifest["services"].items() if value is matches[0])
+    subpaths = contract["review"].get("control_subpaths", {}).get(service_name)
     image = json.loads(private.run(["docker", "image", "inspect", record["Image"]]))[0]
     private.verify_execution(matches[0], record, image, env, expected_running=running)
     _topology(contract, manifest, matches[0], record)
@@ -123,9 +138,9 @@ def verify_container(session, root, state, descriptor, container_id, role, *, ru
                   and values.get("AI_FILTER_CONFIG_PATH") == descriptor["config"]["path"],
                   "startup runtime operation environment differs")
     _mount(record, root, values.get(runtime.ENV_ROOT), writable=False)
-    _mount(record, state, descriptor["state_path"], writable=True)
+    _control_mount(record, subpaths, "state", state, descriptor["state_path"])
     _mount(record, session.path.parent, str(Path(descriptor["database"]["path"]).parent), writable=True)
-    _mount(record, session.permit["freeze"]["root"], descriptor["freeze"]["root"], writable=True)
+    _control_mount(record, subpaths, "freeze", session.permit["freeze"]["root"], descriptor["freeze"]["root"])
     _mount(record, session.permit["config"]["path"], descriptor["config"]["path"], writable=False)
     return record
 

@@ -18,6 +18,7 @@ from handoff_runtime_adapter import inspect_binding
 from miniflux_handoff_adapter import MinifluxDrainControl, MinifluxActivationControl, HEX64, checked_binding, source_sha256 as bridge_source
 from production_receiver_driver import _capture
 from sender_drain_inventory import PostgresReader
+import sender_namespace_http
 from services import sender_drain_contract as contract
 
 MAX_SAMPLES = 32
@@ -26,7 +27,7 @@ MAX_SAMPLES = 32
 def sources():
     names = ("production_sender_driver.py", "sender_drain_inventory.py", "miniflux_handoff_adapter.py",
              "handoff_runtime_adapter.py", "handoff_host_cron.py", "durable_handoff_cutover.py", "observe_handoff_capacity.py",
-             "production_receiver_driver.py")
+             "production_receiver_driver.py", "sender_namespace_http.py")
     return {**{name: hashlib.sha256((Path(__file__).parent/name).read_bytes()).hexdigest() for name in names},
             "sender_drain_contract": contract.source_sha256()}
 
@@ -49,12 +50,15 @@ def validate_plan(plan):
 
 class NativeSenderTransport:
     """Only fixed Docker inspect and authenticated loopback private gate calls."""
-    def __init__(self, url, token_file):
+    def __init__(self, url, token_file, *, container_id=None):
         value = urlsplit(url)
         require(value.scheme == "http" and value.hostname == "127.0.0.1" and value.port and value.path in ("", "/")
                 and not value.query and not value.fragment and not value.username and not value.password,
                 "sender private loopback endpoint required")
         self.port, self.token_file = value.port, Path(token_file)
+        require(container_id is None or (isinstance(container_id, str) and HEX64.fullmatch(container_id)),
+                "exact sender namespace container ID required")
+        self.container_id = container_id
         require(self.token_file.is_absolute(), "absolute private sender token required")
         self.token_sha256 = contract.digest(self._token())
 
@@ -66,6 +70,7 @@ class NativeSenderTransport:
 
     def inspect(self, component_id):
         require(isinstance(component_id, str) and HEX64.fullmatch(component_id), "exact sender container ID required")
+        require(self.container_id is None or component_id == self.container_id, "sender namespace binding differs")
         return parsed(_capture(["/usr/bin/docker", "--host", "unix:///var/run/docker.sock", "inspect", component_id]))
 
     def _allowed(self, method, path):
@@ -78,6 +83,8 @@ class NativeSenderTransport:
         require(contract.digest(token) == self.token_sha256, "sender credential changed")
         body = None if payload is None else encoded(payload)
         require(body is None or len(body) <= 8192, "sender request byte budget")
+        if self.container_id is not None:
+            return sender_namespace_http.request(self.container_id, self.port, method, path, token["token"], payload)
         started = time.monotonic()
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=2)
         try:
@@ -126,7 +133,7 @@ class SenderDriver:
         require(contract.digest(self.plan) == self.plan_sha256, "sender plan mutated")
         binding = self.plan["binding"]
         rows = self._inspect()
-        inspect_binding(rows, {binding["component_name"]:binding["component"]})
+        inspect_binding(rows, {binding["component_name"]:binding["component"]}, allow_external_postgres=True)
         for row in rows:
             env = dict(item.split("=",1) for item in row["Config"]["Env"])
             require(env.get("HANDOFF_ENABLED") == "1" and env.get("HANDOFF_MANIFEST") == binding["manifest"],
@@ -242,7 +249,7 @@ class SenderActivationDriver(SenderDriver):
         require(contract.digest(self.plan) == self.plan_sha256, "activation plan mutated")
         binding = self.plan["binding"]
         rows = self._inspect()
-        inspect_binding(rows, {binding["component_name"]:binding["component"]})
+        inspect_binding(rows, {binding["component_name"]:binding["component"]}, allow_external_postgres=True)
         for row in rows:
             env = dict(item.split("=",1) for item in row["Config"]["Env"])
             require(env.get("HANDOFF_ENABLED") == "1" and env.get("HANDOFF_MANIFEST") == binding["manifest"],

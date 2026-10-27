@@ -18,8 +18,38 @@ from services import admission_fence as gate, webhook_receipts
 
 
 def test_host_reader_is_the_exact_driver_capability_class():
-    from scripts import production_sender_driver as sender
+    import production_sender_driver as sender
     assert native.PostgresReader is sender.PostgresReader
+    from scripts import controlled_release_finalize as registration
+    assert native.SenderActivationDriver is registration.sender.SenderActivationDriver is sender.SenderActivationDriver
+
+
+@pytest.mark.parametrize("outcome", [0, 1, "timeout"])
+def test_failure_cleanup_waits_for_original_guardian_while_transport_is_available(tmp_path, monkeypatch, outcome):
+    from scripts import production_admission_watchdog as watchdog
+    calls = []
+    stopped = {"status": "producers_stopped_drain_pending", "drained": False}
+    monkeypatch.setattr(watchdog, "abort", lambda path: calls.append(("abort", path)) or stopped)
+    class OriginalChild:
+        pid = 12345
+
+        def wait(self, timeout):
+            calls.append(("wait", timeout))
+            if outcome == "timeout":
+                raise subprocess.TimeoutExpired("original synthetic child", timeout)
+            return outcome
+
+    native.abort_native_guardian({"directory": tmp_path, "watchdog_prepared": {"plan_path": "/original/plan"},
+                                 "watchdog_child": OriginalChild()})
+    assert calls == [("abort", "/original/plan"), ("wait", 8)]
+    assert json.loads((tmp_path / "NATIVE_GUARDIAN_FAILURE_STOP.json").read_bytes()) == stopped
+    result = json.loads((tmp_path / "NATIVE_GUARDIAN_FAILURE_EXIT.json").read_bytes())
+    assert result["pid"] == 12345 and result["forced_kill"] is False and result["bridge_still_available"] is True
+    assert result["actual_child_reaped"] is (outcome != "timeout")
+    if outcome == "timeout":
+        assert result["status"] == "exit_unconfirmed" and "exit_code" not in result
+    else:
+        assert result["exit_code"] == outcome
 
 
 def test_synthetic_disk_is_never_opened_and_has_no_llm_backend(tmp_path, monkeypatch):
