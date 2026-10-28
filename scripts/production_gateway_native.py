@@ -11,6 +11,7 @@ from copy import deepcopy
 import errno
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import socket
@@ -39,6 +40,138 @@ http { access_log /dev/stdout; error_log /dev/stderr warn;
   server { listen 5000; location = /health { return 200 'OLD'; } }
 }
 """
+
+DIAGNOSTIC_BYTES = 32768
+
+
+def _json_bound(value):
+    pending, visited = [(value, 0)], 0
+    while pending:
+        row, depth = pending.pop()
+        visited += 1
+        if visited > 512 or depth > 16 or (type(row) in {dict, list} and len(row) > 512):
+            return "shape_bound"
+        if isinstance(row, str) and len(row) > DIAGNOSTIC_BYTES:
+            return "byte_bound"
+        if type(row) is dict:
+            pending.extend((item, depth + 1) for pair in row.items() for item in pair)
+        elif type(row) is list:
+            pending.extend((item, depth + 1) for item in row)
+        elif row is not None and type(row) not in {str, bool, int, float}:
+            return "encoding_invalid"
+        elif type(row) is int and row.bit_length() > 256:
+            return "shape_bound"
+    return None
+
+
+def _value_proof(value):
+    """Hash bounded JSON without making untrusted values public diagnostic text."""
+    digest, total = hashlib.sha256(), 0
+    bound = _json_bound(value)
+    if bound:
+        return {"complete": False, "reason": bound, "sha256": None}
+    try:
+        chunks = json.JSONEncoder(sort_keys=True, separators=(",", ":"), allow_nan=False).iterencode(value)
+        for text in chunks:
+            if len(text) > DIAGNOSTIC_BYTES:
+                return {"complete": False, "reason": "byte_bound", "sha256": None}
+            raw = text.encode()
+            total += len(raw)
+            if total > DIAGNOSTIC_BYTES:
+                return {"complete": False, "reason": "byte_bound", "sha256": None}
+            digest.update(raw)
+    except (TypeError, ValueError):
+        return {"complete": False, "reason": "encoding_invalid", "sha256": None}
+    return {"complete": True, "bytes": total, "sha256": digest.hexdigest()}
+
+
+def _mapping_diagnostic(value, *, present=True):
+    proof = _value_proof(value)
+    kind = "missing" if not present else "null" if value is None else "mapping" if type(value) is dict else "invalid"
+    result = {"present": present, "kind": kind, "shape_valid": False, "proof": proof}
+    if not present or value is None:
+        return result
+    if type(value) is not dict or len(value) > 8 or not proof["complete"]:
+        return result
+    entries = {}
+    for name, rows in value.items():
+        if not isinstance(name, str) or not re.fullmatch(r"[1-9][0-9]{0,4}/(?:tcp|udp)", name) or int(name.split("/")[0]) > 65535:
+            return result
+        if rows is None:
+            entries[name] = None
+            continue
+        if type(rows) is not list or len(rows) > 8:
+            return result
+        bindings = []
+        for row in rows:
+            if type(row) is not dict or set(row) != {"HostIp", "HostPort"}:
+                return result
+            host, port = row["HostIp"], row["HostPort"]
+            if not isinstance(host, str) or not isinstance(port, str) or not re.fullmatch(r"[1-9][0-9]{0,4}", port) or int(port) > 65535:
+                return result
+            # Only loopback/unspecified literals are meaningful public values.
+            bindings.append({"host": host if host in {"127.0.0.1", "0.0.0.0", "::1", "::"} else "other",
+                             "host_proof": _value_proof(host), "port": int(port)})
+        entries[name] = bindings
+    return {**result, "shape_valid": True, "entries": entries}
+
+
+def _startup_diagnostic(row):
+    state = row.get("State") if type(row.get("State")) is dict else {}
+    started = state.get("StartedAt")
+    status = state.get("Status")
+    valid_started = isinstance(started, str) and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z", started)
+    return {"started_at": started if valid_started else None, "started_at_proof": _value_proof(started),
+            "restart_count": row.get("RestartCount") if type(row.get("RestartCount")) is int and 0 <= row["RestartCount"] <= 2**31 else None,
+            "pid": state.get("Pid") if type(state.get("Pid")) is int and 0 <= state["Pid"] <= 2**31 else None,
+            "status": status if isinstance(status, str) and status in {"created", "running", "exited", "paused", "restarting", "dead"} else None,
+            "flags": {key: state[key] if type(state.get(key)) is bool else None
+                      for key in ("Running", "OOMKilled", "Restarting", "Paused", "Dead")}}
+
+
+def _diagnostic_original(path, value):
+    """Selected observations only; O_EXCL keeps failures and partial originals."""
+    gate._directory(path.parent)
+    raw = gate._encoded(value)
+    gate._require(len(raw) <= DIAGNOSTIC_BYTES, "old ingress diagnostic byte bound")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+    gate._sync_directory(path.parent)
+    return {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+
+
+def _record_ingress(root, row, profile, requested, actual, *, confirmed):
+    phase = "after_http" if confirmed else "before_http"
+    observation = {"schema": 1, "phase": phase, "selected_observation_not_full_inspect": True,
+                   "startup": _startup_diagnostic(row),
+                   "requested": _mapping_diagnostic(requested, present="PortBindings" in row["HostConfig"]),
+                   "actual": _mapping_diagnostic(actual, present="Ports" in row["NetworkSettings"]),
+                   "networks_proof": _value_proof(row["NetworkSettings"].get("Networks")), "synthetic_only": True}
+    record = {**profile, "phase": phase, "observation": observation,
+              "diagnostic_only_not_execution_proof": True, "diagnostic_durability_confirmed": False}
+    try:
+        record["observation_original"] = _diagnostic_original(
+            root / ("OLD_INGRESS_AFTER.original.json" if confirmed else "OLD_INGRESS_BEFORE.original.json"), observation)
+        stored = {key: value for key, value in record.items() if key != "diagnostic_durability_confirmed"}
+        record["profile_original"] = _diagnostic_original(
+            root / ("OLD_INGRESS_CONFIRMED.json" if confirmed else "OLD_INGRESS_PROFILE.json"), stored)
+    except BaseException:
+        try:
+            _emit_ingress_diagnostic(record)
+        except BaseException:
+            pass  # Failed reporting cannot replace the original write/sync error.
+        raise
+    record["diagnostic_durability_confirmed"] = True
+    _emit_ingress_diagnostic(record)
+
+
+def _emit_ingress_diagnostic(record):
+    raw = gate._encoded(record)
+    gate._require(len(raw) <= DIAGNOSTIC_BYTES, "old ingress stdout byte bound")
+    print("gateway_ingress_observation=" + raw.decode(), flush=True)
 
 
 def _port():
@@ -121,8 +254,8 @@ def _old_ingress(harness, root, identifier, image, port, *, confirmed=False):
     profile = {"schema": 1, "container_id": identifier, "image_id": image["Id"], "identity_matches": identity,
                "expected_binding": expected, "requested_matches": requested == expected,
                "actual_field_present": "Ports" in row["NetworkSettings"], "actual_matches": published == expected,
-               "actual_mapping_sha256": gate._hash(actual), "synthetic_only": True}
-    gate._write(root / ("OLD_INGRESS_CONFIRMED.json" if confirmed else "OLD_INGRESS_PROFILE.json"), profile)
+               "actual_mapping_sha256": _value_proof(actual)["sha256"], "synthetic_only": True}
+    _record_ingress(root, row, profile, requested, actual, confirmed=confirmed)
     gate._require(identity, "old synthetic gateway execution changed")
     gate._require(requested == expected and published == expected, "old synthetic actual host port mapping absent or changed")
     return row

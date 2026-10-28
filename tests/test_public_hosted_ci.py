@@ -1,8 +1,11 @@
 """Public pull requests run synthetic gates on GitHub-hosted machines only."""
 
+import ast
+from copy import deepcopy
 from pathlib import Path
 from fnmatch import fnmatchcase
 import re
+import shlex
 
 import pytest
 import yaml
@@ -12,7 +15,7 @@ WORKFLOWS = Path(__file__).resolve().parents[1] / ".github" / "workflows"
 EXPECTED_JOBS = {
     "ci.yml": {"lint": "ubuntu-latest", "test": "ubuntu-latest"},
     "admission-fence.yml": {"native-amd64": "ubuntu-24.04"},
-    "cutover-completion.yml": {"native-amd64": "ubuntu-24.04"},
+    "cutover-completion.yml": {"isolated-host-ingress": "ubuntu-24.04", "native-amd64": "ubuntu-24.04"},
     "handoff-operations.yml": {"native-amd64": "ubuntu-24.04"},
     "miniflux-outbox.yml": {"fixed-source": "ubuntu-latest"},
     "miniflux-pause.yml": {"native-fixed-image": "ubuntu-latest"},
@@ -20,13 +23,18 @@ EXPECTED_JOBS = {
     "private-release-config.yml": {"native-amd64": "ubuntu-24.04"},
 }
 EXPECTED_TIMEOUTS = {
-    "admission-fence.yml": 8,
-    "cutover-completion.yml": 15,
-    "handoff-operations.yml": 8,
-    "miniflux-outbox.yml": 15,
-    "miniflux-pause.yml": 20,
-    "webhook-capacity.yml": 40,
-    "private-release-config.yml": 25,
+    "admission-fence.yml": {"native-amd64": 8},
+    "cutover-completion.yml": {"isolated-host-ingress": 5, "native-amd64": 15},
+    "handoff-operations.yml": {"native-amd64": 8},
+    "miniflux-outbox.yml": {"fixed-source": 15},
+    "miniflux-pause.yml": {"native-fixed-image": 20},
+    "webhook-capacity.yml": {"native-amd64": 40},
+    "private-release-config.yml": {"native-amd64": 25},
+}
+POSTGRES_JOBS = {
+    "miniflux-outbox.yml": "fixed-source",
+    "miniflux-pause.yml": "native-fixed-image",
+    "cutover-completion.yml": "native-amd64",
 }
 
 
@@ -37,12 +45,10 @@ def _workflow(name):
 
 def test_all_existing_workflows_and_job_names_are_preserved():
     assert {path.name for path in WORKFLOWS.glob("*.yml")} == set(EXPECTED_JOBS)
-    assert sum(len(jobs) for jobs in EXPECTED_JOBS.values()) == 9
+    assert sum(len(jobs) for jobs in EXPECTED_JOBS.values()) == 10
 
 
-@pytest.mark.parametrize("name", EXPECTED_JOBS)
-def test_every_job_uses_a_literal_hosted_runner_and_can_be_dispatched(name):
-    source, workflow = _workflow(name)
+def _assert_hosted_jobs(name, source, workflow):
     # PyYAML's YAML 1.1 loader treats the unquoted Actions key `on` as True.
     triggers = workflow.get("on", workflow.get(True))
     assert "workflow_dispatch" in triggers
@@ -67,6 +73,12 @@ def test_every_job_uses_a_literal_hosted_runner_and_can_be_dispatched(name):
 
 
 @pytest.mark.parametrize("name", EXPECTED_JOBS)
+def test_every_job_uses_a_literal_hosted_runner_and_can_be_dispatched(name):
+    source, workflow = _workflow(name)
+    _assert_hosted_jobs(name, source, workflow)
+
+
+@pytest.mark.parametrize("name", EXPECTED_JOBS)
 def test_public_jobs_have_read_only_permissions_and_no_persisted_git_credentials(name):
     source, workflow = _workflow(name)
     assert workflow["permissions"] == {"contents": "read"}
@@ -80,24 +92,167 @@ def test_public_jobs_have_read_only_permissions_and_no_persisted_git_credentials
         assert checkouts[0]["with"]["persist-credentials"] is False
 
 
-@pytest.mark.parametrize("name,minutes", EXPECTED_TIMEOUTS.items())
-def test_native_job_timeouts_are_not_relaxed(name, minutes):
-    _, workflow = _workflow(name)
-    assert next(iter(workflow["jobs"].values()))["timeout-minutes"] == minutes
+def _assert_timeout_contracts(name, workflow):
+    expected = EXPECTED_TIMEOUTS[name]
+    assert set(workflow["jobs"]) == set(expected)
+    for job, minutes in expected.items():
+        actual = workflow["jobs"][job]["timeout-minutes"]
+        assert type(actual) is int and actual == minutes
 
 
-@pytest.mark.parametrize("name", ["miniflux-outbox.yml", "miniflux-pause.yml", "cutover-completion.yml"])
-def test_postgres_remains_digest_locked_and_bounded(name):
+@pytest.mark.parametrize("name", EXPECTED_TIMEOUTS)
+def test_native_job_timeouts_are_not_relaxed(name):
     _, workflow = _workflow(name)
-    job = next(iter(workflow["jobs"].values()))
-    postgres = job["services"]["postgres"]
+    _assert_timeout_contracts(name, workflow)
+
+
+def _assert_postgres_contract(name, workflow):
+    postgres = workflow["jobs"][POSTGRES_JOBS[name]]["services"]["postgres"]
     assert postgres["image"] == (
         "postgres@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea"
     )
     assert "--memory 384m --memory-swap 384m --cpus 1 --pids-limit 64" in postgres["options"]
+    options = shlex.split(postgres["options"])
+    for flag, expected in {"--memory": "384m", "--memory-swap": "384m", "--cpus": "1", "--pids-limit": "64"}.items():
+        positions = [index for index, value in enumerate(options) if value.split("=", 1)[0] == flag]
+        assert len(positions) == 1
+        index = positions[0]
+        assert options[index] == flag and options[index + 1] == expected
     assert postgres["env"] == {
         "POSTGRES_DB": "synthetic_outbox", "POSTGRES_PASSWORD": "synthetic-ci-only",
     }
+
+
+@pytest.mark.parametrize("name", POSTGRES_JOBS)
+def test_postgres_remains_digest_locked_and_bounded(name):
+    _, workflow = _workflow(name)
+    _assert_postgres_contract(name, workflow)
+
+
+def _assert_isolated_ingress_contract(workflow):
+    job = workflow["jobs"]["isolated-host-ingress"]
+    assert job["timeout-minutes"] == 5
+    assert "services" not in job
+    proof = [step["run"] for step in job["steps"]
+             if "scripts/production_host_ingress_native.py" in step.get("run", "")]
+    assert len(proof) == 1
+    blocks = re.findall(r"python -I -B - <<'PY'\n(.*?)^PY$", proof[0], re.MULTILINE | re.DOTALL)
+    assert len(blocks) == 2
+    nodes = [node for block in blocks for node in ast.walk(ast.parse(block))]
+    deadlines = [node.value for node in nodes if isinstance(node, ast.Assign)
+                 and any(isinstance(target, ast.Name) and target.id == "deadline" for target in node.targets)]
+    expected = ast.parse("time.monotonic() + 180", mode="eval").body
+    assert len(deadlines) == 1 and ast.dump(deadlines[0]) == ast.dump(expected)
+    calls = [node for node in nodes if isinstance(node, ast.Call)
+             and isinstance(node.func, ast.Attribute) and node.func.attr == "archive_command"]
+    assert [ast.literal_eval(next(kw.value for kw in call.keywords if kw.arg == "seconds"))
+            for call in calls] == [60, 200]
+    assert "'--deadline-monotonic', str(deadline)" in proof[0]
+
+
+def test_independent_ingress_deadline_does_not_replace_complete_native_budget():
+    _, workflow = _workflow("cutover-completion.yml")
+    _assert_isolated_ingress_contract(workflow)
+    _assert_timeout_contracts("cutover-completion.yml", workflow)
+    _assert_postgres_contract("cutover-completion.yml", workflow)
+
+
+@pytest.mark.parametrize("first", ["isolated-host-ingress", "native-amd64"])
+def test_named_cutover_contracts_are_independent_of_job_order(first):
+    name = "cutover-completion.yml"
+    source, workflow = _workflow(name)
+    jobs = workflow["jobs"]
+    workflow["jobs"] = {first: jobs[first], **{key: value for key, value in jobs.items() if key != first}}
+    _assert_hosted_jobs(name, source, workflow)
+    _assert_timeout_contracts(name, workflow)
+    _assert_postgres_contract(name, workflow)
+    _assert_isolated_ingress_contract(workflow)
+
+
+@pytest.mark.parametrize("mutation", ["extra", "missing-original", "missing-independent", "self-hosted",
+                                     "dynamic-runner", "container", "environment", "skip"])
+def test_cutover_job_contract_rejects_unapproved_jobs_and_execution_paths(mutation):
+    name = "cutover-completion.yml"
+    source, original = _workflow(name)
+    workflow = deepcopy(original)
+    jobs, isolated = workflow["jobs"], workflow["jobs"]["isolated-host-ingress"]
+    if mutation == "extra":
+        jobs["unexpected"] = deepcopy(isolated)
+    elif mutation == "missing-original":
+        del jobs["native-amd64"]
+    elif mutation == "missing-independent":
+        del jobs["isolated-host-ingress"]
+    elif mutation == "self-hosted":
+        isolated["runs-on"] = ["self-hosted", "linux"]
+    elif mutation == "dynamic-runner":
+        isolated["runs-on"] = "${{ inputs.runner }}"
+    elif mutation == "container":
+        isolated["container"] = "synthetic:latest"
+    elif mutation == "environment":
+        isolated["environment"] = "production"
+    else:
+        isolated["if"] = "${{ false }}"
+    with pytest.raises(AssertionError):
+        _assert_hosted_jobs(name, source, workflow)
+
+
+@pytest.mark.parametrize("job", ["native-amd64", "isolated-host-ingress"])
+@pytest.mark.parametrize("replacement", [1, 16, "15", None, 5.0, 15.0])
+def test_cutover_each_named_timeout_is_exact(job, replacement):
+    _, workflow = _workflow("cutover-completion.yml")
+    workflow["jobs"][job]["timeout-minutes"] = replacement
+    with pytest.raises(AssertionError):
+        _assert_timeout_contracts("cutover-completion.yml", workflow)
+
+
+@pytest.mark.parametrize("field,replacement", [
+    ("image", "postgres:latest"),
+    ("options", "--memory 768m --memory-swap 768m --cpus 1 --pids-limit 128"),
+    ("options", "--memory 384m --memory-swap 768m --cpus 1 --pids-limit 64"),
+    ("options", "--memory 384m --memory-swap 384m --cpus 2 --pids-limit 64"),
+    ("options", "--memory 384m --memory-swap 384m --cpus 1 --pids-limit 128"),
+    ("env", {"POSTGRES_DB": "other", "POSTGRES_PASSWORD": "synthetic-ci-only"}),
+])
+def test_named_native_postgres_contract_still_rejects_drift(field, replacement):
+    _, workflow = _workflow("cutover-completion.yml")
+    workflow["jobs"]["native-amd64"]["services"]["postgres"][field] = replacement
+    with pytest.raises(AssertionError):
+        _assert_postgres_contract("cutover-completion.yml", workflow)
+
+
+@pytest.mark.parametrize("override", ["--memory 768m", "--memory=768m", "--memory-swap 768m",
+                                      "--cpus=2", "--pids-limit 128"])
+def test_postgres_cannot_override_exact_resource_flags_with_later_duplicates(override):
+    _, workflow = _workflow("cutover-completion.yml")
+    postgres = workflow["jobs"]["native-amd64"]["services"]["postgres"]
+    postgres["options"] += " " + override
+    with pytest.raises(AssertionError):
+        _assert_postgres_contract("cutover-completion.yml", workflow)
+
+
+@pytest.mark.parametrize("before,after", [
+    ("deadline = time.monotonic() + 180", "deadline = time.monotonic() + 181"),
+    ("deadline = time.monotonic() + 180", "deadline = time.monotonic() + int(os.environ['BUDGET'])"),
+    ("seconds=200", "seconds=201"),
+    ("seconds=60", "seconds=61"),
+    ("'--deadline-monotonic', str(deadline)", "'--deadline-monotonic', str(deadline + 60)"),
+])
+def test_independent_ingress_deadline_and_transfer_limits_reject_drift(before, after):
+    _, workflow = _workflow("cutover-completion.yml")
+    step = next(step for step in workflow["jobs"]["isolated-host-ingress"]["steps"]
+                if "scripts/production_host_ingress_native.py" in step.get("run", ""))
+    assert before in step["run"]
+    step["run"] = step["run"].replace(before, after)
+    with pytest.raises(AssertionError):
+        _assert_isolated_ingress_contract(workflow)
+
+
+def test_independent_ingress_cannot_add_an_unbudgeted_postgres_service():
+    _, workflow = _workflow("cutover-completion.yml")
+    workflow["jobs"]["isolated-host-ingress"]["services"] = deepcopy(
+        workflow["jobs"]["native-amd64"]["services"])
+    with pytest.raises(AssertionError):
+        _assert_isolated_ingress_contract(workflow)
 
 
 @pytest.mark.parametrize("name", EXPECTED_JOBS)

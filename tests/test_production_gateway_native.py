@@ -446,3 +446,210 @@ def test_mapping_inspection_consumes_same_phase_and_failure_restores_outer_deadl
     assert health == []
     assert case.harness.phase_deadline == 1000.0
     assert gate._read(case.p["gateway_native_root"] / "OLD_HTTP_OBSERVATIONS.json")["attempts"] == []
+
+
+def diagnostic_packets(capsys):
+    return [json.loads(line.split("=", 1)[1]) for line in capsys.readouterr().out.splitlines()
+            if line.startswith("gateway_ingress_observation=")]
+
+
+def test_selected_originals_are_exclusive_private_and_stdout_has_exact_port_shape(case, capsys):
+    native.prepare(case.harness, case.p)
+    root = case.p["gateway_native_root"]
+    packets = diagnostic_packets(capsys)
+    assert [row["phase"] for row in packets] == ["before_http", "after_http"]
+    for phase, packet in zip(("BEFORE", "AFTER"), packets):
+        path = root / f"OLD_INGRESS_{phase}.original.json"
+        assert path.stat().st_mode & 0o777 == 0o600
+        assert len(path.read_bytes()) <= native.DIAGNOSTIC_BYTES
+        assert packet["observation_original"]["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+        assert packet["diagnostic_durability_confirmed"] is True
+        assert packet["diagnostic_only_not_execution_proof"] is True
+        actual = packet["observation"]["actual"]
+        assert actual["entries"] == {"5000/tcp": [{"host": "127.0.0.1", "port": 35678,
+                "host_proof": native._value_proof("127.0.0.1")}]}
+        assert actual["kind"] == "mapping" and actual["shape_valid"] is True
+
+
+@pytest.mark.parametrize("fault,kind,shape", [("missing", "missing", False), ("null", "null", False),
+        ("empty", "mapping", True), ("wrong_port", "mapping", True), ("wrong_host", "mapping", True),
+        ("extra_bound", "mapping", True), ("requested", "mapping", True)])
+def test_failed_port_guard_diagnostic_is_available_before_any_http(case, monkeypatch, capsys, fault, kind, shape):
+    case.state.mapping_fault = fault
+    health = []
+    monkeypatch.setattr(gateway.NativeTransport, "health", lambda *a: health.append(a))
+    with pytest.raises(gate.AdmissionError, match="actual.*port"):
+        native.prepare(case.harness, case.p)
+    assert health == [] and "gateway_preparation" not in case.p
+    packet, = diagnostic_packets(capsys)
+    assert packet["phase"] == "before_http" and packet["actual_matches"] is (fault == "requested")
+    assert packet["observation"]["actual"]["kind"] == kind
+    assert packet["observation"]["actual"]["shape_valid"] is shape
+    assert packet["diagnostic_durability_confirmed"] is True
+    assert not (case.p["gateway_native_root"] / "OLD_INGRESS_AFTER.original.json").exists()
+
+
+@pytest.mark.parametrize("change", ["StartedAt", "Pid", "RestartCount"])
+def test_before_after_startup_diagnostics_retain_drift_without_confirming_http(case, monkeypatch, capsys, change):
+    def health(*_args):
+        row = case.state.rows[case.identifier]
+        if change == "StartedAt":
+            row["State"][change] = "2026-10-28T03:01:02.123456789Z"
+        elif change == "Pid":
+            row["State"][change] = 20001
+        else:
+            row[change] = 1
+        return {"status": 200, "body_sha256": hashlib.sha256(b"OLD").hexdigest(), "operation": None, "upstream": None}
+    monkeypatch.setattr(gateway.NativeTransport, "health", health)
+    with pytest.raises(gate.AdmissionError):
+        native.prepare(case.harness, case.p)
+    before, after = diagnostic_packets(capsys)
+    assert before["phase"] == "before_http" and after["phase"] == "after_http"
+    assert before["observation"]["startup"] != after["observation"]["startup"]
+    assert case.state.kills == 0 and "gateway_preparation" not in case.p
+    assert not (case.p["gateway_native_root"] / "OLD_HTTP.json").exists()
+
+
+@pytest.mark.parametrize("where", ["host", "port", "entry", "key", "state", "networks", "env"])
+def test_unknown_and_malicious_fields_are_not_repeated_in_new_originals_or_stdout(case, monkeypatch, capsys, where):
+    secret = "DO_NOT_EXPORT_https://private.invalid/token?secret=123"
+    command = case.harness.command
+    def altered(args, **kwargs):
+        value = command(args, **kwargs)
+        if args[0] == "start":
+            row = case.state.rows[case.identifier]
+            actual = row["NetworkSettings"]["Ports"]
+            if where == "host":
+                actual["5000/tcp"][0]["HostIp"] = secret
+            elif where == "port":
+                actual["5000/tcp"][0]["HostPort"] = secret
+            elif where == "entry":
+                actual["5000/tcp"][0]["UNKNOWN"] = secret
+            elif where == "key":
+                actual[secret] = [{"HostIp": "0.0.0.0", "HostPort": "1"}]
+            elif where == "state":
+                row["State"]["StartedAt"] = secret
+            elif where == "networks":
+                row["NetworkSettings"]["Networks"][secret] = {"Secret": secret}
+            else:
+                row["Config"]["Env"] = [secret]
+        return value
+    case.harness.command = altered
+    if where in {"state", "networks", "env"}:
+        native.prepare(case.harness, case.p)
+    else:
+        with pytest.raises(gate.AdmissionError, match="actual.*port"):
+            native.prepare(case.harness, case.p)
+    public = capsys.readouterr().out
+    assert secret not in public and "private.invalid" not in public
+    root = case.p["gateway_native_root"]
+    for name in ("OLD_INGRESS_BEFORE.original.json", "OLD_INGRESS_PROFILE.json"):
+        assert secret.encode() not in (root / name).read_bytes()
+        assert b"Env" not in (root / name).read_bytes()
+
+
+@pytest.mark.parametrize("stage", ["before_original", "before_profile", "after_original", "after_profile"])
+def test_diagnostic_failure_keeps_partial_evidence_and_never_confirms(case, monkeypatch, capsys, stage):
+    actual = native._diagnostic_original
+    names = {"before_original": "OLD_INGRESS_BEFORE.original.json", "before_profile": "OLD_INGRESS_PROFILE.json",
+             "after_original": "OLD_INGRESS_AFTER.original.json", "after_profile": "OLD_INGRESS_CONFIRMED.json"}
+    original = OSError("DO_NOT_EXPORT sync failure")
+    def fail(path, value):
+        if path.name == names[stage]:
+            raise original
+        return actual(path, value)
+    monkeypatch.setattr(native, "_diagnostic_original", fail)
+    with pytest.raises(OSError) as caught:
+        native.prepare(case.harness, case.p)
+    assert caught.value is original
+    packets = diagnostic_packets(capsys)
+    assert packets[-1]["diagnostic_durability_confirmed"] is False
+    assert "DO_NOT_EXPORT" not in json.dumps(packets)
+    assert case.state.kills == 0 and "gateway_preparation" not in case.p
+    assert not (case.p["gateway_native_root"] / "OLD_HTTP.json").exists()
+
+
+@pytest.mark.parametrize("fault", ["exists", "symlink", "fsync", "directory_sync", "stdout"])
+def test_exclusive_and_sync_boundaries_never_allow_http_after_diagnostic_failure(case, monkeypatch, capsys, fault):
+    original_record = native._diagnostic_original
+    health, written = [], []
+    def record(path, value):
+        if path.name == "OLD_INGRESS_BEFORE.original.json":
+            if fault == "exists":
+                path.write_bytes(b"retained original")
+            elif fault == "symlink":
+                target = path.parent / "kept-original"
+                target.write_bytes(b"retained original")
+                path.symlink_to(target)
+            elif fault == "fsync":
+                monkeypatch.setattr(native.os, "fsync", lambda *_: (_ for _ in ()).throw(OSError("sync failed")))
+            elif fault == "directory_sync":
+                monkeypatch.setattr(gate, "_sync_directory", lambda *_: (_ for _ in ()).throw(OSError("directory sync failed")))
+        result = original_record(path, value)
+        written.append(path)
+        return result
+    monkeypatch.setattr(native, "_diagnostic_original", record)
+    monkeypatch.setattr(gateway.NativeTransport, "health", lambda *a: health.append(a))
+    if fault == "stdout":
+        monkeypatch.setattr(native, "_emit_ingress_diagnostic", lambda *_: (_ for _ in ()).throw(BrokenPipeError("closed output")))
+    with pytest.raises((OSError, gate.AdmissionError)):
+        native.prepare(case.harness, case.p)
+    assert health == [] and "gateway_preparation" not in case.p
+    path = case.p["gateway_native_root"] / "OLD_INGRESS_BEFORE.original.json"
+    if fault in {"exists", "symlink"}:
+        assert path.read_bytes() == b"retained original"
+    if fault == "symlink":
+        assert path.is_symlink()
+
+
+def test_mapping_diagnostic_has_fixed_shape_caps_and_never_prints_unknown_scalars():
+    text = "DO_NOT_EXPORT"
+    for value in (text, True, 1, [], {text: None}, {f"{i}/tcp": None for i in range(1, 10)},
+                  {"5000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "1"}] * 9}):
+        result = native._mapping_diagnostic(value)
+        assert result["shape_valid"] is False and text not in json.dumps(result)
+    too_large = {text: "s" * (native.DIAGNOSTIC_BYTES + 1)}
+    result = native._mapping_diagnostic(too_large)
+    assert result["proof"] == {"complete": False, "reason": "byte_bound", "sha256": None}
+    assert "entries" not in result
+    assert native._value_proof(float("nan"))["reason"] == "encoding_invalid"
+
+
+def test_real_format_startup_identity_is_present_on_both_sides_of_http(case, capsys):
+    actual = case.harness.command
+    started = "2026-10-28T03:01:02.123456789Z"
+    def command(args, **kwargs):
+        result = actual(args, **kwargs)
+        if args[0] == "start":
+            case.state.rows[case.identifier]["State"].update(StartedAt=started, Pid=20000)
+        return result
+    case.harness.command = command
+    native.prepare(case.harness, case.p)
+    before, after = diagnostic_packets(capsys)
+    assert before["observation"]["startup"] == after["observation"]["startup"]
+    assert before["observation"]["startup"]["started_at"] == started
+    assert before["observation"]["startup"]["pid"] == 20000
+    assert before["observation"]["startup"]["restart_count"] == 0
+
+
+def test_proof_serialization_preflight_limits_depth_count_and_scalar_size():
+    deep = value = []
+    for _ in range(18):
+        item = []
+        value.append(item)
+        value = item
+    for item in (deep, [None] * 513, 2**1024):
+        assert native._value_proof(item) == {"complete": False, "reason": "shape_bound", "sha256": None}
+    assert native._value_proof(object())["reason"] == "encoding_invalid"
+
+
+def test_failed_diagnostic_stdout_cannot_hide_original_durability_error(case, monkeypatch):
+    original = OSError("original sync failure DO_NOT_EXPORT")
+    def fail(*_args, **_kwargs):
+        raise original
+    monkeypatch.setattr(native, "_diagnostic_original", fail)
+    monkeypatch.setattr(native, "_emit_ingress_diagnostic", lambda *_: (_ for _ in ()).throw(BrokenPipeError("closed output")))
+    with pytest.raises(OSError) as caught:
+        native.prepare(case.harness, case.p)
+    assert caught.value is original
+    assert case.state.kills == 0 and "gateway_preparation" not in case.p

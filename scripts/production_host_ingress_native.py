@@ -326,23 +326,84 @@ def process_snapshot(plan, netns, *, container_pid=None):
     return rows
 
 
-def namespace_snapshot(commands, *, bridge=None):
-    links = json.loads(commands.run([str(TOOLS["ip"]), "-json", "-details", "link", "show"]))
-    require(0 < len(links) <= 8, "namespace interface bound")
-    for row in links:
-        name, kind = row["ifname"], row.get("linkinfo", {}).get("info_kind")
-        require(name == "lo" or (bridge and ((name == bridge and kind == "bridge")
-                                             or (kind == "veth" and row.get("master") == bridge))),
-                "unexpected external interface in private host")
-    routes = []
-    for family in ("-4", "-6"):
-        values = json.loads(commands.run([str(TOOLS["ip"]), "-json", family, "route", "show", "table", "all"]))
-        require(len(values) <= 32, "namespace route bound")
-        for row in values:
-            require(row.get("dst") not in {None, "default", "0.0.0.0/0", "::/0"}
-                    and row.get("dev") in {"lo", bridge} and not row.get("gateway"), "external namespace route")
-        routes.extend(values)
-    return {"links": links, "routes": routes, "netns": os.stat("/proc/self/ns/net").st_ino}
+def namespace_violation(observed, bridge):
+    """Return a fixed reason/location; do not weaken the original route guard."""
+    if observed.get("netns_after") != observed["netns"]:
+        return {"reason": "namespace_identity", "section": "namespace", "index": None}
+    links = observed["links"]
+    if not isinstance(links, list) or not 0 < len(links) <= 8:
+        return {"reason": "interface_bound", "section": "links", "index": None}
+    for index, row in enumerate(links):
+        if not isinstance(row, dict) or not isinstance(row.get("linkinfo", {}), dict):
+            return {"reason": "interface_shape", "section": "links", "index": index}
+        name, kind = row.get("ifname"), row.get("linkinfo", {}).get("info_kind")
+        if not (name == "lo" or (bridge and ((name == bridge and kind == "bridge")
+                                             or (kind == "veth" and row.get("master") == bridge)))):
+            return {"reason": "external_interface", "section": "links", "index": index}
+    for family, values in observed["routes_by_family"].items():
+        if not isinstance(values, list) or len(values) > 32:
+            return {"reason": "route_bound", "section": family, "index": None}
+        for index, row in enumerate(values):
+            if (not isinstance(row, dict) or not isinstance(row.get("dst"), (str, type(None)))
+                    or not isinstance(row.get("dev"), (str, type(None)))):
+                return {"reason": "route_shape", "section": family, "index": index}
+            if (row.get("dst") in {None, "default", "0.0.0.0/0", "::/0"}
+                    or row.get("dev") not in {"lo", bridge} or row.get("gateway")):
+                return {"reason": "external_route", "section": family, "index": index}
+    return None
+
+
+def capture_namespace(commands, observed):
+    for section, argv in [("links", ["-json", "-details", "link", "show"]),
+                          ("ipv4", ["-json", "-4", "route", "show", "table", "all"]),
+                          ("ipv6", ["-json", "-6", "route", "show", "table", "all"])]:
+        raw = commands.run([str(TOOLS["ip"]), *argv])
+        require(len(raw) <= OUTPUT_BYTES, "namespace raw output bound")
+        observed["components"][section] = {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+        values = json.loads(raw)
+        if section == "links":
+            observed["links"] = values
+        else:
+            observed["routes_by_family"][section] = values
+
+
+def preserve_namespace_observation(path, observed, *, primary=None):
+    if path is None:
+        return
+    try:
+        require(len(encoded(observed)) <= OUTPUT_BYTES, "namespace observation size bound")
+        durable(path, observed)
+    except BaseException as evidence_error:
+        if primary is not None:
+            primary.add_note("namespace observation preservation failed: " + type(evidence_error).__name__)
+            raise primary from evidence_error
+        raise
+
+
+def namespace_snapshot(commands, *, bridge=None, evidence_path=None):
+    observed = {"schema": 1, "netns": os.stat("/proc/self/ns/net").st_ino, "bridge": bridge,
+                "links": [], "routes_by_family": {}, "components": {}, "status": "capture_incomplete"}
+    try:
+        capture_namespace(commands, observed)
+        observed["netns_after"] = os.stat("/proc/self/ns/net").st_ino
+    except BaseException as error:
+        observed["error_type"] = type(error).__name__
+        observed["error_sha256"] = hashlib.sha256(str(error).encode()).hexdigest()
+        preserve_namespace_observation(evidence_path, observed, primary=error)
+        raise
+    violation = namespace_violation(observed, bridge)
+    observed["status"] = "rejected" if violation else "validated"
+    observed["violation"] = violation
+    messages = {"namespace_identity": "network namespace identity changed during capture",
+                "interface_bound": "namespace interface bound", "interface_shape": "namespace interface shape",
+                "external_interface": "unexpected external interface in private host", "route_bound": "namespace route bound",
+                "route_shape": "namespace route shape", "external_route": "external namespace route"}
+    failure = ProofError(messages[violation["reason"]]) if violation else None
+    preserve_namespace_observation(evidence_path, observed, primary=failure)
+    if failure is not None:
+        raise failure
+    routes = [row for values in observed["routes_by_family"].values() for row in values]
+    return {"links": observed["links"], "routes": routes, "netns": observed["netns"]}
 
 
 def daemon_config(root, plan):
@@ -390,7 +451,7 @@ def start_daemon(commands, root, plan):
         resolver.touch(mode=0o600, exist_ok=False)
     commands.run([str(TOOLS["mount"]), "--bind", str(root / "resolv.conf"), "/etc/resolv.conf"])
     commands.run([str(TOOLS["ip"]), "link", "set", "lo", "up"])
-    durable(root / "NAMESPACE_BEFORE.json", namespace_snapshot(commands))
+    durable(root / "NAMESPACE_BEFORE.json", namespace_snapshot(commands, evidence_path=root / "NAMESPACE_BEFORE_OBSERVATION.json"))
     durable(root / "daemon.json", daemon_config(root, plan))
     process, logs = launch_daemon(commands, root, plan)
     retain_daemons(deadline=commands.deadline)
@@ -641,7 +702,8 @@ def observe_host(commands, root, plan, identifier, network, port, bridge):
     try:
         response = wait_until(healthy, end)
         actual = commands.inspect(identifier)
-        durable(root / "NAMESPACE_AFTER.json", namespace_snapshot(commands, bridge=bridge))
+        durable(root / "NAMESPACE_AFTER.json", namespace_snapshot(
+            commands, bridge=bridge, evidence_path=root / "NAMESPACE_AFTER_OBSERVATION.json"))
         processes = process_snapshot(plan, os.stat("/proc/self/ns/net").st_ino, container_pid=actual["State"]["Pid"])
         durable(root / "PROCESSES.json", processes)
         return {"http": response, "port": port, "container_id": identifier, "illegal_targets_rejected": 3}
@@ -846,6 +908,74 @@ def safe_namespace(value):
             "links": links, "routes": routes, "omitted_invalid_fields": omitted}
 
 
+def namespace_route_profile(row, roles):
+    if not isinstance(row, dict):
+        return {"shape_valid": False}
+    text, kind, version, prefix = row.get("dst"), "invalid", None, None
+    if text in (None, "default", "0.0.0.0/0", "::/0"):
+        kind = "default_or_absent"
+    else:
+        try:
+            address = ipaddress.ip_network(text, strict=False)
+            version, prefix = address.version, address.prefixlen
+            kind = ("loopback" if address.is_loopback else "link_local" if address.is_link_local else
+                    "multicast" if address.is_multicast else "private" if address.is_private else "other")
+        except (ValueError, TypeError):
+            pass
+    return {"shape_valid": True, "destination_class": kind, "address_family": version, "prefix_length": prefix,
+            "destination_sha256": hashlib.sha256(encoded(text)).hexdigest(),
+            "device_role": roles.get(row.get("dev"), "unknown") if isinstance(row.get("dev"), str) else "unknown",
+            "device_sha256": hashlib.sha256(encoded(row.get("dev"))).hexdigest(),
+            "gateway_present": bool(row.get("gateway")), "gateway_field_present": "gateway" in row,
+            "route_type": row.get("type") if isinstance(row.get("type"), str)
+            and row["type"] in {"unicast", "local", "broadcast", "multicast", "unreachable"} else None}
+
+
+def safe_namespace_observation(value):
+    links, routes, roles = [], {}, {"lo": "loopback"}
+    bridge = value.get("bridge")
+    if isinstance(bridge, str):
+        roles[bridge] = "owned_bridge"
+    raw_links = value.get("links", [])
+    for row in (raw_links[:8] if isinstance(raw_links, list) else []):
+        if not isinstance(row, dict):
+            links.append({"shape_valid": False})
+            continue
+        name, info = row.get("ifname"), row.get("linkinfo", {})
+        kind = info.get("info_kind") if isinstance(info, dict) else None
+        if isinstance(name, str) and bridge and kind == "veth" and row.get("master") == bridge:
+            roles[name] = "owned_veth"
+        links.append({"name_sha256": hashlib.sha256(encoded(name)).hexdigest(),
+                      "role": roles.get(name, "unknown") if isinstance(name, str) else "unknown",
+                      "kind": kind if isinstance(kind, str) and kind in {"bridge", "veth"} else None,
+                      "index": row.get("ifindex") if type(row.get("ifindex")) is int else None})
+    for family, values in value.get("routes_by_family", {}).items():
+        if family in {"ipv4", "ipv6"}:
+            routes[family] = ([namespace_route_profile(row, roles) for row in values[:32]]
+                              if isinstance(values, list) else {"shape_valid": False})
+    violation = value.get("violation")
+    valid_reasons = {"namespace_identity", "interface_bound", "interface_shape", "external_interface",
+                     "route_bound", "route_shape", "external_route"}
+    if not isinstance(violation, dict) or violation.get("reason") not in valid_reasons:
+        violation = None
+    else:
+        violation = {"reason": violation["reason"],
+                     "section": violation.get("section") if violation.get("section") in {"namespace", "links", "ipv4", "ipv6"} else None,
+                     "index": violation.get("index") if type(violation.get("index")) is int else None}
+    components = {key: {"bytes": row.get("bytes"), "sha256": row.get("sha256")}
+                  for key, row in value.get("components", {}).items() if key in {"links", "ipv4", "ipv6"}
+                  and isinstance(row, dict) and type(row.get("bytes")) is int and 0 <= row["bytes"] <= OUTPUT_BYTES
+                  and re.fullmatch(r"[0-9a-f]{64}", str(row.get("sha256")))}
+    return {"status": value.get("status") if value.get("status") in {"validated", "rejected", "capture_incomplete"} else None,
+            "netns": value.get("netns") if type(value.get("netns")) is int else None,
+            "netns_after": value.get("netns_after") if type(value.get("netns_after")) is int else None,
+            "links": links, "routes_by_family": routes, "violation": violation, "components": components,
+            "capture_error_type": value.get("error_type") if value.get("error_type") in {
+                "JSONDecodeError", "ProofError", "TimeoutError", "OSError", "FileNotFoundError", "PermissionError"} else None,
+            "capture_error_sha256": value.get("error_sha256")
+            if re.fullmatch(r"[0-9a-f]{64}", str(value.get("error_sha256"))) else None}
+
+
 def safe_process(value):
     return {**{key: value[key] for key in ("pid", "ppid", "starttime", "netns", "mntns") if type(value.get(key)) is int},
             "cgroup_sha256": hashlib.sha256(str(value.get("cgroup")).encode()).hexdigest()}
@@ -873,6 +1003,8 @@ def profile_for(path):
                 if type(value.get(key)) in {int, bool}}
     if name in {"NAMESPACE_BEFORE.json", "NAMESPACE_AFTER.json"}:
         return safe_namespace(read_original_json(path))
+    if name in {"NAMESPACE_BEFORE_OBSERVATION.json", "NAMESPACE_AFTER_OBSERVATION.json"}:
+        return safe_namespace_observation(read_original_json(path))
     if name in {"DAEMON.json", "RETAINER_PROCESS.json"}:
         return safe_process(read_original_json(path))
     if name == "PROCESSES.json":
@@ -909,10 +1041,12 @@ def evidence_packet(root):
                 require(total <= 16 * 1024**2, "safe evidence total input bound")
                 hashes[name] = {"sha256": proof["sha256"], "bytes": proof["size"]}
                 profile = profile_for(path)
+                require(file_proof(path, limit=OUTPUT_BYTES) == proof, "original changed during profile export")
                 if profile is not None:
                     profiles[name] = profile
     required = {"inner/HTTP_AFTER.json", "inner/CLEANUP.json", "inner/RESOURCES_FINAL.json",
-                "inner/NAMESPACE_BEFORE.json", "inner/NAMESPACE_AFTER.json", "inner/DAEMON.json", "inner/PROCESSES.json"}
+                "inner/NAMESPACE_BEFORE.json", "inner/NAMESPACE_AFTER.json", "inner/DAEMON.json", "inner/PROCESSES.json",
+                "inner/NAMESPACE_BEFORE_OBSERVATION.json", "inner/NAMESPACE_AFTER_OBSERVATION.json"}
     packet = {"schema": 1, "complete": complete and required <= hashes.keys(),
               "scope": "selected_sanitized_metadata_and_original_hashes", "originals": hashes, "profiles": profiles,
               "omitted_raw_data": ["image_tar_bytes", "daemon_storage_and_socket_trees", "raw_private_text_and_config_values"],

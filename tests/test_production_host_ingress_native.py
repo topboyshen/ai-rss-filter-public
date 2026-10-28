@@ -187,7 +187,7 @@ class NetworkCommands:
 
 
 @pytest.mark.parametrize("fault", ["external_link", "default", "gateway", "unknown_dev"])
-def test_no_external_interfaces_or_routes(fault):
+def test_no_external_interfaces_or_routes(fault, namespace_stat):
     links = [{"ifname": "lo"}, {"ifname": "owned", "linkinfo": {"info_kind": "bridge"}},
              {"ifname": "veth1", "master": "owned", "linkinfo": {"info_kind": "veth"}}]
     routes = [{"dst": "172.20.0.0/16", "dev": "owned"}]
@@ -207,6 +207,223 @@ def test_namespace_local_bridge_only(monkeypatch):
     monkeypatch.setattr(native.os, "stat", lambda path: SimpleNamespace(st_ino=123))
     result = native.namespace_snapshot(NetworkCommands([{"ifname": "lo"}], [{"dst": "127.0.0.0/8", "dev": "lo"}]))
     assert result["netns"] == 123
+
+
+class FamilyNetworkCommands:
+    def __init__(self, links, ipv4=(), ipv6=()):
+        self.outputs = {"links": links, "-4": list(ipv4), "-6": list(ipv6)}
+        self.calls = []
+
+    def run(self, argv):
+        self.calls.append(argv)
+        key = "links" if "link" in argv else "-4" if "-4" in argv else "-6"
+        value = self.outputs[key]
+        return value if isinstance(value, bytes) else json.dumps(value).encode()
+
+
+@pytest.fixture
+def namespace_stat(monkeypatch):
+    original = native.os.stat
+    def actual(path, *args, **kwargs):
+        return SimpleNamespace(st_ino=123) if str(path) == "/proc/self/ns/net" else original(path, *args, **kwargs)
+    monkeypatch.setattr(native.os, "stat", actual)
+
+
+def namespace_fixture_links():
+    return [{"ifname": "lo", "ifindex": 1},
+            {"ifname": "afh" + "a" * 10, "ifindex": 2, "linkinfo": {"info_kind": "bridge"}},
+            {"ifname": "veth1234", "ifindex": 3, "master": "afh" + "a" * 10, "linkinfo": {"info_kind": "veth"}}]
+
+
+@pytest.mark.parametrize("row", [
+    {"dst": "default", "dev": "afh" + "a" * 10},
+    {"dst": "::/0", "dev": "afh" + "a" * 10},
+    {"dst": "fe80::/64", "dev": "veth1234"},
+    {"dst": "fe80::/64", "dev": "afh" + "a" * 10, "gateway": "fe80::1"},
+    {"dst": "10.20.0.0/16", "dev": "unknown-sensitive-interface"},
+])
+def test_rejected_route_keeps_exact_original_without_relaxing_guard(tmp_path, namespace_stat, row):
+    path = tmp_path / "NAMESPACE_AFTER_OBSERVATION.json"
+    commands = FamilyNetworkCommands(namespace_fixture_links(), ipv6=[row])
+    with pytest.raises(native.ProofError, match="external namespace route"):
+        native.namespace_snapshot(commands, bridge="afh" + "a" * 10, evidence_path=path)
+    raw = json.loads(path.read_bytes())
+    assert raw["status"] == "rejected" and raw["routes_by_family"]["ipv6"] == [row]
+    assert raw["violation"] == {"reason": "external_route", "section": "ipv6", "index": 0}
+    assert raw["components"]["ipv6"]["sha256"] == hashlib.sha256(json.dumps([row]).encode()).hexdigest()
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert len(commands.calls) == 3
+    profile = native.profile_for(path)
+    text = json.dumps(profile)
+    assert "10.20." not in text and "fe80::" not in text and "sensitive" not in text
+    assert profile["violation"] == raw["violation"]
+    assert profile["routes_by_family"]["ipv6"][0]["gateway_present"] == bool(row.get("gateway"))
+    if row.get("dev") == "veth1234":
+        assert profile["routes_by_family"]["ipv6"][0]["device_role"] == "owned_veth"
+        assert profile["routes_by_family"]["ipv6"][0]["destination_class"] == "link_local"
+
+
+def test_valid_namespace_has_independent_original_and_success_snapshot(tmp_path, namespace_stat):
+    path = tmp_path / "NAMESPACE_AFTER_OBSERVATION.json"
+    bridge = "afh" + "a" * 10
+    ipv4 = [{"dst": "127.0.0.0/8", "dev": "lo"}, {"dst": "172.20.0.0/16", "dev": bridge}]
+    ipv6 = [{"dst": "::1/128", "dev": "lo"}]
+    result = native.namespace_snapshot(FamilyNetworkCommands(namespace_fixture_links(), ipv4, ipv6),
+                                       bridge=bridge, evidence_path=path)
+    assert result["routes"] == ipv4 + ipv6 and result["netns"] == 123
+    original = json.loads(path.read_bytes())
+    assert original["status"] == "validated" and original["violation"] is None
+    assert native.profile_for(path)["status"] == "validated"
+
+
+def test_namespace_identity_drift_retains_evidence_and_cannot_validate(tmp_path, monkeypatch):
+    original, seen = native.os.stat, []
+    def changed(path, *args, **kwargs):
+        if str(path) != "/proc/self/ns/net":
+            return original(path, *args, **kwargs)
+        seen.append(path)
+        return SimpleNamespace(st_ino=123 if len(seen) == 1 else 124)
+    monkeypatch.setattr(native.os, "stat", changed)
+    path = tmp_path / "NAMESPACE_AFTER_OBSERVATION.json"
+    with pytest.raises(native.ProofError, match="namespace identity changed"):
+        native.namespace_snapshot(FamilyNetworkCommands([{"ifname": "lo"}]), evidence_path=path)
+    profile = native.profile_for(path)
+    assert profile["status"] == "rejected" and profile["netns"] == 123 and profile["netns_after"] == 124
+    assert profile["violation"] == {"reason": "namespace_identity", "section": "namespace", "index": None}
+
+
+def test_parse_failure_retains_partial_capture_without_exporting_error_text(tmp_path, namespace_stat):
+    path = tmp_path / "NAMESPACE_AFTER_OBSERVATION.json"
+    commands = FamilyNetworkCommands(namespace_fixture_links())
+    commands.outputs["-4"] = b'{"secret-private-input":'
+    with pytest.raises(json.JSONDecodeError):
+        native.namespace_snapshot(commands, bridge="afh" + "a" * 10, evidence_path=path)
+    original = json.loads(path.read_bytes())
+    assert original["status"] == "capture_incomplete" and original["error_type"] == "JSONDecodeError"
+    assert len(commands.calls) == 2  # Stop on the failed read/parse; never query the next component.
+    assert original["components"]["ipv4"]["sha256"] == hashlib.sha256(commands.outputs["-4"]).hexdigest()
+    profile = native.profile_for(path)
+    assert profile["capture_error_type"] == "JSONDecodeError"
+    assert "secret-private-input" not in json.dumps(profile)
+
+
+def test_capture_timeout_preserves_diagnostic_and_does_not_query_remaining_family(tmp_path, namespace_stat):
+    path = tmp_path / "NAMESPACE_AFTER_OBSERVATION.json"
+    class Commands(FamilyNetworkCommands):
+        def run(self, argv):
+            if "-4" in argv:
+                self.calls.append(argv)
+                raise TimeoutError("private timeout detail must not escape")
+            return super().run(argv)
+    commands = Commands(namespace_fixture_links())
+    with pytest.raises(TimeoutError):
+        native.namespace_snapshot(commands, bridge="afh" + "a" * 10, evidence_path=path)
+    assert len(commands.calls) == 2
+    profile = native.profile_for(path)
+    assert profile["status"] == "capture_incomplete" and profile["capture_error_type"] == "TimeoutError"
+    assert "private timeout" not in json.dumps(profile)
+
+
+@pytest.mark.parametrize("capture", ["timeout", "json"])
+@pytest.mark.parametrize("evidence", ["fsync", "size"])
+def test_capture_error_remains_primary_when_diagnostic_preservation_also_fails(
+        tmp_path, namespace_stat, monkeypatch, capture, evidence):
+    commands = FamilyNetworkCommands(namespace_fixture_links())
+    if capture == "json":
+        commands.outputs["-4"] = b'{"private-broken-json":'
+        expected = json.JSONDecodeError
+    else:
+        original = commands.run
+        def timeout(argv):
+            if "-4" in argv:
+                commands.calls.append(argv)
+                raise TimeoutError("original private capture failure")
+            return original(argv)
+        monkeypatch.setattr(commands, "run", timeout)
+        expected = TimeoutError
+    diagnostic = OSError("synthetic fsync failed")
+    if evidence == "fsync":
+        monkeypatch.setattr(native, "durable", lambda *_: (_ for _ in ()).throw(diagnostic))
+    else:
+        monkeypatch.setattr(native, "encoded", lambda *_: b"x" * (native.OUTPUT_BYTES + 1))
+    path = tmp_path / "NAMESPACE_AFTER_OBSERVATION.json"
+    with pytest.raises(expected) as actual:
+        native.namespace_snapshot(commands, bridge="afh" + "a" * 10, evidence_path=path)
+    assert len(commands.calls) == 2 and not path.exists()
+    assert any("observation preservation failed" in note for note in actual.value.__notes__)
+    assert isinstance(actual.value.__cause__, OSError if evidence == "fsync" else native.ProofError)
+    if evidence == "fsync":
+        assert actual.value.__cause__ is diagnostic
+
+
+def test_policy_rejection_remains_primary_if_its_diagnostic_fsync_fails(tmp_path, namespace_stat, monkeypatch):
+    commands = FamilyNetworkCommands(namespace_fixture_links(), ipv6=[{"dst": "fe80::/64", "dev": "veth1234"}])
+    diagnostic = OSError("synthetic fsync failure")
+    monkeypatch.setattr(native, "durable", lambda *_: (_ for _ in ()).throw(diagnostic))
+    with pytest.raises(native.ProofError, match="external namespace route") as actual:
+        native.namespace_snapshot(commands, bridge="afh" + "a" * 10,
+                                  evidence_path=tmp_path / "NAMESPACE_AFTER_OBSERVATION.json")
+    assert actual.value.__cause__ is diagnostic and len(commands.calls) == 3
+
+
+def test_rejected_diagnostic_does_not_make_success_packet_complete(tmp_path, namespace_stat):
+    root = tmp_path / "inner"
+    root.mkdir()
+    path = root / "NAMESPACE_AFTER_OBSERVATION.json"
+    with pytest.raises(native.ProofError):
+        native.namespace_snapshot(FamilyNetworkCommands(namespace_fixture_links(), ipv6=[{"dst": "fe80::/64", "dev": "veth1234"}]),
+                                  bridge="afh" + "a" * 10, evidence_path=path)
+    packet = native.evidence_packet(tmp_path)
+    assert packet["complete"] is False
+    assert packet["profiles"]["inner/NAMESPACE_AFTER_OBSERVATION.json"]["violation"]["reason"] == "external_route"
+    assert packet["originals"]["inner/NAMESPACE_AFTER_OBSERVATION.json"]["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_profile_export_cannot_mix_original_hash_with_replaced_profile(tmp_path, monkeypatch):
+    (tmp_path / "inner").mkdir()
+    path = tmp_path / "inner/NAMESPACE_AFTER_OBSERVATION.json"
+    native.durable(path, {"status": "capture_incomplete"})
+    original = native.profile_for
+    def swapped(candidate):
+        profile = original(candidate)
+        candidate.rename(candidate.with_suffix(".retained"))
+        native.durable(candidate, {"status": "validated"})
+        return profile
+    monkeypatch.setattr(native, "profile_for", swapped)
+    with pytest.raises(native.ProofError, match="original changed during profile export"):
+        native.evidence_packet(tmp_path)
+    assert path.with_suffix(".retained").read_bytes() == native.encoded({"status": "capture_incomplete"})
+
+
+@pytest.mark.parametrize("kind", ["existing", "symlink"])
+def test_namespace_evidence_cannot_replace_or_follow_existing_original(tmp_path, namespace_stat, kind):
+    original = tmp_path / "private-original"
+    original.write_bytes(b"must remain unchanged")
+    path = tmp_path / "NAMESPACE_AFTER_OBSERVATION.json"
+    if kind == "symlink":
+        path.symlink_to(original)
+    else:
+        path.write_bytes(b"previous evidence")
+    before = path.read_bytes()
+    with pytest.raises(FileExistsError):
+        native.namespace_snapshot(FamilyNetworkCommands([{"ifname": "lo"}]), evidence_path=path)
+    assert path.read_bytes() == before and original.read_bytes() == b"must remain unchanged"
+
+
+@pytest.mark.parametrize("links,routes,reason", [
+    ([{"ifname": "eth0"}], [], "external_interface"),
+    ([{"ifname": "lo"}] * 9, [], "interface_bound"),
+    ([{"ifname": "lo"}], [{"dst": "127.0.0.0/8", "dev": "lo"}] * 33, "route_bound"),
+    ([{"ifname": "lo"}], ["unexpected-value"], "route_shape"),
+    ([{"ifname": "lo"}], [{"dst": ["private-invalid"], "dev": "lo"}], "route_shape"),
+])
+def test_invalid_namespace_shape_is_preserved_as_rejected(tmp_path, namespace_stat, links, routes, reason):
+    path = tmp_path / "NAMESPACE_AFTER_OBSERVATION.json"
+    with pytest.raises(native.ProofError):
+        native.namespace_snapshot(FamilyNetworkCommands(links, routes), evidence_path=path)
+    original = json.loads(path.read_bytes())
+    assert original["status"] == "rejected" and original["violation"]["reason"] == reason
+    assert native.profile_for(path)["violation"]["reason"] == reason
 
 
 @pytest.fixture
@@ -417,6 +634,10 @@ def test_safe_packet_includes_actual_ports_and_hashes_but_not_env_or_paths(tmp_p
     for name in ("NAMESPACE_BEFORE.json", "NAMESPACE_AFTER.json"):
         native.durable(root / name, {"netns": 123, "links": [{"ifname": "lo", "ifindex": 1}],
                                      "routes": [{"dst": "127.0.0.0/8", "dev": "lo"}]})
+        native.durable(root / name.replace(".json", "_OBSERVATION.json"), {
+            "netns": 123, "status": "validated", "bridge": None,
+            "links": [{"ifname": "lo", "ifindex": 1}], "violation": None,
+            "routes_by_family": {"ipv4": [{"dst": "127.0.0.0/8", "dev": "lo"}], "ipv6": []}})
     native.durable(root / "DAEMON.json", {"pid": 42, "netns": 123, "cgroup": "/secret-private-cgroup"})
     native.durable(root / "PROCESSES.json", [{"pid": 42, "netns": 123, "cgroup": "/secret-private-cgroup"}])
     native.durable(root / "command-0001.stderr", b"TOKEN=private-secret /secret/private/path")
