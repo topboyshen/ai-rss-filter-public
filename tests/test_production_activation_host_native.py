@@ -5,6 +5,8 @@ import hashlib
 from io import StringIO
 import json
 from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +21,122 @@ from services import admission_fence as gate
 def reset_local_phase_counter(monkeypatch):
     monkeypatch.setattr(native, "PHASE", "initial_validation")
     monkeypatch.setattr(native, "PHASE_SEQUENCE", 0)
+
+
+def test_imported_cli_delegates_same_arguments_to_canonical_main(monkeypatch):
+    arguments, observed = ["--inside", "--unchanged-argument"], []
+    monkeypatch.setattr(native, "main", lambda argv: observed.append(argv) or 19)
+    assert native.cli(arguments) == 19 and observed == [arguments]
+    assert observed[0] is arguments
+
+
+@pytest.mark.parametrize("fault", ["name", "spec_absent", "spec_name", "spec_origin", "file"])
+def test_cli_refuses_alternate_canonical_module_source_before_delegate(monkeypatch, fault):
+    import scripts
+    calls = []
+    alternate = SimpleNamespace(__name__=native.__name__, __file__=native.__file__,
+        __spec__=SimpleNamespace(name=native.__spec__.name, origin=native.__spec__.origin),
+        main=lambda argv: calls.append(argv))
+    if fault == "name":
+        alternate.__name__ = "malicious_alternate"
+    elif fault == "spec_absent":
+        alternate.__spec__ = None
+    elif fault == "spec_name":
+        alternate.__spec__.name = "malicious_alternate"
+    elif fault == "spec_origin":
+        alternate.__spec__.origin = "/untrusted/substitute.py"
+    else:
+        alternate.__file__ = "/untrusted/substitute.py"
+    monkeypatch.setattr(scripts, "production_activation_host_native", alternate)
+    with pytest.raises(gate.AdmissionError, match="canonical full-host CLI source required"):
+        native.cli([])
+    assert calls == []
+
+
+@pytest.mark.parametrize("inside", [False, True])
+def test_real_isolated_script_cli_keeps_original_argument_validation(tmp_path, inside):
+    # This executes the actual file with Python's isolated CLI, not a copied
+    # dispatcher. Invalid arguments must stop before any native side effect.
+    argv = [sys.executable, "-I", "-B", str(Path(native.__file__).resolve())]
+    argv += (["--inside"] if inside else []) + ["--invalid-native-argument"]
+    result = subprocess.run(argv, cwd=tmp_path, capture_output=True, text=True, timeout=15)
+    value = json.loads(result.stdout)
+    assert result.returncode == 1 and value["status"] == "failed_or_evidence_insufficient"
+    assert value["error_sha256"] == hashlib.sha256(b"2").hexdigest()
+    assert value["full_activation_verified"] is False and value["production_access"] is False
+    assert "error:" in result.stderr and "--repo" in result.stderr
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("inside", [False, True])
+def test_real_runpy_cli_uses_canonical_class_for_outer_and_inside(tmp_path, inside):
+    # A fresh isolated subprocess exercises the real file's __main__ branch.
+    # Only its canonical main body is replaced by a local contract probe; no
+    # native command, network, resource observation or production proof runs.
+    source = r'''
+import json, pathlib, runpy, sys
+sys.path.insert(0, sys.argv[1])
+from scripts import production_activation_host_native as canonical
+from scripts import verify_production_activation_native as activation
+from services import admission_fence as gate
+expected = sys.argv[3:]
+def probe(argv=None):
+    assert argv is None and sys.argv[1:] == expected
+    try:
+        canonical._arguments(["--invalid-native-argument"])
+    except SystemExit as error:
+        assert error.code == 2
+    else:
+        raise AssertionError("original argument validator was bypassed")
+    activation.Harness.__init__ = lambda self, *args, **kwargs: None
+    context = object.__new__(canonical.PrivateHostContext)
+    context.plan = {"started": 123}
+    context.check = lambda: None
+    observed = []
+    context.check_network = lambda row, owner: observed.append((row, owner))
+    harness = activation.ActivationHarness(private_host_context=context)
+    assert harness.private_host_context is context and harness.started == 123
+    harness.owner = "canonical-owner"
+    canonical.require_harness_network(harness, {"network": "unchanged"})
+    assert observed == [({"network": "unchanged"}, "canonical-owner")]
+    class ForeignContext(canonical.PrivateHostContext):
+        pass
+    duplicate = object.__new__(sys.modules["__main__"].PrivateHostContext)
+    assert type(duplicate).__module__ == "__main__" and type(duplicate) is not canonical.PrivateHostContext
+    for fake in (duplicate, object.__new__(ForeignContext), object()):
+        try:
+            activation.ActivationHarness(private_host_context=fake)
+        except gate.AdmissionError as error:
+            assert str(error) == "exact private host context required"
+        else:
+            raise AssertionError("foreign context was accepted")
+        harness.private_host_context = fake
+        try:
+            canonical.require_harness_network(harness, {})
+        except gate.AdmissionError as error:
+            assert str(error) == "ordinary bridge requires the exact full private-host context"
+        else:
+            raise AssertionError("foreign network context was accepted")
+    print(json.dumps({"canonical_module": type(context).__module__, "inside": "--inside" in expected,
+                      "argument_guard": True, "exact_type_guard": True, "native_executed": False}))
+    return 23
+canonical.main = probe
+path = sys.argv[2]
+sys.argv = [path, *expected]
+try:
+    runpy.run_path(path, run_name="__main__")
+except SystemExit as error:
+    assert error.code == 23
+else:
+    raise AssertionError("real script entry did not delegate")
+'''
+    argv = [sys.executable, "-I", "-B", "-c", source, str(native.ROOT), str(Path(native.__file__).resolve())]
+    argv += ["--inside"] if inside else []
+    result = subprocess.run(argv, cwd=tmp_path, capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+    value = json.loads(result.stdout)
+    assert value == {"canonical_module": "scripts.production_activation_host_native", "inside": inside,
+                     "argument_guard": True, "exact_type_guard": True, "native_executed": False}
 
 
 @pytest.mark.parametrize("deadline", [True, False, None, "600", float("nan"), float("inf"), -1, 0, 701])

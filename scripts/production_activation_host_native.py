@@ -898,5 +898,20 @@ def main(argv=None):
             signal.pause()
 
 
+def cli(argv=None):
+    # A script's __main__ classes are distinct from this canonical module's
+    # classes. Delegate both outer and --inside invocations before creating any
+    # context; all exact type, argument, source and runtime guards stay in main.
+    from scripts import production_activation_host_native as canonical
+    expected = Path(__file__).resolve()
+    spec = getattr(canonical, "__spec__", None)
+    gate._require(canonical.__name__ == "scripts.production_activation_host_native"
+                  and spec is not None and spec.name == canonical.__name__
+                  and spec.origin == str(expected)
+                  and Path(canonical.__file__).resolve() == expected,
+                  "canonical full-host CLI source required")
+    return canonical.main(argv)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(cli())
