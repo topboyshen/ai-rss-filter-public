@@ -1,5 +1,6 @@
 """Every adapter change selects the real capped native suite; no broad exemption."""
 import ast
+from copy import deepcopy
 from pathlib import Path
 import re
 import shlex
@@ -293,3 +294,140 @@ def test_full_activation_step_cannot_skip_or_ignore_the_original_gate(field, val
     _full_activation_step(workflow)[field] = value
     with pytest.raises(AssertionError):
         _full_activation_step(workflow)
+
+
+PRIORITY_UPLOAD_NAME = "Preserve bounded prepared priority diagnostics"
+PRIORITY_FILES = (
+    "PRIORITY_DIAGNOSTICS.json",
+    "files/production-startup-source/BOOTSTRAP_PROCESS.stdout",
+    "files/production-startup-source/BOOTSTRAP_PROCESS.stderr",
+    "files/production-startup-source/ACTIVATION_HOST_PROCESS.stdout",
+    "files/production-startup-source/ACTIVATION_HOST_PROCESS.stderr",
+)
+PREPARED_ROOT = "${{ runner.temp }}/cutover-safe-upload/"
+
+
+def _named_step(steps, name):
+    matches = [step for step in steps if step.get("name") == name]
+    assert len(matches) == 1
+    return matches[0]
+
+
+def _assert_priority_upload_contract(workflow):
+    steps = workflow["jobs"]["native-amd64"]["steps"]
+    prepare = _named_step(steps, "Prepare evidence without following fixture links")
+    small = _named_step(steps, PRIORITY_UPLOAD_NAME)
+    original = _named_step(steps, "Preserve original evidence including failures")
+    assert steps.index(small) == steps.index(prepare) + 1
+    assert steps.index(original) == steps.index(small) + 1
+    assert set(prepare) == {"name", "if", "run"} and prepare["if"] == "always()"
+    actual = shlex.split(prepare["run"].replace("\\\n", " "), comments=True)
+    expected = ["python", "-I", "-B", "scripts/prepare_synthetic_evidence.py"]
+    for source in ("cutover-completion", "production-startup", "production-startup-postgres", "production-startup-source"):
+        expected.extend(("--source", source + "=${RUNNER_TEMP}/" + source))
+    expected.extend(("--output", "${RUNNER_TEMP}/cutover-safe-upload"))
+    assert actual == expected
+    for step, name, paths in (
+        (small, "cutover-priority-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}",
+         [PREPARED_ROOT + path for path in PRIORITY_FILES]),
+        (original, "cutover-completion-${{ github.run_id }}-${{ github.run_attempt }}", [PREPARED_ROOT]),
+    ):
+        assert set(step) == {"name", "if", "uses", "with"} and step["if"] == "always()"
+        assert step["uses"] == "actions/upload-artifact@v7"
+        config = step["with"]
+        assert set(config) == {"name", "path", "include-hidden-files", "if-no-files-found", "retention-days"}
+        assert config["name"] == name and config["path"].splitlines() == paths
+        assert config["include-hidden-files"] == "true" and config["if-no-files-found"] == "error"
+        assert config["retention-days"] == "14"
+
+
+def test_small_priority_artifact_uses_only_five_exact_prepared_paths_before_unchanged_full_archive():
+    workflow = yaml.load((ROOT / PATH).read_text(), Loader=yaml.BaseLoader)
+    _assert_priority_upload_contract(workflow)
+
+
+@pytest.mark.parametrize("removed", PRIORITY_FILES)
+def test_priority_artifact_cannot_omit_any_fixed_log_or_result_state(removed):
+    workflow = yaml.load((ROOT / PATH).read_text(), Loader=yaml.BaseLoader)
+    step = _named_step(workflow["jobs"]["native-amd64"]["steps"], PRIORITY_UPLOAD_NAME)
+    step["with"]["path"] = "\n".join(path for path in step["with"]["path"].splitlines()
+                                        if path != PREPARED_ROOT + removed)
+    with pytest.raises(AssertionError):
+        _assert_priority_upload_contract(workflow)
+
+
+@pytest.mark.parametrize("path", [
+    "${{ runner.temp }}/production-startup-source/BOOTSTRAP_PROCESS.stdout",
+    "${{ runner.temp }}/cutover-safe-upload/files/production-startup-source/",
+    "${{ runner.temp }}/cutover-safe-upload/**",
+    "${{ runner.temp }}/cutover-safe-upload/priority-diagnostics/",
+    "${{ runner.temp }}/production-native-bootstrap/activation-originals/",
+    "/root/activation-originals/", "", PREPARED_ROOT,
+])
+def test_priority_artifact_cannot_upload_raw_parent_glob_or_unprepared_paths(path):
+    workflow = yaml.load((ROOT / PATH).read_text(), Loader=yaml.BaseLoader)
+    step = _named_step(workflow["jobs"]["native-amd64"]["steps"], PRIORITY_UPLOAD_NAME)
+    step["with"]["path"] = path
+    with pytest.raises(AssertionError):
+        _assert_priority_upload_contract(workflow)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("if", "success()"), ("if", "${{ false }}"), ("continue-on-error", "true"),
+    ("uses", "actions/upload-artifact@v6"), ("env", {"RAW_SOURCE": "/root/private"}),
+])
+def test_priority_artifact_cannot_skip_failed_runs_or_ignore_upload_errors(field, value):
+    workflow = yaml.load((ROOT / PATH).read_text(), Loader=yaml.BaseLoader)
+    _named_step(workflow["jobs"]["native-amd64"]["steps"], PRIORITY_UPLOAD_NAME)[field] = value
+    with pytest.raises(AssertionError):
+        _assert_priority_upload_contract(workflow)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("if-no-files-found", "warn"), ("if-no-files-found", "ignore"),
+    ("include-hidden-files", "false"), ("retention-days", "15"),
+    ("name", "cutover-completion-${{ github.run_id }}-${{ github.run_attempt }}"),
+])
+def test_priority_artifact_rejects_missing_file_lenience_or_archive_identity_drift(field, value):
+    workflow = yaml.load((ROOT / PATH).read_text(), Loader=yaml.BaseLoader)
+    _named_step(workflow["jobs"]["native-amd64"]["steps"], PRIORITY_UPLOAD_NAME)["with"][field] = value
+    with pytest.raises(AssertionError):
+        _assert_priority_upload_contract(workflow)
+
+
+@pytest.mark.parametrize("mutation", ["missing", "duplicate", "before-collector", "after-original", "interposed-write"])
+def test_priority_artifact_requires_one_upload_between_collector_and_full_archive(mutation):
+    workflow = yaml.load((ROOT / PATH).read_text(), Loader=yaml.BaseLoader)
+    steps = workflow["jobs"]["native-amd64"]["steps"]
+    small = _named_step(steps, PRIORITY_UPLOAD_NAME)
+    if mutation == "duplicate":
+        steps.append(deepcopy(small))
+    elif mutation == "interposed-write":
+        steps.insert(steps.index(small), {"name": "Unverified overwrite", "run": "cp raw-source prepared-output"})
+    else:
+        steps.remove(small)
+        if mutation == "before-collector":
+            steps.insert(0, small)
+        elif mutation == "after-original":
+            steps.append(small)
+    with pytest.raises(AssertionError):
+        _assert_priority_upload_contract(workflow)
+
+
+@pytest.mark.parametrize("mutation", ["missing-source", "extra-source", "raw-output", "ignored-error", "skip"])
+def test_priority_upload_preserves_real_four_source_collector_without_bypass(mutation):
+    workflow = yaml.load((ROOT / PATH).read_text(), Loader=yaml.BaseLoader)
+    prepare = _named_step(workflow["jobs"]["native-amd64"]["steps"], "Prepare evidence without following fixture links")
+    if mutation == "missing-source":
+        prepare["run"] = prepare["run"].replace('--source "production-startup=${RUNNER_TEMP}/production-startup"', "")
+    elif mutation == "extra-source":
+        prepare["run"] += ' --source "private=/root/private"'
+    elif mutation == "raw-output":
+        prepare["run"] = prepare["run"].replace('--output "${RUNNER_TEMP}/cutover-safe-upload"',
+                                                '--output "${RUNNER_TEMP}/production-startup-source"')
+    elif mutation == "ignored-error":
+        prepare["run"] += " || true"
+    else:
+        prepare["if"] = "success()"
+    with pytest.raises(AssertionError):
+        _assert_priority_upload_contract(workflow)

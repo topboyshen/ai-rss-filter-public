@@ -60,10 +60,14 @@ ACTIVATION_STAGES = {"actual_finite_admission_lease", "actual_go_to_real_worker_
 
 def phase(root, name):
     global PHASE, PHASE_SEQUENCE
-    gate._require(name in PHASES, "unknown native phase")
+    gate._require(type(name) is str and name in PHASES, "unknown native phase")
     PHASE, PHASE_SEQUENCE = name, PHASE_SEQUENCE + 1
     gate._require(PHASE_SEQUENCE <= 64, "full-host phase observation bound")
     record(root / ("PHASE_%03d.json" % PHASE_SEQUENCE), {"phase": name, "monotonic": time.monotonic()})
+    # The outer Python diagnostic redirect must not hide bounded progress from
+    # PROCESS.stderr. Never include paths, exception text, argv, or input data.
+    progress = host.encoded({"event": "full_activation_phase", "phase": name, "sequence": PHASE_SEQUENCE})
+    gate._require(len(progress) <= 192 and os.write(2, progress) == len(progress), "native phase progress write incomplete")
 
 
 def error_type(error):
@@ -530,7 +534,7 @@ def inner_execute(root, plan):
               "error_sha256": hashlib.sha256(str(failure).encode()).hexdigest() if failure else None,
               "retained_live_daemon": any(item.poll() is None for item, _log, owned, _plan in host.LIVE_DAEMONS if owned == root),
               "production_access": False, "real_models": 0, "existing_126_modified": False}
-    record(root / "INNER_RESULT.json", result)
+    record(root / "INNER_RESULT.json", result, sealed=True)
     return result
 
 
@@ -622,11 +626,28 @@ def build_requested_candidate(root, plan, commands):
         raise failure
 
 
+def sealed_child_result(root):
+    path = root / "inner/INNER_RESULT.json"
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return None
+    result, _proof = original(path)
+    gate._require(type(result) is dict and result.get("status") in {"passed", "failed_or_evidence_insufficient"},
+                  "sealed child terminal status required")
+    return result
+
+
 def observe_child(process, root, plan, commands):
     requested, build_failure = False, None
     while process.poll() is None:
         remaining(plan["deadline"])
         gate._require(peer_identity() == plan["outer_peer"], "outer daemon socket peer changed")
+        result = sealed_child_result(root)
+        if result is not None and result["status"] == "failed_or_evidence_insufficient":
+            if build_failure:
+                raise build_failure
+            return result  # Retained FD holders are not protocol progress.
         if (root / "BUILD_REQUEST.json").exists() and not requested:
             requested = True  # One attempt only, including a failed or incomplete request.
             try:
@@ -641,8 +662,11 @@ def observe_child(process, root, plan, commands):
         time.sleep(min(0.05, remaining(plan["deadline"])))
     if build_failure:
         raise build_failure
+    result = sealed_child_result(root)
+    gate._require(result is not None, "sealed child terminal result missing")
+    if result["status"] == "failed_or_evidence_insufficient":
+        return result
     gate._require(process.returncode == 0, "full private host child failed; originals retained")
-    result, _ = host.read_original_json(root / "inner/INNER_RESULT.json"), None
     gate._require(result.get("status") == "passed" and result.get("activation_result", {}).get("status") == "passed",
                   "complete private activation or normal cleanup unconfirmed")
     gate._require(requested and (root / "BUILD_RESULT.json").exists(), "complete activation did not perform sealed candidate build")
@@ -717,6 +741,14 @@ def safe_activation(value):
     return result
 
 
+def safe_inner_result(value):
+    return {"status": value.get("status") if type(value.get("status")) is str and value.get("status") in {"passed", "failed_or_evidence_insufficient"} else None,
+            "phase": value.get("phase") if type(value.get("phase")) is str and value.get("phase") in PHASES else None,
+            "retained_live_daemon": value.get("retained_live_daemon") if type(value.get("retained_live_daemon")) is bool else None,
+            "error_type": value.get("error_type") if type(value.get("error_type")) is str and value.get("error_type") in ERROR_TYPES else None,
+            "error_sha256": value.get("error_sha256") if re.fullmatch(r"[0-9a-f]{64}", str(value.get("error_sha256"))) else None}
+
+
 def safe_inventory(root, deadline):
     """Hash bounded originals; explicitly exclude storage trees and raw payloads."""
     records, omissions, total = [], [], 0
@@ -758,14 +790,11 @@ def safe_inventory(root, deadline):
         remaining(deadline)
         path = root / name
         if path.exists():
-            value = host.read_original_json(path)
+            value = original(path)[0] if name.endswith("INNER_RESULT.json") else host.read_original_json(path)
             if name.endswith("activation/RESULT.json"):
                 profiles[name] = safe_activation(value)
             elif name.endswith("INNER_RESULT.json"):
-                profiles[name] = {"status": value.get("status") if value.get("status") in {"passed", "failed_or_evidence_insufficient"} else None,
-                                  "phase": value.get("phase") if value.get("phase") in PHASES else None,
-                                  "retained_live_daemon": value.get("retained_live_daemon") if type(value.get("retained_live_daemon")) is bool else None,
-                                  "error_sha256": value.get("error_sha256") if re.fullmatch(r"[0-9a-f]{64}", str(value.get("error_sha256"))) else None}
+                profiles[name] = safe_inner_result(value)
             elif name.endswith("DAEMON_STOP.json"):
                 profiles[name] = {key: value.get(key) for key in ("all_containers_stopped", "forced_kill", "removed")
                                   if type(value.get(key)) is bool}
@@ -818,6 +847,7 @@ def _main(argv=None):
         from scripts.production_gateway_switch import _hard_deadline
         with open(root / "OUTER_DIAGNOSTICS.txt", "x") as diagnostics, redirect_stdout(diagnostics), redirect_stderr(diagnostics):
             with _hard_deadline(remaining(started + MAX_SECONDS)), native_deadline.scope(started + MAX_SECONDS - FINAL_SECONDS, started + MAX_SECONDS):
+                phase(root, "initial_validation")
                 result = outer_execute(args, root, started)
     except BaseException as error:
         failure, failed_phase = error, PHASE
@@ -835,12 +865,14 @@ def _main(argv=None):
             else:
                 failure, failed_phase = error, PHASE
     passed = failure is None and result is not None and result.get("status") == "passed" and packet and packet["complete"]
+    inner_profile = safe_inner_result(result) if result else None
     summary = {"schema": 1, "scope": "full_synthetic_private_host_activation", "status": "passed" if passed else "failed_or_evidence_insufficient",
-               "phase": failed_phase or PHASE,
+               "phase": failed_phase or (inner_profile["phase"] if inner_profile and result["status"] != "passed" else None) or PHASE,
                "full_activation_verified": bool(passed), "safe_evidence": packet, "full_raw_archive_verified": False,
                "activation": safe_activation(result["activation_result"]) if result and result.get("activation_result") else None,
-               "error_type": error_type(failure) if failure else None,
-               "error_sha256": hashlib.sha256(str(failure).encode()).hexdigest() if failure else None,
+               "inner_result": inner_profile,
+               "error_type": error_type(failure) if failure else inner_profile and inner_profile["error_type"],
+               "error_sha256": hashlib.sha256(str(failure).encode()).hexdigest() if failure else inner_profile and inner_profile["error_sha256"],
                "elapsed_seconds": time.monotonic() - started, "production_access": False, "real_models": 0, "existing_126_modified": False}
     gate._require(len(host.encoded(summary)) <= 512 * 1024, "full-host summary encoding bound")
     if root is not None and root.is_dir():

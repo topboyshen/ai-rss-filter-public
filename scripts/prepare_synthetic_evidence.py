@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Mapping
 from contextlib import contextmanager
+import ctypes
 import errno
 import hashlib
 import json
@@ -29,8 +30,11 @@ DEADLINE = 300
 NOFOLLOW = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
 NATIVE_GROUPS = ('native', 'native-foundation', 'native-activation', 'native-adapters')
 PRIORITY_SOURCE = 'production-startup-source'
-PRIORITY_FILES = ('BOOTSTRAP_PROCESS.stderr', 'BOOTSTRAP_PROCESS.stdout')
+PRIORITY_FILES = ('BOOTSTRAP_PROCESS.stderr', 'BOOTSTRAP_PROCESS.stdout',
+                  'ACTIVATION_HOST_PROCESS.stderr', 'ACTIVATION_HOST_PROCESS.stdout')
 PRIORITY_BYTES = 512 * 1024
+PRIORITY_SUMMARY_BYTES = 16 * 1024
+PRIORITY_SUMMARY = 'PRIORITY_DIAGNOSTICS.json'
 IDENTITY_FIELDS = ('dev', 'ino', 'mode', 'nlink', 'size', 'mtime_ns', 'ctime_ns')
 INVENTORY_HEADER = {'schema': 1, 'columns': ['path', 'kind', 'identity', 'target'],
                     'identity_fields': list(IDENTITY_FIELDS), 'format': 'canonical-jsonl'}
@@ -524,7 +528,7 @@ def prepare_priority(root, output, budget, deadline, report):
     """Save only the producer-bounded logs, charging the original shared budget.
 
     The subsequent full inventory conservatively charges these entries again.
-    Preserving these two files never makes an incomplete full inventory complete.
+    Preserving these fixed files never makes an incomplete full inventory complete.
     """
     state = report['priority_diagnostics']
     inventory = CompactInventory(budget)
@@ -669,6 +673,109 @@ def failure_fields(exc, phase):
     return row
 
 
+def priority_copy_digest(root, output, name, row, copied, report, deadline):
+    check_time(deadline)
+    with directory(root) as source, output_directory(output, identities=report['output_directories']) as prepared:
+        require(identity(os.fstat(source)) == report['priority_diagnostics']['root_identity'],
+                'priority_source_root_changed')
+        with regular(source, name, row['identity']), regular(
+                prepared, str(PurePosixPath('files', PRIORITY_SOURCE, name)), copied['output_identity']) as fd:
+            size = copied['output_identity']['size']
+            require(size == row['identity']['size'] <= PRIORITY_BYTES, 'priority_combined_byte_bound')
+            digest = hashlib.sha256()
+            cursor = 0
+            while cursor < size:
+                check_time(deadline)
+                data = os.pread(fd, min(CHUNK, size - cursor), cursor)
+                require(data, 'unexpected_source_eof')
+                digest.update(data)
+                cursor += len(data)
+            check_time(deadline)
+    return size, digest.hexdigest()
+
+
+def priority_summary(sources, output, report, deadline):
+    """Fixed prepared-file facts; absence is not a successful diagnostic run."""
+    summary = {'schema': 1, 'scope': 'prepared_priority_diagnostics', 'publication_requires_cli_success': True,
+               'files': {name: {'state': 'unverified', 'size': None, 'sha256': None} for name in PRIORITY_FILES}}
+    state = report.get('priority_diagnostics', {})
+    for name, result in summary['files'].items():
+        if PRIORITY_SOURCE not in sources:
+            result['state'] = 'not_requested'
+            continue
+        row = state.get('entries', {}).get(name, {})
+        copied = next((item for item in report['files'] if item.get('priority_diagnostic')
+                       and item['source'] == PRIORITY_SOURCE and item['path'] == name), None)
+        try:
+            if row.get('status') == 'optional_absent':
+                check_time(deadline)
+                with directory(sources[PRIORITY_SOURCE]) as source:
+                    require(identity(os.fstat(source)) == state['root_identity'], 'priority_source_root_changed')
+                    try:
+                        os.stat(name, dir_fd=source, follow_symlinks=False)
+                    except FileNotFoundError:
+                        result['state'] = 'optional_absent'
+                        continue
+                    raise EvidenceError('priority_absent_file_appeared')
+            if row.get('status') == 'copied' and copied is not None:
+                size, digest = priority_copy_digest(sources[PRIORITY_SOURCE], output, name, row, copied, report, deadline)
+                result.update(state='verified_copy' if size else 'verified_empty_copy', size=size, sha256=digest)
+        except (OSError, ValueError) as exc:
+            report['errors'].append({'phase': 'priority_final_verification',
+                                     'code': str(exc) if isinstance(exc, EvidenceError) else 'priority_filesystem_error'})
+    return summary
+
+
+def exclusive_summary_rename(parent, source, target):
+    library = ctypes.CDLL(None, use_errno=True)
+    if hasattr(library, 'renameat2'):
+        function, flag = library.renameat2, 1  # RENAME_NOREPLACE
+    elif hasattr(library, 'renameatx_np'):
+        function, flag = library.renameatx_np, 4  # RENAME_EXCL
+    else:
+        raise OSError('atomic exclusive rename unavailable; no replacement fallback')
+    function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    function.restype = ctypes.c_int
+    if function(parent, os.fsencode(source), parent, os.fsencode(target), flag) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code), target)
+
+
+def publish_priority_summary(output, summary, identities, deadline):
+    """Publish only a fully synced small summary, without replacing any file.
+
+    A failure retains its private temporary original and makes the CLI fail.
+    Existing COMPLETE describes the full archive, never this small publication.
+    """
+    raw = encoded(summary) + b'\n'
+    require(len(raw) <= PRIORITY_SUMMARY_BYTES, 'output_metadata_bound')
+    temporary = '.' + PRIORITY_SUMMARY + '.pending'
+    with output_directory(output, identities=identities) as parent:
+        if summary['archive_complete']:
+            check_time(deadline)
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+            expected = identity(os.fstat(stream.fileno()))
+            require(expected['nlink'] == 1 and stat.S_IMODE(expected['mode']) == 0o600
+                    and identity(os.stat(temporary, dir_fd=parent, follow_symlinks=False)) == expected,
+                    'output_file_identity_changed')
+            if summary['archive_complete']:
+                check_time(deadline)
+            exclusive_summary_rename(parent, temporary, PRIORITY_SUMMARY)
+            # Renaming changes ctime. Bind the final pathname to the still-held
+            # original inode and require every other identity field unchanged.
+            actual = identity(os.fstat(stream.fileno()))
+            require(all(actual[key] == value for key, value in expected.items() if key != 'ctime_ns')
+                    and identity(os.stat(PRIORITY_SUMMARY, dir_fd=parent, follow_symlinks=False)) == actual,
+                    'output_file_identity_changed')
+            os.fsync(parent)
+            if summary['archive_complete']:
+                check_time(deadline)
+
+
 def prepare(sources, output):
     output = Path(output)
     require(1 <= len(sources) <= 4 and len(set(sources)) == len(sources), 'source_count_bound')
@@ -725,8 +832,17 @@ def prepare(sources, output):
             check_time(deadline)
         except EvidenceError as exc:
             report['errors'].append(failure_fields(exc, 'completion'))
+    summary = priority_summary(sources, output, report, deadline)
     report['complete'] = not report['errors']
+    summary['archive_complete'] = report['complete']
+    summary['archive_state'] = 'complete' if report['complete'] else 'stop'
+    summary['error_codes'] = sorted({row['code'] if isinstance(row.get('code'), str)
+                                    and row['code'] in DIAGNOSTIC_CODES else 'unrecognized_error'
+                                    for row in report['errors']})
+    require(len(encoded(summary)) + 1 <= PRIORITY_SUMMARY_BYTES, 'output_metadata_bound')
+    require(len(encoded(report)) + len(encoded(summary)) + 2 <= MAX_OUTPUT_METADATA, 'output_metadata_bound')
     write_json(output / ('COMPLETE.json' if report['complete'] else 'STOP.json'), report, output_ids)
+    publish_priority_summary(output, summary, output_ids, deadline)
     return report
 
 

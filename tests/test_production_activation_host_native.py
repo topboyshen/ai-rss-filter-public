@@ -1,7 +1,8 @@
 """Local negative contracts; these mocks never stand in for a native proof."""
 from copy import deepcopy
-from contextlib import nullcontext
+from contextlib import nullcontext, redirect_stderr
 import hashlib
+from io import StringIO
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,6 +37,41 @@ def test_deadline_is_not_reset_between_phases(monkeypatch):
     clock[0] = 601
     with pytest.raises(gate.AdmissionError):
         native.remaining(600)
+
+
+def test_fixed_phase_progress_reaches_process_stderr_despite_python_redirect(tmp_path, capfd):
+    hidden = StringIO()
+    with redirect_stderr(hidden):
+        native.phase(tmp_path, "dependency_inspect")
+    progress = json.loads(capfd.readouterr().err)
+    assert progress == {"event": "full_activation_phase", "phase": "dependency_inspect", "sequence": 1}
+    assert hidden.getvalue() == ""
+    assert native.host.read_original_json(tmp_path / "PHASE_001.json")["phase"] == "dependency_inspect"
+
+
+@pytest.mark.parametrize("name", ["secret-path-or-token-MUST-NOT-LEAK", [], None])
+def test_unknown_phase_is_rejected_before_any_progress_or_original(tmp_path, capfd, name):
+    with pytest.raises(gate.AdmissionError, match="unknown native phase"):
+        native.phase(tmp_path, name)
+    assert capfd.readouterr().err == "" and list(tmp_path.iterdir()) == []
+
+
+def test_phase_progress_remains_count_and_byte_bounded(tmp_path, monkeypatch):
+    rows = []
+    monkeypatch.setattr(native, "record", lambda *a, **k: {})
+    monkeypatch.setattr(native.os, "write", lambda fd, data: rows.append((fd, data)) or len(data))
+    for _ in range(64):
+        native.phase(tmp_path, "child_observation")
+    with pytest.raises(gate.AdmissionError, match="phase observation bound"):
+        native.phase(tmp_path, "cleanup")
+    assert len(rows) == 64 and all(fd == 2 and len(data) <= 192 for fd, data in rows)
+
+
+def test_short_progress_write_is_failure_with_original_preserved(tmp_path, monkeypatch):
+    monkeypatch.setattr(native.os, "write", lambda fd, data: len(data) - 1)
+    with pytest.raises(gate.AdmissionError, match="progress write incomplete"):
+        native.phase(tmp_path, "namespace_launch")
+    assert (tmp_path / "PHASE_001.json").is_file()
 
 
 def test_outer_supervisor_caps_precede_download_export_and_other_heavy_work(tmp_path, monkeypatch):
@@ -244,6 +280,101 @@ def test_exact_build_ipc_reads_only_fixed_contract(tmp_path, monkeypatch):
     assert seen == [(tmp_path / "inner/activation/receiver/sealed/contract.json", tmp_path, {"require_fresh": True})]
 
 
+def child_observation_fixture(tmp_path, monkeypatch, result=None):
+    inner = tmp_path / "inner"
+    inner.mkdir(mode=0o700)
+    for name in ("inner.stdout", "inner.stderr"):
+        (tmp_path / name).touch(mode=0o600)
+    if result is not None:
+        native.record(inner / "INNER_RESULT.json", result, sealed=True)
+    monkeypatch.setattr(native.time, "monotonic", lambda: 100)
+    monkeypatch.setattr(native, "peer_identity", lambda: {"pid": 1})
+    return {"deadline": 600, "active_deadline": 580, "outer_peer": {"pid": 1}}
+
+
+def failed_child_result():
+    return {"status": "failed_or_evidence_insufficient", "phase": "dependency_pull",
+            "error_type": "ProofError", "error_sha256": "a" * 64,
+            "retained_live_daemon": True, "activation_result": None, "daemon_stop": None}
+
+
+def test_sealed_failed_terminal_returns_while_original_daemon_holder_is_live(tmp_path, monkeypatch):
+    result = failed_child_result()
+    plan = child_observation_fixture(tmp_path, monkeypatch, result)
+    (tmp_path / "BUILD_REQUEST.json").touch(mode=0o400)
+    process = SimpleNamespace(poll=lambda: None, send_signal=lambda *a: pytest.fail("never signal holder"))
+    monkeypatch.setattr(native.time, "sleep", lambda *a: pytest.fail("must not wait after sealed failure"))
+    monkeypatch.setattr(native, "build_requested_candidate", lambda *a: pytest.fail("no build after terminal failure"))
+    assert native.observe_child(process, tmp_path, plan, None) == result
+
+
+@pytest.mark.parametrize("state", ["complete_unsealed", "partial_unsealed", "partial_sealed", "broken_link"])
+def test_partial_or_nonsealed_terminal_never_starts_another_action(tmp_path, monkeypatch, state):
+    plan = child_observation_fixture(tmp_path, monkeypatch)
+    path = tmp_path / "inner/INNER_RESULT.json"
+    if state == "broken_link":
+        path.symlink_to(tmp_path / "absent")
+    else:
+        path.write_text(json.dumps(failed_child_result()) if state == "complete_unsealed" else '{"status":')
+        path.chmod(0o400 if state == "partial_sealed" else 0o600)
+    monkeypatch.setattr(native.time, "sleep", lambda *a: pytest.fail("no terminal-read retry"))
+    monkeypatch.setattr(native, "build_requested_candidate", lambda *a: pytest.fail("cannot build on invalid terminal"))
+    with pytest.raises((ValueError, RuntimeError)):
+        native.observe_child(SimpleNamespace(poll=lambda: None), tmp_path, plan, None)
+
+
+def test_passed_terminal_cannot_replace_real_process_exit(tmp_path, monkeypatch):
+    plan = child_observation_fixture(tmp_path, monkeypatch, {"status": "passed", "activation_result": {"status": "passed"}})
+    clock, waits = [100], []
+    monkeypatch.setattr(native.time, "monotonic", lambda: clock[0])
+    def wait(seconds):
+        waits.append(seconds)
+        clock[0] = 601
+    monkeypatch.setattr(native.time, "sleep", wait)
+    with pytest.raises(gate.AdmissionError, match="deadline expired"):
+        native.observe_child(SimpleNamespace(poll=lambda: None), tmp_path, plan, None)
+    assert waits == [0.05]
+
+
+@pytest.mark.parametrize("returncode", [0, 1])
+def test_passed_terminal_still_requires_zero_exit_and_actual_sealed_candidate_build(tmp_path, monkeypatch, returncode):
+    plan = child_observation_fixture(tmp_path, monkeypatch, {"status": "passed", "activation_result": {"status": "passed"}})
+    with pytest.raises(gate.AdmissionError, match="sealed candidate build" if returncode == 0 else "child failed"):
+        native.observe_child(SimpleNamespace(poll=lambda: returncode, returncode=returncode), tmp_path, plan, None)
+
+
+def test_zero_exit_with_success_and_original_candidate_path_still_passes(tmp_path, monkeypatch):
+    plan = child_observation_fixture(tmp_path, monkeypatch)
+    (tmp_path / "BUILD_REQUEST.json").touch(mode=0o400)
+    state = [None, 0]
+    expected = {"status": "passed", "activation_result": {"status": "passed"}, "daemon_stop": {"status": "stopped"}}
+    def build(*args):
+        native.record(tmp_path / "BUILD_RESULT.json", {"status": "built"}, sealed=True)
+        native.record(tmp_path / "inner/INNER_RESULT.json", expected, sealed=True)
+    monkeypatch.setattr(native, "build_requested_candidate", build)
+    monkeypatch.setattr(native.time, "sleep", lambda *a: None)
+    process = SimpleNamespace(poll=lambda: state.pop(0), returncode=0)
+    assert native.observe_child(process, tmp_path, plan, None) == expected
+
+
+def test_outer_failure_preserves_live_holder_without_any_signal(tmp_path, monkeypatch):
+    result = failed_child_result()
+    plan = {"deadline": 600, "active_deadline": 580, "outer_peer": {"pid": 1}, "source_identity": {},
+            "wrapper_source": native.host.file_proof(Path(native.__file__))}
+    args = SimpleNamespace(repo=tmp_path, source=tmp_path, binary=tmp_path, image_id="sha256:" + "a" * 64)
+    monkeypatch.setattr(native.time, "monotonic", lambda: 100)
+    monkeypatch.setattr(native, "outer_plan", lambda *a: (plan, SimpleNamespace(env={})))
+    monkeypatch.setattr(native, "peer_identity", lambda: {"pid": 1})
+    monkeypatch.setattr(native.private, "source_identity", lambda *a: {})
+    def launch(*args, **kwargs):
+        native.record(tmp_path / "inner/INNER_RESULT.json", result, sealed=True)
+        return SimpleNamespace(poll=lambda: None, pid=123, send_signal=lambda *a: pytest.fail("never signal holder"))
+    monkeypatch.setattr(native.subprocess, "Popen", launch)
+    assert native.outer_execute(args, tmp_path, 100) == result
+    receipt = native.host.read_original_json(tmp_path / "OUTER_CHILD_UNCONFIRMED.json")
+    assert receipt["status"] == "retained_unconfirmed" and receipt["forced_kill"] is False
+
+
 @pytest.mark.parametrize("state", ["uncertain", "running"])
 def test_unknown_or_running_resources_never_authorize_daemon_signal(monkeypatch, state):
     context = SimpleNamespace(check=lambda **kw: None, plan={"deadline": 600},
@@ -321,6 +452,37 @@ def test_actual_stage_allowlist_matches_frozen_source_not_arbitrary_text():
 def test_unknown_error_class_is_not_forwarded():
     evil = type("SecretPasswordMustNotAppear", (Exception,), {})
     assert native.error_type(evil()) == "unrecognized_exception"
+
+
+def test_failed_terminal_summary_reports_safe_child_phase_without_waiting_for_holder(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "private-originals"
+    monkeypatch.setattr(native, "_arguments", lambda argv: SimpleNamespace(output=root, inside=False))
+    monkeypatch.setattr(native.host, "private_directory", lambda path, **kwargs: path.mkdir(mode=0o700))
+    def failed(*args):
+        assert native.host.read_original_json(root / "PHASE_001.json")["phase"] == "initial_validation"
+        return failed_child_result()
+    monkeypatch.setattr(native, "outer_execute", failed)
+    monkeypatch.setattr(native, "safe_inventory", lambda *args: {"complete": False})
+    assert native._main([]) == 1
+    value = json.loads(capsys.readouterr().out)
+    assert value["phase"] == "dependency_pull" and value["error_type"] == "ProofError"
+    assert value["error_sha256"] == "a" * 64 and value["inner_result"]["retained_live_daemon"] is True
+    assert value["full_activation_verified"] is False
+
+
+def test_unrecognized_terminal_phase_and_error_cannot_escape_safe_summary(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "private-originals"
+    secret = "PRIVATE-PATH-TOKEN-MUST-NOT-ESCAPE"
+    result = {**failed_child_result(), "phase": secret, "error_type": secret, "error_sha256": secret, "unknown": secret}
+    monkeypatch.setattr(native, "_arguments", lambda argv: SimpleNamespace(output=root, inside=False))
+    monkeypatch.setattr(native.host, "private_directory", lambda path, **kwargs: path.mkdir(mode=0o700))
+    monkeypatch.setattr(native, "outer_execute", lambda *args: result)
+    monkeypatch.setattr(native, "safe_inventory", lambda *args: {"complete": False})
+    assert native._main([]) == 1
+    text = capsys.readouterr().out
+    value = json.loads(text)
+    assert secret not in text and value["inner_result"]["phase"] is None
+    assert value["inner_result"]["error_type"] is None and value["error_sha256"] is None
 
 
 def test_failed_inventory_keeps_minimal_phase_without_exception_text(tmp_path, monkeypatch, capsys):
@@ -452,7 +614,8 @@ def test_failed_inner_paths_preserve_live_daemon_and_never_term_even_if_ps_empty
     monkeypatch.setattr(native.host, "restrict_private_ipv6", lambda *a: None)
     monkeypatch.setattr(native, "prepare_mounts", lambda *a: None)
     monkeypatch.setattr(native, "resource_check", lambda *a: {})
-    monkeypatch.setattr(native, "record", lambda *a, **k: {})
+    records = []
+    monkeypatch.setattr(native, "record", lambda path, value, **kwargs: records.append((path.name, value, kwargs)) or {})
     monkeypatch.setattr(native, "load_dependencies", lambda *a: None)
     monkeypatch.setattr(native.PrivateHostContext, "check", lambda *a, **k: None)
     commands = SimpleNamespace(deadline=580, uncertain_mutation=False, docker=lambda *a: "")
@@ -476,6 +639,7 @@ def test_failed_inner_paths_preserve_live_daemon_and_never_term_even_if_ps_empty
     result = native.inner_execute(tmp_path, plan)
     assert result["status"] == "failed_or_evidence_insufficient" and result["retained_live_daemon"] is True
     assert result["daemon_stop"] is None
+    assert [kwargs for name, _value, kwargs in records if name == "INNER_RESULT.json"] == [{"sealed": True}]
     if point != "launch_before_tuple_return":
         assert commands.uncertain_mutation is True
 

@@ -561,14 +561,19 @@ def test_priority_logs_survive_first_root_metadata_bound_with_shared_budget_and_
     assert evidence.main() == 1
     result = json.loads((output / 'STOP.json').read_bytes())
     assert not result['complete'] and not (output / 'COMPLETE.json').exists()
-    assert json.loads(capsys.readouterr().out)['files'] == 2
+    count = len(evidence.PRIORITY_FILES)
+    assert json.loads(capsys.readouterr().out)['files'] == count
     assert {row['code'] for row in result['errors']} == {'metadata_bound'}
-    assert len(result['files']) == 2 and all(row['priority_diagnostic'] for row in result['files'])
-    assert budgets[0][0] == budgets[1][0] and budgets[0][1]['entries'] == 2
+    assert len(result['files']) == count and all(row['priority_diagnostic'] for row in result['files'])
+    assert budgets[0][0] == budgets[1][0] and budgets[0][1]['entries'] == count
     assert budgets[1][1]['metadata'] > evidence.MAX_METADATA
     assert result['inventory_budget']['metadata'] >= budgets[1][1]['metadata']
     for name in evidence.PRIORITY_FILES:
         assert (output / 'files' / evidence.PRIORITY_SOURCE / name).read_bytes() == (root / name).read_bytes()
+    summary = json.loads((output / evidence.PRIORITY_SUMMARY).read_bytes())
+    assert summary['archive_complete'] is False and summary['archive_state'] == 'stop'
+    assert summary['error_codes'] == ['metadata_bound']
+    assert all(row['state'] == 'verified_copy' for row in summary['files'].values())
     assert not (output / 'files' / evidence.PRIORITY_SOURCE / 'BOOTSTRAP_PROCESS.unlisted').exists()
     assert before == (originals(root), originals(first))
 
@@ -583,32 +588,34 @@ def test_priority_success_reuses_exact_copies_and_conservatively_charges_twice(t
     monkeypatch.setattr(evidence, 'copy_file', record)
     result = evidence.prepare({evidence.PRIORITY_SOURCE: root}, output)
     assert result['complete'] and not result['errors']
-    assert copied == list(evidence.PRIORITY_FILES) and len(result['files']) == 2
-    assert result['inventory_budget']['entries'] == 4
+    assert copied == list(evidence.PRIORITY_FILES) and len(result['files']) == len(evidence.PRIORITY_FILES)
+    assert result['inventory_budget']['entries'] == 2 * len(evidence.PRIORITY_FILES)
     assert result['inventory_budget']['bytes'] == 2 * sum((root / name).stat().st_size for name in copied)
     assert all(row['status'] == 'copied' for row in result['priority_diagnostics']['entries'].values())
 
 
-@pytest.mark.parametrize('present', [0, 1])
-def test_priority_missing_optional_logs_do_not_invent_copies(tmp_path, present):
+@pytest.mark.parametrize('name', [None, *evidence.PRIORITY_FILES])
+def test_priority_missing_optional_logs_do_not_invent_copies(tmp_path, name):
     root, output = fixture(tmp_path)
-    if present:
-        (root / evidence.PRIORITY_FILES[0]).write_bytes(b'only available log')
+    if name is not None:
+        (root / name).write_bytes(b'only available log')
     result = evidence.prepare({evidence.PRIORITY_SOURCE: root}, output)
+    present = int(name is not None)
     assert result['complete'] and len(result['files']) == present
     states = result['priority_diagnostics']['entries']
-    assert sum(row['status'] == 'optional_absent' for row in states.values()) == 2 - present
+    assert sum(row['status'] == 'optional_absent' for row in states.values()) == len(evidence.PRIORITY_FILES) - present
+    assert {row['path'] for row in result['files']} == ({name} if present else set())
 
 
 @pytest.mark.parametrize('extra', [0, 1])
 def test_priority_combined_producer_limit_is_exact_and_never_falls_back(tmp_path, monkeypatch, extra):
-    root, output = priority_fixture(tmp_path, sizes=(256 * 1024, 256 * 1024 + extra))
+    root, output = priority_fixture(tmp_path, sizes=(128 * 1024,) * 3 + (128 * 1024 + extra,))
     before = originals(root)
     if extra:
         monkeypatch.setattr(evidence, 'copy_file', lambda *args, **kwargs: pytest.fail('oversized logs must not be copied'))
     result = evidence.prepare({evidence.PRIORITY_SOURCE: root}, output)
     assert result['complete'] is (extra == 0)
-    assert len(result['files']) == (0 if extra else 2)
+    assert len(result['files']) == (0 if extra else len(evidence.PRIORITY_FILES))
     if extra:
         assert any(row['code'] == 'priority_combined_byte_bound' for row in result['errors'])
     assert originals(root) == before
@@ -616,9 +623,9 @@ def test_priority_combined_producer_limit_is_exact_and_never_falls_back(tmp_path
 
 @pytest.mark.parametrize('kind', ['external_symlink', 'internal_symlink', 'external_hardlink',
                                  'internal_hardlink', 'directory', 'fifo'])
-def test_priority_requires_regular_single_link_and_never_opens_refused_name(tmp_path, monkeypatch, kind):
+@pytest.mark.parametrize('name', evidence.PRIORITY_FILES)
+def test_priority_requires_regular_single_link_and_never_opens_refused_name(tmp_path, monkeypatch, kind, name):
     root, output = fixture(tmp_path)
-    name = evidence.PRIORITY_FILES[0]
     target = tmp_path / 'outside' if kind.startswith('external') else root / 'original'
     target.write_bytes(b'retained exact bytes')
     if kind.endswith('symlink'):
@@ -666,17 +673,20 @@ def test_priority_uses_original_deadline_before_reading_bytes(tmp_path, monkeypa
 
 
 @pytest.mark.parametrize('change', ['replace', 'hardlink'])
-def test_priority_identity_changed_before_open_is_refused(tmp_path, monkeypatch, change):
-    root, output = priority_fixture(tmp_path)
+@pytest.mark.parametrize('name', evidence.PRIORITY_FILES)
+def test_priority_identity_changed_before_open_is_refused(tmp_path, monkeypatch, change, name):
+    root, output = fixture(tmp_path)
+    (root / name).write_bytes(b'original diagnostic')
     actual = evidence.copy_file
-    def mutate(fd, name, *args, **kwargs):
-        source = root / name
+    def mutate(fd, actual_name, *args, **kwargs):
+        assert actual_name == name
+        source = root / actual_name
         if change == 'replace':
             source.rename(tmp_path / 'retained-original')
             source.write_bytes(b'replacement')
         else:
             os.link(source, tmp_path / 'retained-link')
-        return actual(fd, name, *args, **kwargs)
+        return actual(fd, actual_name, *args, **kwargs)
     monkeypatch.setattr(evidence, 'copy_file', mutate)
     monkeypatch.setattr(evidence, 'sparse_copy', lambda *args: pytest.fail('changed original read'))
     result = evidence.prepare({evidence.PRIORITY_SOURCE: root}, output)
@@ -685,19 +695,20 @@ def test_priority_identity_changed_before_open_is_refused(tmp_path, monkeypatch,
 
 
 @pytest.mark.parametrize('change', ['same_length', 'root_replace', 'missing_appears'])
-def test_priority_originals_are_rechecked_even_after_full_scan_failure(tmp_path, monkeypatch, change):
+@pytest.mark.parametrize('name', evidence.PRIORITY_FILES)
+def test_priority_originals_are_rechecked_even_after_full_scan_failure(tmp_path, monkeypatch, change, name):
     root, output = priority_fixture(tmp_path)
     if change == 'missing_appears':
-        (root / evidence.PRIORITY_FILES[1]).unlink()
+        (root / name).unlink()
     def fail_scan(*args):
         if change == 'same_length':
-            path = root / evidence.PRIORITY_FILES[0]
+            path = root / name
             path.write_bytes(b'X' * path.stat().st_size)
         elif change == 'root_replace':
             root.rename(tmp_path / 'retained-originals')
             root.mkdir(mode=0o700)
         else:
-            (root / evidence.PRIORITY_FILES[1]).write_bytes(b'appeared after priority inventory')
+            (root / name).write_bytes(b'appeared after priority inventory')
         raise evidence.EvidenceError('metadata_bound')
     monkeypatch.setattr(evidence, 'prepare_source', fail_scan)
     result = evidence.prepare({evidence.PRIORITY_SOURCE: root}, output)
@@ -725,11 +736,12 @@ def test_priority_partial_fsync_failure_is_retained_without_retry(tmp_path, monk
 
 
 @pytest.mark.parametrize('inventory_fails', [True, False])
-def test_priority_output_replacement_is_refused_during_reuse_or_final_check(tmp_path, monkeypatch, inventory_fails):
+@pytest.mark.parametrize('name', evidence.PRIORITY_FILES)
+def test_priority_output_replacement_is_refused_during_reuse_or_final_check(tmp_path, monkeypatch, inventory_fails, name):
     root, output = priority_fixture(tmp_path)
     actual = evidence.prepare_source
     def replace(*args):
-        path = output / 'files' / evidence.PRIORITY_SOURCE / evidence.PRIORITY_FILES[0]
+        path = output / 'files' / evidence.PRIORITY_SOURCE / name
         path.rename(tmp_path / 'retained-copy')
         path.write_bytes(b'replacement')
         path.chmod(0o600)
@@ -740,7 +752,7 @@ def test_priority_output_replacement_is_refused_during_reuse_or_final_check(tmp_
     result = evidence.prepare({evidence.PRIORITY_SOURCE: root}, output)
     code = 'output_file_identity_changed' if inventory_fails else 'regular_file_identity_changed'
     assert not result['complete'] and any(row['code'] == code for row in result['errors'])
-    assert (tmp_path / 'retained-copy').read_bytes() == (root / evidence.PRIORITY_FILES[0]).read_bytes()
+    assert (tmp_path / 'retained-copy').read_bytes() == (root / name).read_bytes()
 
 
 def test_priority_root_symlink_is_never_followed(tmp_path, monkeypatch):
@@ -755,18 +767,174 @@ def test_priority_root_symlink_is_never_followed(tmp_path, monkeypatch):
     assert originals(root) == before
 
 
-def test_priority_source_is_rechecked_after_output_verification(tmp_path, monkeypatch):
+@pytest.mark.parametrize('name', evidence.PRIORITY_FILES)
+def test_priority_source_is_rechecked_after_output_verification(tmp_path, monkeypatch, name):
     root, output = priority_fixture(tmp_path)
     actual = evidence.check_output
     def mutate(*args):
         actual(*args)
-        path = root / evidence.PRIORITY_FILES[0]
+        path = root / name
         path.write_bytes(b'X' * path.stat().st_size)
     monkeypatch.setattr(evidence, 'check_output', mutate)
     result = evidence.prepare({evidence.PRIORITY_SOURCE: root}, output)
     assert not result['complete']
     assert any(row.get('phase') == 'priority_final_verification' for row in result['errors'])
     assert not (output / 'COMPLETE.json').exists()
+
+
+def test_fixed_priority_names_and_all_original_caps_remain_exact():
+    assert evidence.PRIORITY_FILES == ('BOOTSTRAP_PROCESS.stderr', 'BOOTSTRAP_PROCESS.stdout',
+                                       'ACTIVATION_HOST_PROCESS.stderr', 'ACTIVATION_HOST_PROCESS.stdout')
+    assert (evidence.PRIORITY_BYTES, evidence.PRIORITY_SUMMARY_BYTES, evidence.MAX_OUTPUT_METADATA) == (
+        512 * 1024, 16 * 1024, 32 * 1024**2)
+    assert (evidence.MAX_METADATA, evidence.DEADLINE) == (8 * 1024**2, 300)
+    assert evidence.PRIORITY_SUMMARY == 'PRIORITY_DIAGNOSTICS.json'
+
+
+def test_priority_summary_hashes_exact_prepared_bytes_and_distinguishes_empty_from_missing(tmp_path):
+    root, output = fixture(tmp_path)
+    full, empty = 'ACTIVATION_HOST_PROCESS.stderr', 'ACTIVATION_HOST_PROCESS.stdout'
+    (root / full).write_bytes(b'private original text never emitted in summary')
+    (root / empty).write_bytes(b'')
+    result = evidence.prepare({evidence.PRIORITY_SOURCE: root}, output)
+    raw = (output / evidence.PRIORITY_SUMMARY).read_bytes()
+    summary = json.loads(raw)
+    assert len(raw) <= 16 * 1024 and summary['scope'] == 'prepared_priority_diagnostics'
+    assert summary['publication_requires_cli_success'] is True
+    assert summary['archive_complete'] is True and summary['archive_state'] == 'complete'
+    assert summary['error_codes'] == [] and 'passed' not in summary
+    assert summary['files'][full] == {'state': 'verified_copy', 'size': (root / full).stat().st_size,
+                                      'sha256': hashlib.sha256((root / full).read_bytes()).hexdigest()}
+    assert summary['files'][empty] == {'state': 'verified_empty_copy', 'size': 0,
+                                       'sha256': hashlib.sha256(b'').hexdigest()}
+    assert summary['files']['BOOTSTRAP_PROCESS.stderr'] == {'state': 'optional_absent', 'size': None, 'sha256': None}
+    assert b'private original text' not in raw and str(root).encode() not in raw
+    report_raw = (output / 'COMPLETE.json').read_bytes()
+    assert result['complete'] and len(report_raw) + len(raw) <= evidence.MAX_OUTPUT_METADATA
+
+
+def test_priority_summary_missing_requested_source_preserves_stop_without_private_path(tmp_path):
+    root = tmp_path / 'private-missing-source'
+    output = tmp_path / 'upload'
+    result = evidence.prepare({evidence.PRIORITY_SOURCE: root}, output)
+    raw = (output / evidence.PRIORITY_SUMMARY).read_bytes()
+    summary = json.loads(raw)
+    assert not result['complete'] and (output / 'STOP.json').exists() and not (output / 'COMPLETE.json').exists()
+    assert summary['archive_complete'] is False and summary['archive_state'] == 'stop'
+    assert all(row == {'state': 'unverified', 'size': None, 'sha256': None} for row in summary['files'].values())
+    assert set(summary['error_codes']) <= evidence.DIAGNOSTIC_CODES
+    assert str(root).encode() not in raw and b'FileNotFoundError' not in raw
+
+
+def test_priority_summary_other_source_complete_does_not_invent_diagnostics(tmp_path):
+    root, output = fixture(tmp_path)
+    (root / 'plain').write_bytes(b'original')
+    result = evidence.prepare({'synthetic': root}, output)
+    summary = json.loads((output / evidence.PRIORITY_SUMMARY).read_bytes())
+    assert result['complete'] and summary['archive_complete']
+    assert all(row['state'] == 'not_requested' and row['sha256'] is None for row in summary['files'].values())
+
+
+@pytest.mark.parametrize('name', evidence.PRIORITY_FILES)
+def test_priority_summary_rechecks_sources_after_earlier_verification(tmp_path, monkeypatch, name):
+    root, output = priority_fixture(tmp_path)
+    actual = evidence.priority_summary
+    def mutate(sources, prepared, report, deadline):
+        path = root / name
+        path.write_bytes(b'X' * path.stat().st_size)
+        return actual(sources, prepared, report, deadline)
+    monkeypatch.setattr(evidence, 'priority_summary', mutate)
+    result = evidence.prepare({evidence.PRIORITY_SOURCE: root}, output)
+    summary = json.loads((output / evidence.PRIORITY_SUMMARY).read_bytes())
+    assert not result['complete'] and not summary['archive_complete']
+    assert summary['files'][name] == {'state': 'unverified', 'size': None, 'sha256': None}
+    assert 'regular_file_identity_changed' in summary['error_codes'] and (output / 'STOP.json').exists()
+
+
+def test_priority_summary_and_report_share_existing_output_metadata_limit(tmp_path, monkeypatch):
+    root, output = priority_fixture(tmp_path)
+    actual = evidence.publish_priority_summary
+    result = evidence.prepare({evidence.PRIORITY_SOURCE: root}, output)
+    total = sum((output / name).stat().st_size for name in ('COMPLETE.json', evidence.PRIORITY_SUMMARY))
+    assert result['complete']
+    second = tmp_path / 'second'
+    monkeypatch.setattr(evidence, 'MAX_OUTPUT_METADATA', total - 1)
+    monkeypatch.setattr(evidence, 'publish_priority_summary', lambda *args: pytest.fail('over-budget publication'))
+    with pytest.raises(evidence.EvidenceError, match='output_metadata_bound'):
+        evidence.prepare({evidence.PRIORITY_SOURCE: root}, second)
+    assert not (second / 'COMPLETE.json').exists() and not (second / evidence.PRIORITY_SUMMARY).exists()
+    monkeypatch.setattr(evidence, 'publish_priority_summary', actual)
+
+
+@pytest.mark.parametrize('failure', ['file_fsync', 'rename', 'directory_fsync'])
+def test_priority_summary_publication_failure_never_returns_cli_success(tmp_path, monkeypatch, capsys, failure):
+    root, output = priority_fixture(tmp_path)
+    original_open, original_fsync, original_rename = evidence.os.open, evidence.os.fsync, evidence.exclusive_summary_rename
+    state = {'temporary_fd': None, 'renamed': False}
+    def opened(path, *args, **kwargs):
+        fd = original_open(path, *args, **kwargs)
+        if str(path) == '.' + evidence.PRIORITY_SUMMARY + '.pending':
+            state['temporary_fd'] = fd
+        return fd
+    def synced(fd):
+        if (failure == 'file_fsync' and fd == state['temporary_fd']
+                or failure == 'directory_fsync' and state['renamed'] and stat.S_ISDIR(os.fstat(fd).st_mode)):
+            raise OSError('synthetic summary synchronization failure')
+        return original_fsync(fd)
+    def renamed(*args):
+        if failure == 'rename':
+            raise OSError('synthetic exclusive publication failure')
+        original_rename(*args)
+        state['renamed'] = True
+    monkeypatch.setattr(evidence.os, 'open', opened)
+    monkeypatch.setattr(evidence.os, 'fsync', synced)
+    monkeypatch.setattr(evidence, 'exclusive_summary_rename', renamed)
+    monkeypatch.setattr('sys.argv', ['prepare', '--source', evidence.PRIORITY_SOURCE + '=' + str(root),
+                                   '--output', str(output)])
+    with pytest.raises(OSError, match='synthetic'):
+        evidence.main()
+    assert capsys.readouterr().out == '' and (output / 'COMPLETE.json').exists()
+    assert (output / evidence.PRIORITY_SUMMARY).exists() is (failure == 'directory_fsync')
+    assert (output / ('.' + evidence.PRIORITY_SUMMARY + '.pending')).exists() is (failure != 'directory_fsync')
+    for name in evidence.PRIORITY_FILES:
+        assert (output / 'files' / evidence.PRIORITY_SOURCE / name).read_bytes() == (root / name).read_bytes()
+
+
+@pytest.mark.parametrize('kind', ['regular', 'symlink'])
+def test_priority_summary_publication_never_replaces_existing_destination(tmp_path, monkeypatch, kind):
+    root, output = priority_fixture(tmp_path)
+    original = evidence.exclusive_summary_rename
+    retained = tmp_path / 'retained-original'
+    retained.write_bytes(b'NEVER REPLACE EXISTING EVIDENCE')
+    def collision(parent, source, target):
+        if kind == 'regular':
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=parent)
+            with os.fdopen(fd, 'wb') as stream:
+                stream.write(retained.read_bytes())
+        else:
+            os.symlink(retained, target, dir_fd=parent)
+        return original(parent, source, target)
+    monkeypatch.setattr(evidence, 'exclusive_summary_rename', collision)
+    with pytest.raises(FileExistsError):
+        evidence.prepare({evidence.PRIORITY_SOURCE: root}, output)
+    assert retained.read_bytes() == b'NEVER REPLACE EXISTING EVIDENCE'
+    assert (output / evidence.PRIORITY_SUMMARY).read_bytes() == retained.read_bytes()
+    assert (output / ('.' + evidence.PRIORITY_SUMMARY + '.pending')).exists()
+
+
+def test_priority_summary_publication_rechecks_temporary_identity_after_atomic_rename(tmp_path, monkeypatch):
+    root, output = priority_fixture(tmp_path)
+    original = evidence.exclusive_summary_rename
+    retained = tmp_path / 'retained-original-summary'
+    def swap(parent, source, target):
+        os.rename(output / source, retained)
+        (output / source).write_bytes(b'NEVER CLAIM THIS IS VERIFIED')
+        return original(parent, source, target)
+    monkeypatch.setattr(evidence, 'exclusive_summary_rename', swap)
+    with pytest.raises(evidence.EvidenceError, match='output_file_identity_changed'):
+        evidence.prepare({evidence.PRIORITY_SOURCE: root}, output)
+    assert json.loads(retained.read_bytes())['scope'] == 'prepared_priority_diagnostics'
+    assert (output / 'COMPLETE.json').exists()
 
 
 def test_failure_stdout_identifies_real_guard_and_hashed_location_without_weakening_stop(tmp_path, monkeypatch, capsys):
@@ -1054,18 +1222,33 @@ def test_shared_source_budget_cannot_reset_when_each_compact_inventory_fits(tmp_
 
 
 @pytest.mark.parametrize('phase', ['source_inventory', 'source_recheck', 'output_verification'])
-def test_scan_failure_diagnostics_identify_exact_fixed_stage_and_budget(phase, tmp_path, monkeypatch):
+@pytest.mark.parametrize('overflow_bytes', [0, 1])
+def test_scan_failure_diagnostics_identify_exact_fixed_stage_and_budget(phase, overflow_bytes, tmp_path):
     root, _output = fixture(tmp_path)
-    (root / 'retained').write_bytes(b'original')
-    monkeypatch.setattr(evidence, 'MAX_METADATA', 256)
-    budget = inventory_budget()
+    retained = root / 'retained'
+    retained.write_bytes(b'original')
+    row = {'kind': 'file', 'identity': evidence.identity(retained.lstat())}
+    raw = (evidence.encoded(evidence.INVENTORY_HEADER) + b'\n'
+           + evidence.encoded(evidence.inventory_record('retained', row)) + b'\n')
+    # Decimal inode/dev/timestamp widths vary across filesystems. Use the actual
+    # serialized bytes and the unchanged production limit, never a guessed 256.
+    assert evidence.MAX_METADATA == 8 * 1024**2
+    precharged = evidence.MAX_METADATA - len(raw) + overflow_bytes
+    budget = {**inventory_budget(), 'metadata': precharged}
+    if not overflow_bytes:
+        with evidence.directory(root) as fd:
+            inventory = evidence.staged_scan(fd, budget, float('inf'), phase)
+        assert inventory.to_bytes() == raw and inventory['retained'] == row
+        assert budget == {'entries': 1, 'bytes': 8, 'metadata': evidence.MAX_METADATA}
+        return
     with evidence.directory(root) as fd, pytest.raises(evidence.EvidenceError) as raised:
         evidence.staged_scan(fd, budget, float('inf'), phase)
     row = evidence.failure_fields(raised.value, 'source_processing')
     row['source'] = 'private-source'
     diagnostic = evidence.failure_diagnostics({'errors': [row]})['rows'][0]
     assert diagnostic['phase'] == phase and diagnostic['code'] == 'metadata_bound'
-    assert diagnostic['inventory_budget'] == budget and budget['metadata'] > 256
+    assert diagnostic['inventory_budget'] == budget
+    assert budget == {'entries': 1, 'bytes': 8, 'metadata': evidence.MAX_METADATA + 1}
     assert 'private-source' not in json.dumps(diagnostic)
 
 
