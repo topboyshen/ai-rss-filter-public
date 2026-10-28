@@ -38,6 +38,9 @@ on:
       - 'scripts/production_gateway_switch.py'
       - 'scripts/production_gateway_native.py'
       - 'scripts/production_host_ingress_native.py'
+      - 'scripts/production_activation_host_native.py'
+      - 'scripts/production_offline_registry.py'
+      - 'scripts/production_native_deadline.py'
       - 'scripts/production_namespace_native.py'
       - 'scripts/production_sender_bootstrap.py'
       - 'scripts/production_sender_bootstrap_native.py'
@@ -129,6 +132,9 @@ on:
       - 'scripts/production_gateway_switch.py'
       - 'scripts/production_gateway_native.py'
       - 'scripts/production_host_ingress_native.py'
+      - 'scripts/production_activation_host_native.py'
+      - 'scripts/production_offline_registry.py'
+      - 'scripts/production_native_deadline.py'
       - 'scripts/production_namespace_native.py'
       - 'scripts/production_sender_bootstrap.py'
       - 'scripts/production_sender_bootstrap_native.py'
@@ -368,10 +374,22 @@ jobs:
           result = json.loads(pathlib.Path(str(output) + '.stdout').read_bytes())
           assert result['status'] == 'passed' and result['safe_evidence']['complete'] is True
           PY
-          python -I -B scripts/verify_production_activation_native.py \
-            --repo . --source "$RUNNER_TEMP/startup-miniflux" \
-            --binary "$RUNNER_TEMP/production-startup-source/production-activation-build/miniflux" --image-id "$image_id" \
-            --output "$RUNNER_TEMP/production-startup-source/production-activation"
+          python -I -B - <<'PY'
+          import importlib.util, json, os, pathlib, sys
+          spec = importlib.util.spec_from_file_location('activation_archive', 'scripts/verify_production_startup_native.py')
+          archive = importlib.util.module_from_spec(spec); spec.loader.exec_module(archive)
+          root = pathlib.Path(os.environ['AI_FILTER_NATIVE_BOOTSTRAP_STAGE'])
+          output = pathlib.Path(os.environ['RUNNER_TEMP']) / 'production-startup-source' / 'ACTIVATION_HOST_PROCESS'
+          args = ['/usr/bin/sudo', '-n', '--', sys.executable, '-I', '-B',
+                  str(root / 'source/scripts/production_activation_host_native.py'),
+                  '--repo', str(root / 'source'), '--source', str(root / 'miniflux'),
+                  '--binary', str(root / 'miniflux-binary'), '--image-id', os.environ['AI_FILTER_NATIVE_BOOTSTRAP_IMAGE'],
+                  '--output', str(root / 'activation-originals')]
+          archive.archive_command(args, output, seconds=600, limit=512 * 1024, child_umask=0o077)
+          result = json.loads(pathlib.Path(str(output) + '.stdout').read_bytes())
+          assert result['status'] == 'passed' and result['safe_evidence']['complete'] is True
+          assert result['full_activation_verified'] is True
+          PY
       - name: Preserve actual synthetic PostgreSQL state on success or failure
         if: always()
         env:
