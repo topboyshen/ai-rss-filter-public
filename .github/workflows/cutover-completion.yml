@@ -37,6 +37,7 @@ on:
       - 'scripts/production_legacy_takeover.py'
       - 'scripts/production_gateway_switch.py'
       - 'scripts/production_gateway_native.py'
+      - 'scripts/production_host_ingress_native.py'
       - 'scripts/production_namespace_native.py'
       - 'scripts/production_sender_bootstrap.py'
       - 'scripts/production_sender_bootstrap_native.py'
@@ -127,6 +128,7 @@ on:
       - 'scripts/production_legacy_takeover.py'
       - 'scripts/production_gateway_switch.py'
       - 'scripts/production_gateway_native.py'
+      - 'scripts/production_host_ingress_native.py'
       - 'scripts/production_namespace_native.py'
       - 'scripts/production_sender_bootstrap.py'
       - 'scripts/production_sender_bootstrap_native.py'
@@ -191,6 +193,75 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  isolated-host-ingress:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Fixed host-entry diagnostic dependencies
+        run: |
+          python -m pip install --only-binary=:all: -r requirements.txt -r requirements-ops.txt
+      - name: Independent isolated host loopback proof
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -m 700 "$RUNNER_TEMP/isolated-host-ingress"
+          python -I -B - <<'PY'
+          import importlib.util, os, pathlib
+          spec = importlib.util.spec_from_file_location('host_entry_archive', 'scripts/verify_production_startup_native.py')
+          archive = importlib.util.module_from_spec(spec); spec.loader.exec_module(archive)
+          output = pathlib.Path(os.environ['RUNNER_TEMP']) / 'isolated-host-ingress' / 'FIXED_IMAGE_PULL'
+          archive.archive_command(['/usr/bin/docker', '--host', 'unix:///var/run/docker.sock', 'pull',
+              '--platform=linux/amd64',
+              'nginx:stable-alpine@sha256:0d3b80406a13a767339fbe2f41406d6c7da727ab89cf8fae399e81f780f814d1'],
+              output, seconds=60, limit=128 * 1024, child_umask=0o077)
+          PY
+          source_sha="$(git rev-parse HEAD)"
+          native_stage="$(sudo -n mktemp -d /tmp/ai-filter-host-ingress.XXXXXX)"
+          sudo -n install -d -m 0700 "$native_stage/source"
+          sudo -n git -c "safe.directory=$GITHUB_WORKSPACE" clone --no-local --no-hardlinks \
+            "$GITHUB_WORKSPACE" "$native_stage/source"
+          sudo -n test "$(sudo -n git -C "$native_stage/source" rev-parse HEAD)" = "$source_sha"
+          export AI_FILTER_HOST_INGRESS_STAGE="$native_stage"
+          python -I -B - <<'PY'
+          import importlib.util, json, os, pathlib, sys, time
+          spec = importlib.util.spec_from_file_location('host_entry_archive', 'scripts/verify_production_startup_native.py')
+          archive = importlib.util.module_from_spec(spec); spec.loader.exec_module(archive)
+          root = pathlib.Path(os.environ['AI_FILTER_HOST_INGRESS_STAGE'])
+          output = pathlib.Path(os.environ['RUNNER_TEMP']) / 'isolated-host-ingress' / 'HOST_INGRESS_PROCESS'
+          deadline = time.monotonic() + 180
+          args = ['/usr/bin/sudo', '-n', '--', sys.executable, '-I', '-B',
+                  str(root / 'source/scripts/production_host_ingress_native.py'),
+                  '--repo', str(root / 'source'), '--output', str(root / 'originals'),
+                  '--deadline-monotonic', str(deadline)]
+          archive.archive_command(args, output, seconds=200, limit=512 * 1024, child_umask=0o077)
+          result = json.loads(pathlib.Path(str(output) + '.stdout').read_bytes())
+          assert result['status'] == 'passed' and result['safe_evidence']['complete'] is True
+          assert result['scope'] == 'independent_synthetic_host_namespace_only'
+          assert result['full_activation_verified'] is False and result['runner_global_loopback_verified'] is False
+          print('isolated_host_ingress_summary=' + json.dumps(result, sort_keys=True), flush=True)
+          PY
+      - name: Prepare independent safe host-entry evidence
+        if: always()
+        run: |
+          python -I -B scripts/prepare_synthetic_evidence.py \
+            --source "isolated-host-ingress=${RUNNER_TEMP}/isolated-host-ingress" \
+            --output "${RUNNER_TEMP}/isolated-host-ingress-upload"
+      - name: Preserve independent host-entry evidence including failure
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: isolated-host-ingress-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/isolated-host-ingress-upload/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
   native-amd64:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
