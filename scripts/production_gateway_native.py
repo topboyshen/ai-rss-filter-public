@@ -8,6 +8,7 @@ and never pulls images, changes resource budgets, or removes containers.
 from __future__ import annotations
 
 from copy import deepcopy
+import errno
 import hashlib
 import json
 from pathlib import Path
@@ -106,14 +107,62 @@ def _create_old(harness, root, name, project, network, image, old_config, port, 
     return identifier
 
 
-def _observe_old(harness, root, identifier, image, port, operation):
+def _old_ingress(harness, root, identifier, image, port, *, confirmed=False):
+    row = _inspect(harness, identifier)
+    expected = {"5000/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(port)}]}
+    requested = row["HostConfig"].get("PortBindings")
+    actual = row["NetworkSettings"].get("Ports")
+    # Docker may also list the pinned image's exposed, unpublished port as null.
+    published = {key: value for key, value in actual.items() if value is not None} if isinstance(actual, dict) else None
+    identity = (row["Id"] == identifier and row["Image"] == image["Id"]
+                and row["State"].get("Running") is True and row["State"].get("Status") == "running"
+                and not any(row["State"].get(key, False) for key in ("OOMKilled", "Restarting", "Paused", "Dead"))
+                and row["RestartCount"] == 0 and row["Config"]["Labels"].get(LABEL) == harness.owner)
+    profile = {"schema": 1, "container_id": identifier, "image_id": image["Id"], "identity_matches": identity,
+               "expected_binding": expected, "requested_matches": requested == expected,
+               "actual_field_present": "Ports" in row["NetworkSettings"], "actual_matches": published == expected,
+               "actual_mapping_sha256": gate._hash(actual), "synthetic_only": True}
+    gate._write(root / ("OLD_INGRESS_CONFIRMED.json" if confirmed else "OLD_INGRESS_PROFILE.json"), profile)
+    gate._require(identity, "old synthetic gateway execution changed")
+    gate._require(requested == expected and published == expected, "old synthetic actual host port mapping absent or changed")
+    return row
+
+
+def _http_error(error):
+    classes = {errno.ECONNREFUSED: "connection_refused", errno.ECONNRESET: "connection_reset",
+               errno.ECONNABORTED: "connection_aborted", errno.ETIMEDOUT: "timeout",
+               errno.ENETUNREACH: "network_unreachable", errno.EHOSTUNREACH: "host_unreachable",
+               errno.EACCES: "permission_denied", errno.EPERM: "permission_denied"}
+    number = getattr(error, "errno", None)
+    number = number if type(number) is int and number in classes else None
+    return {"class": "timeout" if isinstance(error, TimeoutError) else classes.get(number, "unclassified"),
+            "errno": number, "message_sha256": hashlib.sha256(str(error).encode()).hexdigest()}
+
+
+def _old_http(harness, root, port, operation):
     transport = gateway.NativeTransport()
+    started = time.monotonic()
+    deadline = started + 10
+    if getattr(harness, "phase_deadline", None) is not None:
+        deadline = min(deadline, harness.phase_deadline)
+    transport.deadline = min(transport.deadline, deadline)
+    attempts = []
 
     def healthy():
+        gate._require(len(attempts) < 64 and time.monotonic() < deadline, "old HTTP diagnostic/phase bound")
+        attempt = {"index": len(attempts) + 1, "stage": "host_http", "started_seconds": time.monotonic() - started}
+        attempts.append(attempt)
         try:
             actual = transport.health("127.0.0.1", port, operation)
-        except (ConnectionError, OSError):
+        except (ConnectionError, OSError) as error:
+            attempt.update(outcome="raised", **_http_error(error))
             return None
+        except Exception as error:
+            attempt.update(outcome="raised", **_http_error(error))
+            raise
+        finally:
+            attempt["elapsed_seconds"] = time.monotonic() - started - attempt["started_seconds"]
+        attempt.update(outcome="response", status=actual["status"] if type(actual["status"]) is int else None)
         gate._require(
             actual["status"] == 200
             and actual["body_sha256"] == hashlib.sha256(b"OLD").hexdigest()
@@ -123,16 +172,39 @@ def _observe_old(harness, root, identifier, image, port, operation):
         )
         return actual
 
-    observed = harness.wait(healthy, seconds=10)
-    before = _inspect(harness, identifier)
-    gate._require(
-        before["Id"] == identifier
-        and before["Image"] == image["Id"]
-        and before["State"]["Running"]
-        and before["RestartCount"] == 0
-        and before["Config"]["Labels"].get(LABEL) == harness.owner,
-        "old synthetic gateway execution changed",
-    )
+    def preserve():
+        value = {"schema": 1, "operation_id": operation, "target": {"host": "127.0.0.1", "port": port},
+                 "wait_seconds": 10, "elapsed_seconds": time.monotonic() - started, "attempts": attempts,
+                 "detailed_transport_stage": "not_observed", "synthetic_only": True}
+        gate._require(len(gate._encoded(value)) <= 32768, "old HTTP diagnostics too large")
+        gate._write(root / "OLD_HTTP_OBSERVATIONS.json", value)
+
+    try:
+        observed = harness.wait(healthy, seconds=10)
+    except BaseException as error:
+        try:
+            preserve()
+        except BaseException as evidence_error:
+            raise error from evidence_error
+        raise
+    preserve()
+    return observed
+
+
+def _observe_old(harness, root, identifier, image, port, operation):
+    prior = getattr(harness, "phase_deadline", None)
+    deadline = time.monotonic() + 10
+    harness.phase_deadline = min(prior, deadline) if prior is not None else deadline
+    try:
+        initial = _old_ingress(harness, root, identifier, image, port)
+        observed = _old_http(harness, root, port, operation)
+        before = _old_ingress(harness, root, identifier, image, port, confirmed=True)
+        gate._require(time.monotonic() < harness.phase_deadline, "old ingress observation exceeded phase budget")
+        gate._require(gateway.gateway_identity(before) == gateway.gateway_identity(initial)
+                      and before["State"] == initial["State"]
+                      and before["NetworkSettings"] == initial["NetworkSettings"], "old gateway changed during HTTP observation")
+    finally:
+        harness.phase_deadline = prior
     gate._write(
         root / "OLD_HTTP.json",
         {

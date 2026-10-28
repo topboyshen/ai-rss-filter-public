@@ -1,16 +1,37 @@
 """Fixture wiring guards; mocked Docker/HTTP does not prove native execution."""
 
 from copy import deepcopy
+import errno
 import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
+import time
 
 import pytest
 
 from scripts import production_gateway_native as native
 from scripts import production_gateway_switch as gateway
 from services import admission_fence as gate
+
+
+def mapping_fault(row, fault):
+    if fault == "empty":
+        row["NetworkSettings"]["Ports"] = {}
+    elif fault == "missing":
+        row["NetworkSettings"].pop("Ports")
+    elif fault == "null":
+        row["NetworkSettings"]["Ports"] = None
+    elif fault == "wrong_port":
+        row["NetworkSettings"]["Ports"]["5000/tcp"][0]["HostPort"] = "35679"
+    elif fault == "wrong_host":
+        row["NetworkSettings"]["Ports"]["5000/tcp"][0]["HostIp"] = "0.0.0.0"
+    elif fault == "extra_bound":
+        row["NetworkSettings"]["Ports"]["80/tcp"] = [{"HostIp": "127.0.0.1", "HostPort": "80"}]
+    elif fault == "extra_unpublished":
+        row["NetworkSettings"]["Ports"]["80/tcp"] = None
+    elif fault == "requested":
+        row["HostConfig"]["PortBindings"]["5000/tcp"][0]["HostPort"] = "35679"
 
 
 @pytest.fixture
@@ -46,7 +67,8 @@ def case(tmp_path, monkeypatch):
         "Os": "linux",
         "RepoDigests": ["nginx@" + gateway.NGINX_REF.split("@", 1)[1]],
     }
-    state = SimpleNamespace(rows={}, calls=[], fail=None, network=network, image=image, kills=0)
+    state = SimpleNamespace(rows={}, calls=[], fail=None, mapping_fault=None, runtime_fault=None,
+                            network=network, image=image, kills=0)
     harness = SimpleNamespace(
         owner=owner,
         prefix="synthetic-owned",
@@ -74,15 +96,27 @@ def case(tmp_path, monkeypatch):
                 "RestartCount": 0,
                 "Config": {"Labels": labels},
                 "State": {"Running": False, "Status": "created", "StartedAt": "", "ExitCode": 0, "OOMKilled": False},
-                "HostConfig": {"Memory": 128 * 1024**2, "MemorySwap": 128 * 1024**2, "PidsLimit": 64},
+                "HostConfig": {"Memory": 128 * 1024**2, "MemorySwap": 128 * 1024**2, "PidsLimit": 64,
+                               "PortBindings": {"5000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "35678"}]}},
                 "Mounts": [{"Source": source, "Destination": gateway.CONFIG_TARGET, "RW": False}],
-                "NetworkSettings": {"Networks": {network["Name"]: {"NetworkID": network_id}}},
+                "NetworkSettings": {"Networks": {network["Name"]: {"NetworkID": network_id}},
+                                    "Ports": {"5000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "35678"}]}},
             }
+            mapping_fault(state.rows[identifier], state.mapping_fault)
             if state.fail == "create":
                 raise TimeoutError("synthetic create ACK lost")
             return identifier + "\n"
         if args[0] == "start":
             state.rows[args[-1]]["State"].update(Running=True, Status="running", StartedAt="actual-synthetic-start")
+            row = state.rows[args[-1]]
+            if state.runtime_fault == "image":
+                row["Image"] = "sha256:" + "f" * 64
+            elif state.runtime_fault == "owner":
+                row["Config"]["Labels"][native.LABEL] = "f" * 32
+            elif state.runtime_fault == "restarted":
+                row["RestartCount"] = 1
+            elif state.runtime_fault:
+                row["State"][state.runtime_fault] = False if state.runtime_fault == "Running" else True
             return identifier
         if args[0] == "kill":
             assert args == ["kill", "--signal", "TERM", identifier]
@@ -214,3 +248,201 @@ def test_preparation_requires_original_old_http_evidence(case, monkeypatch):
     native.preserve(c.harness, c.p)
     assert c.state.kills == 1
     assert not c.state.rows[c.identifier]["State"]["Running"]
+
+
+def test_declared_binding_without_actual_mapping_cannot_pass_on_http_body_alone(case):
+    case.state.mapping_fault = "empty"
+    with pytest.raises(gate.AdmissionError, match="actual.*port"):
+        native.prepare(case.harness, case.p)
+    assert "gateway_preparation" not in case.p
+
+
+@pytest.mark.parametrize("fault", ["empty", "missing", "null", "wrong_port", "wrong_host", "extra_bound", "requested"])
+def test_actual_mapping_failure_precedes_http_and_preserves_originals(case, monkeypatch, fault):
+    c = case
+    c.state.mapping_fault = fault
+    health = []
+    monkeypatch.setattr(gateway.NativeTransport, "health", lambda *args: health.append(args))
+    with pytest.raises(gate.AdmissionError, match="actual.*port"):
+        native.prepare(c.harness, c.p)
+    root = c.p["gateway_native_root"]
+    profile = gate._read(root / "OLD_INGRESS_PROFILE.json")
+    assert profile["identity_matches"] is True
+    assert profile["actual_matches"] is (fault == "requested")
+    assert profile["actual_field_present"] is (fault != "missing")
+    assert health == [] and c.state.kills == 0
+    assert not (root / "OLD_HTTP_OBSERVATIONS.json").exists()
+    assert (root / "old-nginx.conf").read_bytes() == native.OLD_CONFIG
+    native.preserve(c.harness, c.p)
+    assert c.state.kills == 1 and (root / "STOPPED_old.json").exists()
+
+
+def test_unpublished_image_exposure_is_not_an_extra_host_binding(case):
+    case.state.mapping_fault = "extra_unpublished"
+    native.prepare(case.harness, case.p)
+    root = case.p["gateway_native_root"]
+    assert gate._read(root / "OLD_INGRESS_PROFILE.json")["actual_matches"] is True
+    assert gate._read(root / "OLD_INGRESS_CONFIRMED.json")["actual_matches"] is True
+
+
+def test_actual_mapping_drift_after_http_still_stops(case, monkeypatch):
+    def health(*_args):
+        case.state.rows[case.identifier]["NetworkSettings"]["Ports"] = {}
+        return {"status": 200, "body_sha256": hashlib.sha256(b"OLD").hexdigest(), "operation": None, "upstream": None}
+
+    monkeypatch.setattr(gateway.NativeTransport, "health", health)
+    with pytest.raises(gate.AdmissionError, match="actual.*port"):
+        native.prepare(case.harness, case.p)
+    root = case.p["gateway_native_root"]
+    assert gate._read(root / "OLD_INGRESS_CONFIRMED.json")["actual_matches"] is False
+    assert case.state.kills == 0 and "gateway_preparation" not in case.p
+
+
+@pytest.mark.parametrize("fault", ["image", "owner", "restarted", "Running", "OOMKilled", "Restarting", "Paused", "Dead"])
+def test_running_identity_failure_precedes_any_http(case, monkeypatch, fault):
+    case.state.runtime_fault = fault
+    seen = []
+    monkeypatch.setattr(gateway.NativeTransport, "health", lambda *args: seen.append(args))
+    with pytest.raises(gate.AdmissionError, match="execution changed"):
+        native.prepare(case.harness, case.p)
+    profile = gate._read(case.p["gateway_native_root"] / "OLD_INGRESS_PROFILE.json")
+    assert profile["identity_matches"] is False and seen == []
+    assert case.state.kills == 0 and "gateway_preparation" not in case.p
+
+
+@pytest.mark.parametrize("change", ["StartedAt", "endpoint"])
+def test_identity_and_network_state_drift_during_http_are_not_confirmed(case, monkeypatch, change):
+    def health(*_args):
+        row = case.state.rows[case.identifier]
+        if change == "StartedAt":
+            row["State"]["StartedAt"] = "a-different-start"
+        else:
+            row["NetworkSettings"]["Networks"][case.state.network["Name"]]["EndpointID"] = "f" * 64
+        return {"status": 200, "body_sha256": hashlib.sha256(b"OLD").hexdigest(), "operation": None, "upstream": None}
+
+    monkeypatch.setattr(gateway.NativeTransport, "health", health)
+    with pytest.raises(gate.AdmissionError, match="changed during HTTP"):
+        native.prepare(case.harness, case.p)
+    assert case.state.kills == 0 and "gateway_preparation" not in case.p
+
+
+def test_http_failures_are_bounded_classified_and_do_not_replace_timeout(case, monkeypatch):
+    secret = "http://synthetic-user:DO_NOT_EXPORT@private.invalid/private/config"
+    original = TimeoutError("original fixed phase timeout")
+    seen = []
+
+    def health(transport, host, port, operation):
+        seen.append((host, port, transport.deadline))
+        raise ConnectionRefusedError(errno.ECONNREFUSED, secret)
+
+    def wait(function, *, seconds):
+        assert seconds == 10
+        assert function() is None
+        assert function() is None
+        raise original
+
+    case.harness.phase_deadline = time.monotonic() + 2
+    case.harness.wait = wait
+    monkeypatch.setattr(gateway.NativeTransport, "health", health)
+    with pytest.raises(TimeoutError) as caught:
+        native.prepare(case.harness, case.p)
+    assert caught.value is original
+    raw = (case.p["gateway_native_root"] / "OLD_HTTP_OBSERVATIONS.json").read_bytes()
+    record = json.loads(raw)
+    assert len(record["attempts"]) == 2 and len(raw) <= 32768
+    assert all(row["class"] == "connection_refused" and row["errno"] == errno.ECONNREFUSED for row in record["attempts"])
+    assert all(host == "127.0.0.1" and port == 35678 and deadline <= case.harness.phase_deadline for host, port, deadline in seen)
+    assert secret.encode() not in raw and b"DO_NOT_EXPORT" not in raw and b"private.invalid" not in raw
+    assert "gateway_preparation" not in case.p and case.state.kills == 0
+
+
+@pytest.mark.parametrize("evidence_fails", [False, True])
+def test_http_unknown_error_and_evidence_sync_error_keep_original_failure(case, monkeypatch, evidence_fails):
+    original = RuntimeError("unknown error with private body DO_NOT_EXPORT")
+    actual_write = gate._write
+
+    def fail_health(*_args):
+        raise original
+
+    def fail_observation(path, value):
+        if evidence_fails and path.name == "OLD_HTTP_OBSERVATIONS.json":
+            raise OSError("synthetic directory sync failure")
+        return actual_write(path, value)
+
+    monkeypatch.setattr(gateway.NativeTransport, "health", fail_health)
+    monkeypatch.setattr(gate, "_write", fail_observation)
+    with pytest.raises(RuntimeError) as caught:
+        native.prepare(case.harness, case.p)
+    assert caught.value is original
+    if evidence_fails:
+        assert isinstance(caught.value.__cause__, OSError)
+    else:
+        raw = (case.p["gateway_native_root"] / "OLD_HTTP_OBSERVATIONS.json").read_bytes()
+        assert b"DO_NOT_EXPORT" not in raw and b"private body" not in raw
+        assert json.loads(raw)["attempts"][0]["class"] == "unclassified"
+    assert "gateway_preparation" not in case.p
+
+
+def test_successful_http_without_durable_observation_is_not_confirmed(case, monkeypatch):
+    actual_write = gate._write
+    original = OSError("synthetic observation sync failure")
+
+    def fail_observation(path, value):
+        if path.name == "OLD_HTTP_OBSERVATIONS.json":
+            raise original
+        return actual_write(path, value)
+
+    monkeypatch.setattr(gate, "_write", fail_observation)
+    with pytest.raises(OSError) as caught:
+        native.prepare(case.harness, case.p)
+    assert caught.value is original and "gateway_preparation" not in case.p
+    assert case.state.kills == 0
+
+
+def test_http_attempt_and_expired_phase_limits_are_hard(case, monkeypatch):
+    calls = []
+
+    def fail_health(*_args):
+        calls.append(True)
+        raise TimeoutError("bounded synthetic timeout")
+
+    def wait(function, *, seconds):
+        assert seconds == 10
+        for _ in range(65):
+            function()
+
+    case.harness.wait = wait
+    monkeypatch.setattr(gateway.NativeTransport, "health", fail_health)
+    with pytest.raises(gate.AdmissionError, match="diagnostic/phase bound"):
+        native.prepare(case.harness, case.p)
+    record = gate._read(case.p["gateway_native_root"] / "OLD_HTTP_OBSERVATIONS.json")
+    assert len(calls) == len(record["attempts"]) == 64
+    assert all(row["class"] == "timeout" for row in record["attempts"])
+    expired_root = case.p["directory"] / "expired-observation"
+    expired_root.mkdir(mode=0o700)
+    case.harness.phase_deadline = time.monotonic() - 1
+    with pytest.raises(gate.AdmissionError, match="diagnostic/phase bound"):
+        native._old_http(case.harness, expired_root, 35678, "a" * 64)
+    assert len(calls) == 64
+    assert gate._read(expired_root / "OLD_HTTP_OBSERVATIONS.json")["attempts"] == []
+
+
+def test_mapping_inspection_consumes_same_phase_and_failure_restores_outer_deadline(case, monkeypatch):
+    clock, health = [100.0], []
+    original_command = case.harness.command
+    case.harness.phase_deadline = 1000.0
+
+    def command(args, **kwargs):
+        result = original_command(args, **kwargs)
+        if args[0] == "inspect":
+            clock[0] += 11
+        return result
+
+    case.harness.command = command
+    monkeypatch.setattr(native.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(gateway.NativeTransport, "health", lambda *args: health.append(args))
+    with pytest.raises(gate.AdmissionError, match="diagnostic/phase bound"):
+        native.prepare(case.harness, case.p)
+    assert health == []
+    assert case.harness.phase_deadline == 1000.0
+    assert gate._read(case.p["gateway_native_root"] / "OLD_HTTP_OBSERVATIONS.json")["attempts"] == []
