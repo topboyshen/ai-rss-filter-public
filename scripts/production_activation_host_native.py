@@ -24,6 +24,16 @@ import time
 import uuid
 from contextlib import redirect_stderr, redirect_stdout
 
+# Only the real script entry emits this fixed, pre-project-import observation.
+# Canonical delegation carries this ORIGINAL clock into _main without resetting
+# the outer budget; an ordinary import neither observes time nor writes output.
+CLI_STARTED, CLI_PHASE_OFFSET = None, 0
+if __name__ == "__main__":
+    CLI_STARTED, CLI_PHASE_OFFSET = time.monotonic(), 1
+    _CLI_BEGIN = b'{"event":"full_activation_cli","phase":"script_start","sequence":1}\n'
+    if os.write(2, _CLI_BEGIN) != len(_CLI_BEGIN):
+        raise RuntimeError("native CLI progress write incomplete")
+
 ROOT = Path(__file__).resolve().parents[1]
 for directory in (ROOT, ROOT / "scripts"):
     if str(directory) not in sys.path:
@@ -44,7 +54,9 @@ CONTEXT_SCHEMA = "full-private-activation-host-v1"
 PHASES = {"initial_validation", "dependency_inspect", "sender_export", "offline_bundle", "namespace_launch",
           "namespace_setup", "namespace_daemon", "dependency_pull", "network_setup", "full_activation",
           "candidate_build", "child_observation", "cleanup", "evidence_export"}
-PHASE, PHASE_SEQUENCE = "initial_validation", 0
+PHASE, PHASE_SEQUENCE = "initial_validation", CLI_PHASE_OFFSET
+CLI_PHASES = {"canonical_import_before", "canonical_import_verified", "canonical_main_enter",
+              "arguments_before", "arguments_verified"}
 ERROR_TYPES = {"AdmissionError", "AdmissionUncertain", "ContractError", "ProofError", "ValueError", "TypeError",
                "KeyError", "RuntimeError", "TimeoutError", "OSError", "FileNotFoundError", "FileExistsError",
                "PermissionError", "ProcessLookupError", "JSONDecodeError", "CalledProcessError", "TimeoutExpired"}
@@ -68,6 +80,23 @@ def phase(root, name):
     # PROCESS.stderr. Never include paths, exception text, argv, or input data.
     progress = host.encoded({"event": "full_activation_phase", "phase": name, "sequence": PHASE_SEQUENCE})
     gate._require(len(progress) <= 192 and os.write(2, progress) == len(progress), "native phase progress write incomplete")
+
+
+def cli_progress(name):
+    global PHASE_SEQUENCE
+    gate._require(type(name) is str and name in CLI_PHASES, "unknown native CLI phase")
+    PHASE_SEQUENCE += 1
+    gate._require(PHASE_SEQUENCE <= 64, "full-host phase observation bound")
+    progress = host.encoded({"event": "full_activation_cli", "phase": name, "sequence": PHASE_SEQUENCE})
+    gate._require(len(progress) <= 192 and os.write(2, progress) == len(progress), "native CLI progress write incomplete")
+
+
+def cli_start(value):
+    now = time.monotonic()
+    gate._require(type(value) in {int, float} and math.isfinite(value)
+                  and value <= now and now - value < MAX_SECONDS,
+                  "original native CLI start required")
+    return value
 
 
 def error_type(error):
@@ -827,10 +856,15 @@ def _arguments(argv):
     return args
 
 
-def _main(argv=None):
-    started, result, failure, root, failed_phase = time.monotonic(), None, None, None, None
+def _main(argv=None, *, _cli_started=None):
+    started = time.monotonic() if _cli_started is None else cli_start(_cli_started)
+    result, failure, root, failed_phase = None, None, None, None
     try:
+        if _cli_started is not None:
+            cli_progress("arguments_before")
         args = _arguments(argv)
+        if _cli_started is not None:
+            cli_progress("arguments_verified")
         os.umask(0o077)
         root = args.output
         if args.inside:
@@ -887,9 +921,11 @@ def _main(argv=None):
     return 0 if summary["full_activation_verified"] else 1
 
 
-def main(argv=None):
+def main(argv=None, *, _cli_started=None):
     try:
-        return _main(argv)
+        if _cli_started is not None:
+            cli_progress("canonical_main_enter")
+        return _main(argv) if _cli_started is None else _main(argv, _cli_started=_cli_started)
     finally:
         # Including launch/retainer/fsync/stdout failures: the detached namespace
         # holder keeps its ORIGINAL read FDs while any registered daemon is live.
@@ -902,6 +938,7 @@ def cli(argv=None):
     # A script's __main__ classes are distinct from this canonical module's
     # classes. Delegate both outer and --inside invocations before creating any
     # context; all exact type, argument, source and runtime guards stay in main.
+    cli_progress("canonical_import_before")
     from scripts import production_activation_host_native as canonical
     expected = Path(__file__).resolve()
     spec = getattr(canonical, "__spec__", None)
@@ -910,7 +947,11 @@ def cli(argv=None):
                   and spec.origin == str(expected)
                   and Path(canonical.__file__).resolve() == expected,
                   "canonical full-host CLI source required")
-    return canonical.main(argv)
+    if canonical.__dict__ is not globals():
+        gate._require(canonical.PHASE_SEQUENCE == 0, "canonical CLI observations already started")
+        canonical.PHASE_SEQUENCE = PHASE_SEQUENCE
+    canonical.cli_progress("canonical_import_verified")
+    return canonical.main(argv) if CLI_STARTED is None else canonical.main(argv, _cli_started=CLI_STARTED)
 
 
 if __name__ == "__main__":

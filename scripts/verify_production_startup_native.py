@@ -370,6 +370,33 @@ def scenario(root, workspace, workers, raw_dsn, miniflux_source, stage, report, 
 
 
 
+def _finish_archive_outputs(files, path, failure, captured, complete):
+    errors = []
+    for stream in files:
+        try:
+            stream.flush()
+            os.fsync(stream.fileno())
+        except BaseException as error:
+            errors.append(error)
+        try:
+            stream.close()
+        except BaseException as error:
+            errors.append(error)
+    try:
+        gate._sync_directory(path.parent)
+    except BaseException as error:
+        errors.append(error)
+    if failure is not None:
+        try:
+            _emit_archive_diagnostic(captured, complete)
+        except BaseException as error:
+            errors.append(error)
+        for error in errors:
+            failure.add_note("synthetic command output preservation failed: " + type(error).__name__)
+    elif errors:
+        raise errors[0]
+
+
 def archive_command(args, path, *, seconds=120, limit=8 * 1024**2, child_umask=-1, stdin_bytes=None):
     """Bound both pipes while retaining original synthetic tool output."""
     private.require(stdin_bytes is None or (isinstance(stdin_bytes, bytes) and len(stdin_bytes) <= 256),
@@ -377,10 +404,12 @@ def archive_command(args, path, *, seconds=120, limit=8 * 1024**2, child_umask=-
     total, complete, failure = 0, False, None
     captured = [bytearray(), bytearray()]
     deadline = time.monotonic() + native_deadline.clamp(seconds)
-    files = [open(str(path) + suffix, "xb") for suffix in (".stdout", ".stderr")]
-    for stream in files:
-        os.chmod(stream.name, 0o600)
+    files = []
     try:
+        for suffix in (".stdout", ".stderr"):
+            stream = open(str(path) + suffix, "xb", buffering=0)
+            files.append(stream)
+            os.chmod(stream.name, 0o600)
         with native_deadline.process(subprocess.Popen, args, stdin=subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
                               umask=child_umask) as process:
@@ -401,7 +430,9 @@ def archive_command(args, path, *, seconds=120, limit=8 * 1024**2, child_umask=-
                             total += len(chunk)
                             private.require(total <= limit, "synthetic command evidence byte bound exceeded")
                             index, stream = key.data
-                            stream.write(chunk)
+                            private.require(stream.write(chunk) == len(chunk), "synthetic command evidence short write")
+                            os.fsync(stream.fileno())
+                            private.require(time.monotonic() < deadline, "synthetic command deadline exceeded")
                             if captured[index] is not None:
                                 if len(captured[index]) + len(chunk) > DIAGNOSTIC_INPUT_BYTES[index]:
                                     captured[index] = None
@@ -417,13 +448,7 @@ def archive_command(args, path, *, seconds=120, limit=8 * 1024**2, child_umask=-
         failure = error
         raise
     finally:
-        for stream in files:
-            stream.flush()
-            os.fsync(stream.fileno())
-            stream.close()
-        gate._sync_directory(path.parent)
-        if failure is not None:
-            _emit_archive_diagnostic(captured, complete)
+        _finish_archive_outputs(files, path, failure, captured, complete)
 
 
 def extract_public_source(archive, context, evidence, *, deadline=None):

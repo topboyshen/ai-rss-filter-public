@@ -65,6 +65,11 @@ def test_real_isolated_script_cli_keeps_original_argument_validation(tmp_path, i
     assert value["error_sha256"] == hashlib.sha256(b"2").hexdigest()
     assert value["full_activation_verified"] is False and value["production_access"] is False
     assert "error:" in result.stderr and "--repo" in result.stderr
+    progress = [json.loads(line) for line in result.stderr.splitlines() if line.startswith('{"event":')]
+    assert [row["phase"] for row in progress] == ["script_start", "canonical_import_before", "canonical_import_verified",
+                                                "canonical_main_enter", "arguments_before"]
+    assert [row["sequence"] for row in progress] == [1, 2, 3, 4, 5]
+    assert all(len(json.dumps(row, separators=(",", ":")).encode()) + 1 <= 192 for row in progress)
     assert list(tmp_path.iterdir()) == []
 
 
@@ -80,8 +85,9 @@ from scripts import production_activation_host_native as canonical
 from scripts import verify_production_activation_native as activation
 from services import admission_fence as gate
 expected = sys.argv[3:]
-def probe(argv=None):
+def probe(argv=None, *, _cli_started=None):
     assert argv is None and sys.argv[1:] == expected
+    assert isinstance(_cli_started, float) and _cli_started <= canonical.time.monotonic()
     try:
         canonical._arguments(["--invalid-native-argument"])
     except SystemExit as error:
@@ -137,6 +143,118 @@ else:
     value = json.loads(result.stdout)
     assert value == {"canonical_module": "scripts.production_activation_host_native", "inside": inside,
                      "argument_guard": True, "exact_type_guard": True, "native_executed": False}
+
+
+def test_ordinary_isolated_import_has_no_cli_clock_or_output(tmp_path):
+    source = "import sys,json;sys.path.insert(0,sys.argv[1]);from scripts import production_activation_host_native as n;"
+    source += "print(json.dumps({'started':n.CLI_STARTED,'offset':n.CLI_PHASE_OFFSET,'sequence':n.PHASE_SEQUENCE}))"
+    result = subprocess.run([sys.executable, "-I", "-B", "-c", source, str(native.ROOT)],
+                            cwd=tmp_path, capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0 and result.stderr == ""
+    assert json.loads(result.stdout) == {"started": None, "offset": 0, "sequence": 0}
+
+
+@pytest.mark.parametrize("fault", ["exception", "short_write"])
+def test_real_preimport_cli_write_failure_stops_before_canonical_import(tmp_path, fault):
+    source = r'''
+import os, runpy, sys
+def failed_write(fd, data):
+    if sys.argv[2] == "short_write":
+        return 0
+    raise OSError("synthetic fixed progress failure")
+os.write = failed_write
+try:
+    runpy.run_path(sys.argv[1], run_name="__main__")
+except (OSError, RuntimeError):
+    assert "scripts.production_activation_host_native" not in sys.modules
+else:
+    raise AssertionError("progress write failure was ignored")
+raise SystemExit(17)
+'''
+    result = subprocess.run([sys.executable, "-I", "-B", "-c", source, str(Path(native.__file__).resolve()), fault],
+                            cwd=tmp_path, capture_output=True, text=True, timeout=15)
+    assert result.returncode == 17 and result.stdout == "" and result.stderr == ""
+
+
+@pytest.mark.parametrize("at_write", [1, 2])
+def test_cli_progress_failure_never_calls_canonical_main(monkeypatch, at_write):
+    calls, writes = [], []
+    def write(fd, data):
+        writes.append((fd, data))
+        return 0 if len(writes) == at_write else len(data)
+    monkeypatch.setattr(native.os, "write", write)
+    monkeypatch.setattr(native, "main", lambda argv: calls.append(argv))
+    with pytest.raises(gate.AdmissionError, match="CLI progress write incomplete"):
+        native.cli([])
+    assert calls == [] and len(writes) == at_write
+
+
+def test_canonical_main_entry_progress_failure_stops_original_main(monkeypatch):
+    calls = []
+    monkeypatch.setattr(native.os, "write", lambda *args: 0)
+    monkeypatch.setattr(native, "_main", lambda *args, **kwargs: calls.append((args, kwargs)))
+    monkeypatch.setattr(native.host, "LIVE_DAEMONS", [])
+    with pytest.raises(gate.AdmissionError, match="CLI progress write incomplete"):
+        native.main([], _cli_started=100)
+    assert calls == []
+
+
+@pytest.mark.parametrize("at_write", [1, 2])
+def test_argument_progress_failure_never_enters_native_operation(tmp_path, monkeypatch, capsys, at_write):
+    writes, calls, native_calls = [], [], []
+    monkeypatch.setattr(native.time, "monotonic", lambda: 100)
+    def write(fd, data):
+        writes.append((fd, data))
+        return 0 if len(writes) == at_write else len(data)
+    monkeypatch.setattr(native.os, "write", write)
+    monkeypatch.setattr(native, "_arguments", lambda argv: calls.append(argv) or SimpleNamespace(output=tmp_path, inside=False))
+    monkeypatch.setattr(native, "outer_execute", lambda *args: native_calls.append(args))
+    assert native._main([], _cli_started=90) == 1
+    value = json.loads(capsys.readouterr().out)
+    assert value["full_activation_verified"] is False and native_calls == []
+    assert len(calls) == at_write - 1 and list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("value", [True, False, "100", float("nan"), float("inf"), 101, -500, -501])
+def test_cli_start_rejects_future_invalid_or_expired_origin_before_arguments(monkeypatch, value):
+    monkeypatch.setattr(native.time, "monotonic", lambda: 100)
+    monkeypatch.setattr(native, "_arguments", lambda argv: pytest.fail("invalid start reached arguments"))
+    with pytest.raises(gate.AdmissionError, match="original native CLI start required"):
+        native._main([], _cli_started=value)
+
+
+def test_original_cli_start_survives_import_and_argument_delay(tmp_path, monkeypatch, capsys):
+    root, observed = tmp_path / "originals", []
+    monkeypatch.setattr(native.time, "monotonic", lambda: 130)
+    monkeypatch.setattr(native, "_arguments", lambda argv: SimpleNamespace(output=root, inside=False))
+    monkeypatch.setattr(native.host, "private_directory", lambda path, **kwargs: path.mkdir(mode=0o700))
+    monkeypatch.setattr(native, "outer_execute", lambda args, output, started: observed.append(started) or failed_child_result())
+    monkeypatch.setattr(native, "safe_inventory", lambda *args: {"complete": False})
+    assert native._main([], _cli_started=100) == 1
+    value = json.loads(capsys.readouterr().out)
+    assert observed == [100] and value["elapsed_seconds"] == 30
+
+
+def test_cli_and_runtime_phase_share_original_total_line_budget(tmp_path, monkeypatch):
+    rows = []
+    monkeypatch.setattr(native, "record", lambda *args, **kwargs: {})
+    monkeypatch.setattr(native.os, "write", lambda fd, data: rows.append((fd, data)) or len(data))
+    for index in range(64):
+        if index % 2:
+            native.phase(tmp_path, "child_observation")
+        else:
+            native.cli_progress("arguments_before")
+    with pytest.raises(gate.AdmissionError, match="phase observation bound"):
+        native.cli_progress("arguments_verified")
+    assert len(rows) == 64 and all(fd == 2 and len(data) <= 192 for fd, data in rows)
+
+
+@pytest.mark.parametrize("value", ["PATH-TOKEN-MUST-NOT-ESCAPE", None, []])
+def test_cli_progress_refuses_unknown_or_malicious_phase_without_write(monkeypatch, value):
+    monkeypatch.setattr(native.os, "write", lambda *args: pytest.fail("untrusted CLI progress escaped"))
+    with pytest.raises(gate.AdmissionError, match="unknown native CLI phase"):
+        native.cli_progress(value)
+    assert native.PHASE_SEQUENCE == 0
 
 
 @pytest.mark.parametrize("deadline", [True, False, None, "600", float("nan"), float("inf"), -1, 0, 701])

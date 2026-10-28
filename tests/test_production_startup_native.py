@@ -3,9 +3,12 @@ import json
 import io
 import os
 from pathlib import Path
+import signal
 import sqlite3
+import subprocess
 import sys
 import tarfile
+import time
 
 import pytest
 
@@ -171,6 +174,164 @@ def test_failed_command_keeps_original_failure_bytes(tmp_path):
     with pytest.raises(private.ContractError):
         native.archive_command([sys.executable, "-c", "import sys;print('failure-original',file=sys.stderr);sys.exit(19)"], path)
     assert Path(str(path) + ".stderr").read_bytes() == b"failure-original\n"
+
+
+def cancel_controller_after_recorded_chunk(tmp_path, stream):
+    controller = tmp_path / "controller.py"
+    controller.write_text('''from pathlib import Path
+import builtins,json,os,signal,sys
+sys.path.insert(0,sys.argv[1])
+from scripts import verify_production_startup_native as native
+root=Path(sys.argv[2]); path=root/'command'; marker=root/'READ_BOUNDARY.json'
+real_read,real_fsync,real_open=os.read,os.fsync,builtins.open
+state={'read_chunk':False,'synced':[],'files':{}}
+def opened(name,*args,**kwargs):
+ stream=real_open(name,*args,**kwargs)
+ if str(name) in (str(path)+'.stdout',str(path)+'.stderr'):state['files'][stream.fileno()]=str(name)
+ return stream
+def synced(fd):
+ real_fsync(fd)
+ if fd in state['files']:state['synced'].append(Path(state['files'][fd]).name)
+def read(fd,size):
+ if state['read_chunk']:
+  packet={'stdout':Path(str(path)+'.stdout').read_text(),'stderr':Path(str(path)+'.stderr').read_text(),'synced':state['synced']}
+  raw=json.dumps(packet,sort_keys=True).encode();pending=marker.with_suffix('.pending');out=os.open(pending,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+  try:os.write(out,raw);real_fsync(out)
+  finally:os.close(out)
+  os.rename(pending,marker)
+  signal.pause()
+ data=real_read(fd,size)
+ if data:state['read_chunk']=True
+ return data
+native.open=opened;native.os.read=read;native.os.fsync=synced
+native.archive_command([sys.executable,'-I','-B','-c',"import sys;print('fixed synthetic phase',file=sys."+sys.argv[3]+",flush=True)"],path,seconds=5,limit=128)
+''')
+    root = Path(native.__file__).resolve().parents[1]
+    process = subprocess.Popen([sys.executable, "-I", "-B", str(controller), str(root), str(tmp_path), stream],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    try:
+        deadline = time.monotonic() + 5
+        while not (tmp_path / "READ_BOUNDARY.json").exists() and time.monotonic() < deadline and process.poll() is None:
+            time.sleep(0.01)
+        assert (tmp_path / "READ_BOUNDARY.json").exists(), "controller did not reach a second read"
+        process.send_signal(signal.SIGTERM)
+        stdout, stderr = process.communicate(timeout=3)
+        assert process.returncode == -signal.SIGTERM and stdout == stderr == b""
+        return json.loads((tmp_path / "READ_BOUNDARY.json").read_bytes())
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=3)
+
+
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+def test_controller_cancellation_keeps_chunk_synced_before_next_read_without_claiming_success(tmp_path, stream):
+    result = cancel_controller_after_recorded_chunk(tmp_path, stream)
+    assert result[stream] == "fixed synthetic phase\n"
+    assert result["stderr" if stream == "stdout" else "stdout"] == ""
+    assert result["synced"] == ["command." + stream]
+    assert Path(str(tmp_path / "command") + "." + stream).read_bytes() == b"fixed synthetic phase\n"
+
+
+@pytest.mark.parametrize("failure", ["short", "zero", "none"])
+def test_archive_short_write_is_a_failure_and_never_retried(tmp_path, monkeypatch, failure):
+    actual = open
+    writes = []
+    class ShortWriter:
+        def __init__(self, stream):
+            self.stream, self.name = stream, stream.name
+        def __getattr__(self, name):
+            return getattr(self.stream, name)
+        def write(self, raw):
+            writes.append(bytes(raw))
+            if failure == "none":
+                return None
+            return self.stream.write(raw[:-1] if failure == "short" else b"")
+    def opened(name, *args, **kwargs):
+        assert kwargs["buffering"] == 0
+        return ShortWriter(actual(name, *args, **kwargs))
+    monkeypatch.setattr(native, "open", opened, raising=False)
+    path = tmp_path / "short"
+    with pytest.raises(private.ContractError, match="evidence short write"):
+        native.archive_command([sys.executable, "-c", "print('fixed original',flush=True)"], path)
+    assert writes == [b"fixed original\n"]
+    assert Path(str(path) + ".stdout").read_bytes() == (b"fixed original" if failure == "short" else b"")
+
+
+@pytest.mark.parametrize("failure", ["chunk_sync", "final_sync", "directory_sync", "close"])
+def test_archive_preservation_failure_never_returns_success(tmp_path, monkeypatch, failure):
+    actual_open, actual_sync = open, native.os.fsync
+    calls, closed = [], []
+    class CloseFailure:
+        def __init__(self, stream):
+            self.stream, self.name = stream, stream.name
+        def __getattr__(self, name):
+            return getattr(self.stream, name)
+        def close(self):
+            self.stream.close()
+            closed.append(self.name)
+            raise OSError("synthetic output close failure")
+    if failure == "close":
+        monkeypatch.setattr(native, "open", lambda *a, **k: CloseFailure(actual_open(*a, **k)), raising=False)
+    def sync(fd):
+        calls.append(fd)
+        if failure == "chunk_sync" or failure == "final_sync" and len(calls) > 1:
+            raise OSError("synthetic output synchronization failure")
+        return actual_sync(fd)
+    monkeypatch.setattr(native.os, "fsync", sync)
+    if failure == "directory_sync":
+        monkeypatch.setattr(native.gate, "_sync_directory", lambda *a: (_ for _ in ()).throw(OSError("synthetic directory failure")))
+    with pytest.raises(OSError, match="synthetic"):
+        native.archive_command([sys.executable, "-c", "print('fixed original',flush=True)"], tmp_path / "sync")
+    assert Path(str(tmp_path / "sync") + ".stdout").read_bytes() == b"fixed original\n"
+    if failure == "close":
+        assert len(closed) == 2
+
+
+def test_real_nonzero_exit_remains_primary_when_all_output_cleanup_also_fails(tmp_path, monkeypatch):
+    calls = []
+    def failed_sync(_fd):
+        calls.append("file")
+        raise OSError("synthetic cleanup synchronization failure")
+    def failed_directory(_root):
+        calls.append("directory")
+        raise OSError("synthetic cleanup directory failure")
+    monkeypatch.setattr(native.os, "fsync", failed_sync)
+    monkeypatch.setattr(native.gate, "_sync_directory", failed_directory)
+    monkeypatch.setattr(native, "_emit_archive_diagnostic", lambda *a: (_ for _ in ()).throw(KeyboardInterrupt()))
+    with pytest.raises(private.ContractError, match="synthetic command failed; original evidence retained") as raised:
+        native.archive_command([sys.executable, "-c", "raise SystemExit(19)"], tmp_path / "failed")
+    assert calls == ["file", "file", "directory"]
+    assert len(raised.value.__notes__) == 4
+    assert all("synthetic cleanup" not in note for note in raised.value.__notes__)
+
+
+@pytest.mark.parametrize("limit", [21, 22])
+def test_per_chunk_sync_retains_exact_original_byte_limit(tmp_path, limit):
+    path = tmp_path / "exact"
+    command = [sys.executable, "-c", "print('fixed synthetic phase',flush=True)"]
+    if limit == 22:
+        native.archive_command(command, path, limit=limit)
+        assert Path(str(path) + ".stdout").read_bytes() == b"fixed synthetic phase\n"
+    else:
+        with pytest.raises(private.ContractError, match="evidence byte bound"):
+            native.archive_command(command, path, limit=limit)
+        assert Path(str(path) + ".stdout").read_bytes() == b""
+
+
+def test_chunk_sync_time_is_charged_to_original_deadline(tmp_path, monkeypatch):
+    clock, synced = {"now": 0}, []
+    original_sync = native.os.fsync
+    monkeypatch.setattr(native.time, "monotonic", lambda: clock["now"])
+    def sync(fd):
+        original_sync(fd)
+        synced.append(fd)
+        clock["now"] = 2
+    monkeypatch.setattr(native.os, "fsync", sync)
+    path = tmp_path / "deadline"
+    with pytest.raises(private.ContractError, match="command deadline exceeded"):
+        native.archive_command([sys.executable, "-c", "print('fixed synthetic phase',flush=True)"], path, seconds=1)
+    assert synced and Path(str(path) + ".stdout").read_bytes() == b"fixed synthetic phase\n"
 
 
 def test_bounded_archive_stdin_is_not_exposed_in_argv_or_evidence(tmp_path):
