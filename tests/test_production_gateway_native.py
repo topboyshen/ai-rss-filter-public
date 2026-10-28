@@ -155,6 +155,39 @@ def case(tmp_path, monkeypatch):
     return SimpleNamespace(p=p, harness=harness, state=state, identifier=identifier)
 
 
+@pytest.mark.parametrize("fault", [None, "missing", "null", "empty", "wrong_port", "extra_bound", "extra_unpublished", "requested"])
+def test_private_host_proof_never_replaces_actual_ports_guard(case, monkeypatch, fault):
+    from scripts.production_activation_host_native import PrivateHostContext
+    c, calls, contexts = case, [], []
+    context = object.__new__(PrivateHostContext)
+    context.check_network = lambda row, owner: contexts.append((row["Id"], owner))
+    c.harness.private_host_context = context
+    c.state.network["Internal"] = False
+    c.state.mapping_fault = fault
+    def health(*args):
+        calls.append("actual_host_http_after_port_guard")
+        return {"status": 200, "body_sha256": hashlib.sha256(b"OLD").hexdigest(), "operation": None, "upstream": None}
+    monkeypatch.setattr(gateway.NativeTransport, "health", health)
+    if fault not in {None, "extra_unpublished"}:
+        with pytest.raises(gate.AdmissionError):
+            native.prepare(c.harness, c.p)
+        assert calls == []
+    else:
+        native.prepare(c.harness, c.p)
+        assert len(calls) == 1
+    assert contexts == [(c.state.network["Id"], c.harness.owner)]
+
+
+def test_ordinary_bridge_without_exact_context_refuses_before_create_or_http(case, monkeypatch):
+    c = case
+    c.state.network["Internal"] = False
+    c.harness.private_host_context = SimpleNamespace(check_network=lambda *a: None)
+    monkeypatch.setattr(gateway.NativeTransport, "health", lambda *a: pytest.fail("must reject before host HTTP"))
+    with pytest.raises(gate.AdmissionError):
+        native.prepare(c.harness, c.p)
+    assert not c.state.rows
+
+
 def test_prepare_keeps_two_apps_fixed_resources_old_original_and_real_port_preconditions(case):
     c = case
     before = c.p["manifest_path"].read_bytes()

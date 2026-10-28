@@ -16,7 +16,6 @@ import os
 from pathlib import Path
 import re
 import selectors
-import signal
 import shlex
 from decimal import Decimal
 import stat
@@ -24,6 +23,10 @@ import subprocess
 import sys
 import tempfile
 import time
+
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from scripts import production_native_deadline as native_deadline  # noqa: E402
 
 
 SCHEMA = "ai-filter-private-release-v1"
@@ -133,9 +136,9 @@ def run(args, *, env=None):
     # completion would permit unbounded memory before reaching the size check.
     output = bytearray()
     total = 0
-    deadline = time.monotonic() + 120
-    with subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          start_new_session=True) as process:
+    deadline = time.monotonic() + native_deadline.clamp(120)
+    with native_deadline.process(subprocess.Popen, args, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 start_new_session=True) as process:
         try:
             with selectors.DefaultSelector() as selector:
                 selector.register(process.stdout, selectors.EVENT_READ, True)
@@ -154,10 +157,8 @@ def run(args, *, env=None):
                             output.extend(chunk)
                 require(process.wait(timeout=max(0.001, deadline - time.monotonic())) == 0,
                         "private release subprocess failed")
-        except BaseException:
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
+        except BaseException as error:
+            native_deadline.finish_client(process, error)
             raise
     return bytes(output)
 

@@ -1,6 +1,7 @@
 """Actual first-CLOSED Go gate, retained-container lifecycle and T0 activation.
 
-Only new synthetic storage and an internal network are used. The real worker
+Only new synthetic storage and an internal network (or a strictly attested
+private host namespace with its own daemon and bridge) are used. The real worker
 filters the sole Synthetic article through an explicit blacklist; llm=[] and
 no external network means this proof makes no model or scoring-quality claim.
 """
@@ -25,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts import private_release_contract as private, production_activation_fixture as fixture  # noqa: E402
 from scripts import verify_production_startup_native as startup_native  # noqa: E402
 from scripts import production_gateway_native as gateway_native  # noqa: E402
+from scripts import production_native_deadline as native_deadline  # noqa: E402
 from scripts.verify_miniflux_pause_native import Harness, CLIENT, image_checks, source_binding, sha  # noqa: E402
 from scripts.miniflux_host_joint_native import component  # noqa: E402
 from scripts.miniflux_handoff_adapter import source_sha256 as bridge_source, CutoverError  # noqa: E402
@@ -54,6 +56,45 @@ def require_rejected(function):
 class ActivationHarness(Harness):
     sender_role = "miniflux"
 
+    def __init__(self, *args, private_host_context=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.private_host_context = private_host_context
+        if private_host_context is not None:
+            from scripts.production_activation_host_native import PrivateHostContext
+            gate._require(type(private_host_context) is PrivateHostContext, "exact private host context required")
+            private_host_context.check()
+            self.started = private_host_context.plan["started"]
+
+    def command(self, *args, **kwargs):
+        context = getattr(self, "private_host_context", None)
+        if context is not None:
+            context.check(final=kwargs.get("final", False))
+            from scripts.production_activation_host_native import remaining
+            end = context.plan["deadline"] if kwargs.get("final", False) else context.plan["active_deadline"]
+            kwargs["timeout"] = min(kwargs.get("timeout", 30), remaining(end))
+        try:
+            result = super().command(*args, **kwargs)
+            if context is not None:
+                saved = gate._read(self.output / f"command-{self.sequence:04d}.json")
+                if saved.get("rc") is None:
+                    context.commands.uncertain_mutation = True
+                context.check(final=kwargs.get("final", False))
+            return result
+        except BaseException as error:
+            if context is not None:
+                context.commands.uncertain_mutation = True
+                try:
+                    context.check(final=kwargs.get("final", False))
+                except BaseException as drift:
+                    error.add_note("private host identity observation failed: " + type(drift).__name__)
+            raise
+
+    def prepare_network(self):
+        if self.private_host_context is None:
+            return super().prepare_network()
+        network = self.private_host_context.prepare_network(self)
+        fixture.save(self.output / "NETWORK.json", network)
+
     def compose_parser_command(self, args):
         allowed = (("compose", "version"), ("compose", "create", "--help"),
                    ("compose", "create", "--no-deps", "--help"))
@@ -63,7 +104,8 @@ class ActivationHarness(Harness):
         gate._require(not gate._present(path), "static Compose evidence already exists")
         command = ["docker", "--host", "unix:///var/run/docker.sock", *args]
         output, total, code, error = [bytearray(), bytearray()], 0, None, None
-        deadline = time.monotonic() + 5
+        context = getattr(self, "private_host_context", None)
+        deadline = min(time.monotonic() + 5, context.plan["active_deadline"]) if context else time.monotonic() + 5
         try:
             with subprocess.Popen(command, env=self.env, stdin=subprocess.DEVNULL,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) as process:
@@ -112,6 +154,9 @@ class ActivationHarness(Harness):
             "daemon_mutation": False, "production_access": False})
 
     def stage(self, name):
+        if getattr(self, "private_host_context", None) is not None:
+            self.private_host_context.check()
+            self.private_host_context.check_running_inventory(self)
         sequence = getattr(self, "stage_sequence", 0) + 1
         gate._require(sequence <= 32, "synthetic stage budget exceeded")
         self.stage_sequence, self.current_stage = sequence, name
@@ -286,6 +331,10 @@ def actual_namespace_transport(harness, p, stopped):
             "--image-id", record["Image"], "--manifest", harness.manifest,
             "--network", harness.network, "--stop-operation", stopped["sender"]["operation_id"],
             "--evidence-root", original]
+    context = getattr(harness, "private_host_context", None)
+    if context is not None:
+        context.check()
+        args += ["--private-host-context", str(context.path), "--private-host-context-sha256", context.proof_sha256]
     path = p["directory"] / "NAMESPACE_PROCESS"
     startup_native.archive_command(args, path, seconds=35, limit=2 * 1024**2,
         child_umask=0o077, stdin_bytes=json.dumps({"token": harness.token}).encode())
@@ -473,10 +522,17 @@ def scenario(harness, output):
         sealed = fixture.seal_inputs(harness.repo, p)
         contract, _manifest, contract_sha = private.load(sealed, harness.repo, require_fresh=True)
         harness.stage("build_exact_application_image")
-        digest = startup_native.build_candidate(harness.repo, p["directory"], p["source"],
-                    "ai-filter-activation-native:" + p["project"], contract, contract_sha)
+        if getattr(harness, "private_host_context", None) is None:
+            digest = startup_native.build_candidate(harness.repo, p["directory"], p["source"],
+                        "ai-filter-activation-native:" + p["project"], contract, contract_sha)
+        else:
+            digest = harness.private_host_context.build_candidate(p, sealed, contract_sha)
         harness.stage("probe_exact_application_image")
-        startup_native.probe_candidate(contract, sealed.parent, digest, p["directory"])
+        if getattr(harness, "private_host_context", None) is None:
+            startup_native.probe_candidate(contract, sealed.parent, digest, p["directory"])
+        else:
+            startup_native.probe_candidate(contract, sealed.parent, digest, p["directory"],
+                                           deadline=harness.private_host_context.plan["active_deadline"])
         harness.stage("bind_exact_migration_permit")
         permit = fixture.migration_permit(p, sealed, digest)
         gateway_native.bind_plan(p, permit)
@@ -492,13 +548,14 @@ def scenario(harness, output):
                 abort_native_guardian(p)
                 raise
     finally:
-        try:
+        with native_deadline.final_phase():
             try:
-                gateway_native.preserve(harness, p)
+                try:
+                    gateway_native.preserve(harness, p)
+                finally:
+                    startup_native.preserve_scenario(p)
             finally:
-                startup_native.preserve_scenario(p)
-        finally:
-            p["anchor"].close()
+                p["anchor"].close()
 
 
 def record_failure(error, repo, output, stage):
@@ -511,9 +568,9 @@ def record_failure(error, repo, output, stage):
     return failure
 
 
-def execute(repo, source, image_id, binary, output):
+def execute(repo, source, image_id, binary, output, *, private_host_context=None):
     binding = source_binding(repo, source, binary)
-    harness = ActivationHarness(repo, source, image_id, binary, output)
+    harness = ActivationHarness(repo, source, image_id, binary, output, private_host_context=private_host_context)
     fixture.save(output / "SOURCE.json", binding)
     failure, evidence_errors = None, []
     try:
@@ -526,13 +583,14 @@ def execute(repo, source, image_id, binary, output):
     except BaseException as error:
         failure = record_failure(error, repo, output, harness.current_stage)
     finally:
-        if "pg" in harness.names:
-            try:
-                harness.command(["exec", harness.names["pg"], "pg_dump", "-U", "synthetic", "-d", "synthetic_pause"],
-                                timeout=30, final=True)
-            except Exception as error:
-                evidence_errors.append(type(error).__name__)
-        evidence_errors.extend(harness.preserve())
+        with native_deadline.final_phase():
+            if "pg" in harness.names:
+                try:
+                    harness.command(["exec", harness.names["pg"], "pg_dump", "-U", "synthetic", "-d", "synthetic_pause"],
+                                    timeout=30, final=True)
+                except Exception as error:
+                    evidence_errors.append(type(error).__name__)
+            evidence_errors.extend(harness.preserve())
     report = {"schema": "production-activation-native-v1", "source_sha": binding["revision"],
         "status": "passed" if failure is None and not evidence_errors else "failed_or_evidence_insufficient",
         "failure": failure, "evidence_errors": evidence_errors, "elapsed_seconds": time.monotonic() - harness.started,

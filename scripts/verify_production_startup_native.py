@@ -10,10 +10,10 @@ import ast
 import builtins
 import hashlib
 import json
+import math
 import os
 import re
 import selectors
-import signal
 import shutil
 import stat
 from pathlib import Path, PurePosixPath
@@ -25,6 +25,7 @@ import traceback
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts import private_release_contract as private  # noqa: E402
+from scripts import production_native_deadline as native_deadline  # noqa: E402
 from scripts import production_startup_fixture as fixture  # noqa: E402
 from scripts.verify_private_release_native import advance_stage, save  # noqa: E402
 from services import admission_fence as gate, controlled_startup as isolation, production_migration as migration  # noqa: E402
@@ -206,7 +207,7 @@ def _emit_archive_diagnostic(captured, complete):
 
 
 def wait_for_slots(session, p, expected, *, attempts=None, seconds=40):
-    deadline = time.monotonic() + seconds
+    deadline = time.monotonic() + native_deadline.clamp(seconds)
     while time.monotonic() < deadline:
         results = {}
         for slot in expected:
@@ -375,12 +376,12 @@ def archive_command(args, path, *, seconds=120, limit=8 * 1024**2, child_umask=-
                     "fixed synthetic command stdin bound exceeded")
     total, complete, failure = 0, False, None
     captured = [bytearray(), bytearray()]
-    deadline = time.monotonic() + seconds
+    deadline = time.monotonic() + native_deadline.clamp(seconds)
     files = [open(str(path) + suffix, "xb") for suffix in (".stdout", ".stderr")]
     for stream in files:
         os.chmod(stream.name, 0o600)
     try:
-        with subprocess.Popen(args, stdin=subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL,
+        with native_deadline.process(subprocess.Popen, args, stdin=subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
                               umask=child_umask) as process:
             try:
@@ -411,8 +412,7 @@ def archive_command(args, path, *, seconds=120, limit=8 * 1024**2, child_umask=-
                                     "synthetic command failed; original evidence retained")
             finally:
                 if process.poll() is None:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait()
+                    native_deadline.finish_client(process, sys.exc_info()[1])
     except BaseException as error:
         failure = error
         raise
@@ -426,11 +426,12 @@ def archive_command(args, path, *, seconds=120, limit=8 * 1024**2, child_umask=-
             _emit_archive_diagnostic(captured, complete)
 
 
-def extract_public_source(archive, context, evidence):
+def extract_public_source(archive, context, evidence, *, deadline=None):
     # The outer workspace remains private. Only clean public Git archive files
     # need normal image-source modes: Docker COPY makes them root-owned while
     # the reviewed application UID must still be able to read/execute them.
-    archive_command(["tar", "-xf", str(archive), "--no-same-permissions", "-C", str(context)], evidence, child_umask=0o022)
+    archive_command(["tar", "-xf", str(archive), "--no-same-permissions", "-C", str(context)], evidence,
+                    child_umask=0o022, seconds=phase_seconds(120, deadline))
 
 
 
@@ -622,7 +623,16 @@ class SharedPublicSource:
             self.outer_fd = None
 
 
-def probe_candidate(contract, directory, digest, workspace):
+def phase_seconds(default, deadline):
+    if deadline is None:
+        return default
+    private.require(type(deadline) in {int, float} and math.isfinite(deadline), "original native build deadline required")
+    seconds = deadline - time.monotonic()
+    private.require(0 < seconds <= 600, "original native build deadline expired or replaced")
+    return min(default, seconds)
+
+
+def probe_candidate(contract, directory, digest, workspace, *, deadline=None):
     sequence = 0
     def retained_run(args):
         nonlocal sequence
@@ -630,26 +640,31 @@ def probe_candidate(contract, directory, digest, workspace):
         sequence += 1
         # These inputs are synthetic only. Production probing keeps its normal
         # no-output behavior; this transport retains bounded original stderr.
-        archive_command(args, path, seconds=120, limit=private.MAX_BYTES)
+        archive_command(args, path, seconds=phase_seconds(120, deadline), limit=private.MAX_BYTES)
         return Path(str(path) + ".stdout").read_bytes()
     private.image_probe(contract, directory, digest, runner=retained_run)
 
 
-def _oneoff_public_source(root, workspace, source):
+def _oneoff_public_source(root, workspace, source, *, deadline=None):
     context = workspace / "context"
     context.mkdir(mode=0o700)
     archive = workspace / "source.tar"
     archive_command(["git", "-C", str(root), "archive", "--format=tar", "--output=" + str(archive), source["source_sha"]],
-                    workspace / "git-archive")
+                    workspace / "git-archive", seconds=phase_seconds(120, deadline))
     archive.chmod(0o600)
     private.require(archive.stat().st_size <= 128 * 1024**2, "synthetic source archive bound exceeded")
-    extract_public_source(archive, context, workspace / "archive-extract")
+    if deadline is None:
+        extract_public_source(archive, context, workspace / "archive-extract")
+    else:
+        extract_public_source(archive, context, workspace / "archive-extract", deadline=deadline)
     return context
 
 
-def build_candidate(root, workspace, source, image, contract, contract_sha, *, shared_source=None):
+def build_candidate(root, workspace, source, image, contract, contract_sha, *, shared_source=None, deadline=None):
+    phase_seconds(600, deadline)
     if shared_source is None:
-        context = _oneoff_public_source(root, workspace, source)
+        context = (_oneoff_public_source(root, workspace, source) if deadline is None else
+                   _oneoff_public_source(root, workspace, source, deadline=deadline))
     else:
         private.require(type(shared_source) is SharedPublicSource, "actual shared public source required")
         reference = shared_source.check(root, source)
@@ -663,7 +678,7 @@ def build_candidate(root, workspace, source, image, contract, contract_sha, *, s
     for key, value in labels.items():
         args += ["--build-arg", key + "=" + value]
     try:
-        archive_command([*args, str(context)], workspace / "application-build", seconds=600)
+        archive_command([*args, str(context)], workspace / "application-build", seconds=phase_seconds(600, deadline))
     finally:
         original_failure = sys.exc_info()[1]
         if shared_source is not None:
@@ -673,7 +688,13 @@ def build_candidate(root, workspace, source, image, contract, contract_sha, *, s
                 if original_failure is not None:
                     raise original_failure from verification_error
                 raise
-    image_info = json.loads(private.run(["docker", "image", "inspect", image]))[0]
+    if deadline is None:
+        image_info = json.loads(private.run(["docker", "image", "inspect", image]))[0]
+    else:
+        inspect_path = workspace / "bounded-image-inspect"
+        archive_command(["docker", "image", "inspect", image], inspect_path,
+                        seconds=phase_seconds(120, deadline), limit=private.MAX_BYTES)
+        image_info = json.loads(Path(str(inspect_path) + ".stdout").read_bytes())[0]
     save(workspace / "image-inspect.json", image_info)
     for key, value in {"io.ai-filter.private-release.sha256": contract_sha,
                        "io.ai-filter.runtime-config.sha256": contract["files"]["runtime.yaml"],

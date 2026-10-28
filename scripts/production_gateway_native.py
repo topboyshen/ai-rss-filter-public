@@ -384,9 +384,14 @@ def prepare(harness, p):
         "gateway fixture must retain exactly two candidate app services",
     )
     network = json.loads(harness.command(["network", "inspect", harness.network], timeout=3))[0]
+    isolated = network["Internal"] is True
+    if not isolated:
+        from scripts.production_activation_host_native import require_harness_network
+        require_harness_network(harness, network)
+        isolated = True
     gate._require(
         network["Name"] == harness.network
-        and network["Internal"] is True
+        and isolated
         and network["Labels"].get(LABEL) == harness.owner
         and network["Driver"] == "bridge"
         and network["Scope"] == "local"

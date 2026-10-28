@@ -846,3 +846,327 @@ def test_failure_diagnostic_limits_do_not_change_original_copy_bounds():
     assert (evidence.MAX_ENTRIES, evidence.MAX_BYTES, evidence.MAX_METADATA, evidence.DEADLINE) == (
         50000, 8 * 1024**3, 8 * 1024**2, 300)
     assert evidence.DIAGNOSTIC_ERRORS == 16
+    assert evidence.MAX_INDEX_PATH_BYTES == 8 * 1024**2
+
+
+def inventory_budget():
+    return {'entries': 0, 'bytes': 0, 'metadata': 0}
+
+
+def inventory_file(inode=123456789):
+    return {'kind': 'file', 'identity': dict(zip(evidence.IDENTITY_FIELDS,
+            [2049, inode, 33152, 1, 64, 1793160000123456789, 1793160000123456789], strict=True))}
+
+
+def test_actual_compact_inventory_roundtrips_all_fields_without_retaining_row_dicts(tmp_path):
+    root, _output = fixture(tmp_path)
+    (root / 'directory').mkdir()
+    (root / 'directory/中文').write_bytes(b'synthetic')
+    (root / 'alias').symlink_to('directory/中文')
+    os.mkfifo(root / 'pipe')
+    budget = inventory_budget()
+    with evidence.directory(root) as fd:
+        inventory = evidence.scan(fd, budget, float('inf'))
+    raw = inventory.to_bytes()
+    restored = evidence.CompactInventory.from_bytes(raw, inventory.proof()['sha256'])
+    expected = {name: {'kind': 'directory' if path.is_dir() else 'symlink' if path.is_symlink()
+                      else 'file' if path.is_file() else 'special', 'identity': evidence.identity(path.lstat())}
+                for name, path in ((str(p.relative_to(root)), p) for p in root.rglob('*'))}
+    expected['alias']['target'] = 'directory/中文'
+    assert inventory == restored == expected and dict(restored) == expected
+    assert raw.startswith(evidence.encoded(evidence.INVENTORY_HEADER) + b'\n')
+    assert budget['metadata'] == len(raw) and budget['entries'] == len(inventory)
+    assert isinstance(inventory._raw, bytearray) and b'"mtime_ns":' not in raw
+    assert all(isinstance(span, tuple) and all(type(n) is int for n in span) for span in inventory._index.values())
+    assert inventory.path_bytes == sum(len(os.fsencode(name)) for name in expected)
+
+
+def test_21054_complete_entries_use_real_compact_layout_instead_of_expanded_output_overflow():
+    source, output = evidence.CompactInventory(), evidence.CompactInventory()
+    source_budget = {**inventory_budget(), 'metadata': len(source.to_bytes())}
+    output_budget = {**inventory_budget(), 'metadata': len(output.to_bytes())}
+    expanded_source = expanded_output = 0
+    for index in range(21054):
+        name = 'native-activation/fixtures/disk-fixtures/s/' + 'x' * 170 + f'/{index:05d}.json'
+        row = inventory_file()
+        destination = 'files/cutover-completion/' + name
+        expanded_source += len(evidence.encoded({name: row}))
+        expanded_output += len(evidence.encoded({destination: row}))
+        source.add(name, row, source_budget)
+        output.add(destination, row, output_budget)
+    assert expanded_source < evidence.MAX_METADATA < expanded_output
+    assert source_budget['metadata'] == len(source.to_bytes()) <= evidence.MAX_METADATA
+    assert output_budget['metadata'] == len(output.to_bytes()) <= evidence.MAX_METADATA
+    assert len(source) == len(output) == 21054
+    assert all(output['files/cutover-completion/' + name] == row for name, row in source.items())
+    assert evidence.CompactInventory.from_bytes(output.to_bytes(), output.proof()['sha256']) == output
+
+
+def test_actual_compact_metadata_exact_eight_mib_boundary_and_next_row_stops():
+    budget = inventory_budget()
+    inventory = evidence.CompactInventory(budget)
+    row = inventory_file()
+    chunk = len(evidence.encoded(evidence.inventory_record('n00000' + 'x' * 4000, row))) + 1
+    index = 0
+    while evidence.MAX_METADATA - budget['metadata'] >= chunk * 2:
+        inventory.add(f'n{index:05d}' + 'x' * 4000, row, budget)
+        index += 1
+    minimum = sum(len(evidence.encoded(evidence.inventory_record(name, row))) + 1 for name in ('last1', 'last2'))
+    remaining = evidence.MAX_METADATA - budget['metadata'] - minimum
+    first = min(4091, remaining)
+    inventory.add('last1' + 'x' * first, row, budget)
+    inventory.add('last2' + 'x' * (remaining - first), row, budget)
+    raw = inventory.to_bytes()
+    assert len(raw) == budget['metadata'] == evidence.MAX_METADATA == 8 * 1024**2
+    assert inventory.path_bytes <= evidence.MAX_METADATA and len(inventory) < evidence.MAX_ENTRIES
+    assert evidence.CompactInventory.from_bytes(raw).to_bytes() == raw
+    with pytest.raises(evidence.EvidenceError, match='metadata_bound'):
+        inventory.add('one-more', row, budget)
+    assert inventory.to_bytes() == raw and budget['metadata'] > evidence.MAX_METADATA
+    with pytest.raises(evidence.EvidenceError, match='metadata_bound'):
+        evidence.CompactInventory.from_bytes(raw + b'\n')
+
+
+@pytest.mark.parametrize('change', ['truncated', 'missing_field', 'extra_field', 'duplicate',
+                                'wrong_header', 'noncanonical', 'bad_json', 'bool_identity', 'bad_target', 'bad_path'])
+def test_compact_inventory_corruption_and_truncation_fail_closed(change):
+    inventory = evidence.CompactInventory()
+    row = inventory_file()
+    record = evidence.inventory_record('retained', row)
+    inventory.add('retained', row, {**inventory_budget(), 'metadata': len(inventory.to_bytes())})
+    header = evidence.encoded(evidence.INVENTORY_HEADER) + b'\n'
+    raw = inventory.to_bytes()
+    if change == 'truncated':
+        raw = raw[:-1]
+    elif change == 'duplicate':
+        raw += evidence.encoded(record) + b'\n'
+    elif change == 'wrong_header':
+        raw = raw.replace(b'"schema":1', b'"schema":2', 1)
+    elif change == 'noncanonical':
+        raw = header + json.dumps(record, indent=1).encode() + b'\n'
+    elif change == 'bad_json':
+        raw = header + b'not-json\n'
+    else:
+        {'missing_field': lambda: record.pop(), 'extra_field': lambda: record.append('extra'),
+         'bool_identity': lambda: record[2].__setitem__(0, True),
+         'bad_target': lambda: record.__setitem__(3, 'unlisted'),
+         'bad_path': lambda: record.__setitem__(0, '../untrusted')}[change]()
+        raw = header + evidence.encoded(record) + b'\n'
+    with pytest.raises(evidence.EvidenceError):
+        evidence.CompactInventory.from_bytes(raw)
+
+
+def test_compact_inventory_equal_length_valid_rewrite_requires_original_digest():
+    inventory = evidence.CompactInventory()
+    inventory.add('original', inventory_file(), {**inventory_budget(), 'metadata': len(inventory.to_bytes())})
+    rewritten = inventory.to_bytes().replace(b'original', b'replaced')
+    assert len(rewritten) == len(inventory.to_bytes())
+    with pytest.raises(evidence.EvidenceError, match='inventory_digest_mismatch'):
+        evidence.CompactInventory.from_bytes(rewritten, inventory.proof()['sha256'])
+    assert evidence.CompactInventory.from_bytes(rewritten) != inventory
+
+
+@pytest.mark.parametrize('field,value', [('size', -1), ('nlink', -1), ('nlink', 0), ('nlink', True),
+                                       ('size', 1.0), ('ino', 0), ('ino', -1), ('dev', -1),
+                                       ('mode', -1), ('mode', 0), ('mode', 0o200000),
+                                       ('mode', stat.S_IFDIR | 0o600), ('mtime_ns', False), ('ctime_ns', 'now')])
+def test_decoder_rejects_forged_negative_or_mismatched_file_identity(field, value):
+    record = evidence.inventory_record('retained', inventory_file())
+    record[2][evidence.IDENTITY_FIELDS.index(field)] = value
+    raw = evidence.encoded(evidence.INVENTORY_HEADER) + b'\n' + evidence.encoded(record) + b'\n'
+    with pytest.raises(evidence.EvidenceError, match='inventory_record_invalid'):
+        evidence.CompactInventory.from_bytes(raw)
+
+
+@pytest.mark.parametrize('kind', ['unknown', '', None, True, [], {}])
+def test_decoder_rejects_illegal_inventory_kinds(kind):
+    record = evidence.inventory_record('retained', inventory_file())
+    record[1] = kind
+    raw = evidence.encoded(evidence.INVENTORY_HEADER) + b'\n' + evidence.encoded(record) + b'\n'
+    with pytest.raises(evidence.EvidenceError, match='inventory_record_invalid'):
+        evidence.CompactInventory.from_bytes(raw)
+
+
+def test_compact_index_path_bound_applies_before_retaining_next_path(monkeypatch):
+    monkeypatch.setattr(evidence, 'MAX_INDEX_PATH_BYTES', 8)
+    budget = inventory_budget()
+    inventory = evidence.CompactInventory(budget)
+    inventory.add('retained', inventory_file(), budget)
+    original = inventory.to_bytes()
+    with pytest.raises(evidence.EvidenceError, match='inventory_index_path_bound'):
+        inventory.add('next', inventory_file(), budget)
+    assert len(inventory) == 1 and inventory.path_bytes == 8 and inventory.to_bytes() == original
+
+
+def test_compact_index_count_bound_survives_an_external_counter_reset(monkeypatch):
+    monkeypatch.setattr(evidence, 'MAX_ENTRIES', 1)
+    inventory = evidence.CompactInventory()
+    inventory.add('retained', inventory_file(), inventory_budget())
+    with pytest.raises(evidence.EvidenceError, match='entry_count_bound'):
+        inventory.add('next', inventory_file(), inventory_budget())
+    assert len(inventory) == 1
+
+
+def test_decoder_preserves_zero_size_and_signed_historical_timestamp_integers():
+    row = inventory_file()
+    row['identity'].update(size=0, mtime_ns=-1, ctime_ns=-2)
+    inventory = evidence.CompactInventory()
+    inventory.add('retained', row, inventory_budget())
+    assert evidence.CompactInventory.from_bytes(inventory.to_bytes())['retained'] == row
+
+
+@pytest.mark.parametrize('value', ['secret-value', True, -1, 2**65, {}, []])
+def test_public_inventory_budget_never_echoes_untrusted_or_invalid_values(value):
+    diagnostic = evidence.failure_diagnostics({'errors': [{'code': 'metadata_bound',
+        'phase': 'output_verification', 'inventory_budget': {'entries': 1, 'bytes': 1, 'metadata': value}}]})
+    assert 'inventory_budget' not in diagnostic['rows'][0]
+    assert 'secret-value' not in json.dumps(diagnostic)
+
+
+def test_compact_inventory_entry_and_logical_byte_limits_still_apply(monkeypatch):
+    for limit, code in (('MAX_ENTRIES', 'entry_count_bound'), ('MAX_BYTES', 'logical_byte_bound')):
+        with monkeypatch.context() as patch:
+            patch.setattr(evidence, limit, 0)
+            budget = inventory_budget()
+            inventory = evidence.CompactInventory(budget)
+            before = inventory.to_bytes()
+            with pytest.raises(evidence.EvidenceError, match=code):
+                inventory.add('retained', inventory_file(), budget)
+            assert inventory.to_bytes() == before and len(inventory) == 0
+
+
+def test_shared_source_budget_cannot_reset_when_each_compact_inventory_fits(tmp_path, monkeypatch):
+    roots = []
+    for name in ('first', 'second'):
+        root = tmp_path / name
+        root.mkdir(mode=0o700)
+        (root / 'retained').write_bytes(b'original')
+        roots.append(root)
+    budget = inventory_budget()
+    with evidence.directory(roots[0]) as fd:
+        evidence.scan(fd, budget, float('inf'))
+    monkeypatch.setattr(evidence, 'MAX_METADATA', budget['metadata'] * 2 - 1)
+    result = evidence.prepare(dict(zip(('first', 'second'), roots, strict=True)), tmp_path / 'upload')
+    assert not result['complete'] and not (tmp_path / 'upload/COMPLETE.json').exists()
+    assert any(error.get('source') == 'second' and error['code'] == 'metadata_bound'
+               and error['phase'] == 'source_inventory' for error in result['errors'])
+    assert (roots[0] / 'retained').read_bytes() == (roots[1] / 'retained').read_bytes() == b'original'
+
+
+@pytest.mark.parametrize('phase', ['source_inventory', 'source_recheck', 'output_verification'])
+def test_scan_failure_diagnostics_identify_exact_fixed_stage_and_budget(phase, tmp_path, monkeypatch):
+    root, _output = fixture(tmp_path)
+    (root / 'retained').write_bytes(b'original')
+    monkeypatch.setattr(evidence, 'MAX_METADATA', 256)
+    budget = inventory_budget()
+    with evidence.directory(root) as fd, pytest.raises(evidence.EvidenceError) as raised:
+        evidence.staged_scan(fd, budget, float('inf'), phase)
+    row = evidence.failure_fields(raised.value, 'source_processing')
+    row['source'] = 'private-source'
+    diagnostic = evidence.failure_diagnostics({'errors': [row]})['rows'][0]
+    assert diagnostic['phase'] == phase and diagnostic['code'] == 'metadata_bound'
+    assert diagnostic['inventory_budget'] == budget and budget['metadata'] > 256
+    assert 'private-source' not in json.dumps(diagnostic)
+
+
+def test_output_verification_failure_is_explicit_not_an_unattributed_preparation(tmp_path, monkeypatch):
+    root, output = fixture(tmp_path)
+    (root / 'retained').write_bytes(b'original')
+    actual = evidence.check_output
+    def fail_final(*args):
+        with monkeypatch.context() as patch:
+            patch.setattr(evidence, 'MAX_METADATA', 256)
+            return actual(*args)
+    monkeypatch.setattr(evidence, 'check_output', fail_final)
+    result = evidence.prepare({'synthetic': root}, output)
+    assert not result['complete'] and len(result['files']) == 1
+    error = result['errors'][0]
+    assert error['phase'] == 'output_verification' and error['code'] == 'metadata_bound'
+    assert 'source' not in error and error['inventory_budget']['metadata'] > 256
+    diagnostic = evidence.failure_diagnostics(result)['rows'][0]
+    assert diagnostic['phase'] == 'output_verification' and not diagnostic['source']['present']
+    assert not (output / 'COMPLETE.json').exists() and (output / 'STOP.json').exists()
+
+
+@pytest.mark.parametrize('which', ['left', 'right'])
+def test_compact_comparison_checks_deadline_after_last_decoded_row(monkeypatch, which):
+    left, right = evidence.CompactInventory(), evidence.CompactInventory()
+    for item in (left, right):
+        item.add('retained', inventory_file(), inventory_budget())
+    clock = {'now': 0}
+    monkeypatch.setattr(evidence.time, 'monotonic', lambda: clock['now'])
+    actual = evidence.CompactInventory.__getitem__
+    def expire(item, name):
+        result = actual(item, name)
+        if item is (left if which == 'left' else right):
+            clock['now'] = 2
+        return result
+    monkeypatch.setattr(evidence.CompactInventory, '__getitem__', expire)
+    with pytest.raises(evidence.EvidenceError, match='preparation_deadline'):
+        evidence.inventories_match(left, right, 1)
+
+
+def test_real_source_recheck_cannot_complete_after_compact_decode_expires(tmp_path, monkeypatch):
+    root, output = fixture(tmp_path)
+    (root / 'retained').write_bytes(b'original')
+    clock = {'now': 0, 'phase': None}
+    monkeypatch.setattr(evidence.time, 'monotonic', lambda: clock['now'])
+    real_scan, real_get = evidence.staged_scan, evidence.CompactInventory.__getitem__
+    def scanned(*args):
+        result = real_scan(*args)
+        clock['phase'] = args[3]
+        return result
+    def decoded(item, name):
+        result = real_get(item, name)
+        if clock['phase'] == 'source_recheck':
+            clock['now'] = evidence.DEADLINE + 1
+        return result
+    monkeypatch.setattr(evidence, 'staged_scan', scanned)
+    monkeypatch.setattr(evidence.CompactInventory, '__getitem__', decoded)
+    result = evidence.prepare({'synthetic': root}, output)
+    assert not result['complete'] and not (output / 'COMPLETE.json').exists()
+    assert any(row['phase'] == 'source_recheck' and row['code'] == 'preparation_deadline'
+               for row in result['errors'])
+    assert (root / 'retained').read_bytes() == b'original' and (output / 'STOP.json').exists()
+
+
+def test_output_last_directory_decode_checks_deadline_before_success(tmp_path, monkeypatch):
+    root, output = fixture(tmp_path)
+    (root / 'retained').write_bytes(b'original')
+    clock = {'now': 0}
+    monkeypatch.setattr(evidence.time, 'monotonic', lambda: clock['now'])
+    actual = evidence.CompactInventory.__getitem__
+    def decoded(item, name):
+        result = actual(item, name)
+        if name == 'files/synthetic':
+            clock['now'] = evidence.DEADLINE + 1
+        return result
+    monkeypatch.setattr(evidence.CompactInventory, '__getitem__', decoded)
+    result = evidence.prepare({'synthetic': root}, output)
+    assert not result['complete'] and not (output / 'COMPLETE.json').exists()
+    assert result['errors'][0]['phase'] == 'output_verification'
+    assert result['errors'][0]['code'] == 'preparation_deadline' and (output / 'STOP.json').exists()
+
+
+def test_expiry_between_final_output_check_and_complete_still_writes_stop(tmp_path, monkeypatch):
+    root, output = fixture(tmp_path)
+    (root / 'retained').write_bytes(b'original')
+    clock = {'now': 0}
+    monkeypatch.setattr(evidence.time, 'monotonic', lambda: clock['now'])
+    actual = evidence.check_output
+    def expire(*args):
+        actual(*args)
+        clock['now'] = evidence.DEADLINE + 1
+    monkeypatch.setattr(evidence, 'check_output', expire)
+    result = evidence.prepare({'synthetic': root}, output)
+    assert not result['complete'] and result['errors'][0]['phase'] == 'completion'
+    assert result['errors'][0]['code'] == 'preparation_deadline'
+    assert not (output / 'COMPLETE.json').exists() and (output / 'STOP.json').exists()
+
+
+def test_actual_preparation_does_not_use_unguarded_replay_import_decoder(tmp_path, monkeypatch):
+    root, output = fixture(tmp_path)
+    (root / 'retained').write_bytes(b'original')
+    monkeypatch.setattr(evidence.CompactInventory, 'from_bytes',
+                        lambda *args: pytest.fail('replay import decoder is not the live inventory path'))
+    assert evidence.prepare({'synthetic': root}, output)['complete']

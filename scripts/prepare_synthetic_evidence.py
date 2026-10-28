@@ -8,6 +8,7 @@ that all originals were copied. Sparse files stay sparse in the upload tree.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 from contextlib import contextmanager
 import errno
 import hashlib
@@ -21,6 +22,7 @@ import time
 MAX_ENTRIES = 50_000
 MAX_BYTES = 8 * 1024**3
 MAX_METADATA = 8 * 1024**2
+MAX_INDEX_PATH_BYTES = 8 * 1024**2
 MAX_OUTPUT_METADATA = 32 * 1024**2
 CHUNK = 1024**2
 DEADLINE = 300
@@ -29,6 +31,12 @@ NATIVE_GROUPS = ('native', 'native-foundation', 'native-activation', 'native-ada
 PRIORITY_SOURCE = 'production-startup-source'
 PRIORITY_FILES = ('BOOTSTRAP_PROCESS.stderr', 'BOOTSTRAP_PROCESS.stdout')
 PRIORITY_BYTES = 512 * 1024
+IDENTITY_FIELDS = ('dev', 'ino', 'mode', 'nlink', 'size', 'mtime_ns', 'ctime_ns')
+INVENTORY_HEADER = {'schema': 1, 'columns': ['path', 'kind', 'identity', 'target'],
+                    'identity_fields': list(IDENTITY_FIELDS), 'format': 'canonical-jsonl'}
+DIAGNOSTIC_PHASES = frozenset(('priority_diagnostics', 'priority_final_verification',
+                             'source_inventory', 'source_processing', 'source_recheck',
+                             'output_verification', 'completion'))
 DIAGNOSTIC_ERRORS = 16
 # Only fixed implementation reasons may enter public workflow stdout. Original
 # paths and exception text remain in the private STOP report, never this summary.
@@ -48,6 +56,9 @@ priority_diagnostic_not_preserved_or_changed hardlink_inventory_incomplete
 special_file_refused filesystem_error source_inventory_changed source_root_changed
 output_inventory_changed output_file_identity_changed priority_filesystem_error
 source_unavailable_or_invalid output_verification_failed
+inventory_schema_invalid inventory_record_invalid inventory_truncated
+inventory_duplicate_path inventory_noncanonical inventory_index_path_bound
+inventory_digest_mismatch
 '''.split())
 
 
@@ -61,12 +72,130 @@ def require(value, code):
 
 
 def identity(info):
-    return {key: getattr(info, 'st_' + key) for key in
-            ('dev', 'ino', 'mode', 'nlink', 'size', 'mtime_ns', 'ctime_ns')}
+    return {key: getattr(info, 'st_' + key) for key in IDENTITY_FIELDS}
 
 
 def encoded(value):
     return json.dumps(value, sort_keys=True, ensure_ascii=True, separators=(',', ':')).encode()
+
+
+def valid_inventory_identity(info, kind):
+    if not isinstance(info, dict) or set(info) != set(IDENTITY_FIELDS) or not all(
+            type(info[key]) is int for key in IDENTITY_FIELDS):
+        return False
+    if info['dev'] < 0 or info['ino'] <= 0 or info['nlink'] < 1 or info['size'] < 0:
+        return False
+    mode = info['mode']
+    if not 0 <= mode <= 0o177777 or stat.S_IFMT(mode) not in (
+            stat.S_IFREG, stat.S_IFDIR, stat.S_IFLNK, stat.S_IFIFO, stat.S_IFSOCK, stat.S_IFBLK, stat.S_IFCHR):
+        return False
+    actual = ('file' if stat.S_ISREG(mode) else 'directory' if stat.S_ISDIR(mode)
+              else 'symlink' if stat.S_ISLNK(mode) else 'special')
+    return kind == actual or kind == 'refused' and actual != 'file'
+
+
+def inventory_record(name, row):
+    require(isinstance(name, str) and name and '\x00' not in name and len(os.fsencode(name)) <= 4096
+            and str(PurePosixPath(name)) == name and name != '.'
+            and not PurePosixPath(name).is_absolute() and '..' not in PurePosixPath(name).parts,
+            'inventory_record_invalid')
+    kind = row.get('kind')
+    require(kind in ('file', 'directory', 'symlink', 'special', 'refused')
+            and set(row) == {'kind', 'identity'} | ({'target'} if kind == 'symlink' else set()),
+            'inventory_record_invalid')
+    info = row['identity']
+    require(valid_inventory_identity(info, kind), 'inventory_record_invalid')
+    target = row.get('target')
+    require(kind != 'symlink' or isinstance(target, str) and len(os.fsencode(target)) <= 4096,
+            'inventory_record_invalid')
+    return [name, kind, [info[key] for key in IDENTITY_FIELDS], target]
+
+
+def decoded_inventory_record(raw):
+    try:
+        record = json.loads(raw)
+        require(isinstance(record, list) and len(record) == 4 and isinstance(record[2], list)
+                and len(record[2]) == len(IDENTITY_FIELDS), 'inventory_record_invalid')
+        row = {'kind': record[1], 'identity': dict(zip(IDENTITY_FIELDS, record[2], strict=True))}
+        if record[1] == 'symlink':
+            row['target'] = record[3]
+        require(inventory_record(record[0], row) == record, 'inventory_record_invalid')
+        require(encoded(record) + b'\n' == raw, 'inventory_noncanonical')
+        return record[0], row
+    except (TypeError, KeyError, UnicodeError, json.JSONDecodeError) as exc:
+        raise EvidenceError('inventory_record_invalid') from exc
+
+
+class CompactInventory(Mapping):
+    """Actual canonical JSONL bytes plus bounded offsets; rows decode on demand.
+
+    The 8 MiB charge is the real lossless layout, including its field table.
+    The index has at most MAX_ENTRIES names and MAX_METADATA path bytes; it
+    never retains expanded per-entry identity dictionaries or follows links.
+    """
+
+    def __init__(self, budget=None):
+        self._raw = bytearray(encoded(INVENTORY_HEADER) + b'\n')
+        self._index = {}
+        self.path_bytes = 0
+        if budget is not None:
+            budget['metadata'] += len(self._raw)
+            require(budget['metadata'] <= MAX_METADATA, 'metadata_bound')
+        require(len(self._raw) <= MAX_METADATA, 'metadata_bound')
+
+    def add(self, name, row, budget):
+        raw = encoded(inventory_record(name, row)) + b'\n'
+        require(name not in self._index, 'inventory_duplicate_path')
+        require(len(self._index) < MAX_ENTRIES, 'entry_count_bound')
+        charge_entry(row, budget, len(raw))
+        require(len(self._raw) + len(raw) <= MAX_METADATA, 'metadata_bound')
+        path_bytes = self.path_bytes + len(os.fsencode(name))
+        require(path_bytes <= MAX_INDEX_PATH_BYTES, 'inventory_index_path_bound')
+        start = len(self._raw)
+        self._raw.extend(raw)
+        self._index[name] = (start, len(self._raw))
+        self.path_bytes = path_bytes
+
+    def __getitem__(self, name):
+        start, end = self._index[name]
+        return decoded_inventory_record(bytes(self._raw[start:end]))[1]
+
+    def __iter__(self):
+        return iter(self._index)
+
+    def __len__(self):
+        return len(self._index)
+
+    def __eq__(self, other):
+        return isinstance(other, Mapping) and len(self) == len(other) and all(
+            name in other and self[name] == other[name] for name in self)
+
+    def to_bytes(self):
+        return bytes(self._raw)
+
+    def proof(self):
+        return {'schema': 1, 'format': 'canonical-jsonl', 'bytes': len(self._raw),
+                'entries': len(self), 'index_path_bytes': self.path_bytes,
+                'sha256': hashlib.sha256(self._raw).hexdigest()}
+
+    @classmethod
+    def from_bytes(cls, raw, expected_sha256=None):
+        """Without an independently retained digest this checks structure only."""
+        require(type(raw) is bytes and len(raw) <= MAX_METADATA, 'metadata_bound')
+        require(expected_sha256 is None or hashlib.sha256(raw).hexdigest() == expected_sha256,
+                'inventory_digest_mismatch')
+        header = encoded(INVENTORY_HEADER) + b'\n'
+        require(raw.startswith(header), 'inventory_schema_invalid')
+        result = cls()
+        budget = {'entries': 0, 'bytes': 0, 'metadata': len(header)}
+        start = len(header)
+        while start < len(raw):
+            end = raw.find(b'\n', start)
+            require(end >= start, 'inventory_truncated')
+            name, row = decoded_inventory_record(raw[start:end + 1])
+            result.add(name, row, budget)
+            start = end + 1
+        return result
 
 
 @contextmanager
@@ -89,17 +218,18 @@ def check_time(deadline):
     require(time.monotonic() <= deadline, 'preparation_deadline')
 
 
-def charge_entry(name, row, budget):
+def charge_entry(row, budget, metadata_bytes):
     budget['entries'] += 1
     budget['bytes'] += row['identity']['size'] if row['kind'] == 'file' else 0
-    budget['metadata'] += len(encoded({name: row}))
+    budget['metadata'] += metadata_bytes
     require(budget['entries'] <= MAX_ENTRIES, 'entry_count_bound')
     require(budget['bytes'] <= MAX_BYTES, 'logical_byte_bound')
     require(budget['metadata'] <= MAX_METADATA, 'metadata_bound')
 
 
-def scan(fd, budget, deadline, prefix=''):
-    result = {}
+def scan(fd, budget, deadline, prefix='', result=None):
+    if result is None:
+        result = CompactInventory(budget)
     check_time(deadline)
     before = identity(os.fstat(fd))
     with os.scandir(fd) as children:
@@ -114,17 +244,49 @@ def scan(fd, budget, deadline, prefix=''):
             if kind == 'symlink':
                 row['target'] = os.readlink(child.name, dir_fd=fd)
                 require(len(os.fsencode(row['target'])) <= 4096, 'link_target_bound')
-            charge_entry(name, row, budget)
-            result[name] = row
+            result.add(name, row, budget)
             if kind == 'directory':
                 nested = os.open(child.name, NOFOLLOW | os.O_DIRECTORY, dir_fd=fd)
                 try:
                     require(identity(os.fstat(nested)) == row['identity'], 'directory_identity_changed')
-                    result.update(scan(nested, budget, deadline, name))
+                    scan(nested, budget, deadline, name, result)
                 finally:
                     os.close(nested)
     require(identity(os.fstat(fd)) == before, 'directory_changed_during_inventory')
     return result
+
+
+def staged_scan(fd, budget, deadline, phase):
+    try:
+        return scan(fd, budget, deadline)
+    except (OSError, ValueError) as exc:
+        exc.evidence_phase = phase
+        exc.evidence_budget = dict(budget)
+        raise
+
+
+def inventories_match(left, right, deadline):
+    check_time(deadline)
+    if len(left) != len(right):
+        return False
+    for name, row in left.items():
+        check_time(deadline)
+        if name not in right or row != right[name]:
+            return False
+    check_time(deadline)
+    return True
+
+
+def recheck_source(fd, root, entries, deadline):
+    try:
+        after = staged_scan(fd, {'entries': 0, 'bytes': 0, 'metadata': 0}, deadline, 'source_recheck')
+        require(inventories_match(after, entries, deadline), 'source_inventory_changed')
+        with directory(root) as current:
+            require(identity(os.fstat(current)) == identity(os.fstat(fd)), 'source_root_changed')
+        check_time(deadline)
+    except (OSError, ValueError) as exc:
+        exc.evidence_phase = 'source_recheck'
+        raise
 
 
 @contextmanager
@@ -365,6 +527,7 @@ def prepare_priority(root, output, budget, deadline, report):
     Preserving these two files never makes an incomplete full inventory complete.
     """
     state = report['priority_diagnostics']
+    inventory = CompactInventory(budget)
     with directory(root) as fd:
         private_directory(fd)
         state['root_identity'] = identity(os.fstat(fd))
@@ -377,9 +540,10 @@ def prepare_priority(root, output, budget, deadline, report):
                 continue
             row = {'kind': 'file' if stat.S_ISREG(info.st_mode) else 'refused', 'identity': identity(info)}
             state['entries'][name] = {'status': 'selected', **row}
-            charge_entry(name, row, budget)
+            inventory.add(name, row, budget)
             require(row['kind'] == 'file' and info.st_nlink == 1, 'priority_regular_single_link_required')
         total = sum(row['identity']['size'] for row in state['entries'].values() if 'identity' in row)
+        state['inventory_metadata'] = inventory.proof()
         require(total <= PRIORITY_BYTES, 'priority_combined_byte_bound')
         for name, row in state['entries'].items():
             if row['status'] == 'optional_absent':
@@ -436,9 +600,11 @@ def prepare_source(label, root, output, budget, deadline, report):
         report['sources'].append({'label': label, 'identity': identity(os.fstat(fd))})
         with output_directory(output, ('files', label), report['output_directories']):
             pass
-        entries = scan(fd, budget, deadline)
+        entries = staged_scan(fd, budget, deadline, 'source_inventory')
+        report.setdefault('inventory_metadata', {})[label] = entries.proof()
         inodes = {}
         for name, row in entries.items():
+            check_time(deadline)
             if row['kind'] == 'file':
                 key = (row['identity']['dev'], row['identity']['ino'])
                 inodes.setdefault(key, []).append(name)
@@ -470,26 +636,37 @@ def prepare_source(label, root, output, budget, deadline, report):
             except (OSError, ValueError) as exc:
                 report['errors'].append({'source': label, 'path': name, 'error': type(exc).__name__,
                                          'code': str(exc) if isinstance(exc, EvidenceError) else 'filesystem_error'})
-        after = scan(fd, {'entries': 0, 'bytes': 0, 'metadata': 0}, deadline)
-        require(after == entries, 'source_inventory_changed')
-        with directory(root) as current:
-            require(identity(os.fstat(current)) == identity(os.fstat(fd)), 'source_root_changed')
+        recheck_source(fd, root, entries, deadline)
 
 
 def check_output(output, report, metadata, deadline):
     with output_directory(output, identities=report['output_directories']) as fd:
-        actual = scan(fd, {'entries': 0, 'bytes': 0, 'metadata': 0}, deadline)
+        actual = staged_scan(fd, {'entries': 0, 'bytes': 0, 'metadata': 0}, deadline, 'output_verification')
+    report['output_inventory_metadata'] = actual.proof()
     expected_files = {str(PurePosixPath('files', row['source'], row['path'])): row['output_identity']
                       for row in report['files']}
     expected_files.update(metadata)
     directories = {name: value for name, value in report['output_directories'].items() if name}
     require(set(actual) == set(expected_files) | set(directories), 'output_inventory_changed')
     for name, expected in expected_files.items():
-        require(actual[name]['kind'] == 'file' and actual[name]['identity'] == expected
+        check_time(deadline)
+        row = actual[name]
+        require(row['kind'] == 'file' and row['identity'] == expected
                 and stat.S_IMODE(expected['mode']) == 0o600, 'output_file_identity_changed')
     for name, expected in directories.items():
-        require(actual[name]['kind'] == 'directory'
-                and {key: actual[name]['identity'][key] for key in expected} == expected, 'output_directory_identity_changed')
+        check_time(deadline)
+        row = actual[name]
+        require(row['kind'] == 'directory'
+                and {key: row['identity'][key] for key in expected} == expected, 'output_directory_identity_changed')
+    check_time(deadline)
+
+
+def failure_fields(exc, phase):
+    row = {'error': type(exc).__name__, 'phase': getattr(exc, 'evidence_phase', phase),
+           'code': str(exc) if isinstance(exc, EvidenceError) else 'source_unavailable_or_invalid'}
+    if hasattr(exc, 'evidence_budget'):
+        row['inventory_budget'] = exc.evidence_budget
+    return row
 
 
 def prepare(sources, output):
@@ -526,15 +703,16 @@ def prepare(sources, output):
         try:
             prepare_source(label, root, output, budget, deadline, report)
         except (OSError, ValueError) as exc:
-            report['errors'].append({'source': label, 'error': type(exc).__name__,
-                                     'code': str(exc) if isinstance(exc, EvidenceError) else 'source_unavailable_or_invalid'})
+            report['errors'].append({'source': label, **failure_fields(exc, 'source_processing')})
     report['inventory_budget'] = budget
     links = write_json(output / 'LINK_METADATA.json', {'schema': 1, 'links': report['links'], 'target_read': False}, output_ids)
     try:
         check_output(output, report, {'PREPARATION_STARTED.json': started, 'LINK_METADATA.json': links}, deadline)
     except (OSError, ValueError) as exc:
-        report['errors'].append({'error': type(exc).__name__,
-                                 'code': str(exc) if isinstance(exc, EvidenceError) else 'output_verification_failed'})
+        row = failure_fields(exc, 'output_verification')
+        if not isinstance(exc, EvidenceError):
+            row['code'] = 'output_verification_failed'
+        report['errors'].append(row)
     if PRIORITY_SOURCE in sources:
         try:
             verify_priority(sources[PRIORITY_SOURCE], deadline, report)
@@ -542,6 +720,11 @@ def prepare(sources, output):
             report['errors'].append({'source': PRIORITY_SOURCE, 'phase': 'priority_final_verification',
                                      'error': type(exc).__name__,
                                      'code': str(exc) if isinstance(exc, EvidenceError) else 'priority_filesystem_error'})
+    if not report['errors']:
+        try:
+            check_time(deadline)
+        except EvidenceError as exc:
+            report['errors'].append(failure_fields(exc, 'completion'))
     report['complete'] = not report['errors']
     write_json(output / ('COMPLETE.json' if report['complete'] else 'STOP.json'), report, output_ids)
     return report
@@ -566,9 +749,13 @@ def failure_diagnostics(report):
         code = error.get('code')
         phase = error.get('phase')
         rows.append({'code': code if isinstance(code, str) and code in DIAGNOSTIC_CODES else 'unrecognized_error',
-                     'phase': phase if isinstance(phase, str) and phase in {'priority_diagnostics', 'priority_final_verification'} else 'preparation',
+                     'phase': phase if isinstance(phase, str) and phase in DIAGNOSTIC_PHASES else 'preparation',
                      'source': _diagnostic_identity(error.get('source'), 64),
                      'path': _diagnostic_identity(error.get('path'), 4096)})
+        budget = error.get('inventory_budget')
+        if isinstance(budget, dict) and set(budget) == {'entries', 'bytes', 'metadata'} and all(
+                type(value) is int and 0 <= value <= 2**64 for value in budget.values()):
+            rows[-1]['inventory_budget'] = budget
     return {'schema': 1, 'total_errors': len(errors), 'listed_errors': len(rows),
             'all_errors_listed': len(rows) == len(errors), 'locations_are_hashes_only': True, 'rows': rows}
 

@@ -392,16 +392,19 @@ def test_activation_native_runs_after_closed_startup_and_preserves_failures():
     _, workflow = _workflow("cutover-completion.yml")
     steps = workflow["jobs"]["native-amd64"]["steps"]
     closed = next(i for i, step in enumerate(steps) if "scripts/verify_production_startup_native.py" in step.get("run", ""))
-    activation = next(i for i, step in enumerate(steps) if "scripts/verify_production_activation_native.py" in step.get("run", ""))
+    activation = next(i for i, step in enumerate(steps) if "scripts/production_activation_host_native.py" in step.get("run", ""))
     assert closed < activation
     run = steps[activation]["run"]
-    assert "--source \"$RUNNER_TEMP/startup-miniflux\"" in run
+    assert "'--source', str(root / 'miniflux')" in run
     assert "CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -p 1 -trimpath" in run
     assert 'chmod 0755 "$RUNNER_TEMP/production-startup-source/production-activation-build/miniflux"' in run
     assert "redis:7-alpine@sha256:" in run and "--platform=linux/amd64" in run
     prepare = next(step for step in steps if "scripts/prepare_synthetic_evidence.py" in step.get("run", ""))
     assert prepare["if"] == "always()"
-    assert '--output "$RUNNER_TEMP/production-startup-source/production-activation"' in run
+    assert "'--output', str(root / 'activation-originals')" in run
+    assert "'production-startup-source' / 'ACTIVATION_HOST_PROCESS'" in run
+    assert "result['full_activation_verified'] is True" in run
+    assert "seconds=600" in run and "limit=512 * 1024" in run
     assert prepare["run"].count("--source ") == 4
     assert '--source "production-startup-source=${RUNNER_TEMP}/production-startup-source"' in prepare["run"]
     assert '--source "production-activation' not in prepare["run"]

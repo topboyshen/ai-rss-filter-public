@@ -73,6 +73,27 @@ def test_owned_fixture_single_post_original_query_and_private_evidence(owned):
     assert len(p.calls) == 3
 
 
+@pytest.mark.parametrize("fault", [None, "before", "after"])
+def test_private_host_branch_requires_frozen_context_before_and_after_http(owned, tmp_path, monkeypatch, fault):
+    from scripts import production_activation_host_native as host
+    p, seen = owned, []
+    p.options.update(private_host_context=str(tmp_path / "HOST_CONTEXT.json"), private_host_context_sha256="1" * 64)
+    p.network["Internal"] = False
+    def require(*args):
+        seen.append(args)
+        if fault == "before" or fault == "after" and len(seen) == 2:
+            raise gate.AdmissionError("frozen live host identity drift")
+    monkeypatch.setattr(host, "require_context_network", require)
+    if fault:
+        with pytest.raises(gate.AdmissionError):
+            native.execute_owned(p.options, p.token)
+        assert p.calls == [] if fault == "before" else len([x for x in p.calls if x[0] == "POST"]) == 1
+    else:
+        assert native.execute_owned(p.options, p.token)["status"] == "passed"
+        assert len(seen) == 2
+    assert all(row[1] == "1" * 64 and row[-1] == p.options["owner"] for row in seen)
+
+
 def test_lost_response_preserves_intent_and_never_reposts(owned):
     p = owned
     p.lost = True

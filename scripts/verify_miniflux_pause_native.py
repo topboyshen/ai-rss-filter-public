@@ -268,11 +268,7 @@ class Harness:
         native_host(info)
         save(self.output / "HOST.json", {"native_amd64": True, "machine": platform.machine(),
                                          "docker_architecture": info["Architecture"]})
-        self.command(["network", "create", "--internal", "--label", LABEL + "=" + self.owner, self.network])
-        network = json.loads(self.command(["network", "inspect", self.network]))[0]
-        if network["Internal"] is not True:
-            raise ValueError("isolation network is not internal")
-        save(self.output / "NETWORK.json", network)
+        self.prepare_network()
         images = {}
         for name, reference in (("sender", self.image_id), ("python", PYTHON_IMAGE), ("postgres", PG_IMAGE)):
             row = json.loads(self.command(["image", "inspect", reference]))[0]
@@ -293,6 +289,13 @@ class Harness:
                     "--mount", "type=bind,src=" + str(self.repo / "scripts/miniflux_pause_fixture.py") + ",dst=/fixture.py,readonly",
                     "-e", "MINIFLUX_PAUSE_FIXTURE_TOKEN=" + self.token], ["python", "-B", "/fixture.py"])
         self.wait(lambda: self.http("fixture", "/health"), readiness=True)
+
+    def prepare_network(self):
+        self.command(["network", "create", "--internal", "--label", LABEL + "=" + self.owner, self.network])
+        network = json.loads(self.command(["network", "inspect", self.network]))[0]
+        if network["Internal"] is not True:
+            raise ValueError("isolation network is not internal")
+        save(self.output / "NETWORK.json", network)
 
     def launch_sender(self):
         lock = json.loads((self.repo / "ops/miniflux/pause-source-lock.json").read_text())

@@ -46,7 +46,14 @@ def _docker(args, deadline):
 
 def _checked_options(options):
     keys = {"container_id", "owner", "image_id", "manifest", "network", "stop_operation", "evidence_root"}
-    gate._require(isinstance(options, dict) and set(options) == keys, "exact synthetic namespace options required")
+    host_keys = {"private_host_context", "private_host_context_sha256"}
+    gate._require(isinstance(options, dict) and set(options) in (keys, keys | host_keys),
+                  "exact synthetic namespace options required")
+    if host_keys <= options.keys():
+        gate._require(isinstance(options["private_host_context_sha256"], str)
+                      and namespace.HEX64.fullmatch(options["private_host_context_sha256"]),
+                      "exact private host proof hash required")
+        safe_path(options["private_host_context"])
     gate._require(all(isinstance(options[key], str) and namespace.HEX64.fullmatch(options[key])
                       for key in ("container_id", "manifest", "stop_operation"))
                   and re.fullmatch(r"[0-9a-f]{32}", options["owner"])
@@ -100,7 +107,13 @@ def _exercise(options, root, token, deadline):
     before = _owned(options, token, deadline)
     gate._write(root / "inspect.before.json", before)
     network = _docker(["network", "inspect", options["network"]], deadline)
-    gate._require(isinstance(network, list) and len(network) == 1 and network[0]["Internal"] is True
+    isolated = isinstance(network, list) and len(network) == 1 and network[0]["Internal"] is True
+    if not isolated and "private_host_context" in options and isinstance(network, list) and len(network) == 1:
+        from scripts.production_activation_host_native import require_context_network
+        require_context_network(Path(options["private_host_context"]), options["private_host_context_sha256"],
+                                network[0], options["owner"])
+        isolated = True
+    gate._require(isinstance(network, list) and len(network) == 1 and isolated
                   and network[0]["Name"] == options["network"] and network[0]["Labels"].get(LABEL) == options["owner"],
                   "actual owned internal network required")
     gate._write(root / "network.json", network)
@@ -123,6 +136,12 @@ def _exercise(options, root, token, deadline):
     gate._require(checked["generation"] == value["generation"], "queried original operation generation differs")
     after = _owned(options, token, deadline)
     gate._write(root / "inspect.after.json", after)
+    if "private_host_context" in options:
+        from scripts.production_activation_host_native import require_context_network
+        network_after = _docker(["network", "inspect", options["network"]], deadline)
+        gate._require(isinstance(network_after, list) and len(network_after) == 1, "one private host network required after HTTP")
+        require_context_network(Path(options["private_host_context"]), options["private_host_context_sha256"],
+                                network_after[0], options["owner"])
     gate._require(all(before[key] == after[key] for key in ("Id", "Image", "RestartCount"))
                   and all(before["State"][key] == after["State"][key] for key in ("Pid", "StartedAt"))
                   and time.monotonic() < deadline, "synthetic owner changed or native deadline expired")
@@ -277,7 +296,9 @@ def main():
     parser = argparse.ArgumentParser()
     for name in ("container-id", "owner", "image-id", "manifest", "network", "stop-operation", "evidence-root"):
         parser.add_argument("--" + name, required=True)
-    options = vars(parser.parse_args())
+    parser.add_argument("--private-host-context")
+    parser.add_argument("--private-host-context-sha256")
+    options = {key: value for key, value in vars(parser.parse_args()).items() if value is not None}
     try:
         raw = sys.stdin.buffer.read(256)
         value = namespace._parsed(raw)
