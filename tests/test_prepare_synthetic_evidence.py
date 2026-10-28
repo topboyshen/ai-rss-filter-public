@@ -1,5 +1,6 @@
 """Actual private files/links/sparse bytes; no Docker or remote uploads."""
 import errno
+import hashlib
 import json
 import os
 import stat
@@ -766,3 +767,82 @@ def test_priority_source_is_rechecked_after_output_verification(tmp_path, monkey
     assert not result['complete']
     assert any(row.get('phase') == 'priority_final_verification' for row in result['errors'])
     assert not (output / 'COMPLETE.json').exists()
+
+
+def test_failure_stdout_identifies_real_guard_and_hashed_location_without_weakening_stop(tmp_path, monkeypatch, capsys):
+    root, output = fixture(tmp_path)
+    name = 'private-location-that-must-not-be-printed'
+    os.mkfifo(root / name)
+    before = originals(root)
+    monkeypatch.setattr('sys.argv', ['prepare', '--source', 'synthetic=' + str(root), '--output', str(output)])
+    assert evidence.main() == 1
+    stdout = capsys.readouterr().out
+    summary = json.loads(stdout)
+    assert not summary['complete'] and summary['errors'] == 1
+    diagnostic = summary['failure_diagnostics']
+    assert diagnostic['total_errors'] == diagnostic['listed_errors'] == 1
+    assert diagnostic['all_errors_listed'] and diagnostic['locations_are_hashes_only']
+    row = diagnostic['rows'][0]
+    assert row['code'] == 'special_file_refused' and row['phase'] == 'preparation'
+    assert row['source']['sha256'] == hashlib.sha256(b'synthetic').hexdigest()
+    assert row['path']['sha256'] == hashlib.sha256(name.encode()).hexdigest()
+    assert name not in stdout and str(root) not in stdout
+    stop = json.loads((output / 'STOP.json').read_bytes())
+    assert stop['errors'][0]['path'] == name and not (output / 'COMPLETE.json').exists()
+    assert originals(root) == before
+
+
+def test_success_stdout_does_not_claim_failure_or_change_exit_code(tmp_path, monkeypatch, capsys):
+    root, output = fixture(tmp_path)
+    (root / 'plain').write_bytes(b'preserved')
+    monkeypatch.setattr('sys.argv', ['prepare', '--source', 'synthetic=' + str(root), '--output', str(output)])
+    assert evidence.main() == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary['complete'] and summary['errors'] == 0
+    assert summary['failure_diagnostics'] == {
+        'schema': 1, 'total_errors': 0, 'listed_errors': 0, 'all_errors_listed': True,
+        'locations_are_hashes_only': True, 'rows': []}
+    assert (output / 'COMPLETE.json').exists() and not (output / 'STOP.json').exists()
+
+
+@pytest.mark.parametrize('code', ['metadata_bound', 'source_inventory_changed', 'filesystem_error',
+                                'invalid_native_mapping', 'priority_filesystem_error'])
+def test_fixed_failure_reasons_remain_useful_without_exception_messages(code):
+    report = {'errors': [{'source': 'private-source', 'path': 'private/path', 'code': code,
+                          'error': 'SECRET_EXCEPTION_TEXT', 'message': 'SECRET_MESSAGE',
+                          'phase': 'priority_final_verification'}]}
+    diagnostic = evidence.failure_diagnostics(report)
+    assert diagnostic['rows'][0]['code'] == code
+    assert diagnostic['rows'][0]['phase'] == 'priority_final_verification'
+    text = json.dumps(diagnostic)
+    assert all(value not in text for value in ['private-source', 'private/path', 'SECRET_EXCEPTION_TEXT', 'SECRET_MESSAGE'])
+
+
+@pytest.mark.parametrize('unknown', ['secret_token', ['metadata_bound'], {'metadata_bound': True}, None])
+def test_unknown_reason_and_phase_cannot_become_public_diagnostic_text(unknown):
+    diagnostic = evidence.failure_diagnostics({'errors': [{'code': unknown, 'phase': unknown}]})
+    assert diagnostic['rows'][0]['code'] == 'unrecognized_error'
+    assert diagnostic['rows'][0]['phase'] == 'preparation'
+    assert 'secret_token' not in json.dumps(diagnostic)
+
+
+@pytest.mark.parametrize('size', [0, 1, evidence.DIAGNOSTIC_ERRORS, evidence.DIAGNOSTIC_ERRORS + 1, 50000])
+def test_failure_stdout_is_bounded_and_explicit_when_truncated(size):
+    report = {'errors': [{'code': 'metadata_bound', 'path': 'x' * 4096}] * size}
+    diagnostic = evidence.failure_diagnostics(report)
+    assert diagnostic['total_errors'] == size
+    assert diagnostic['listed_errors'] == min(size, evidence.DIAGNOSTIC_ERRORS)
+    assert diagnostic['all_errors_listed'] is (size <= evidence.DIAGNOSTIC_ERRORS)
+    assert len(json.dumps(diagnostic)) < 8192
+
+
+@pytest.mark.parametrize('value', ['x' * 4097, '\U0001f300' * 1025, 1, True, {}, []])
+def test_unbounded_or_non_text_locations_are_neither_read_nor_printed(value):
+    diagnostic = evidence.failure_diagnostics({'errors': [{'code': 'metadata_bound', 'path': value}]})
+    assert diagnostic['rows'][0]['path'] == {'present': True, 'bounded': False, 'sha256': None}
+
+
+def test_failure_diagnostic_limits_do_not_change_original_copy_bounds():
+    assert (evidence.MAX_ENTRIES, evidence.MAX_BYTES, evidence.MAX_METADATA, evidence.DEADLINE) == (
+        50000, 8 * 1024**3, 8 * 1024**2, 300)
+    assert evidence.DIAGNOSTIC_ERRORS == 16

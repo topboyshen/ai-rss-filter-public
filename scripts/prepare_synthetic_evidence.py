@@ -29,6 +29,26 @@ NATIVE_GROUPS = ('native', 'native-foundation', 'native-activation', 'native-ada
 PRIORITY_SOURCE = 'production-startup-source'
 PRIORITY_FILES = ('BOOTSTRAP_PROCESS.stderr', 'BOOTSTRAP_PROCESS.stdout')
 PRIORITY_BYTES = 512 * 1024
+DIAGNOSTIC_ERRORS = 16
+# Only fixed implementation reasons may enter public workflow stdout. Original
+# paths and exception text remain in the private STOP report, never this summary.
+DIAGNOSTIC_CODES = frozenset('''
+absolute_unambiguous_root_required preparation_deadline entry_count_bound
+logical_byte_bound metadata_bound entry_path_bound link_target_bound
+directory_identity_changed directory_changed_during_inventory
+regular_file_identity_changed regular_file_changed_during_copy
+ambiguous_sparse_extent unexpected_source_eof short_destination_write
+private_output_required output_directory_identity_changed
+native_mapping_identity_mismatch unknown_native_group invalid_native_mapping
+duplicate_native_mapping_key ambiguous_link_target ambiguous_link_parent_component
+external_or_ambiguous_link_target external_link_target cross_native_group_link
+link_target_contains_link output_metadata_bound priority_regular_single_link_required
+priority_combined_byte_bound priority_source_root_changed priority_absent_file_appeared
+priority_diagnostic_not_preserved_or_changed hardlink_inventory_incomplete
+special_file_refused filesystem_error source_inventory_changed source_root_changed
+output_inventory_changed output_file_identity_changed priority_filesystem_error
+source_unavailable_or_invalid output_verification_failed
+'''.split())
 
 
 class EvidenceError(ValueError):
@@ -527,6 +547,32 @@ def prepare(sources, output):
     return report
 
 
+def _diagnostic_identity(value, limit):
+    if value is None:
+        return {'present': False, 'bounded': True, 'sha256': None}
+    if not isinstance(value, str) or len(value) > limit:
+        return {'present': True, 'bounded': False, 'sha256': None}
+    raw = value.encode('utf-8', errors='surrogatepass')
+    if len(raw) > limit:
+        return {'present': True, 'bounded': False, 'sha256': None}
+    return {'present': True, 'bounded': True, 'sha256': hashlib.sha256(raw).hexdigest()}
+
+
+def failure_diagnostics(report):
+    """Fixed reasons and hashed locations; never make partial archives complete."""
+    errors = report['errors']
+    rows = []
+    for error in errors[:DIAGNOSTIC_ERRORS]:
+        code = error.get('code')
+        phase = error.get('phase')
+        rows.append({'code': code if isinstance(code, str) and code in DIAGNOSTIC_CODES else 'unrecognized_error',
+                     'phase': phase if isinstance(phase, str) and phase in {'priority_diagnostics', 'priority_final_verification'} else 'preparation',
+                     'source': _diagnostic_identity(error.get('source'), 64),
+                     'path': _diagnostic_identity(error.get('path'), 4096)})
+    return {'schema': 1, 'total_errors': len(errors), 'listed_errors': len(rows),
+            'all_errors_listed': len(rows) == len(errors), 'locations_are_hashes_only': True, 'rows': rows}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', action='append', required=True, help='LABEL=absolute-private-fixture-root')
@@ -536,7 +582,8 @@ def main():
     require(all(len(pair) == 2 for pair in pairs) and len({pair[0] for pair in pairs}) == len(pairs), 'invalid_sources')
     report = prepare({label: Path(path) for label, path in pairs}, args.output)
     print(json.dumps({'complete': report['complete'], 'files': len(report['files']),
-                      'links': len(report['links']), 'errors': len(report['errors'])}))
+                      'links': len(report['links']), 'errors': len(report['errors']),
+                      'failure_diagnostics': failure_diagnostics(report)}))
     return 0 if report['complete'] else 1
 
 

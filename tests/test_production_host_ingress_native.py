@@ -1,5 +1,6 @@
 """Offline boundary tests, not Linux namespace/Docker execution evidence."""
 from copy import deepcopy
+import ast
 import hashlib
 import json
 import os
@@ -233,6 +234,237 @@ def namespace_fixture_links():
     return [{"ifname": "lo", "ifindex": 1},
             {"ifname": "afh" + "a" * 10, "ifindex": 2, "linkinfo": {"info_kind": "bridge"}},
             {"ifname": "veth1234", "ifindex": 3, "master": "afh" + "a" * 10, "linkinfo": {"info_kind": "veth"}}]
+
+
+@pytest.fixture
+def ipv6_context(plan, monkeypatch, namespace_stat):
+    parent = {"pid": 17, "ppid": 1, "starttime": 50, "netns": 1, "mntns": 2,
+              "cgroup": plan["cgroup"] + "/supervisor"}
+    expected = {**parent, "pid": os.getpid(), "ppid": 18, "netns": 123, "mntns": 124, "starttime": 51}
+    plan["parent"], plan["deadline"] = parent, time.monotonic() + 10
+    actual = {expected["pid"]: deepcopy(expected), 17: deepcopy(parent)}
+    monkeypatch.setattr(native, "proc_identity", lambda pid: deepcopy(actual[pid]))
+    return plan, expected, actual
+
+
+@pytest.fixture
+def fake_ipv6_sysctl(monkeypatch):
+    values, calls = {"all": "0", "default": "0", "lo": "0"}, []
+    def syscall(name, *, write=False):
+        calls.append((name, write))
+        if write:
+            values[name] = "1"
+            if name == "all":
+                values.update(default="1", lo="1")
+        return values[name]
+    monkeypatch.setattr(native, "ipv6_sysctl", syscall)
+    return values, calls
+
+
+def test_private_ipv6_only_disables_new_netns_before_daemon(tmp_path, ipv6_context, fake_ipv6_sysctl, monkeypatch):
+    plan, expected, _ = ipv6_context
+    commands = FamilyNetworkCommands([{"ifname": "lo"}])
+    monkeypatch.setattr(native, "Commands", lambda *_: commands)
+    def daemon(*_):
+        record = json.loads((tmp_path / "PRIVATE_IPV6_RESTRICTION.json").read_bytes())
+        assert record["status"] == "restricted" and record["writes"] == ["all", "default"]
+        assert record["after"] == {"all": "1", "default": "1", "lo": "1"}
+        assert len(commands.calls) == 6
+        raise RuntimeError("test stop before actual daemon")
+    monkeypatch.setattr(native, "start_daemon", daemon)
+    with pytest.raises(RuntimeError, match="test stop before actual daemon"):
+        native.inner_proof(tmp_path, plan)
+    assert fake_ipv6_sysctl[1] == [(x, False) for x in ("all", "default", "lo")] + [
+        ("all", True), ("default", True)] + [(x, False) for x in ("all", "default", "lo")]
+    assert expected["netns"] != plan["parent"]["netns"]
+
+
+@pytest.mark.parametrize("fault", ["netns", "mntns", "cgroup", "starttime", "parent"])
+def test_private_ipv6_wrong_context_never_writes(tmp_path, ipv6_context, fake_ipv6_sysctl, fault):
+    plan, expected, actual = ipv6_context
+    if fault == "parent":
+        actual[17]["starttime"] += 1
+    elif fault == "cgroup":
+        actual[expected["pid"]][fault] = "/outside"
+    else:
+        actual[expected["pid"]][fault] = plan["parent"].get(fault, 99)
+    with pytest.raises(native.ProofError, match="namespace/resource identity"):
+        native.restrict_private_ipv6(FamilyNetworkCommands([{"ifname": "lo"}]), tmp_path, plan, expected)
+    assert fake_ipv6_sysctl[1] == []
+    assert json.loads((tmp_path / "PRIVATE_IPV6_RESTRICTION.json").read_bytes())["status"] == "incomplete"
+
+
+@pytest.mark.parametrize("field", ["netns", "mntns", "cgroup"])
+def test_private_ipv6_matching_but_host_or_uncharged_identity_is_rejected(
+        tmp_path, ipv6_context, fake_ipv6_sysctl, field):
+    plan, expected, actual = ipv6_context
+    value = "/outside" if field == "cgroup" else plan["parent"][field]
+    expected[field] = actual[expected["pid"]][field] = value
+    with pytest.raises(native.ProofError, match="namespace/resource identity"):
+        native.restrict_private_ipv6(FamilyNetworkCommands([{"ifname": "lo"}]), tmp_path, plan, expected)
+    assert fake_ipv6_sysctl[1] == []
+
+
+@pytest.mark.parametrize("stage", ["initial_read", "all_write", "default_write", "final_read"])
+def test_private_ipv6_io_failure_keeps_original_and_never_starts_daemon(
+        tmp_path, ipv6_context, fake_ipv6_sysctl, monkeypatch, stage):
+    plan, expected, _ = ipv6_context
+    original, observed = native.ipv6_sysctl, []
+    def syscall(name, *, write=False):
+        observed.append((name, write))
+        if ((stage == "initial_read" and len(observed) == 1)
+                or (stage == "all_write" and write and name == "all")
+                or (stage == "default_write" and write and name == "default")
+                or (stage == "final_read" and len(observed) == 6)):
+            raise PermissionError("private sysctl unavailable")
+        return original(name, write=write)
+    monkeypatch.setattr(native, "ipv6_sysctl", syscall)
+    monkeypatch.setattr(native, "Commands", lambda *_: FamilyNetworkCommands([{"ifname": "lo"}]))
+    monkeypatch.setattr(native, "start_daemon", lambda *_: pytest.fail("sysctl failure must prevent daemon"))
+    with pytest.raises(PermissionError, match="private sysctl unavailable"):
+        native.inner_proof(tmp_path, plan)
+    record = json.loads((tmp_path / "PRIVATE_IPV6_RESTRICTION.json").read_bytes())
+    assert record["status"] == "incomplete" and record["error_type"] == "PermissionError"
+    assert "private sysctl unavailable" not in json.dumps(record)
+    assert record["netns"] == expected["netns"]
+
+
+@pytest.mark.parametrize("changed", ["all", "default"])
+def test_private_ipv6_write_readback_mismatch_stops(tmp_path, ipv6_context, fake_ipv6_sysctl, monkeypatch, changed):
+    plan, expected, _ = ipv6_context
+    original = native.ipv6_sysctl
+    def syscall(name, *, write=False):
+        value = original(name, write=write)
+        return "0" if name == changed and write else value
+    monkeypatch.setattr(native, "ipv6_sysctl", syscall)
+    with pytest.raises(native.ProofError, match="write readback differs"):
+        native.restrict_private_ipv6(FamilyNetworkCommands([{"ifname": "lo"}]), tmp_path, plan, expected)
+    assert json.loads((tmp_path / "PRIVATE_IPV6_RESTRICTION.json").read_bytes())["status"] == "incomplete"
+
+
+@pytest.mark.parametrize("changed", ["lo", "default"])
+def test_private_ipv6_all_readback_cannot_replace_interface_default_check(
+        tmp_path, ipv6_context, fake_ipv6_sysctl, monkeypatch, changed):
+    plan, expected, _ = ipv6_context
+    original = native.ipv6_sysctl
+    def syscall(name, *, write=False):
+        value = original(name, write=write)
+        return "0" if name == changed and not write else value
+    monkeypatch.setattr(native, "ipv6_sysctl", syscall)
+    with pytest.raises(native.ProofError, match="interface/default not disabled"):
+        native.restrict_private_ipv6(FamilyNetworkCommands([{"ifname": "lo"}]), tmp_path, plan, expected)
+    assert json.loads((tmp_path / "PRIVATE_IPV6_RESTRICTION.json").read_bytes())["status"] == "incomplete"
+
+
+def test_private_ipv6_all_is_not_aggregate_enabled_status(tmp_path, ipv6_context, fake_ipv6_sysctl, monkeypatch):
+    plan, expected, _ = ipv6_context
+    original = native.ipv6_sysctl
+    monkeypatch.setattr(native, "ipv6_sysctl", lambda name, write=False: (
+        "0" if name == "all" and not write else original(name, write=write)))
+    native.restrict_private_ipv6(FamilyNetworkCommands([{"ifname": "lo"}]), tmp_path, plan, expected)
+    record = json.loads((tmp_path / "PRIVATE_IPV6_RESTRICTION.json").read_bytes())
+    assert record["status"] == "restricted" and record["after"]["all"] == "0"
+    assert record["after"]["lo"] == record["after"]["default"] == "1"
+
+
+@pytest.mark.parametrize("phase", ["before", "after"])
+def test_private_ipv6_unexpected_interface_stops_without_allowlist_change(
+        tmp_path, ipv6_context, fake_ipv6_sysctl, phase):
+    plan, expected, _ = ipv6_context
+    class Changed(FamilyNetworkCommands):
+        def run(self, argv):
+            if "link" in argv and (phase == "before" or len(self.calls) == 3):
+                self.outputs["links"].append({"ifname": "unknown"})
+            return super().run(argv)
+    with pytest.raises(native.ProofError, match="unexpected external interface"):
+        native.restrict_private_ipv6(Changed([{"ifname": "lo"}]), tmp_path, plan, expected)
+    if phase == "before":
+        assert fake_ipv6_sysctl[1] == []
+
+
+def test_private_ipv6_context_drift_between_writes_stops_next_write(tmp_path, ipv6_context, fake_ipv6_sysctl, monkeypatch):
+    plan, expected, actual = ipv6_context
+    original = native.ipv6_sysctl
+    def syscall(name, *, write=False):
+        value = original(name, write=write)
+        if write:
+            actual[expected["pid"]]["netns"] = 999
+        return value
+    monkeypatch.setattr(native, "ipv6_sysctl", syscall)
+    with pytest.raises(native.ProofError, match="namespace/resource identity"):
+        native.restrict_private_ipv6(FamilyNetworkCommands([{"ifname": "lo"}]), tmp_path, plan, expected)
+    assert [(name, write) for name, write in fake_ipv6_sysctl[1] if write] == [("all", True)]
+
+
+@pytest.mark.parametrize("name,write", [("eth0", False), ("../all", True), ("lo", True), ("all", 1)])
+def test_private_ipv6_sysctl_rejects_scope_before_open(monkeypatch, name, write):
+    monkeypatch.setattr(native.os, "open", lambda *_: pytest.fail("invalid scope cannot open"))
+    with pytest.raises(native.ProofError, match="scope"):
+        native.ipv6_sysctl(name, write=write)
+
+
+@pytest.fixture
+def proc_sysctl_file(tmp_path, monkeypatch):
+    target, calls = tmp_path / "disable_ipv6", []
+    target.write_bytes(b"0\n")
+    original_open, original_fstat = native.os.open, native.os.fstat
+    def opened(path, flags):
+        calls.append((str(path), flags))
+        assert str(path) in {"/proc/sys/net/ipv6/conf/" + n + "/disable_ipv6" for n in ("all", "default", "lo")}
+        return original_open(target, flags)
+    monkeypatch.setattr(native.os, "open", opened)
+    monkeypatch.setattr(native.os, "fstat", lambda fd: SimpleNamespace(st_mode=original_fstat(fd).st_mode, st_uid=0))
+    return target, calls
+
+
+def test_private_ipv6_actual_fd_scope_nofollow_bounded_read_and_no_kernel_fsync(proc_sysctl_file, monkeypatch):
+    target, calls = proc_sysctl_file
+    original_read, sizes = native.os.read, []
+    def bounded_read(fd, count):
+        sizes.append(count)
+        return original_read(fd, count)
+    monkeypatch.setattr(native.os, "read", bounded_read)
+    monkeypatch.setattr(native.os, "fsync", lambda *_: pytest.fail("kernel state is not fsync durability"))
+    assert native.ipv6_sysctl("all", write=True) == "1"
+    assert native.ipv6_sysctl("default") == "1" and native.ipv6_sysctl("lo") == "1"
+    assert target.read_bytes() == b"1\n"
+    assert all(flags & os.O_NOFOLLOW and flags & os.O_CLOEXEC for _, flags in calls)
+    assert calls[0][1] & os.O_RDWR and all(not flags & os.O_RDWR for _, flags in calls[1:])
+    assert sizes == [3, 3, 3]
+
+
+@pytest.mark.parametrize("fault", ["owner", "mode"])
+def test_private_ipv6_sysctl_unexpected_inode_refused_before_write(proc_sysctl_file, monkeypatch, fault):
+    target, _ = proc_sysctl_file
+    monkeypatch.setattr(native.os, "fstat", lambda _: SimpleNamespace(
+        st_mode=0o040755 if fault == "mode" else 0o100644, st_uid=1 if fault == "owner" else 0))
+    with pytest.raises(native.ProofError, match="sysctl inode"):
+        native.ipv6_sysctl("all", write=True)
+    assert target.read_bytes() == b"0\n"
+
+
+@pytest.mark.parametrize("fault", ["symlink", "short_write", "invalid_value", "read_error"])
+def test_private_ipv6_fd_failures_do_not_turn_into_success(proc_sysctl_file, monkeypatch, fault):
+    target, _ = proc_sysctl_file
+    if fault == "symlink":
+        original = target.with_suffix(".original")
+        target.rename(original)
+        target.symlink_to(original)
+    elif fault == "short_write":
+        monkeypatch.setattr(native.os, "write", lambda *_: 1)
+    elif fault == "invalid_value":
+        target.write_bytes(b"1\nx")
+    else:
+        monkeypatch.setattr(native.os, "read", lambda *_: (_ for _ in ()).throw(OSError("read failed")))
+    with pytest.raises((native.ProofError, OSError)):
+        native.ipv6_sysctl("all", write=fault == "short_write")
+
+
+def test_namespace_guard_stays_byte_identical_to_07f282a():
+    source = Path(native.__file__).read_text()
+    node = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name == "namespace_violation")
+    segment = "\n".join(source.splitlines()[node.lineno - 1:node.end_lineno]) + "\n"
+    assert hashlib.sha256(segment.encode()).hexdigest() == "ae25bf0641ba998dfdb17a43cf686305762e49192969cf14eea3256c5a730fa9"
 
 
 @pytest.mark.parametrize("row", [
@@ -640,6 +872,9 @@ def test_safe_packet_includes_actual_ports_and_hashes_but_not_env_or_paths(tmp_p
             "routes_by_family": {"ipv4": [{"dst": "127.0.0.0/8", "dev": "lo"}], "ipv6": []}})
     native.durable(root / "DAEMON.json", {"pid": 42, "netns": 123, "cgroup": "/secret-private-cgroup"})
     native.durable(root / "PROCESSES.json", [{"pid": 42, "netns": 123, "cgroup": "/secret-private-cgroup"}])
+    native.durable(root / "PRIVATE_IPV6_RESTRICTION.json", {
+        "status": "restricted", "netns": 123, "writes": ["all", "default"],
+        "after": {"all": "0", "default": "1", "lo": "1"}, "Env": ["TOKEN=private-secret"]})
     native.durable(root / "command-0001.stderr", b"TOKEN=private-secret /secret/private/path")
     packet = native.evidence_packet(tmp_path)
     encoded = json.dumps(packet)
@@ -651,6 +886,26 @@ def test_safe_packet_includes_actual_ports_and_hashes_but_not_env_or_paths(tmp_p
     assert packet["originals"]["inner/command-0001.stderr"]["sha256"] == hashlib.sha256(
         b"TOKEN=private-secret /secret/private/path").hexdigest()
     assert packet["full_raw_archive_verified"] is False
+    assert packet["profiles"]["inner/PRIVATE_IPV6_RESTRICTION.json"]["kernel_state_durability"] == "runtime_only_not_fsync"
+
+
+@pytest.mark.parametrize("fault", ["absent", "incomplete", "missing_write", "default_enabled", "lo_enabled"])
+def test_private_ipv6_evidence_must_confirm_restriction_for_complete_packet(tmp_path, fault):
+    (tmp_path / "inner").mkdir()
+    names = {"HTTP_AFTER", "CLEANUP", "RESOURCES_FINAL", "NAMESPACE_BEFORE", "NAMESPACE_AFTER", "DAEMON",
+             "PROCESSES", "NAMESPACE_BEFORE_OBSERVATION", "NAMESPACE_AFTER_OBSERVATION"}
+    for name in names:
+        native.durable(tmp_path / "inner" / (name + ".json"), [] if name == "PROCESSES" else {})
+    record = {"status": "restricted", "netns": 123, "writes": ["all", "default"], "after": {"default": "1", "lo": "1"}}
+    if fault == "incomplete":
+        record["status"] = "incomplete"
+    elif fault == "missing_write":
+        record["writes"] = ["all"]
+    elif fault in {"default_enabled", "lo_enabled"}:
+        record["after"][fault.split("_")[0]] = "0"
+    if fault != "absent":
+        native.durable(tmp_path / "inner/PRIVATE_IPV6_RESTRICTION.json", record)
+    assert native.evidence_packet(tmp_path)["complete"] is False
 
 
 @pytest.mark.parametrize("kind", ["symlink", "hardlink"])

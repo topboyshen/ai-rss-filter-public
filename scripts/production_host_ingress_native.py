@@ -406,6 +406,64 @@ def namespace_snapshot(commands, *, bridge=None, evidence_path=None):
     return {"links": observed["links"], "routes": routes, "netns": observed["netns"]}
 
 
+def private_namespace_context(plan, expected):
+    current = proc_identity(os.getpid())
+    require(current == expected and current["netns"] != plan["parent"]["netns"]
+            and current["mntns"] != plan["parent"]["mntns"]
+            and current["cgroup"] == plan["cgroup"] + "/supervisor"
+            and proc_identity(plan["parent"]["pid"]) == plan["parent"],
+            "private IPv6 sysctl namespace/resource identity differs")
+
+
+def ipv6_sysctl(interface, *, write=False):
+    require(interface in {"all", "default", "lo"} and type(write) is bool
+            and (not write or interface in {"all", "default"}), "illegal private IPv6 sysctl scope")
+    path = Path("/proc/sys/net/ipv6/conf") / interface / "disable_ipv6"
+    fd = os.open(path, (os.O_RDWR if write else os.O_RDONLY) | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        info = os.fstat(fd)
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == 0, "unexpected private IPv6 sysctl inode")
+        if write:
+            require(os.write(fd, b"1\n") == 2, "short private IPv6 sysctl write")
+            os.lseek(fd, 0, os.SEEK_SET)
+        value = os.read(fd, 3)
+        require(value in {b"0\n", b"1\n"}, "invalid private IPv6 sysctl value")
+        return value.decode().strip()
+    finally:
+        os.close(fd)
+
+
+def restrict_private_ipv6(commands, root, plan, expected):
+    """Restrict this new netns before devices exist; proc writes are runtime state, not fsync durability."""
+    record = {"schema": 1, "status": "incomplete", "netns": expected["netns"], "writes": [],
+              "before": {}, "after": {}, "kernel_state_durability": "runtime_only_not_fsync"}
+    try:
+        private_namespace_context(plan, expected)
+        before = namespace_snapshot(commands)
+        require(before["netns"] == expected["netns"] and [r["ifname"] for r in before["links"]] == ["lo"],
+                "private IPv6 restriction requires fresh loopback-only namespace")
+        record["before"] = {name: ipv6_sysctl(name) for name in ("all", "default", "lo")}
+        for name in ("all", "default"):
+            private_namespace_context(plan, expected)
+            require(ipv6_sysctl(name, write=True) == "1", "private IPv6 sysctl write readback differs")
+            record["writes"].append(name)
+            private_namespace_context(plan, expected)
+        after = namespace_snapshot(commands)
+        require(after["netns"] == expected["netns"] and [r["ifname"] for r in after["links"]] == ["lo"],
+                "private IPv6 namespace changed during restriction")
+        record["after"] = {name: ipv6_sysctl(name) for name in ("all", "default", "lo")}
+        # conf/all is not an aggregate status: check the actual existing interface and future-device default.
+        require(record["after"]["default"] == record["after"]["lo"] == "1", "private IPv6 interface/default not disabled")
+        private_namespace_context(plan, expected)
+        record["status"] = "restricted"
+    except BaseException as error:
+        record["error_type"] = type(error).__name__
+        record["error_sha256"] = hashlib.sha256(str(error).encode()).hexdigest()
+        preserve_namespace_observation(root / "PRIVATE_IPV6_RESTRICTION.json", record, primary=error)
+        raise
+    durable(root / "PRIVATE_IPV6_RESTRICTION.json", record)
+
+
 def daemon_config(root, plan):
     return {"hosts": ["unix:///var/run/docker.sock"], "data-root": str(root / "data"),
             "exec-root": str(root / "exec"), "pidfile": str(root / "daemon.pid"), "bridge": "none",
@@ -764,6 +822,7 @@ def inner_proof(root, plan):
     (root / "client").mkdir(mode=0o700)
     daemon, actual, logs, result, failure = None, None, None, None, None
     try:
+        restrict_private_ipv6(commands, root, plan, current)
         daemon, actual, logs = start_daemon(commands, root, plan)
         tar = root.parent / "image.tar"
         require(file_proof(tar) == plan["tar"], "offline archive changed before load")
@@ -981,6 +1040,18 @@ def safe_process(value):
             "cgroup_sha256": hashlib.sha256(str(value.get("cgroup")).encode()).hexdigest()}
 
 
+def safe_ipv6_restriction(value):
+    return {"status": value.get("status") if value.get("status") in {"restricted", "incomplete"} else None,
+            "netns": value.get("netns") if type(value.get("netns")) is int else None,
+            "writes": [key for key in value.get("writes", []) if key in {"all", "default"}],
+            "before": {key: v for key, v in value.get("before", {}).items() if key in {"all", "default", "lo"} and v in {"0", "1"}},
+            "after": {key: v for key, v in value.get("after", {}).items() if key in {"all", "default", "lo"} and v in {"0", "1"}},
+            "kernel_state_durability": "runtime_only_not_fsync",
+            "error_type": value.get("error_type") if value.get("error_type") in {
+                "ProofError", "OSError", "FileNotFoundError", "PermissionError"} else None,
+            "error_sha256": value.get("error_sha256") if re.fullmatch(r"[0-9a-f]{64}", str(value.get("error_sha256"))) else None}
+
+
 def read_original_json(path):
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     try:
@@ -995,6 +1066,8 @@ def read_original_json(path):
 
 def profile_for(path):
     name = path.name
+    if name == "PRIVATE_IPV6_RESTRICTION.json":
+        return safe_ipv6_restriction(read_original_json(path))
     if name in {"HTTP_AFTER.json", "PRESERVE_INSPECT.json", "STOPPED_INSPECT.json"}:
         return safe_container(read_original_json(path))
     if name == "CLEANUP.json":
@@ -1024,7 +1097,8 @@ def evidence_packet(root):
     """Fixed flat original inventory; never inspect daemon storage or link targets."""
     hashes, profiles, complete, total = {}, {}, True, 0
     allowed = re.compile(r"(?:command-[0-9]{4}\.(?:json|stdout|stderr)|[A-Z_]+\.(?:json|txt)|"
-                         r"HTTP_INSPECT_[0-9]{4}\.json|daemon\.(?:json|stdout|stderr)|resolv\.conf|nginx\.conf)")
+                         r"PRIVATE_IPV6_RESTRICTION\.json|HTTP_INSPECT_[0-9]{4}\.json|"
+                         r"daemon\.(?:json|stdout|stderr)|resolv\.conf|nginx\.conf)")
     for directory in (root, root / "inner"):
         if not directory.exists():
             complete = False
@@ -1046,8 +1120,12 @@ def evidence_packet(root):
                     profiles[name] = profile
     required = {"inner/HTTP_AFTER.json", "inner/CLEANUP.json", "inner/RESOURCES_FINAL.json",
                 "inner/NAMESPACE_BEFORE.json", "inner/NAMESPACE_AFTER.json", "inner/DAEMON.json", "inner/PROCESSES.json",
-                "inner/NAMESPACE_BEFORE_OBSERVATION.json", "inner/NAMESPACE_AFTER_OBSERVATION.json"}
-    packet = {"schema": 1, "complete": complete and required <= hashes.keys(),
+                "inner/NAMESPACE_BEFORE_OBSERVATION.json", "inner/NAMESPACE_AFTER_OBSERVATION.json",
+                "inner/PRIVATE_IPV6_RESTRICTION.json"}
+    ipv6 = profiles.get("inner/PRIVATE_IPV6_RESTRICTION.json", {})
+    restricted = (ipv6.get("status") == "restricted" and ipv6.get("writes") == ["all", "default"]
+                  and ipv6.get("after", {}).get("default") == ipv6.get("after", {}).get("lo") == "1")
+    packet = {"schema": 1, "complete": complete and required <= hashes.keys() and restricted,
               "scope": "selected_sanitized_metadata_and_original_hashes", "originals": hashes, "profiles": profiles,
               "omitted_raw_data": ["image_tar_bytes", "daemon_storage_and_socket_trees", "raw_private_text_and_config_values"],
               "full_raw_archive_verified": False}

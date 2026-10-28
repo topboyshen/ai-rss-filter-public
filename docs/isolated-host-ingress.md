@@ -19,6 +19,11 @@ activation 的网络、身份校验或成功标准。
 - 只允许 Linux root 和精确 checkout 的 root 私有副本；原 checkout 不改属主。
 - namespace 只有 loopback 和本次自有 bridge/veth，核对 IPv4/IPv6 全表无默认
   路由、外部接口或 gateway；DNS 指向 namespace 本地的 `127.0.0.1`。
+- 在创建 daemon 和 bridge 前，仅对新建、身份已绑定且只有 loopback 的私有
+  network namespace 禁用 IPv6。写入前后复核自身与外层父进程身份，核验未来
+  接口的 default 和已有 lo 均已禁用；不能只凭 `conf/all` 的读值判定。
+  `PRIVATE_IPV6_RESTRICTION.json` 记录这项限制；kernel sysctl 是本次运行状态，
+  不把 proc 写入描述成 fsync 耐久性，也不写 runner 全局 network namespace。
 - mount propagation 设为 private，并在 namespace 内遮蔽 `/run`。私有 daemon
   不使用 runner 的 Docker/containerd socket；数据、exec、PID、配置目录均独立。
 - 固定 nginx 完整 digest 只在外层预拉取一次。外层 RepoDigest、Linux/amd64、
@@ -90,3 +95,7 @@ namespace 检查先有界采集接口和 IPv4/IPv6 全表路由，再执行原�
 完整 activation 的旧网关另保留 HTTP 前后的选定启动身份、requested/actual
 端口形状与哈希。安全摘要可从作业日志读取，不必为了判断空映射而下载整个大包。
 这类记录仍不代替实际端口等值守卫、真实 HTTP 或完整切换，也不补齐历史归档缺口。
+
+合成证据准备的 CLI 另输出最多 16 条固定错误类别及 source/path 哈希，省略
+异常正文和路径文本。摘要明确记录总数与是否截断；它不改变复制和链接规则、
+原预算、退出码或 STOP/COMPLETE 判定，不能把上传成功当作原件归档完整。
