@@ -423,6 +423,21 @@ jobs:
             --source "production-startup-source=${RUNNER_TEMP}/production-startup-source" \
             --output "${RUNNER_TEMP}/cutover-safe-upload"
 
+      - name: Preserve bounded prepared priority diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cutover-priority-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/cutover-safe-upload/PRIORITY_DIAGNOSTICS.json
+            ${{ runner.temp }}/cutover-safe-upload/files/production-startup-source/BOOTSTRAP_PROCESS.stdout
+            ${{ runner.temp }}/cutover-safe-upload/files/production-startup-source/BOOTSTRAP_PROCESS.stderr
+            ${{ runner.temp }}/cutover-safe-upload/files/production-startup-source/ACTIVATION_HOST_PROCESS.stdout
+            ${{ runner.temp }}/cutover-safe-upload/files/production-startup-source/ACTIVATION_HOST_PROCESS.stderr
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Preserve original evidence including failures
         if: always()
         uses: actions/upload-artifact@v7
