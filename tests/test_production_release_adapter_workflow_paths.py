@@ -28,6 +28,7 @@ def selected(path, patterns):
     "scripts/production_legacy_takeover.py", "scripts/production_admission_watchdog.py",
     "scripts/production_admission_supervisor.py", "tests/test_sender_namespace_http.py",
     "scripts/production_gateway_native.py", "scripts/production_namespace_native.py",
+    "scripts/production_host_ingress_native.py", "tests/test_production_host_ingress_native.py",
     "scripts/production_sender_bootstrap.py", "tests/test_production_namespace_native.py",
     "scripts/production_sender_bootstrap_native.py",
     "scripts/production_receiver_bootstrap.py", "scripts/production_receiver_bootstrap_native.py",
@@ -51,6 +52,7 @@ def test_each_real_adapter_path_triggers_native(event, path):
     "docs/production-release.md", "README.md", "core/scorer.py",
     "scripts/controlled_production_release.py.bak", "scripts/nested/private_control_subpaths.py",
     "scripts/production_receiver_bootstrap.py.bak", "scripts/nested/production_receiver_bootstrap_native.py",
+    "scripts/production_host_ingress_native.py.bak", "scripts/nested/production_host_ingress_native.py",
     "tests/nested/test_controlled_release_finalize.py", "tests/test_unrelated.py",
 ])
 def test_unrelated_and_lookalike_paths_do_not_trigger(event, path):
@@ -86,3 +88,33 @@ def test_bootstrap_uses_actual_checkout_and_original_build_evidence_without_syst
     for name in ('BUILD.log', 'IMAGE_BUILD.log', 'rawimage.json'):
         assert f'native_stage/build/{name}' in run
     assert "'--build-evidence'" in run and "sudo crontab" not in run and "sudo -n crontab" not in run
+
+
+def test_host_entry_proof_is_independent_and_does_not_replace_full_activation():
+    workflow = yaml.load((ROOT / PATH).read_text(), Loader=yaml.BaseLoader)
+    job = workflow["jobs"]["isolated-host-ingress"]
+    assert job["runs-on"] == "ubuntu-24.04" and job["timeout-minutes"] == "5"
+    assert "services" not in job and "needs" not in job
+    checkout = job["steps"][0]["with"]
+    assert checkout["ref"] == "${{ github.event.pull_request.head.sha || github.sha }}"
+    assert checkout["persist-credentials"] == "false"
+    run = next(s["run"] for s in job["steps"] if s.get("name") == "Independent isolated host loopback proof")
+    for required in ("clone --no-local --no-hardlinks", 'install -d -m 0700 "$native_stage/source"',
+                     "'--platform=linux/amd64'", "seconds=60", "time.monotonic() + 180",
+                     "'--deadline-monotonic', str(deadline)", "seconds=200", "limit=512 * 1024",
+                     "result['safe_evidence']['complete'] is True", "independent_synthetic_host_namespace_only",
+                     "result['full_activation_verified'] is False", "result['runner_global_loopback_verified'] is False"):
+        assert required in run
+    assert "nginx:stable-alpine@sha256:0d3b80406a13a767339fbe2f41406d6c7da727ab89cf8fae399e81f780f814d1" in run
+    for forbidden in ("go build", "verify_production_activation_native.py", "safe.directory=*", "git config --global",
+                      "chmod -R", "chown", "docker system prune", "docker rm", "|| true"):
+        assert forbidden not in run
+    assert all("continue-on-error" not in s for s in job["steps"])
+    evidence = job["steps"][-2:]
+    assert all(s["if"] == "always()" for s in evidence)
+    assert "prepare_synthetic_evidence.py" in evidence[0]["run"]
+    assert "isolated-host-ingress=${RUNNER_TEMP}/isolated-host-ingress" in evidence[0]["run"]
+    assert evidence[1]["with"]["if-no-files-found"] == "error"
+    original = workflow["jobs"]["native-amd64"]
+    assert "needs" not in original and original["timeout-minutes"] == "15"
+    assert not any("production_host_ingress_native.py" in s.get("run", "") for s in original["steps"])
