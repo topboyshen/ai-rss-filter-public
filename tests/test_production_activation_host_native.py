@@ -918,3 +918,71 @@ def test_source_preparation_cannot_replay_elapsed_build_budget(tmp_path, monkeyp
     with pytest.raises(ValueError, match="deadline expired"):
         startup.build_candidate(tmp_path, tmp_path, source, "fixed", contract, "e" * 64, deadline=200)
     assert seen == []
+
+
+def _gateway_switch_dir(root):
+    switch = root / "inner/activation/receiver/gateway-native/switch"
+    switch.mkdir(parents=True, mode=0o700)
+    return switch
+
+
+def test_inventory_exports_gateway_command_stderr_redacted_with_size_and_hash(tmp_path, monkeypatch):
+    root = tmp_path / "evidence"
+    switch = _gateway_switch_dir(root)
+    stderr = (b'nginx: [emerg] could not build map_hash, you should increase map_hash_bucket_size: 64\n'
+              b'password=hunter2-secret Authorization: Bearer abc.def.ghi\n')
+    (switch / "config-test-start.stderr").write_bytes(stderr)
+    receipt = b'{"argv_sha256":"' + b"a" * 64 + b'","returncode":1}'
+    (switch / "config-test-start.command.json").write_bytes(receipt)
+    (switch / "config-test-start.stdout").write_bytes(b"stdout must stay hash-only token=zzz\n")
+    (switch / "new-nginx.conf").write_bytes(b"config stays hash-only\n")
+    (root / "inner/other.stderr").write_bytes(b"non-gateway stderr stays hash-only\n")
+    monkeypatch.setattr(native.time, "monotonic", lambda: 100)
+    result = native.safe_inventory(root, 600)
+    rows = {row["path"]: row for row in result["gateway_command_stderr"]}
+    prefix = "inner/activation/receiver/gateway-native/switch/"
+    assert set(rows) == {prefix + "config-test-start.stderr", prefix + "config-test-start.command.json"}
+    row = rows[prefix + "config-test-start.stderr"]
+    assert row["tag"] == "gateway_command_stderr" and row["truncated"] is False
+    assert row["bytes"] == len(stderr) and row["sha256"] == hashlib.sha256(stderr).hexdigest()
+    assert "map_hash_bucket_size: 64" in row["text"]
+    assert "hunter2" not in row["text"] and "abc.def.ghi" not in row["text"] and "[REDACTED]" in row["text"]
+    assert rows[prefix + "config-test-start.command.json"]["text"] == receipt.decode()
+    encoded = json.dumps(result)
+    for hidden in ("stdout must stay", "config stays", "non-gateway stderr", "token=zzz"):
+        assert hidden not in encoded
+    hashes = {r["path_sha256"]: r for r in result["originals"]}
+    for name in ("config-test-start.stdout", "new-nginx.conf"):
+        assert hashlib.sha256((prefix + name).encode()).hexdigest() in hashes
+
+
+def test_gateway_stderr_export_is_capped_with_marker_and_budget(tmp_path, monkeypatch):
+    root = tmp_path / "evidence"
+    switch = _gateway_switch_dir(root)
+    big = (b"x" * 1023 + b"\n") * 65
+    for name in ("a-start", "b-start", "c-start"):
+        (switch / (name + ".stderr")).write_bytes(big)
+    monkeypatch.setattr(native.time, "monotonic", lambda: 100)
+    rows = native.safe_inventory(root, 600)["gateway_command_stderr"]
+    assert [row["path"].rsplit("/", 1)[1] for row in rows] == ["a-start.stderr", "b-start.stderr", "c-start.stderr"]
+    first = rows[0]
+    assert first["truncated"] is True and first["bytes"] == len(big) and first["sha256"] == hashlib.sha256(big).hexdigest()
+    assert first["text"].startswith("x" * 100) and first["text"].count("x") == 64 * 1023
+    assert first["text"].endswith(f"[TRUNCATED: first {native.GATEWAY_TEXT_CAP} of {len(big)} bytes]")
+    assert rows[1]["text"] is not None
+    assert rows[2]["text"] is None and rows[2]["reason"] == "export_budget_exhausted"
+    assert rows[2]["sha256"] == hashlib.sha256(big).hexdigest()
+
+
+def test_gateway_export_ignores_lookalike_paths_and_links(tmp_path, monkeypatch):
+    root = tmp_path / "evidence"
+    switch = _gateway_switch_dir(root)
+    (root / "inner/gateway-native").mkdir(parents=True)
+    (root / "inner/gateway-native/switch.stderr").write_bytes(b"wrong place")
+    outside = tmp_path / "outside.stderr"
+    outside.write_bytes(b"outside secret")
+    (switch / "linked.stderr").symlink_to(outside)
+    monkeypatch.setattr(native.time, "monotonic", lambda: 100)
+    result = native.safe_inventory(root, 600)
+    assert result["gateway_command_stderr"] == []
+    assert "outside secret" not in json.dumps(result) and "wrong place" not in json.dumps(result)

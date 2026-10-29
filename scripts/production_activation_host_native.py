@@ -778,9 +778,40 @@ def safe_inner_result(value):
             "error_sha256": value.get("error_sha256") if re.fullmatch(r"[0-9a-f]{64}", str(value.get("error_sha256"))) else None}
 
 
+GATEWAY_COMMAND_RE = re.compile(r"inner/activation/receiver/gateway-native/switch/[a-z][a-z-]{0,40}\.(?:stderr|command\.json)")
+GATEWAY_TEXT_CAP, GATEWAY_TEXT_BUDGET = 64 * 1024, 160 * 1024
+
+
+def gateway_command_exports(items, deadline):
+    """Export only gateway Docker command stderr/receipts: capped, redacted, size+hash bound to the original."""
+    from scripts.capture_release_diagnostics import redact_text
+
+    exports, used = [], 0
+    for path, relative, proof in sorted(items, key=lambda item: item[1]):
+        remaining(deadline)
+        row = {"tag": "gateway_command_stderr", "path": relative, "bytes": proof["size"], "sha256": proof["sha256"],
+               "truncated": proof["size"] > GATEWAY_TEXT_CAP, "text": None}
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            head = os.read(fd, GATEWAY_TEXT_CAP)
+        finally:
+            os.close(fd)
+        # Redact per line: keeps line structure and avoids redact_text's 4096-char whole-field cap.
+        text = "\n".join(redact_text(line) for line in head.decode("utf-8", errors="replace").split("\n"))
+        if row["truncated"]:
+            text += f"\n[TRUNCATED: first {len(head)} of {proof['size']} bytes]"
+        size = len(host.encoded(text))
+        if used + size > GATEWAY_TEXT_BUDGET:
+            row["reason"] = "export_budget_exhausted"
+        else:
+            used, row["text"] = used + size, text
+        exports.append(row)
+    return exports
+
+
 def safe_inventory(root, deadline):
     """Hash bounded originals; explicitly exclude storage trees and raw payloads."""
-    records, omissions, total = [], [], 0
+    records, omissions, total, gateway_texts = [], [], 0, []
     excluded = {root / "inner/data", root / "inner/exec", root / "inner/run", root / "bundle/objects",
                 root / "outer-build/context"}
     for directory, dirs, files in os.walk(root, followlinks=False):
@@ -811,6 +842,8 @@ def safe_inventory(root, deadline):
             proof = host.file_proof(path, limit=8 * 1024**2)
             total += proof["size"]
             records.append({**entry, "sha256": proof["sha256"], "bytes": proof["size"]})
+            if GATEWAY_COMMAND_RE.fullmatch(relative):
+                gateway_texts.append((path, relative, proof))
     required = {"inner/INNER_RESULT.json", "inner/activation/RESULT.json", "inner/DAEMON_STOP.json", "inner/RESOURCES_FINAL.json"}
     expected = {hashlib.sha256(name.encode()).hexdigest() for name in required}
     complete = expected <= {row["path_sha256"] for row in records}
@@ -832,7 +865,8 @@ def safe_inventory(root, deadline):
                 profiles[name] = {key: value.get(key) for key in SUPERVISOR if value.get(key) == SUPERVISOR[key]}
     packet = {"schema": 1, "scope": "selected_sanitized_original_hash_inventory", "complete": complete,
               "originals": records, "omissions": omissions, "hashed_original_bytes": total,
-              "profiles": profiles, "full_raw_archive_verified": False, "raw_originals_preserved_privately": True}
+              "profiles": profiles, "full_raw_archive_verified": False, "raw_originals_preserved_privately": True,
+              "gateway_command_stderr": gateway_command_exports(gateway_texts, deadline)}
     gate._require(len(host.encoded(packet)) <= 384 * 1024, "selected full-host evidence encoding bound")
     remaining(deadline)
     return packet
