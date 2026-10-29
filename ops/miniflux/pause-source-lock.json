@@ -4,7 +4,7 @@
   "revision": "51f2e0d8199ea8fa305081f6e175bba64b0ef94b",
   "patch": "0002-unified-pause-and-held-originals.patch",
   "base_patch_sha256": "0bf94e8fcb31dc902088122221c459f92a00854976f5a34200b21a37c40102f6",
-  "patch_sha256": "a89d6ec12ec8105fe848e01c154a7f39ef8ebddcc6a0a1d05b05526cabec97a3",
+  "patch_sha256": "22d3fad04dffff0a856e870054af22d5ec95b78d4540ec05b23f225f7590cae1",
   "patched_files_sha256": {
     "internal/api/category_handlers.go": "42cb763ac647be311710920f097eb02691c75f4c63e577ceba8dbacb5ec3b594",
     "internal/api/entry_handlers.go": "95b9bd05f94a4dc495ebe095d4b996861efa1ca9a3744946766f495fedc2dfc4",
@@ -34,7 +34,7 @@
     "internal/googlereader/middleware.go": "4ad95478bc4acf1c808b8c9318edd8cc1e474759fb4ae7ddbd5f9eabd31ab8b6",
     "internal/handoff/activation.go": "277514b0952b15bbe00ee0e3df116668a12ac64b5a8a4cbd9c0d9a63533049b3",
     "internal/handoff/activation_integration_test.go": "b0ca52e7f9f4eae4b2adc6ea088b6e07c11542c0a5025c6546d0076425c3bb08",
-    "internal/handoff/activity_wait_integration_test.go": "ccf8833645b0b57a8fe49eca3de404a45201613c5ef4b2d2e0039125dab01495",
+    "internal/handoff/activity_wait_integration_test.go": "8174d6b82f53363f159e069b647069ae3ad5c8164e3e7d224842966162e57a3a",
     "internal/handoff/drain.go": "8c1f111a05cf3adf96aea0ede68fdfbe2406605f62f3c14849306ccad1a11248",
     "internal/handoff/drain_integration_test.go": "9d0fba7701fedfeabf8a97619d825638f8c0eee74bdd88694f500a7594ffe0d7",
     "internal/handoff/handoff.go": "712df7048344e564baee0eb80ff8fcfc0b41eb229b9793954e91834fa3d2601b",
