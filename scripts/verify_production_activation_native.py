@@ -384,7 +384,8 @@ def _watchdog_window(p, harness, receiver, native_driver):
                                       stop_paths=(guardian_root / "STOP.json",))
     except BaseException as error:
         window.record(p["gateway_evidence"], sub_stage, window_started, error,
-                      harness_output=getattr(harness, "output", None), child=child)
+                      harness_output=getattr(harness, "output", None), child=child,
+                      control_root=getattr(getattr(native_driver, "control", None), "root", None))
         raise
     return guardian, ready
 

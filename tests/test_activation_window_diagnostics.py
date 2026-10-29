@@ -1,6 +1,7 @@
 import json
 
 import pytest
+from types import SimpleNamespace
 import socket
 import time
 
@@ -40,7 +41,9 @@ def test_timeout_record_written_redacted_bounded_and_exported(tmp_path, monkeypa
     assert not list(switch.glob(".*.tmp"))
     value = json.loads(raw)
     assert value["sub_stage"] == "prepare" and value["error_type"] == "TimeoutError"
-    assert value["elapsed_seconds"] >= 2.5 and value["configured_seconds"]["native_transport_client"] == 2
+    assert value["elapsed_seconds"] >= 2.5 and value["configured_seconds"] == {
+        "native_transport_client_default": 2, "native_bridge_client": 20, "native_bridge_request": 18,
+        "native_bridge_command_cap": 15}
     assert "GET /activation-registration" in value["endpoints"]
     assert len(value["error_message"]) <= window.TEXT_LIMIT and value["error_message"].startswith("timed out")
     assert value["bridge"]["requests"] == 1 and value["bridge"]["results"] == 0
@@ -88,22 +91,26 @@ def _window_case(tmp_path, monkeypatch, failing):
     switch = tmp_path / "switch"
     switch.mkdir()
     p = {"gateway_evidence": switch}
-    return verify, p, error, switch
+    control = tmp_path / "control"
+    control.mkdir()
+    (control / "query-01.json").write_text(json.dumps({"status": 409, "response": EMPTY_409}))
+    return verify, p, error, switch, SimpleNamespace(control=SimpleNamespace(root=control))
 
 
 @pytest.mark.parametrize("failing", ["prepare", "start", "ready"])
 def test_activate_window_failure_writes_record_and_reraises_original(tmp_path, monkeypatch, failing):
-    verify, p, error, switch = _window_case(tmp_path, monkeypatch, failing)
+    verify, p, error, switch, driver = _window_case(tmp_path, monkeypatch, failing)
     with pytest.raises(TimeoutError) as caught:
-        verify._watchdog_window(p, SimpleHarness(tmp_path), object(), object())
+        verify._watchdog_window(p, SimpleHarness(tmp_path), object(), driver)
     assert caught.value is error and str(caught.value) == "timed out"
     value = json.loads((switch / "watchdog-window.stderr").read_bytes())
     assert value["sub_stage"] == failing and value["error_type"] == "TimeoutError"
+    assert value["control_exchange"]["status"] == 409
 
 
 def test_activate_window_success_writes_nothing(tmp_path, monkeypatch):
-    verify, p, _error, switch = _window_case(tmp_path, monkeypatch, None)
-    guardian, ready = verify._watchdog_window(p, SimpleHarness(tmp_path), object(), object())
+    verify, p, _error, switch, driver = _window_case(tmp_path, monkeypatch, None)
+    guardian, ready = verify._watchdog_window(p, SimpleHarness(tmp_path), object(), driver)
     assert ready == {"ready": True} and p["watchdog_prepared"] is guardian
     assert not (switch / "watchdog-window.stderr").exists()
 
@@ -111,3 +118,61 @@ def test_activate_window_success_writes_nothing(tmp_path, monkeypatch):
 class SimpleHarness:
     def __init__(self, output):
         self.output = output
+
+
+EMPTY_409 = {"result": {"schema": 0, "manifest": "", "operation_id": "", "action": "", "state": "",
+                        "previous_generation": 0, "generation": 0, "durable": False, "confirmed": False,
+                        "active_leases": 0, "uncertain_leases": 0}, "confirmed": False}
+
+
+def test_control_exchange_summary_of_rejected_confirm(tmp_path):
+    control = tmp_path / "control"
+    control.mkdir()
+    (control / "query-01.json").write_text(json.dumps({"status": 409, "response": EMPTY_409}))
+    summary = window.control_exchange(control)
+    assert summary["name"] == "query-01.json" and summary["status"] == 409
+    assert summary["keys"] == ["confirmed", "result"]
+    assert summary["confirmed"] == {"type": "bool", "value": False}
+    assert summary["result"]["state"] == "" and summary["result"]["durable"] is False
+    assert summary["body_bytes"] <= window.TEXT_LIMIT and '"confirmed":false' in summary["body_text"]
+
+
+def test_control_exchange_long_body_text_omitted(tmp_path):
+    control = tmp_path / "control"
+    control.mkdir()
+    (control / "query-03.json").write_text(json.dumps({"status": 409, "response": {"result": "z" * 400}}))
+    summary = window.control_exchange(control)
+    assert summary["body_bytes"] > window.TEXT_LIMIT and summary["body_text"] is None
+    assert summary["result"] == {"type": "str"}
+
+
+def test_control_exchange_short_body_is_redacted_and_long_values_bounded(tmp_path):
+    control = tmp_path / "control"
+    control.mkdir()
+    response = {"result": {"state": "closed", "operation_id": "c" * 64}, "confirmed": "token=leak9"}
+    (control / "query-02.json").write_text(json.dumps({"status": 200, "response": response}))
+    (control / "unrelated.json").write_text("{}")
+    summary = window.control_exchange(control)
+    assert summary["result"] == {"state": "closed"} and summary["confirmed"]["type"] == "str"
+    assert "leak9" not in json.dumps(summary) and "c" * 64 not in json.dumps(summary)
+    assert summary["body_text"] is not None and len(summary["body_text"]) <= window.TEXT_LIMIT
+    assert window.control_exchange(tmp_path / "missing") is None
+
+
+def test_rejected_confirm_record_is_exported_and_adapter_logic_unchanged(tmp_path, monkeypatch):
+    from scripts.miniflux_handoff_adapter import CutoverError, MinifluxActivationControl
+    root = tmp_path / "evidence"
+    switch = _gateway_switch_dir(root)
+    control = tmp_path / "control"
+    control.mkdir()
+    (control / "query-01.json").write_text(json.dumps({"status": 409, "response": EMPTY_409}))
+    fake = SimpleNamespace(binding={"manifest": "m"})
+    with pytest.raises(CutoverError, match="private control not confirmed"):
+        MinifluxActivationControl._confirmed(fake, 409, EMPTY_409, "a" * 64, 0, "initialize_closed", "closed")
+    error = CutoverError("private control not confirmed; original response retained")
+    window.record(switch, "prepare", time.monotonic(), error, control_root=control)
+    monkeypatch.setattr(native.time, "monotonic", lambda: 100)
+    rows = native.safe_inventory(root, 600)["gateway_command_stderr"]
+    text = rows[0]["text"]
+    assert rows[0]["path"].endswith("watchdog-window.stderr") and len(text) <= window.RECORD_LIMIT
+    assert '"status": 409' in text and '"keys": ["confirmed", "result"]' in text

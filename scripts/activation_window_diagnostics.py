@@ -6,6 +6,7 @@ no timeout, retry or control-flow change.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -18,8 +19,24 @@ from services import admission_fence as gate
 RECORD_NAME = "watchdog-window.stderr"
 RECORD_LIMIT = 8192
 TEXT_LIMIT = 256
-# Configured values observed in code (documentation only; nothing here changes them).
-CONFIGURED_SECONDS = {"native_transport_client": 2, "native_bridge_request": 3, "native_bridge_command_cap": 2}
+RESULT_FIELDS = ("action", "state", "phase", "generation", "previous_generation", "durable", "confirmed",
+                 "active_leases", "uncertain_leases")
+
+
+def configured_seconds():
+    """Read (never set) the live constants so the record cannot drift from the code."""
+    try:
+        return _configured_seconds()
+    except Exception:  # noqa: BLE001 - diagnostics only
+        return None
+
+
+def _configured_seconds():
+    from scripts import production_sender_native_bridge as bridge
+    from production_sender_driver import NativeSenderTransport
+    return {"native_transport_client_default": NativeSenderTransport.DEFAULT_TIMEOUT_SECONDS,
+            "native_bridge_client": bridge.CLIENT_SECONDS, "native_bridge_request": bridge.REQUEST_SECONDS,
+            "native_bridge_command_cap": bridge.COMMAND_SECONDS}
 ENDPOINTS = {"prepare": ["GET /activation-registration", "GET /operations/<operation>"],
              "start": [], "ready": []}
 _SECRET = re.compile(r"(?i)(bearer\s+)\S+|([0-9a-f]{32,})|((?:token|secret|password|auth)[^=:\s]*[=:]\s*)\S+")
@@ -73,13 +90,46 @@ def _last_command(output):
         return None
 
 
-def record(evidence_root, sub_stage, started, error, *, harness_output=None, child=None):
+def _scalar(value):
+    return value if type(value) in (bool, int, float) or value is None else _redact(value)[:64]
+
+
+def control_exchange(control_root):
+    """Summary of the adapter's own last retained private-control exchange (status + response shape)."""
+    try:
+        paths = [p for p in Path(control_root).iterdir() if re.fullmatch(r"(?:query|attempt)-\d{2}\.json", p.name)]
+        if not paths:
+            return None
+        path = max(paths, key=lambda item: (item.stat().st_mtime_ns, item.name))
+        value = json.loads(path.read_text())
+        response = value.get("response")
+        raw = json.dumps(response, sort_keys=True, separators=(",", ":")).encode()
+        out = {"name": path.name, "status": value.get("status"), "body_bytes": len(raw),
+               "body_sha256": hashlib.sha256(raw).hexdigest(), "keys": None, "confirmed": None, "result": None}
+        if isinstance(response, dict):
+            out["keys"] = sorted(_redact(k)[:40] for k in response)[:16]
+            if "confirmed" in response:
+                out["confirmed"] = {"type": type(response["confirmed"]).__name__, "value": _scalar(response["confirmed"])}
+            result = response.get("result")
+            if isinstance(result, dict):
+                out["result"] = {k: _scalar(result[k]) for k in RESULT_FIELDS if k in result}
+            else:
+                out["result"] = {"type": type(result).__name__}
+        text = _redact(raw.decode(errors="replace"))
+        out["body_text"] = text if len(raw) <= TEXT_LIMIT else None
+        return out
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def record(evidence_root, sub_stage, started, error, *, harness_output=None, child=None, control_root=None):
     """Atomically write <=8 KiB; never raises (the original error must surface)."""
     try:
         root = Path(evidence_root)
         output = Path(harness_output) if harness_output is not None else None
         value = {"schema": 1, "sub_stage": sub_stage, "endpoints": ENDPOINTS.get(sub_stage, []),
-                 "configured_seconds": CONFIGURED_SECONDS, "elapsed_seconds": round(time.monotonic() - started, 3),
+                 "configured_seconds": configured_seconds(),
+                 "control_exchange": control_exchange(control_root) if control_root is not None else None, "elapsed_seconds": round(time.monotonic() - started, 3),
                  "error_type": type(error).__name__, "error_message": _redact(error),
                  "watchdog_child_alive": None if child is None else child.poll() is None,
                  "bridge": _bridge(output / "native-control-bridge") if output else None,
