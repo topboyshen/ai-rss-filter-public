@@ -78,7 +78,8 @@ def prepare_disk(directory, source, network, previous_image_id, *, workers=2):
         "production_missing_metadata_authorized": False})
     operation = gate.secrets.token_hex(32)
     project = "activation-native-" + gate.secrets.token_hex(6)
-    manifest = manifest_input(paths, project, operation, workers, binding, network)
+    session_secret = session_secret_file(directory, api_key)
+    manifest = manifest_input(paths, project, operation, workers, binding, network, session_secret)
     manifest_path = directory / "manifest.json"
     save(manifest_path, manifest)
     environment = directory / "environment"
@@ -92,9 +93,32 @@ def prepare_disk(directory, source, network, previous_image_id, *, workers=2):
             "environment": environment, "strategy": config.config.cfg["scoring_strategy_version"]}
 
 
-def manifest_input(paths, project, operation, workers, binding, network):
+SESSION_SECRET_NAME = "dashboard_session_secret"
+
+
+def session_secret_file(directory, api_key):
+    """Per-run synthetic dashboard session secret, file-injected like production docker-compose.yml."""
+    secrets_dir = directory / "secrets"
+    secrets_dir.mkdir(mode=0o700)
+    value = "synthetic-session-" + gate.secrets.token_hex(32)
+    gate._require(value != api_key and 32 <= len(value) <= 4096, "synthetic session secret must differ from API key")
+    path = secrets_dir / SESSION_SECRET_NAME
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    with os.fdopen(fd, "w") as stream:
+        stream.write(value + "\n")
+    return path
+
+
+def manifest_input(paths, project, operation, workers, binding, network, session_secret=None):
     manifest = startup.manifest_input(paths, project, operation, workers, binding)
     manifest["networks"] = {"isolated": {"external": True, "name": network}}
+    if session_secret is not None:
+        # Same shape as production: web gets the secret by named file reference, never as a literal.
+        manifest["secrets"] = {SESSION_SECRET_NAME: {"file": str(session_secret)}}
+        web = manifest["services"]["ai-filter-api"]
+        web["secrets"] = [SESSION_SECRET_NAME]
+        web["environment"].update({"AI_FILTER_SESSION_SECRET": "",
+                                   "AI_FILTER_SESSION_SECRET_FILE": "/run/secrets/" + SESSION_SECRET_NAME})
     for service in manifest["services"].values():
         service.pop("network_mode")
         service["networks"] = ["isolated"]
