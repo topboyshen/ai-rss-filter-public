@@ -34,6 +34,17 @@ from production_sender_driver import SenderActivationDriver, PostgresReader, sou
 from scripts.sender_drain_inventory import IDENTITY_SQL, IDENTITY_KEYS  # noqa: E402
 from services import admission_fence as gate  # noqa: E402
 
+GUARDIAN_EXIT_DEFAULT_SECONDS = 25
+GUARDIAN_EXIT_CI_SECONDS = 90  # 15 s supervisor tick + bounded bridge requests on cold hosted runners
+
+
+def guardian_exit_seconds(environ=None):
+    """Only a GitHub Actions run widens the guardian reap wait; every other caller keeps 25 s."""
+    environ = os.environ if environ is None else environ
+    hosted = environ.get("GITHUB_ACTIONS") == "true" and environ.get("CI") == "true"
+    return GUARDIAN_EXIT_CI_SECONDS if hosted else GUARDIAN_EXIT_DEFAULT_SECONDS
+
+
 REDIS = "redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99"
 
 
@@ -470,7 +481,7 @@ def complete_native_supervision(harness, p, active, native_driver, migration_roo
     fixture.save(p["directory"] / "ACTUAL_RESTRICTIVE_STOP.json", stopped)
     child = p["watchdog_child"]
     gate._require(child.pid == live["owner"]["pid"], "native guardian child differs from actual live owner")
-    status = child.wait(timeout=25)
+    status = child.wait(timeout=guardian_exit_seconds())
     gate._require(status == 0, "actual guardian did not exit after confirmed original controlled stop")
     fixture.save(p["directory"] / "ACTUAL_GUARDIAN_EXIT.json", {"pid": live["owner"]["pid"], "exit_code": status,
                  "actual_child_reaped": True, "forced_kill": False})
