@@ -126,16 +126,17 @@ index 28687c6..d52ca6d 100644
 +		httpServers = append(httpServers, server.StartWebServer(store, pool)...)
 diff --git a/internal/cli/handoff_control.go b/internal/cli/handoff_control.go
 new file mode 100644
-index 0000000..16197dd
+index 0000000..03ea94c
 --- /dev/null
 +++ b/internal/cli/handoff_control.go
-@@ -0,0 +1,136 @@
+@@ -0,0 +1,170 @@
 +// SPDX-License-Identifier: Apache-2.0
 +package cli
 +
 +import (
 +	"context"
 +	"crypto/subtle"
++	"database/sql"
 +	"encoding/json"
 +	"errors"
 +	"io"
@@ -147,7 +148,38 @@ index 0000000..16197dd
 +	"miniflux.app/v2/internal/config"
 +	"miniflux.app/v2/internal/handoff"
 +	"miniflux.app/v2/internal/storage"
++
++	"github.com/lib/pq"
 +)
++
++// handoffCategoryHeader carries only a fixed diagnostic enum on refusals. The
++// JSON body, status code and acceptance rules are unchanged.
++const handoffCategoryHeader = "X-Handoff-Error-Category"
++
++func handoffErrorCategory(err error) string {
++	var pgErr *pq.Error
++	switch {
++	case err == nil:
++		return "unconfirmed"
++	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
++		return "deadline"
++	case errors.Is(err, handoff.ErrUncertain):
++		return "uncertain"
++	case errors.Is(err, handoff.ErrConflict):
++		return "conflict"
++	case errors.Is(err, handoff.ErrClosed):
++		return "closed"
++	case errors.Is(err, sql.ErrNoRows):
++		return "no_rows"
++	case errors.As(err, &pgErr) && pgErr.Code == "55P03":
++		return "lock"
++	case errors.As(err, &pgErr) && pgErr.Code == "57014":
++		return "deadline"
++	case errors.As(err, &pgErr):
++		return "db"
++	}
++	return "other"
++}
 +
 +func handoffFields(r *http.Request) (map[string]string, error) {
 +	defer r.Body.Close()
@@ -199,7 +231,8 @@ index 0000000..16197dd
 +		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 +		defer cancel()
 +		if r.Method == "GET" && r.URL.Path == "/activation-registration" {
-+			if store.ActivationHandoffAvailable(ctx) != nil {
++			if err := store.ActivationHandoffAvailable(ctx); err != nil {
++				w.Header().Set(handoffCategoryHeader, handoffErrorCategory(err))
 +				http.Error(w, "activation capability unavailable", http.StatusConflict)
 +				return
 +			}
@@ -247,6 +280,7 @@ index 0000000..16197dd
 +		receipt, ok := result.(handoff.Receipt)
 +		confirmed := err == nil && ok && receipt.Durable && receipt.Confirmed
 +		if !confirmed {
++			w.Header().Set(handoffCategoryHeader, handoffErrorCategory(err))
 +			w.WriteHeader(http.StatusConflict)
 +		}
 +		json.NewEncoder(w).Encode(map[string]any{"result": result, "confirmed": confirmed})
@@ -268,17 +302,24 @@ index 0000000..16197dd
 +}
 diff --git a/internal/cli/handoff_control_test.go b/internal/cli/handoff_control_test.go
 new file mode 100644
-index 0000000..8e43a12
+index 0000000..095969e
 --- /dev/null
 +++ b/internal/cli/handoff_control_test.go
-@@ -0,0 +1,20 @@
+@@ -0,0 +1,49 @@
 +// SPDX-License-Identifier: Apache-2.0
 +package cli
 +
 +import (
++	"context"
++	"database/sql"
++	"errors"
++	"fmt"
 +	"net/http/httptest"
 +	"strings"
 +	"testing"
++
++	"github.com/lib/pq"
++	"miniflux.app/v2/internal/handoff"
 +)
 +
 +func TestHandoffControlStrictCommandBody(t *testing.T) {
@@ -290,6 +331,28 @@ index 0000000..8e43a12
 +	fields, err := handoffFields(httptest.NewRequest("POST", "/pause", strings.NewReader(`{"operation_id":"exact"}`)))
 +	if err != nil || fields["operation_id"] != "exact" {
 +		t.Fatal("valid command rejected")
++	}
++}
++
++func TestHandoffErrorCategoryIsFixedEnum(t *testing.T) {
++	cases := map[string]error{
++		"unconfirmed": nil,
++		"deadline":    fmt.Errorf("wrapped: %w", context.DeadlineExceeded),
++		"uncertain":   handoff.ErrUncertain,
++		"conflict":    handoff.ErrConflict,
++		"closed":      handoff.ErrClosed,
++		"no_rows":     sql.ErrNoRows,
++		"lock":        &pq.Error{Code: "55P03", Message: "secret detail"},
++		"db":          &pq.Error{Code: "08006"},
++		"other":       errors.New("token=secret"),
++	}
++	for want, err := range cases {
++		if got := handoffErrorCategory(err); got != want {
++			t.Fatalf("%s: got %s", want, got)
++		}
++	}
++	if handoffErrorCategory(&pq.Error{Code: "57014"}) != "deadline" {
++		t.Fatal("statement cancel must be deadline")
 +	}
 +}
 diff --git a/internal/cli/scheduler.go b/internal/cli/scheduler.go

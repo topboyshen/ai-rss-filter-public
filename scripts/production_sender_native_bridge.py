@@ -243,12 +243,17 @@ class NativeControlBridge:
         route = "/operations/<operation_id>" if path.startswith("/operations/") else path
         gate._write(self.root / f"request-{sequence:03d}.intent.json", {"method": method, "route": route, "path_sha256": _hash(path.encode()),
                     "body_sha256": _hash(raw), "forwarded_result_not_synthesized": True})
+        self.harness.last_error_category = None
+        started = time.monotonic()
         status, body = self.harness.private_exchange(path, method, value)
+        elapsed = round(time.monotonic() - started, 3)
+        category = getattr(self.harness, "last_error_category", None) if status == 409 else None
         gate._require(type(status) is int and status in {200, 409} and isinstance(body, dict)
                       and len(namespace._encoded(body)) <= namespace.MAX_HTTP and time.monotonic() < deadline,
                       "native Go response unconfirmed")
         gate._write(self.root / f"request-{sequence:03d}.result.json", {"status": status,
-                    "body_sha256": _hash(namespace._encoded(body)), "elapsed_within_seconds": REQUEST_SECONDS})
+                    "body_sha256": _hash(namespace._encoded(body)), "elapsed_within_seconds": REQUEST_SECONDS,
+                    "elapsed_seconds": elapsed, "error_category": category})
         return status, body
 
     def transport(self, token_file):

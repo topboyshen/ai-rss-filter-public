@@ -74,6 +74,13 @@ def _bridge(root):
             out["last_intent"] = _redact(f"{last.get('method')} {last.get('route')}")
         except (OSError, ValueError, AttributeError):
             pass
+    results = sorted(root.glob("request-*.result.json"))
+    if results:
+        try:
+            last = json.loads(results[-1].read_text())
+            out["last_result"] = {k: _redact(last.get(k)) for k in ("status", "elapsed_seconds", "error_category")}
+        except (OSError, ValueError, AttributeError):
+            pass
     port = out.get("start", {}).get("port")
     out["port_listening"] = _port_listening(port) if port not in (None, "None") else None
     return out
@@ -159,7 +166,13 @@ PG_QUERIES = (
                "GROUP BY 1, 2 ORDER BY 1, 2 LIMIT 16"),
     ("operation_counts", "SELECT status, count(*) FROM handoff_operations GROUP BY 1 ORDER BY 1 LIMIT 8"),
     ("operations", "SELECT action, status, previous_generation, generation, operation_id FROM handoff_operations "
-                   "ORDER BY generation DESC, operation_id LIMIT 6"))
+                   "ORDER BY generation DESC, operation_id LIMIT 6"),
+    # Catalog views only (no lock functions): who holds/awaits the Go handoff advisory keys.
+    ("advisory_locks", "SELECT classid::bigint, objsubid, mode, granted, count(*), count(DISTINCT pid) FROM pg_locks "
+                       "WHERE locktype='advisory' AND classid IN (20261023::oid, 20261024::oid) "
+                       "GROUP BY 1, 2, 3, 4 ORDER BY 1, 2, 3, 4 LIMIT 16"),
+    ("activity", "SELECT state, wait_event_type, wait_event, count(*) FROM pg_stat_activity "
+                 "WHERE datname=current_database() AND pid<>pg_backend_pid() GROUP BY 1, 2, 3 ORDER BY 4 DESC LIMIT 16"))
 
 
 def _short(value):
@@ -194,7 +207,15 @@ def _pg_rows(cursor):
                                     for a, b, c in out["leases"]],
             "operation_counts": {_redact(a)[:24]: c for a, c in out["operation_counts"]},
             "recent_operations": [{"action": _redact(a)[:24], "status": _redact(b)[:24], "previous_generation": c,
-                                   "generation": d, "operation": _short(e)} for a, b, c, d, e in out["operations"]]}
+                                   "generation": d, "operation": _short(e)} for a, b, c, d, e in out["operations"]],
+            **_pg_contention(out)}
+
+
+def _pg_contention(out):
+    return {"advisory_locks": [{"classid": a, "objsubid": b, "mode": _redact(c)[:24], "granted": d, "locks": e, "pids": f}
+                               for a, b, c, d, e, f in out["advisory_locks"]],
+            "activity": [{"state": _redact(a)[:24], "wait": _redact(f"{b}:{c}")[:48], "count": d}
+                         for a, b, c, d in out["activity"]]}
 
 
 def pg_snapshot(harness, p, *, connect=None):

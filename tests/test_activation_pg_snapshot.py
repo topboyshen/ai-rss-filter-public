@@ -43,6 +43,10 @@ class Cursor:
             return [("active", "outbox_pass", 1), ("uncertain", "token=leak7 " + "s" * 80, 2)] * 8
         if "count(*) FROM handoff_operations" in self.last:
             return [("confirmed", 3)]
+        if "pg_locks" in self.last:
+            return [(20261024, 2, "ShareLock", True, 1, 1), (20261024, 2, "ExclusiveLock", False, 1, 1)]
+        if "pg_stat_activity" in self.last:
+            return [("idle", None, None, 3), ("active", "Lock", "advisory", 1)]
         return [("initialize_closed", "confirmed", -1, 0, "c" * 64)] * 6
 
 
@@ -85,7 +89,7 @@ def test_snapshot_is_read_only_bounded_and_redacted(tmp_path):
     assert seen[1].rolled_back is True
     queries = [q for q in log if q.startswith("SELECT")]
     assert queries and all("LIMIT" in q for q in queries)
-    assert not any(word in " ".join(log).upper() for word in ("INSERT", "UPDATE ", "DELETE", "ALTER", "LOCK TABLE", "FOR UPDATE", "ADVISORY"))
+    assert not any(word in " ".join(log).upper() for word in ("INSERT", "UPDATE ", "DELETE", "ALTER", "LOCK TABLE", "FOR UPDATE", "PG_ADVISORY", "PG_TRY"))
     assert value["state"]["phase"] == "closed" and len(value["state"]["current_operation"]) == 12
     raw = json.dumps(value)
     assert "b" * 64 not in raw and "c" * 64 not in raw and "leak7" not in raw and PASSWORD not in raw
@@ -138,3 +142,20 @@ def test_only_ci_native_verifier_invokes_snapshot():
             if isinstance(node, ast.Attribute) and node.attr in ("pg_snapshot", "synthetic_dsn"):
                 callers.add(path.name)
     assert callers == {"verify_production_activation_native.py"}
+
+
+def test_snapshot_reports_advisory_holders_and_wait_events(tmp_path):
+    log = []
+    value = window.pg_snapshot(ActivationHarness(), _p(tmp_path), connect=_connect(log, []))
+    lock_sql = next(q for q in log if "pg_locks" in q)
+    assert "20261023::oid" in lock_sql and "20261024::oid" in lock_sql and "locktype='advisory'" in lock_sql
+    assert value["advisory_locks"][0] == {"classid": 20261024, "objsubid": 2, "mode": "ShareLock", "granted": True,
+                                          "locks": 1, "pids": 1}
+    assert value["activity"][1] == {"state": "active", "wait": "Lock:advisory", "count": 1}
+    assert all("query" not in q.split("FROM")[0] and "usename" not in q for q in log if "pg_stat_activity" in q)
+
+
+def test_snapshot_contention_queries_on_real_postgres_shape():
+    names = [name for name, _ in window.PG_QUERIES]
+    assert names[-2:] == ["advisory_locks", "activity"]
+    assert all(sql.lstrip().startswith("SELECT") and "LIMIT 16" in sql for _, sql in window.PG_QUERIES[-2:])

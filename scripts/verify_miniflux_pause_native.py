@@ -36,9 +36,19 @@ body=json.dumps(p['value']).encode() if p.get('value') is not None else None
 r=urllib.request.Request(p['url'],data=body,headers=headers,method=p['method'])
 try:
  with urllib.request.urlopen(r,timeout=12) as s: value={'status':s.status,'body':s.read(1048576).decode()}
-except urllib.error.HTTPError as s: value={'status':s.code,'body':s.read(1048576).decode()}
+except urllib.error.HTTPError as s: value={'status':s.code,'body':s.read(1048576).decode(),'category':s.headers.get('X-Handoff-Error-Category')}
 print(json.dumps(value))
 """
+
+
+ERROR_CATEGORIES = frozenset({"unconfirmed", "deadline", "uncertain", "conflict", "closed", "no_rows", "lock", "db", "other"})
+
+
+def error_category(value):
+    """CI diagnostic only: a fixed Go enum header, never free-form error text."""
+    if value is None:
+        return None
+    return value if value in ERROR_CATEGORIES else "invalid"
 
 
 def save(path, value):
@@ -138,6 +148,7 @@ class Harness:
         self.network = self.prefix + "-network"
         self.names, self.images, self.created = {}, {}, []
         self.sequence, self.started = 0, time.monotonic()
+        self.last_error_category = None
         self.phase_deadline = None
         self.password, self.token = secrets.token_hex(24), secrets.token_hex(32)
         self.auth = "Basic " + base64.b64encode(("synthetic:" + self.password).encode()).decode()
@@ -255,6 +266,7 @@ class Harness:
         row = json.loads(self.command(["inspect", name]))[0]
         resource_checks(row, self.python_id, self.owner, "container:" + sender["Id"])
         result = json.loads(raw)
+        self.last_error_category = error_category(result.get("category"))
         return result["status"], json.loads(result["body"]) if result["body"] else None
 
     def private_control(self, path, method="GET", value=None, *, expected=200):
