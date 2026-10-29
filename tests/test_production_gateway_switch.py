@@ -553,3 +553,18 @@ def test_hard_wall_bounds_blocking_calls_and_restores_handler():
     assert time.monotonic() - start < 0.5
     assert signal.getsignal(signal.SIGALRM) == before
     assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+
+
+def test_rendered_config_sizes_map_hash_for_64_hex_operation_keys():
+    """nginx -t rejects the 64-hex map keys with the default 64-byte bucket (CI run 40820168445)."""
+    operation = "a" * 64
+    text = switch.render_config(operation, "ai-filter-api").decode()
+    lines = [line.strip() for line in text.splitlines()]
+    http = lines.index("http {")
+    server = lines.index("server {")
+    assert lines.count("map_hash_bucket_size 128;") == 1
+    assert http < lines.index("map_hash_bucket_size 128;") < server
+    maps = [line for line in lines if line.startswith("map ")]
+    assert len(maps) == 2 and all(f"{operation} " in line for line in maps)
+    assert text.count("{") == text.count("}") and lines.count("server {") == 1 and lines.count("location / {") == 1
+    assert "proxy_pass $api_upstream$request_uri;" in lines and "listen 5000;" in lines

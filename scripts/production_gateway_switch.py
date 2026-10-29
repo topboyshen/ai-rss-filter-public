@@ -93,6 +93,7 @@ http {
   include /etc/nginx/mime.types;
   default_type application/octet-stream;
   server_tokens off;
+  map_hash_bucket_size 128;
   access_log /dev/stdout;
   error_log /dev/stderr warn;
   resolver 127.0.0.11 valid=10s ipv6=off;
