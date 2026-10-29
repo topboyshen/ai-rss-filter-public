@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import http.client
+import math
 from pathlib import Path
 import time
 from urllib.parse import urlsplit
@@ -50,7 +51,10 @@ def validate_plan(plan):
 
 class NativeSenderTransport:
     """Only fixed Docker inspect and authenticated loopback private gate calls."""
-    def __init__(self, url, token_file, *, container_id=None):
+    DEFAULT_TIMEOUT_SECONDS = 2
+    MAX_TIMEOUT_SECONDS = 30
+
+    def __init__(self, url, token_file, *, container_id=None, timeout_seconds=None):
         value = urlsplit(url)
         require(value.scheme == "http" and value.hostname == "127.0.0.1" and value.port and value.path in ("", "/")
                 and not value.query and not value.fragment and not value.username and not value.password,
@@ -59,6 +63,11 @@ class NativeSenderTransport:
         require(container_id is None or (isinstance(container_id, str) and HEX64.fullmatch(container_id)),
                 "exact sender namespace container ID required")
         self.container_id = container_id
+        if timeout_seconds is None:
+            timeout_seconds = self.DEFAULT_TIMEOUT_SECONDS
+        require(type(timeout_seconds) in (int, float) and math.isfinite(timeout_seconds)
+                and 0 < timeout_seconds <= self.MAX_TIMEOUT_SECONDS, "bounded sender control timeout required")
+        self.timeout_seconds = timeout_seconds
         require(self.token_file.is_absolute(), "absolute private sender token required")
         self.token_sha256 = contract.digest(self._token())
 
@@ -85,21 +94,21 @@ class NativeSenderTransport:
         require(body is None or len(body) <= 8192, "sender request byte budget")
         if self.container_id is not None:
             return sender_namespace_http.request(self.container_id, self.port, method, path, token["token"], payload)
-        started = time.monotonic()
-        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=2)
+        started, limit = time.monotonic(), self.timeout_seconds
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=limit)
         try:
             connection.request(method, path, body=body, headers={"Authorization":"Bearer " + token["token"], "Content-Type":"application/json"})
             response = connection.getresponse()
             raw = bytearray()
             while len(raw) <= 65536:
-                require(time.monotonic()-started < 2, "sender control deadline; outcome unknown")
+                require(time.monotonic()-started < limit, "sender control deadline; outcome unknown")
                 if connection.sock:
-                    connection.sock.settimeout(max(0.001, 2-(time.monotonic()-started)))
+                    connection.sock.settimeout(max(0.001, limit-(time.monotonic()-started)))
                 chunk = response.read1(min(4096, 65537-len(raw)))
                 if not chunk:
                     break
                 raw.extend(chunk)
-            require(len(raw) <= 65536 and response.status in (200,409) and time.monotonic()-started < 2,
+            require(len(raw) <= 65536 and response.status in (200,409) and time.monotonic()-started < limit,
                     "sender response unconfirmed; exact query only")
             return response.status, parsed(bytes(raw))
         finally:

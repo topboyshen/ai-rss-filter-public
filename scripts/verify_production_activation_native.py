@@ -365,6 +365,30 @@ def finite_native_consumption(harness, p, receiver, driver):
     harness.consume_after_open(p, receiver)
     return ongoing
 
+def _watchdog_window(p, harness, receiver, native_driver):
+    """Step-9 watchdog prepare/start/ready; on failure write a bounded record and re-raise unchanged."""
+    from scripts import production_admission_watchdog as watchdog
+    from scripts.controlled_production_release import _actual_child_receipt
+    from scripts import activation_window_diagnostics as window
+    sub_stage, window_started, child = "prepare", time.monotonic(), None
+    try:
+        guardian = watchdog.prepare(receiver, native_driver)
+        p["watchdog_prepared"] = guardian
+        sub_stage, window_started = "start", time.monotonic()
+        child = watchdog.start(guardian["plan_path"])
+        p["watchdog_child"] = child
+        guardian_root = Path(guardian["plan_path"]).parent
+        sub_stage, window_started = "ready", time.monotonic()
+        ready = _actual_child_receipt(child, lambda: watchdog.query_ready(guardian["plan_path"], child.pid), 8,
+                                      receipt_path=guardian_root / "pulse.json",
+                                      stop_paths=(guardian_root / "STOP.json",))
+    except BaseException as error:
+        window.record(p["gateway_evidence"], sub_stage, window_started, error,
+                      harness_output=getattr(harness, "output", None), child=child)
+        raise
+    return guardian, ready
+
+
 
 def activate(harness, p, driver, migration_root, native_driver, *, release_lock=None):
     from services.production_activation_control import locked_activation
@@ -400,25 +424,7 @@ def activate(harness, p, driver, migration_root, native_driver, *, release_lock=
         checked_gateway = gateway.query()
         fixture.save(p["directory"] / "ACTUAL_GATEWAY.json", {"switch": switched, "query": checked_gateway,
                      "real_nginx_and_http": True, "production_access": False})
-        from scripts import production_admission_watchdog as watchdog
-        from scripts.controlled_production_release import _actual_child_receipt
-        from scripts import activation_window_diagnostics as window
-        sub_stage, window_started, child = "prepare", time.monotonic(), None
-        try:
-            guardian = watchdog.prepare(receiver, native_driver)
-            p["watchdog_prepared"] = guardian
-            sub_stage, window_started = "start", time.monotonic()
-            child = watchdog.start(guardian["plan_path"])
-            p["watchdog_child"] = child
-            guardian_root = Path(guardian["plan_path"]).parent
-            sub_stage, window_started = "ready", time.monotonic()
-            ready = _actual_child_receipt(child, lambda: watchdog.query_ready(guardian["plan_path"], child.pid), 8,
-                                          receipt_path=guardian_root / "pulse.json",
-                                          stop_paths=(guardian_root / "STOP.json",))
-        except BaseException as error:
-            window.record(p["gateway_evidence"], sub_stage, window_started, error,
-                          harness_output=getattr(harness, "output", None), child=child)
-            raise
+        guardian, ready = _watchdog_window(p, harness, receiver, native_driver)
         fixture.save(p["directory"] / "ACTUAL_PREOPEN_GUARDIAN.json", {"plan": guardian, "ready": ready,
                      "actual_process": True, "transport_scope": "synthetic_loopback_to_owned_go"})
         harness.stage("receiver_resume_and_independent_runtime_verification")

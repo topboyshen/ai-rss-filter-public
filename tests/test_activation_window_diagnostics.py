@@ -1,4 +1,6 @@
 import json
+
+import pytest
 import socket
 import time
 
@@ -59,3 +61,53 @@ def test_record_is_capped_and_never_raises(tmp_path, monkeypatch):
     path = window.record(switch, "start", time.monotonic(), OSError("boom"))
     assert path is not None and len(path.read_bytes()) == window.RECORD_LIMIT
     assert window.record(tmp_path / "missing", "ready", time.monotonic(), OSError("x")) is None
+
+
+def _window_case(tmp_path, monkeypatch, failing):
+    import inspect
+    from types import SimpleNamespace
+
+    from scripts import controlled_production_release as release
+    from scripts import production_admission_watchdog as watchdog
+    from scripts import verify_production_activation_native as verify
+
+    assert "_watchdog_window(p, harness, receiver, native_driver)" in inspect.getsource(verify.activate)
+    error = TimeoutError("timed out")
+    plan = tmp_path / "guardian" / "plan.json"
+    child = SimpleNamespace(pid=1, poll=lambda: None)
+
+    def step(name, value):
+        def run(*_args, **_kwargs):
+            if name == failing:
+                raise error
+            return value
+        return run
+    monkeypatch.setattr(watchdog, "prepare", step("prepare", {"plan_path": str(plan)}))
+    monkeypatch.setattr(watchdog, "start", step("start", child))
+    monkeypatch.setattr(release, "_actual_child_receipt", step("ready", {"ready": True}))
+    switch = tmp_path / "switch"
+    switch.mkdir()
+    p = {"gateway_evidence": switch}
+    return verify, p, error, switch
+
+
+@pytest.mark.parametrize("failing", ["prepare", "start", "ready"])
+def test_activate_window_failure_writes_record_and_reraises_original(tmp_path, monkeypatch, failing):
+    verify, p, error, switch = _window_case(tmp_path, monkeypatch, failing)
+    with pytest.raises(TimeoutError) as caught:
+        verify._watchdog_window(p, SimpleHarness(tmp_path), object(), object())
+    assert caught.value is error and str(caught.value) == "timed out"
+    value = json.loads((switch / "watchdog-window.stderr").read_bytes())
+    assert value["sub_stage"] == failing and value["error_type"] == "TimeoutError"
+
+
+def test_activate_window_success_writes_nothing(tmp_path, monkeypatch):
+    verify, p, _error, switch = _window_case(tmp_path, monkeypatch, None)
+    guardian, ready = verify._watchdog_window(p, SimpleHarness(tmp_path), object(), object())
+    assert ready == {"ready": True} and p["watchdog_prepared"] is guardian
+    assert not (switch / "watchdog-window.stderr").exists()
+
+
+class SimpleHarness:
+    def __init__(self, output):
+        self.output = output

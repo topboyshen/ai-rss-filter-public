@@ -57,7 +57,8 @@ def test_actual_driver_class_reaches_loopback_and_context_restores_commands(case
         assert (status, body) == (200, {"source": "actual-synthetic-backend", "confirmed": True, "result": {"original": 17}})
         transport.request("POST", "/initialize-closed", {"operation_id": "c" * 64})
         h.command(["main-thread-inspect"], timeout=17)
-        assert all(0 < row[2]["timeout"] <= 2 for row in h.commands[:2])
+        assert all(2 < row[2]["timeout"] <= bridge_module.COMMAND_SECONDS for row in h.commands[:2])
+        assert transport.timeout_seconds == bridge_module.CLIENT_SECONDS
         assert h.commands[-1][2]["timeout"] == 17
     assert h.command == original and not bridge.thread.is_alive()
     records = b"".join(path.read_bytes() for path in bridge.root.iterdir())
@@ -149,7 +150,7 @@ def test_all_harness_commands_share_real_lock_without_changing_main_timeout(case
         main.join(2)
         assert not client.is_alive() and not main.is_alive() and not errors
     assert [row[0] for row in rows] == [1, 2]
-    assert rows[0][2]["timeout"] <= 2 and rows[1][2]["timeout"] == 19
+    assert 2 < rows[0][2]["timeout"] <= bridge_module.COMMAND_SECONDS and rows[1][2]["timeout"] == 19
 
 
 def test_finite_request_budget_closes_listener(case, monkeypatch):
@@ -195,3 +196,9 @@ def test_start_record_failure_restores_original_method_and_closes_socket(case, m
     with pytest.raises(OSError):
         bridge.__enter__()
     assert not bridge.live and case.harness.command == original and bridge.server.fileno() == -1
+
+
+def test_bridge_budget_constants_are_pinned():
+    assert (bridge_module.REQUEST_SECONDS, bridge_module.COMMAND_SECONDS, bridge_module.CLIENT_SECONDS) == (18, 15, 20)
+    assert bridge_module.COMMAND_SECONDS < bridge_module.REQUEST_SECONDS < bridge_module.CLIENT_SECONDS
+    assert bridge_module.REQUEST_SECONDS not in (3, 17, 19) and bridge_module.CLIENT_SECONDS not in (2, 19, 21)

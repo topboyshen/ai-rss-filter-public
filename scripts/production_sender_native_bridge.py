@@ -26,7 +26,9 @@ import sender_namespace_http as namespace  # noqa: E402
 from scripts.verify_miniflux_pause_native import Harness  # noqa: E402
 from services import admission_fence as gate  # noqa: E402
 
-REQUEST_SECONDS = 3
+REQUEST_SECONDS = 18  # cold `docker run` client container must fit (CI bridge only)
+COMMAND_SECONDS = 15  # per forwarded docker command; margin below REQUEST_SECONDS
+CLIENT_SECONDS = 20  # bridge client waits slightly longer so the bridge reports first
 MAX_REQUESTS = 200
 MAX_BODY = 8192
 
@@ -219,7 +221,7 @@ class NativeControlBridge:
         try:
             remaining = self.request_deadline - time.monotonic()
             gate._require(remaining > 0, "native bridge command deadline")
-            kwargs["timeout"] = min(2, kwargs.get("timeout", 30), remaining)
+            kwargs["timeout"] = min(COMMAND_SECONDS, kwargs.get("timeout", 30), remaining)
             return self.original_command(*args, **kwargs)
         finally:
             self.command_lock.release()
@@ -255,4 +257,5 @@ class NativeControlBridge:
         gate._require(token_file.is_absolute() and not gate._present(token_file)
                       and not gate._present(token_file.with_suffix(".json.pending")), "new private synthetic token file required")
         gate._write(token_file, {"token": self.token})
-        return NativeSenderActivationTransport(f"http://127.0.0.1:{self.server.server_port}", token_file, container_id=None)
+        return NativeSenderActivationTransport(f"http://127.0.0.1:{self.server.server_port}", token_file, container_id=None,
+                                                timeout_seconds=CLIENT_SECONDS)
