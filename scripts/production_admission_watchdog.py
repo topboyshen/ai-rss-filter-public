@@ -51,7 +51,8 @@ def prepare(session, sender):
              "sender_plan": sender.plan, "sender_evidence_root": str(sender.root),
              "sender_url": f"http://127.0.0.1:{sender.transport.port}", "token_file": str(sender.transport.token_file),
              "dsn_file": str(sender.postgres.path), "sender_namespace_container_id": sender.transport.container_id, "config_path": session.permit["config"]["path"],
-             "source_sha256": life.source_sha256(), "clock": session.arm["clock"]}
+             "source_sha256": life.source_sha256(), "clock": session.arm["clock"],
+             **supervisor.bridge_timeout_field(sender)}
     root = session.root / "watchdog"
     gate._require(not gate._present(root), "watchdog already prepared; no replacement authority")
     root.mkdir(mode=0o700)
@@ -68,7 +69,7 @@ def prepare(session, sender):
 def load(path):
     path = Path(path)
     value = runtime.read_confirmed(path)
-    gate._require(set(value) == KEYS and value["schema"] == SCHEMA and value["source_sha256"] == life.source_sha256()
+    gate._require(supervisor.plan_keys_valid(value, KEYS) and value["schema"] == SCHEMA and value["source_sha256"] == life.source_sha256()
                   and path == Path(value["runtime_root"]) / "watchdog/plan.json", "fixed watchdog plan/source required")
     permit = runtime.read_confirmed(Path(value["migration_root"]) / "permit.json")
     descriptor = runtime.read_confirmed(Path(value["runtime_root"]) / "descriptor.json")

@@ -54,7 +54,7 @@ def test_timeout_record_written_redacted_bounded_and_exported(tmp_path, monkeypa
     monkeypatch.setattr(native.time, "monotonic", lambda: 100)
     rows = native.safe_inventory(root, 600)["gateway_command_stderr"]
     assert [r["path"].rsplit("/", 1)[1] for r in rows] == ["watchdog-window.stderr"]
-    assert '"sub_stage": "prepare"' in rows[0]["text"] and "leak123" not in rows[0]["text"]
+    assert json.loads(rows[0]["text"])["sub_stage"] == "prepare" and "leak123" not in rows[0]["text"]
 
 
 def test_record_is_capped_and_never_raises(tmp_path, monkeypatch):
@@ -106,6 +106,7 @@ def test_activate_window_failure_writes_record_and_reraises_original(tmp_path, m
     value = json.loads((switch / "watchdog-window.stderr").read_bytes())
     assert value["sub_stage"] == failing and value["error_type"] == "TimeoutError"
     assert value["control_exchange"]["status"] == 409
+    assert value["postgres"]["at_failure"]["error_type"] == "AdmissionError"  # non-CI harness refused, not masked
 
 
 def test_activate_window_success_writes_nothing(tmp_path, monkeypatch):
@@ -175,4 +176,5 @@ def test_rejected_confirm_record_is_exported_and_adapter_logic_unchanged(tmp_pat
     rows = native.safe_inventory(root, 600)["gateway_command_stderr"]
     text = rows[0]["text"]
     assert rows[0]["path"].endswith("watchdog-window.stderr") and len(text) <= window.RECORD_LIMIT
-    assert '"status": 409' in text and '"keys": ["confirmed", "result"]' in text
+    exchange = json.loads(text)["control_exchange"]
+    assert exchange["status"] == 409 and exchange["keys"] == ["confirmed", "result"]

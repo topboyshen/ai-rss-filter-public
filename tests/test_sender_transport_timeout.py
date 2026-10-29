@@ -41,4 +41,5 @@ def test_only_ci_bridge_passes_longer_timeout():
     rows = list(_constructions())
     assert len(rows) >= 4
     with_timeout = {name for name, keys in rows if "timeout_seconds" in keys}
-    assert with_timeout == {"production_sender_native_bridge.py"}
+    # supervisor only forwards the validated plan field (absent => default 2 s); see test_supervisor_bridge_timeout
+    assert with_timeout == {"production_sender_native_bridge.py", "production_admission_supervisor.py"}

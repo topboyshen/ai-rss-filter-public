@@ -122,19 +122,22 @@ def control_exchange(control_root):
         return None
 
 
-def record(evidence_root, sub_stage, started, error, *, harness_output=None, child=None, control_root=None):
+def record(evidence_root, sub_stage, started, error, *, harness_output=None, child=None, control_root=None,
+           postgres=None):
     """Atomically write <=8 KiB; never raises (the original error must surface)."""
     try:
         root = Path(evidence_root)
         output = Path(harness_output) if harness_output is not None else None
         value = {"schema": 1, "sub_stage": sub_stage, "endpoints": ENDPOINTS.get(sub_stage, []),
                  "configured_seconds": configured_seconds(),
-                 "control_exchange": control_exchange(control_root) if control_root is not None else None, "elapsed_seconds": round(time.monotonic() - started, 3),
+                 "control_exchange": control_exchange(control_root) if control_root is not None else None,
+                 "postgres": postgres, "elapsed_seconds": round(time.monotonic() - started, 3),
                  "error_type": type(error).__name__, "error_message": _redact(error),
                  "watchdog_child_alive": None if child is None else child.poll() is None,
                  "bridge": _bridge(output / "native-control-bridge") if output else None,
                  "last_harness_command": _last_command(output) if output else None}
-        raw = (json.dumps(value, sort_keys=True) + "\n").encode()[:RECORD_LIMIT]
+        # indent keeps every line far below the 4096-char per-line export redaction cap
+        raw = (json.dumps(value, sort_keys=True, indent=1) + "\n").encode()[:RECORD_LIMIT]
         temporary, target = root / ("." + RECORD_NAME + ".tmp"), root / RECORD_NAME
         temporary.unlink(missing_ok=True)
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -147,3 +150,70 @@ def record(evidence_root, sub_stage, started, error, *, harness_output=None, chi
         return target
     except Exception:  # noqa: BLE001 - diagnostics must never mask the real failure
         return None
+
+
+SYNTHETIC_USER, SYNTHETIC_DB = "synthetic", "synthetic_pause"
+PG_QUERIES = (
+    ("state", "SELECT manifest, generation, phase, current_operation FROM handoff_state WHERE id=1 LIMIT 1"),
+    ("leases", "SELECT status, source, count(*) FROM handoff_leases WHERE status<>'finished' "
+               "GROUP BY 1, 2 ORDER BY 1, 2 LIMIT 16"),
+    ("operation_counts", "SELECT status, count(*) FROM handoff_operations GROUP BY 1 ORDER BY 1 LIMIT 8"),
+    ("operations", "SELECT action, status, previous_generation, generation, operation_id FROM handoff_operations "
+                   "ORDER BY generation DESC, operation_id LIMIT 6"))
+
+
+def _short(value):
+    return None if value is None else hashlib.sha256(str(value).encode()).hexdigest()[:12]
+
+
+def synthetic_dsn(harness, p):
+    """Only the CI harness's own synthetic PG: owned harness + fixed synthetic user/db on a private address."""
+    import ipaddress
+    from urllib.parse import urlsplit
+    gate._require(type(harness).__name__ == "ActivationHarness"
+                  and re.fullmatch(r"[0-9a-f]{32}", str(getattr(harness, "owner", "")))
+                  and getattr(harness, "network", None) == "miniflux-pause-" + harness.owner[:12] + "-network",
+                  "owned synthetic CI harness required")
+    dsn = json.loads((Path(p["directory"]) / "postgres.json").read_text())["dsn"]
+    value = urlsplit(dsn)
+    gate._require(value.scheme == "postgres" and value.username == SYNTHETIC_USER and value.path == "/" + SYNTHETIC_DB
+                  and value.port == 5432 and ipaddress.ip_address(value.hostname).is_private
+                  and not ipaddress.ip_address(value.hostname).is_loopback, "synthetic CI PostgreSQL target required")
+    return dsn
+
+
+def _pg_rows(cursor):
+    out = {}
+    for name, sql in PG_QUERIES:
+        cursor.execute(sql)
+        out[name] = cursor.fetchall()
+    state = out["state"][0] if out["state"] else None
+    return {"state": None if state is None else {"manifest": _short(state[0]), "generation": state[1],
+                                                 "phase": _redact(state[2])[:32], "current_operation": _short(state[3])},
+            "leases_not_finished": [{"status": _redact(a)[:24], "source": _redact(b)[:32], "count": c}
+                                    for a, b, c in out["leases"]],
+            "operation_counts": {_redact(a)[:24]: c for a, c in out["operation_counts"]},
+            "recent_operations": [{"action": _redact(a)[:24], "status": _redact(b)[:24], "previous_generation": c,
+                                   "generation": d, "operation": _short(e)} for a, b, c, d, e in out["operations"]]}
+
+
+def pg_snapshot(harness, p, *, connect=None):
+    """READ ONLY, <=3 s, small LIMITs; never raises (diagnostics must not mask the original failure)."""
+    started = time.monotonic()
+    try:
+        dsn = synthetic_dsn(harness, p)
+        if connect is None:
+            import psycopg
+            connect = psycopg.connect
+        with connect(dsn, connect_timeout=3, autocommit=False) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                cursor.execute("SET LOCAL statement_timeout='3000ms'")
+                cursor.execute("SET LOCAL lock_timeout='1000ms'")
+                value = _pg_rows(cursor)
+            connection.rollback()
+        value["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        return value
+    except Exception as error:  # noqa: BLE001
+        return {"error_type": type(error).__name__, "error_message": _redact(error)[:128],
+                "elapsed_seconds": round(time.monotonic() - started, 3)}

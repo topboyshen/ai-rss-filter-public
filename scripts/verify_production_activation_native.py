@@ -277,6 +277,8 @@ def closed_initialization(harness, p):
         raise AssertionError("synthetic initialize ACK was not dropped")
     gate._require(receipt["state"] == "closed" and receipt["generation"] == 0, "first CLOSED result differs")
     require_rejected(lambda: driver.initialize_closed(initial))
+    from scripts import activation_window_diagnostics as window
+    p["pg_baseline"] = window.pg_snapshot(harness, p)  # read-only CI diagnostic baseline
     gate._require(transport.posts.count("/initialize-closed") == 1, "initial close was reposted")
     harness.http("sender", "/v1/categories", expected=503)
     fixture.save(p["directory"] / "INITIAL_CLOSED.json", {"receipt": receipt, "postgres": driver.bind(),
@@ -383,7 +385,9 @@ def _watchdog_window(p, harness, receiver, native_driver):
                                       receipt_path=guardian_root / "pulse.json",
                                       stop_paths=(guardian_root / "STOP.json",))
     except BaseException as error:
-        window.record(p["gateway_evidence"], sub_stage, window_started, error,
+        postgres = {"baseline_after_closed_initialization": p.get("pg_baseline"),
+                    "at_failure": window.pg_snapshot(harness, p)}
+        window.record(p["gateway_evidence"], sub_stage, window_started, error, postgres=postgres,
                       harness_output=getattr(harness, "output", None), child=child,
                       control_root=getattr(getattr(native_driver, "control", None), "root", None))
         raise

@@ -115,7 +115,7 @@ def prepare(session, sender):
             "sender_plan": sender.plan, "sender_evidence_root": str(sender.root),
             "sender_url": f"http://127.0.0.1:{sender.transport.port}", "token_file": str(sender.transport.token_file),
             "dsn_file": str(sender.postgres.path), "sender_namespace_container_id": sender.transport.container_id, "config_path": session.permit["config"]["path"],
-            "source_sha256": life.source_sha256(), "interval_seconds": 15}
+            "source_sha256": life.source_sha256(), "interval_seconds": 15, **bridge_timeout_field(sender)}
     path = root / "supervisor.plan.json"
     if gate._present(path):
         gate._require(runtime.read_confirmed(path) == plan, "supervisor plan changed")
@@ -134,7 +134,7 @@ def prepare(session, sender):
 def load(path):
     path = Path(path)
     plan = runtime.read_confirmed(path)
-    gate._require(set(plan) == KEYS and plan["schema"] == SCHEMA and plan["interval_seconds"] == 15
+    gate._require(plan_keys_valid(plan, KEYS) and plan["schema"] == SCHEMA and plan["interval_seconds"] == 15
                   and plan["source_sha256"] == life.source_sha256(), "fixed supervisor plan/source required")
     root = Path(plan["runtime_root"]) / "continuation"
     gate._require(path == root / "supervisor.plan.json", "supervisor canonical plan path differs")
@@ -150,8 +150,28 @@ def load(path):
     return plan, root, authority
 
 
+TIMEOUT_KEY = "sender_timeout_seconds"  # CI native bridge only; absent => transport default (2 s)
+
+
+def bridge_timeout_field(sender):
+    """Plan field only when the transport carries a non-default (CI bridge) timeout."""
+    value = getattr(sender.transport, "timeout_seconds", NativeSenderActivationTransport.DEFAULT_TIMEOUT_SECONDS)
+    if value == NativeSenderActivationTransport.DEFAULT_TIMEOUT_SECONDS:
+        return {}
+    gate._require(sender.transport.container_id is None, "longer sender timeout is CI bridge only")
+    return {TIMEOUT_KEY: value}
+
+
+def plan_keys_valid(plan, keys):
+    extra = set(plan) - keys
+    return set(plan) >= keys and extra <= {TIMEOUT_KEY} and (not extra or (
+        plan["sender_namespace_container_id"] is None and type(plan[TIMEOUT_KEY]) in (int, float)
+        and 0 < plan[TIMEOUT_KEY] <= NativeSenderActivationTransport.MAX_TIMEOUT_SECONDS))
+
+
 def sender_from_plan(plan):
-    return SenderActivationDriver(plan["sender_plan"], NativeSenderActivationTransport(plan["sender_url"], plan["token_file"], container_id=plan["sender_namespace_container_id"]),
+    return SenderActivationDriver(plan["sender_plan"], NativeSenderActivationTransport(plan["sender_url"], plan["token_file"], container_id=plan["sender_namespace_container_id"],
+                                  timeout_seconds=plan.get(TIMEOUT_KEY)),
                                   PostgresReader(plan["dsn_file"], plan["sender_plan"]["postgres_identity"]),
                                   Path(plan["sender_evidence_root"]))
 
