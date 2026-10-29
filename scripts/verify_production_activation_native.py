@@ -402,13 +402,23 @@ def activate(harness, p, driver, migration_root, native_driver, *, release_lock=
                      "real_nginx_and_http": True, "production_access": False})
         from scripts import production_admission_watchdog as watchdog
         from scripts.controlled_production_release import _actual_child_receipt
-        guardian = watchdog.prepare(receiver, native_driver)
-        p["watchdog_prepared"] = guardian
-        child = watchdog.start(guardian["plan_path"])
-        p["watchdog_child"] = child
-        guardian_root = Path(guardian["plan_path"]).parent
-        ready = _actual_child_receipt(child, lambda: watchdog.query_ready(guardian["plan_path"], child.pid), 8,
-                                      receipt_path=guardian_root / "pulse.json", stop_paths=(guardian_root / "STOP.json",))
+        from scripts import activation_window_diagnostics as window
+        sub_stage, window_started, child = "prepare", time.monotonic(), None
+        try:
+            guardian = watchdog.prepare(receiver, native_driver)
+            p["watchdog_prepared"] = guardian
+            sub_stage, window_started = "start", time.monotonic()
+            child = watchdog.start(guardian["plan_path"])
+            p["watchdog_child"] = child
+            guardian_root = Path(guardian["plan_path"]).parent
+            sub_stage, window_started = "ready", time.monotonic()
+            ready = _actual_child_receipt(child, lambda: watchdog.query_ready(guardian["plan_path"], child.pid), 8,
+                                          receipt_path=guardian_root / "pulse.json",
+                                          stop_paths=(guardian_root / "STOP.json",))
+        except BaseException as error:
+            window.record(p["gateway_evidence"], sub_stage, window_started, error,
+                          harness_output=getattr(harness, "output", None), child=child)
+            raise
         fixture.save(p["directory"] / "ACTUAL_PREOPEN_GUARDIAN.json", {"plan": guardian, "ready": ready,
                      "actual_process": True, "transport_scope": "synthetic_loopback_to_owned_go"})
         harness.stage("receiver_resume_and_independent_runtime_verification")
