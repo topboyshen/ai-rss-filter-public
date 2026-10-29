@@ -464,20 +464,39 @@ def activate(harness, p, driver, migration_root, native_driver, *, release_lock=
         return {"watchdog": guardian, "supervisor": ongoing}
 
 
-def complete_native_supervision(harness, p, active, native_driver, migration_root):
-    from scripts.controlled_production_release import _handoff
+def _restrictive_stop(harness, p, native_driver, migration_root):
+    """Diagnostic wrapper only: same calls and checks; on failure write restrictive-stop.stderr and re-raise."""
     from services.production_activation_control import locked_activation
     from services import production_admission_lifecycle as lifetime
+    from scripts import activation_window_diagnostics as window
+    started, outcomes, state = time.monotonic(), {}, {}
+    try:
+        with window.observe_stop(lifetime, outcomes), locked_activation(
+                migration_root, p["paths"]["grants"], p["paths"]["slots"],
+                operation_id=p["activation_operation"]) as receiver:
+            state["root"] = receiver.root / "continuation"
+            state["stopped"] = lifetime.stop_new(receiver, native_driver, reason_code="operator")
+        stopped = state["stopped"]
+        gate._require(stopped["status"] == "producers_stopped_drain_pending" and stopped["drained"] is False,
+                      "actual restrictive stop not confirmed")
+        return stopped
+    except BaseException as error:
+        window.record_stop(p["gateway_evidence"], "restrictive_stop", started, error, outcomes=outcomes,
+                           returned=state.get("stopped"), lifecycle_root=state.get("root"),
+                           child=p.get("watchdog_child"),
+                           closed_evidence_source=(p.get("watchdog_prepared") or {}).get("closed_evidence_source"),
+                           postgres={"at_failure": window.pg_snapshot(harness, p)})
+        raise
+
+
+def complete_native_supervision(harness, p, active, native_driver, migration_root):
+    from scripts.controlled_production_release import _handoff
     harness.stage("actual_same_guardian_handoff_and_live_tick")
     live = _handoff(active)
     fixture.save(p["directory"] / "ACTUAL_SUPERVISOR_TICK.json", {"tick": live, "same_guardian_pid": True,
         "actual_go_and_pg": True, "transport_scope": "synthetic_loopback_to_owned_go", "production_access": False})
     harness.stage("actual_restrictive_stop_without_false_drain")
-    with locked_activation(migration_root, p["paths"]["grants"], p["paths"]["slots"],
-                           operation_id=p["activation_operation"]) as receiver:
-        stopped = lifetime.stop_new(receiver, native_driver, reason_code="operator")
-    gate._require(stopped["status"] == "producers_stopped_drain_pending" and stopped["drained"] is False,
-                  "actual restrictive stop not confirmed")
+    stopped = _restrictive_stop(harness, p, native_driver, migration_root)
     fixture.save(p["directory"] / "ACTUAL_RESTRICTIVE_STOP.json", stopped)
     child = p["watchdog_child"]
     gate._require(child.pid == live["owner"]["pid"], "native guardian child differs from actual live owner")

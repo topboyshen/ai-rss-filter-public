@@ -12,6 +12,7 @@ import os
 import re
 import socket
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from services import admission_fence as gate
@@ -143,18 +144,86 @@ def record(evidence_root, sub_stage, started, error, *, harness_output=None, chi
                  "watchdog_child_alive": None if child is None else child.poll() is None,
                  "bridge": _bridge(output / "native-control-bridge") if output else None,
                  "last_harness_command": _last_command(output) if output else None}
-        # indent keeps every line far below the 4096-char per-line export redaction cap
-        raw = (json.dumps(value, sort_keys=True, indent=1) + "\n").encode()[:RECORD_LIMIT]
-        temporary, target = root / ("." + RECORD_NAME + ".tmp"), root / RECORD_NAME
-        temporary.unlink(missing_ok=True)
-        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(raw)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, target)
-        gate._sync_directory(root)
-        return target
+        return _write_record(root, RECORD_NAME, value)
+    except Exception:  # noqa: BLE001 - diagnostics must never mask the real failure
+        return None
+
+
+def _write_record(root, name, value):
+    """Atomic capped write into the exported gateway evidence directory."""
+    # indent keeps every line far below the 4096-char per-line export redaction cap
+    raw = (json.dumps(value, sort_keys=True, indent=1) + "\n").encode()[:RECORD_LIMIT]
+    temporary, target = root / ("." + name + ".tmp"), root / name
+    temporary.unlink(missing_ok=True)
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, target)
+    gate._sync_directory(root)
+    return target
+
+
+STOP_RECORD_NAME = "restrictive-stop.stderr"
+STOP_CALLS = ("_stop_sender", "_stop_receiver")
+
+
+@contextmanager
+def observe_stop(lifetime, outcomes):
+    """Time each restrictive sub-call and keep its redacted error text.
+
+    The original callables run unchanged and every exception is re-raised, so
+    _stop's own error capture and status stay exactly as before."""
+    originals = {name: getattr(lifetime, name) for name in STOP_CALLS}
+
+    def wrap(name, call):
+        def observed(*args, **kwargs):
+            started = time.monotonic()
+            try:
+                value = call(*args, **kwargs)
+            except BaseException as error:
+                outcomes[name] = {"ok": False, "elapsed_seconds": round(time.monotonic() - started, 3),
+                                  "error_type": type(error).__name__, "error_message": _redact(error)}
+                raise
+            outcomes[name] = {"ok": True, "elapsed_seconds": round(time.monotonic() - started, 3)}
+            return value
+        return observed
+    for name, call in originals.items():
+        setattr(lifetime, name, wrap(name, call))
+    try:
+        yield outcomes
+    finally:
+        for name, call in originals.items():
+            setattr(lifetime, name, call)
+
+
+def _stop_result(value):
+    if not isinstance(value, dict):
+        return None
+    errors = value.get("errors") if isinstance(value.get("errors"), dict) else {}
+    return {"status": _scalar(value.get("status")), "drained": _scalar(value.get("drained")),
+            "queue_checked": _scalar(value.get("queue_checked")),
+            "parts": sorted(_redact(k)[:24] for k in value if k in ("sender", "receiver")),
+            "errors": {_redact(k)[:24]: {"type": _scalar((e or {}).get("type")) if isinstance(e, dict) else None}
+                       for k, e in list(errors.items())[:8]}}
+
+
+def record_stop(evidence_root, sub_stage, started, error, *, outcomes, returned=None, lifecycle_root=None,
+                child=None, closed_evidence_source=None, postgres=None):
+    """Step-9 restrictive stop failure record; never raises."""
+    try:
+        written = None
+        if lifecycle_root is not None and (Path(lifecycle_root) / "shutdown-result.json").is_file():
+            written = json.loads((Path(lifecycle_root) / "shutdown-result.json").read_bytes()[:65536])
+        value = {"schema": 1, "sub_stage": sub_stage, "elapsed_seconds": round(time.monotonic() - started, 3),
+                 "error_type": type(error).__name__, "error_message": _redact(error),
+                 "sub_calls": {k: {f: _scalar(v) for f, v in o.items()} for k, o in outcomes.items()},
+                 "returned": _stop_result(returned), "shutdown_result_file": _stop_result(written),
+                 "watchdog_child_alive": None if child is None else child.poll() is None,
+                 "watchdog_child_returncode": None if child is None else _scalar(child.poll()),
+                 "closed_evidence_source": _scalar(closed_evidence_source), "postgres": postgres}
+        return _write_record(Path(evidence_root), STOP_RECORD_NAME, value)
     except Exception:  # noqa: BLE001 - diagnostics must never mask the real failure
         return None
 
