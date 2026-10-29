@@ -86,7 +86,7 @@ def test_original_resources_and_complete_native_steps_remain():
     workflow = yaml.load((ROOT / PATH).read_text(), Loader=yaml.BaseLoader)
     job = workflow["jobs"]["native-amd64"]
     assert job["runs-on"] == "ubuntu-24.04"
-    assert job["timeout-minutes"] == "15"
+    assert job["timeout-minutes"] == "25"
     pg = job["services"]["postgres"]["options"]
     for token in ("--memory 384m", "--memory-swap 384m", "--pids-limit 64"):
         assert token in pg
@@ -138,7 +138,7 @@ def test_host_entry_proof_is_independent_and_does_not_replace_full_activation():
     assert "isolated-host-ingress=${RUNNER_TEMP}/isolated-host-ingress" in evidence[0]["run"]
     assert evidence[1]["with"]["if-no-files-found"] == "error"
     original = workflow["jobs"]["native-amd64"]
-    assert "needs" not in original and original["timeout-minutes"] == "15"
+    assert "needs" not in original and original["timeout-minutes"] == "25"
     assert not any("production_host_ingress_native.py" in s.get("run", "") for s in original["steps"])
 
 
@@ -156,7 +156,7 @@ def test_full_activation_uses_private_clone_and_real_result_without_guard_overri
     for forbidden in ('|| true', 'continue-on-error', '--privileged', '--network=host', 'docker exec',
                       'skip-guard', 'allow-unsafe', 'safe.directory=*', 'chmod -R', 'chown -R'):
         assert forbidden not in run
-    assert job['timeout-minutes'] == '15'
+    assert job['timeout-minutes'] == '25'
     assert all('continue-on-error' not in step for step in job['steps'])
     collector = next(step['run'] for step in job['steps'] if step.get('name') == 'Prepare evidence without following fixture links')
     assert 'production-startup-source=${RUNNER_TEMP}/production-startup-source' in collector

@@ -270,7 +270,9 @@ jobs:
           retention-days: 14
   native-amd64:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # Steps 1-8 take ~6.5 min; step 9 alone is bounded by 240 s bootstrap +
+    # 600 s activation plus Go/image build, so 15 min cancelled a healthy run.
+    timeout-minutes: 25
     services:
       postgres:
         image: postgres@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea

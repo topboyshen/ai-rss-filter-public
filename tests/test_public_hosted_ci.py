@@ -24,7 +24,7 @@ EXPECTED_JOBS = {
 }
 EXPECTED_TIMEOUTS = {
     "admission-fence.yml": {"native-amd64": 8},
-    "cutover-completion.yml": {"isolated-host-ingress": 5, "native-amd64": 15},
+    "cutover-completion.yml": {"isolated-host-ingress": 5, "native-amd64": 25},
     "handoff-operations.yml": {"native-amd64": 8},
     "miniflux-outbox.yml": {"fixed-source": 15},
     "miniflux-pause.yml": {"native-fixed-image": 20},
@@ -197,7 +197,7 @@ def test_cutover_job_contract_rejects_unapproved_jobs_and_execution_paths(mutati
 
 
 @pytest.mark.parametrize("job", ["native-amd64", "isolated-host-ingress"])
-@pytest.mark.parametrize("replacement", [1, 16, "15", None, 5.0, 15.0])
+@pytest.mark.parametrize("replacement", [1, 15, 16, 24, 26, "15", "25", None, 5.0, 15.0, 25.0])
 def test_cutover_each_named_timeout_is_exact(job, replacement):
     _, workflow = _workflow("cutover-completion.yml")
     workflow["jobs"][job]["timeout-minutes"] = replacement
