@@ -910,3 +910,39 @@ def test_tree_count_bound_includes_root_and_nested_directories(tmp_path, monkeyp
         assert all((leaf / name).read_bytes() == b"retained public bytes" for name in ("one", "two"))
     finally:
         os.close(fd)
+
+
+def _build_args(args):
+    return [args[index + 1] for index, value in enumerate(args) if value == "--build-arg"]
+
+
+def test_pip_index_override_is_ci_only_and_exact(shared_source, tmp_path, monkeypatch):
+    repo, source, shared = shared_source
+    builds, _ = fake_candidate_docker(monkeypatch)
+    monkeypatch.delenv("STARTUP_PIP_INDEX_URL", raising=False)
+    (tmp_path / "a").mkdir(mode=0o700)
+    native.build_candidate(repo, tmp_path / "a", source, "synthetic:1", synthetic_contract(1), "c" * 64, shared_source=shared)
+    default = _build_args(builds[-1][0])
+    assert len(default) == 7 and not any(value.startswith("PIP_INDEX_URL=") for value in default)
+    monkeypatch.setenv("STARTUP_PIP_INDEX_URL", "https://pypi.org/simple")
+    (tmp_path / "b").mkdir(mode=0o700)
+    native.build_candidate(repo, tmp_path / "b", source, "synthetic:1", synthetic_contract(1), "c" * 64, shared_source=shared)
+    assert _build_args(builds[-1][0]) == default + ["PIP_INDEX_URL=https://pypi.org/simple"]
+
+
+@pytest.mark.parametrize("value", ["http://pypi.org/simple", "https://user:pw@pypi.org/simple", "file:///tmp/x",
+                                   "https://pypi.org/simple?x=1", "https://pypi.org/simple\n--network=host", "https:///simple"])
+def test_pip_index_override_rejects_unsafe_values_before_build(value):
+    with pytest.raises(private.ContractError, match="STARTUP_PIP_INDEX_URL"):
+        native.pip_index_build_args({"STARTUP_PIP_INDEX_URL": value})
+
+
+def test_dockerfile_default_index_unchanged_and_ci_step_overrides():
+    root = Path(__file__).resolve().parents[1]
+    dockerfile = (root / "Dockerfile").read_text()
+    assert "ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple\n" in dockerfile
+    assert dockerfile.count('-i "$PIP_INDEX_URL"') == 2 and dockerfile.count("tuna.tsinghua") == 1
+    workflow = (root / ".github/workflows/cutover-completion.yml").read_text()
+    assert workflow.count("STARTUP_PIP_INDEX_URL: https://pypi.org/simple") == 1
+    step = workflow.split("- name: Actual application image migration and closed multiworker startup", 1)[1].split("- name:", 1)[0]
+    assert "STARTUP_PIP_INDEX_URL: https://pypi.org/simple" in step

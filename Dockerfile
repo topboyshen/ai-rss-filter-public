@@ -11,10 +11,11 @@ COPY requirements-prod.txt .
 # Install wheels only: production does not build sdists or need packaging tools.
 # Remove the tools AND ensurepip's bundled archives in this same layer. Upgrading
 # top-level wheel alone does not replace setuptools/pip's private vendor copies.
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 RUN python -m pip install --no-cache-dir --only-binary=:all: --upgrade "pip==26.2.0" \
-      -i https://pypi.tuna.tsinghua.edu.cn/simple \
+      -i "$PIP_INDEX_URL" \
  && python -m pip install --no-cache-dir --only-binary=:all: -r requirements-prod.txt \
-      -i https://pypi.tuna.tsinghua.edu.cn/simple \
+      -i "$PIP_INDEX_URL" \
  && python -m pip check \
  && python -m pip uninstall --yes setuptools wheel pip \
  && python -c "import pathlib, shutil, sysconfig; shutil.rmtree(pathlib.Path(sysconfig.get_path('stdlib')) / 'ensurepip')"

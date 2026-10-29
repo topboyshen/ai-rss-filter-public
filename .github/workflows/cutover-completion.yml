@@ -302,6 +302,9 @@ jobs:
           python -I -B scripts/verify_cutover_completion_native.py \
             --repo . --output "${RUNNER_TEMP}/cutover-completion"
       - name: Actual application image migration and closed multiworker startup
+        env:
+          # Hosted runners can be refused by the production Tsinghua mirror.
+          STARTUP_PIP_INDEX_URL: https://pypi.org/simple
         run: |
           set -euo pipefail
           umask 077

@@ -22,6 +22,7 @@ import sys
 import tarfile
 import time
 import traceback
+import urllib.parse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts import private_release_contract as private  # noqa: E402
@@ -685,6 +686,18 @@ def _oneoff_public_source(root, workspace, source, *, deadline=None):
     return context
 
 
+def pip_index_build_args(environ):
+    """CI-only package index override; unset keeps the Dockerfile default."""
+    value = environ.get("STARTUP_PIP_INDEX_URL", "")
+    if not value:
+        return []
+    parsed = urllib.parse.urlsplit(value)
+    private.require(parsed.scheme == "https" and bool(parsed.hostname) and "@" not in parsed.netloc
+                    and not parsed.query and not parsed.fragment and value.isprintable() and " " not in value,
+                    "STARTUP_PIP_INDEX_URL must be a credential-free https URL")
+    return ["--build-arg", "PIP_INDEX_URL=" + value]
+
+
 def build_candidate(root, workspace, source, image, contract, contract_sha, *, shared_source=None, deadline=None):
     phase_seconds(600, deadline)
     if shared_source is None:
@@ -702,6 +715,7 @@ def build_candidate(root, workspace, source, image, contract, contract_sha, *, s
     args = ["docker", "build", "--platform", "linux/amd64", "--tag", image]
     for key, value in labels.items():
         args += ["--build-arg", key + "=" + value]
+    args += pip_index_build_args(os.environ)
     try:
         archive_command([*args, str(context)], workspace / "application-build", seconds=phase_seconds(600, deadline))
     finally:
