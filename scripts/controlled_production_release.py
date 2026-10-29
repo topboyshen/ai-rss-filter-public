@@ -149,6 +149,7 @@ def _watchdog_ready(prepared):
 
 def _actual_child_receipt(child, query, seconds, *, receipt_path=None, stop_paths=()):
     deadline = time.monotonic() + seconds
+    pending = False
     while time.monotonic() < deadline:
         gate._require(child.poll() is None, "bound guardian exited before actual readiness")
         for path in stop_paths:
@@ -157,15 +158,17 @@ def _actual_child_receipt(child, query, seconds, *, receipt_path=None, stop_path
                           "bound guardian has stopped or stop is uncertain")
         if receipt_path is not None:
             path = Path(receipt_path)
-            gate._require(not gate._present(path.with_suffix(path.suffix + ".pending")),
-                          "bound guardian readiness write is uncertain")
-            if not gate._present(path):
-                time.sleep(0.1)
+            # A live child's atomic write shows .pending until its rename; a
+            # dead writer is caught by poll() above, a stuck one at deadline.
+            pending = gate._present(path.with_suffix(path.suffix + ".pending"))
+            if pending or not gate._present(path):
+                time.sleep(0.05 if pending else 0.1)
                 continue
         value = query()
         if time.monotonic() >= deadline:
             raise gate.AdmissionUncertain("bound guardian readiness query exceeded deadline")
         return value
+    gate._require(not pending, "bound guardian readiness write is uncertain")
     raise gate.AdmissionUncertain("bound guardian did not prove readiness")
 
 

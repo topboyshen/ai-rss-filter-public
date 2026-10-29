@@ -271,7 +271,46 @@ def test_actual_guardian_waits_only_for_not_yet_created_receipt(tmp_path, monkey
     assert result == {"pid": 123} and calls == ["verified_original"]
 
 
-@pytest.mark.parametrize("marker", ["pulse.json.pending", "STOP.json", "STOP.json.pending"])
+def test_inflight_readiness_write_is_retried_then_original_receipt_verified(tmp_path, monkeypatch):
+    path, calls = tmp_path / "pulse.json", []
+    pending = tmp_path / "pulse.json.pending"
+    pending.write_text("child write in flight")
+
+    def rename(_seconds):
+        calls.append("waited")
+        pending.rename(path)
+    monkeypatch.setattr(deploy.time, "sleep", rename)
+    result = deploy._actual_child_receipt(SimpleNamespace(poll=lambda: None),
+                                         lambda: calls.append("verified_original") or {"pid": 123}, 1,
+                                         receipt_path=path, stop_paths=(tmp_path / "STOP.json",))
+    assert result == {"pid": 123} and calls == ["waited", "verified_original"]
+
+
+def test_persistent_readiness_pending_is_uncertain_at_deadline_without_query(tmp_path):
+    (tmp_path / "pulse.json").write_text("older original")
+    (tmp_path / "pulse.json.pending").write_text("stuck write")
+    with pytest.raises(gate.AdmissionError, match="readiness write is uncertain"):
+        deploy._actual_child_receipt(SimpleNamespace(poll=lambda: None), lambda: pytest.fail("must not query"), 0.2,
+                                    receipt_path=tmp_path / "pulse.json", stop_paths=(tmp_path / "STOP.json",))
+
+
+@pytest.mark.parametrize("change", ["exit", "stop"])
+def test_readiness_pending_never_hides_child_exit_or_stop(tmp_path, monkeypatch, change):
+    (tmp_path / "pulse.json.pending").write_text("write in flight")
+    state = {"rc": None}
+
+    def fault(_seconds):
+        if change == "exit":
+            state["rc"] = 1
+        else:
+            (tmp_path / "STOP.json").write_text("stopped")
+    monkeypatch.setattr(deploy.time, "sleep", fault)
+    with pytest.raises(gate.AdmissionError, match="exited|stopped"):
+        deploy._actual_child_receipt(SimpleNamespace(poll=lambda: state["rc"]), lambda: pytest.fail("must not query"), 1,
+                                    receipt_path=tmp_path / "pulse.json", stop_paths=(tmp_path / "STOP.json",))
+
+
+@pytest.mark.parametrize("marker", ["STOP.json", "STOP.json.pending"])
 def test_actual_guardian_never_waits_past_uncertain_write_or_stop(tmp_path, monkeypatch, marker):
     (tmp_path / marker).write_text("retained original")
     monkeypatch.setattr(deploy.time, "sleep", lambda *_a: pytest.fail("must stop before sleeping"))
