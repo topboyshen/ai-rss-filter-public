@@ -26,13 +26,31 @@ KEYS = {"schema", "parent", "runtime_root", "migration_root", "state", "activati
         "sender_evidence_root", "sender_url", "token_file", "dsn_file", "config_path", "source_sha256", "clock", "sender_namespace_container_id"}
 
 
+FROZEN_EVIDENCE = "frozen_pg_snapshot_and_recorded_receipt"
+LIVE_EVIDENCE = "live_go_query"
+
+
+def _closed_evidence(session, sender):
+    """Explicit branch: a frozen session's PG locks block Go metadata queries."""
+    from scripts.sender_drain_inventory import FrozenPostgres
+    operation = sender.plan["binding"]["initial_operation_id"]
+    if not session.opened and session.storage is not None:
+        frozen = getattr(session.shadow, "sender", None)
+        # check_receiver_resume just re-ran FrozenPostgres.check under both locks.
+        gate._require(type(frozen) is FrozenPostgres and frozen.connection is not None
+                      and frozen.latest_snapshot is not None, "frozen sender PG lock evidence missing")
+        sample = frozen.latest_snapshot
+        return sample, sender.recorded_initialize_closed(operation, sample), FROZEN_EVIDENCE
+    sample = sender.bind()
+    return sample, sender.query_initialize_closed(operation), LIVE_EVIDENCE
+
+
 def prepare(session, sender):
     gate._require(type(session) is ReceiverActivationSession and type(sender) is SenderActivationDriver,
                   "actual closed activation capabilities required")
     session._identity(active=True)
     proof = session.check_receiver_resume()
-    sample = sender.bind()
-    receipt = sender.query_initialize_closed(sender.plan["binding"]["initial_operation_id"])
+    sample, receipt, source = _closed_evidence(session, sender)
     gate._require(not session.opened and receipt["state"] == "closed" and receipt["generation"] == 0
                   and sample["gate"] == {"manifest": receipt["manifest"], "generation": 0,
                                          "phase": "closed", "current_operation": receipt["operation_id"]},
@@ -63,7 +81,7 @@ def prepare(session, sender):
         os.close(fd)
     gate._write(root / "plan.json", value)
     gate._sync_directory(root.parent)
-    return {"plan_path": str(root / "plan.json"), "plan_sha256": gate._hash(value)}
+    return {"plan_path": str(root / "plan.json"), "plan_sha256": gate._hash(value), "closed_evidence_source": source}
 
 
 def load(path):

@@ -285,6 +285,17 @@ class SenderActivationDriver(SenderDriver):
                 and sample["retained_leases"]["active"] == sample["retained_leases"]["uncertain"] == 0,
                 "actual sender closed state differs")
 
+    def recorded_initialize_closed(self, operation, frozen_sample):
+        """Closed proof while the receiver session holds the sender PG locks.
+
+        Go metadata queries would block on those locks, so the evidence is the
+        snapshot taken under them plus the original confirmed receipt on disk."""
+        self.bind()
+        receipt = self.control.recorded_initialize_closed(operation)
+        require(frozen_sample["database_identity"] == self.plan["postgres_identity"], "frozen sender PG identity differs")
+        self._check_closed(frozen_sample, receipt)
+        return receipt
+
     def query_initialize_closed(self, operation):
         self.bind()
         receipt = self.control.query_initialize_closed(operation)

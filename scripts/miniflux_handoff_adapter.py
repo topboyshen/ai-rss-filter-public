@@ -484,6 +484,16 @@ class MinifluxActivationControl(MinifluxPauseControl):
             receipt = self._confirmed(status, raw, operation, 0, "initialize_closed", "closed")
             return self._persist_result("initialize_closed", receipt)
 
+    def recorded_initialize_closed(self, operation):
+        """Already-confirmed closed initialization from disk only; never contacts Go."""
+        with locked(self.root / "control.lock", True):
+            require(not present(self.root / "initialize_closed.intent.json.pending")
+                    and read_private(self.root / "initialize_closed.intent.json") == self._closed_intent(operation),
+                    "original closed initialization intent missing/conflicting")
+            path = self.root / "initialize_closed.confirmed.json"
+            require(present(path), "confirmed closed initialization receipt missing")
+            return _pg_receipt(read_private(path), self.binding["manifest"], operation, 0, "initialize_closed", "closed")
+
     def query_initialize_closed(self, operation):
         with locked(self.root / "control.lock", True):
             require(not present(self.root / "initialize_closed.intent.json.pending")
