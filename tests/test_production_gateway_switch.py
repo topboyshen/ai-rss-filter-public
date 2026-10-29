@@ -1,6 +1,7 @@
 """Synthetic native-transport boundaries only; no Docker daemon or HTTP server."""
 
 from copy import deepcopy
+import json
 import fcntl
 import hashlib
 import os
@@ -568,3 +569,34 @@ def test_rendered_config_sizes_map_hash_for_64_hex_operation_keys():
     assert len(maps) == 2 and all(f"{operation} " in line for line in maps)
     assert text.count("{") == text.count("}") and lines.count("server {") == 1 and lines.count("location / {") == 1
     assert "proxy_pass $api_upstream$request_uri;" in lines and "listen 5000;" in lines
+
+
+def test_failed_gateway_probe_records_bounded_observation_for_export(case):
+    p = case
+    p.state.wrong_http = True
+    subject = adapter(p)
+    with pytest.raises(gate.AdmissionError, match="actual gateway HTTP"):
+        subject.switch()
+    record_path = p.evidence / "route-probe.stderr"
+    raw = record_path.read_bytes()
+    assert len(raw) <= switch.PROBE_RECORD_LIMIT
+    probe = json.loads(raw)["probes"][-1]
+    assert probe["status"] == 200 and probe["operation_matches"] is True
+    assert probe["upstream"] == "wrong:5000" and probe["upstream_matches"] is False
+    assert probe["upstream_expected"].endswith(":5000") and probe["failed_checks"] == ["upstream"]
+    assert not list(p.evidence.glob(".route-probe*"))
+    # A second failing query overwrites (never O_EXCL-crashes) and stays bounded.
+    with pytest.raises(gate.AdmissionError, match="actual gateway HTTP"):
+        subject.query()
+    assert len(record_path.read_bytes()) <= switch.PROBE_RECORD_LIMIT
+
+
+def test_probe_observation_bounds_and_short_body_only():
+    expected = {"status": 200, "body_sha256": "x", "operation": "a" * 64, "upstream": "172.19.0.7:5000"}
+    long_row = switch._probe_observation({"HostPort": "1"}, {"status": 503, "upstream": "u" * 5000},
+                                         expected, b"N" * 65)
+    assert long_row["body_bytes"] == 65 and "body_text" not in long_row
+    assert len(long_row["upstream"]) == switch.PROBE_TEXT_LIMIT
+    assert long_row["failed_checks"] == ["body_sha256", "operation", "status", "upstream"]
+    short = switch._probe_observation({}, {"status": 503}, expected, b"NOT READY")
+    assert short["body_text"] == "NOT READY" and short["upstream"] is None

@@ -986,3 +986,16 @@ def test_gateway_export_ignores_lookalike_paths_and_links(tmp_path, monkeypatch)
     result = native.safe_inventory(root, 600)
     assert result["gateway_command_stderr"] == []
     assert "outside secret" not in json.dumps(result) and "wrong place" not in json.dumps(result)
+
+
+def test_route_probe_record_is_exported_redacted(tmp_path, monkeypatch):
+    root = tmp_path / "evidence"
+    switch_dir = _gateway_switch_dir(root)
+    record = {"schema": 1, "probes": [{"status": 503, "body_text": "token=leakme123", "upstream": None,
+                                       "failed_checks": ["status", "upstream"]}]}
+    (switch_dir / "route-probe.stderr").write_text(json.dumps(record) + "\n")
+    monkeypatch.setattr(native.time, "monotonic", lambda: 100)
+    rows = native.safe_inventory(root, 600)["gateway_command_stderr"]
+    assert [r["path"].rsplit("/", 1)[1] for r in rows] == ["route-probe.stderr"]
+    assert '"status": 503' in rows[0]["text"] and "failed_checks" in rows[0]["text"]
+    assert "leakme123" not in rows[0]["text"]

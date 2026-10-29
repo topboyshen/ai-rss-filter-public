@@ -178,6 +178,7 @@ class NativeTransport:
     def __init__(self):
         self.deadline = time.monotonic() + 120
         self.last_result = None
+        self.last_probe_body = None
 
     def run(self, args, *, seconds=3):
         remaining = min(seconds, self.deadline - time.monotonic())
@@ -301,6 +302,7 @@ class NativeTransport:
                     break
                 body.extend(chunk)
             gate._require(len(body) <= 65536 and time.monotonic() < deadline, "gateway HTTP bound")
+            self.last_probe_body = bytes(body)
             return {
                 "status": response.status,
                 "body_sha256": hashlib.sha256(body).hexdigest(),
@@ -393,6 +395,30 @@ def _execution(row):
         "cap_drop": host.get("CapDrop") or [],
         "security": ["no-new-privileges:true"],
     }
+
+
+PROBE_TEXT_LIMIT, PROBE_RECORD_LIMIT = 256, 8192
+
+
+def _probe_observation(port, proof, expected, body):
+    proof = proof if isinstance(proof, dict) else {}
+    upstream = proof.get("upstream")
+    row = {
+        "binding": port,
+        "status": proof.get("status"),
+        "body_sha256": proof.get("body_sha256"),
+        "operation_matches": proof.get("operation") == expected["operation"],
+        "operation_present": proof.get("operation") not in (None, ""),
+        "upstream": None if upstream is None else str(upstream)[:PROBE_TEXT_LIMIT],
+        "upstream_expected": expected["upstream"],
+        "upstream_matches": upstream == expected["upstream"],
+        "failed_checks": sorted(key for key in expected if proof.get(key) != expected[key]),
+    }
+    if isinstance(body, (bytes, bytearray)):
+        row["body_bytes"] = len(body)
+        if len(body) <= 64:
+            row["body_text"] = bytes(body).decode("utf-8", errors="replace")
+    return row
 
 
 def _save_raw(path, value):
@@ -715,6 +741,16 @@ class GatewaySwitch:
                     },
                 )
 
+    def _record_probe(self, observed):
+        """Bounded diagnostic of a failed probe; exported (capped, redacted) as gateway_command_stderr."""
+        raw = (json.dumps({"schema": 1, "probes": observed[-8:]}, sort_keys=True) + "\n").encode()[:PROBE_RECORD_LIMIT]
+        target = self.root / "route-probe.stderr"
+        temporary = self.root / ".route-probe.stderr.tmp"
+        temporary.unlink(missing_ok=True)
+        _save_raw(temporary, raw)
+        os.replace(temporary, target)
+        gate._sync_directory(self.root)
+
     def _start(self, identifier, purpose):
         self.check(active=True)
         gate._write(self.root / (purpose + "-start.intent.json"), {"id": identifier, "operation_id": self.operation})
@@ -757,19 +793,27 @@ class GatewaySwitch:
             and ipaddress.ip_address(attachment["IPAddress"]).version == 4,
             "running gateway endpoint is not bound to the exact network",
         )
-        proofs = []
+        proofs, observed = [], []
+        expected = {
+            "status": 200,
+            "body_sha256": hashlib.sha256(b"OK").hexdigest(),
+            "operation": self.operation,
+            "upstream": self.intent["api"]["address"] + ":5000",
+        }
         for port in self.intent["ports"]:
-            proof = self.transport.health(port["HostIp"], int(port["HostPort"]), self.operation)
-            gate._require(
-                proof
-                == {
-                    "status": 200,
-                    "body_sha256": hashlib.sha256(b"OK").hexdigest(),
-                    "operation": self.operation,
-                    "upstream": self.intent["api"]["address"] + ":5000",
-                },
-                "actual gateway HTTP did not reach the exact granted API endpoint",
-            )
+            self.transport.last_probe_body = None
+            try:
+                proof = self.transport.health(port["HostIp"], int(port["HostPort"]), self.operation)
+            except Exception as error:
+                observed.append({"binding": port, "error_type": type(error).__name__,
+                                 "error": str(error)[:PROBE_TEXT_LIMIT]})
+                self._record_probe(observed)
+                raise
+            row_observed = _probe_observation(port, proof, expected, getattr(self.transport, "last_probe_body", None))
+            observed.append(row_observed)
+            if proof != expected:
+                self._record_probe(observed)
+            gate._require(proof == expected, "actual gateway HTTP did not reach the exact granted API endpoint")
             proofs.append({"binding": port, **proof})
         self.check()
         after = self.transport.inspect(row["Id"])
