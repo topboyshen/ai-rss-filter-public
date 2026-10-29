@@ -383,7 +383,8 @@ def _stop_sender(root, authority, sender):
     gate._require(sender.plan_sha256 == authority["identity"]["sender_plan_sha256"], "shutdown sender plan differs")
     transport = sender.transport
     if type(transport) is NativeSenderActivationTransport:
-        transport = NativeSenderTransport(f"http://127.0.0.1:{transport.port}", transport.token_file, container_id=transport.container_id)
+        transport = NativeSenderTransport(f"http://127.0.0.1:{transport.port}", transport.token_file, container_id=transport.container_id,
+                                          timeout_seconds=transport.timeout_seconds)
     driver = SenderDriver(_stop_plan(root, authority, sender), transport, sender.postgres, root / "shutdown-sender")
     operation = gate._hash({"authority": gate._hash(authority), "action": "sender_stop_new"})
     path = driver.control.root / "stop_new.intent.json"
