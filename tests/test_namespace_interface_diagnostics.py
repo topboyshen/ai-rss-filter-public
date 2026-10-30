@@ -6,11 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from scripts import private_release_contract as private
 from scripts import production_host_ingress_native as ingress
 from scripts import production_namespace_native as namespace_native
 from scripts import verify_production_activation_native as native
-from tests.test_production_host_ingress_native import FamilyNetworkCommands, namespace_stat  # noqa: F401
+from tests.test_production_host_ingress_native import FamilyNetworkCommands
+from tests.test_production_host_ingress_native import namespace_stat as _namespace_stat
+
+namespace_stat = _namespace_stat
 
 REPO = Path(__file__).resolve().parents[1]
 BRIDGE = "afa0123456789"
