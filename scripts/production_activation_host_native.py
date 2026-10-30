@@ -766,6 +766,12 @@ def safe_activation(value):
         result["failure_message_sha256"] = (failure.get("message_sha256") if
             re.fullmatch(r"[0-9a-f]{64}", str(failure.get("message_sha256"))) else None)
         result["failure_type_sha256"] = hashlib.sha256(host.encoded(failure.get("type"))).hexdigest()
+        kind = failure.get("type")
+        result["failure_type"] = kind if isinstance(kind, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]{0,80}", kind) else None
+        for key, limit in (("message_literal", 200), ("namespace_helper", 400)):
+            item = failure.get(key)
+            result["failure_" + key] = (item if isinstance(item, str) and 0 < len(item) <= limit
+                                        and re.fullmatch(r"[ -~]+", item) and not re.search(r"[0-9a-fA-F]{32,}", item) else None)
     result["evidence_error_count"] = len(value.get("evidence_errors", [])) if isinstance(value.get("evidence_errors"), list) else None
     return result
 

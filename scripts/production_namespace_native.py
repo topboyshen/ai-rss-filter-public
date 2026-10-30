@@ -273,13 +273,30 @@ def safe_export(options, token):
     return packet
 
 
+def _literal_message(error):
+    """Only a fixed string literal from this reviewed helper or its imports; runtime data never passes."""
+    text = str(error)
+    if not 0 < len(text) <= 200 or re.search(r"[0-9a-fA-F]{32,}", text) or not re.fullmatch(r"[ -~]+", text) or '"' in text:
+        return None
+    root = Path(__file__).resolve().parents[1]
+    for folder in ("scripts", "services"):
+        for source in sorted((root / folder).glob("*.py")):
+            try:
+                if ('"' + text + '"') in source.read_text(encoding="utf-8"):
+                    return text
+            except (OSError, UnicodeError):
+                continue
+    return None
+
+
 def run_report(options, token):
     """Both success and failure produce a bounded safe stdout evidence packet."""
     try:
         result = execute_owned(options, token)
     except BaseException as error:
         result = {"status": "unconfirmed", "error_type": type(error).__name__,
-                  "error_sha256": hashlib.sha256(str(error).encode()).hexdigest()}
+                  "error_sha256": hashlib.sha256(str(error).encode()).hexdigest(),
+                  "error_message_literal": _literal_message(error)}
     try:
         packet = safe_export(options, token)
     except BaseException as error:

@@ -11,6 +11,7 @@ import argparse
 import base64
 import hashlib
 import json
+import re
 import os
 from pathlib import Path
 import selectors
@@ -332,6 +333,25 @@ def create_and_start(session, p):
     raise TimeoutError("actual candidate startup did not confirm")
 
 
+def namespace_helper_summary(path, repo):
+    """Only the helper's plain status/class names and source-literal message; never raises."""
+    try:
+        value = json.loads(Path(str(path) + ".stdout").read_bytes()[:2 * 1024**2])
+    except BaseException as error:
+        return "stdout_unreadable=" + type(error).__name__
+    if not isinstance(value, dict):
+        return "stdout_not_object"
+    fields = []
+    for key in ("status", "execution_status", "error_type"):
+        item = value.get(key)
+        if isinstance(item, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]{0,80}", item):
+            fields.append(key + "=" + item)
+    literal = source_literal(value.get("error_message_literal"), repo)
+    if literal is not None:
+        fields.append("error_message=" + literal)
+    return ",".join(fields) or "no_status_fields"
+
+
 def actual_namespace_transport(harness, p, stopped):
     """Only this synthetic Go container; the production transport has no sudo."""
     record = harness.inspect_role("sender")
@@ -349,8 +369,12 @@ def actual_namespace_transport(harness, p, stopped):
         context.check()
         args += ["--private-host-context", str(context.path), "--private-host-context-sha256", context.proof_sha256]
     path = p["directory"] / "NAMESPACE_PROCESS"
-    startup_native.archive_command(args, path, seconds=35, limit=2 * 1024**2,
-        child_umask=0o077, stdin_bytes=json.dumps({"token": harness.token}).encode())
+    try:
+        startup_native.archive_command(args, path, seconds=35, limit=2 * 1024**2,
+            child_umask=0o077, stdin_bytes=json.dumps({"token": harness.token}).encode())
+    except BaseException as error:
+        error.add_note(NAMESPACE_NOTE + namespace_helper_summary(path, harness.repo))
+        raise
     result = json.loads(Path(str(path) + ".stdout").read_bytes())
     gate._require(result["status"] == "passed" and result["namespace_transport"] is True
                   and result["post_count"] == 1 and result["queue_drained"] is False,
@@ -609,12 +633,41 @@ def scenario(harness, output):
                 p["anchor"].close()
 
 
+DIAGNOSTIC_HEX_RE = re.compile(r"[0-9a-fA-F]{32,}")
+DIAGNOSTIC_TEXT_CHARS = 200
+NAMESPACE_NOTE = "namespace helper: "
+
+
+def source_literal(text, repo):
+    """Return text only when it is a fixed string literal in reviewed source; runtime data never passes."""
+    if not isinstance(text, str) or not 0 < len(text) <= DIAGNOSTIC_TEXT_CHARS or DIAGNOSTIC_HEX_RE.search(text):
+        return None
+    if not re.fullmatch(r"[ -~]+", text) or '"' in text or "\\" in text:
+        return None
+    needle = '"' + text + '"'
+    for folder in ("scripts", "services"):
+        for source in sorted((Path(repo) / folder).glob("*.py")):
+            try:
+                if needle in source.read_text(encoding="utf-8"):
+                    return text
+            except (OSError, UnicodeError):
+                continue
+    return None
+
+
 def record_failure(error, repo, output, stage):
     failure = {"type": type(error).__name__, "message_sha256": hashlib.sha256(str(error).encode()).hexdigest(),
+
                "locations": [{"file": Path(row.filename).name, "function": row.name, "line": row.lineno}
                              for row in traceback.extract_tb(error.__traceback__) if Path(row.filename).resolve().is_relative_to(repo)]}
-    print("activation_native_failure=" + json.dumps({"type": failure["type"],
-          "message_sha256": failure["message_sha256"], "stage": stage}, sort_keys=True), flush=True)
+    summary = {"type": failure["type"], "message_sha256": failure["message_sha256"], "stage": stage}
+    literal = source_literal(str(error), repo)
+    if literal is not None:
+        failure["message_literal"] = summary["message_literal"] = literal
+    helper = [note[len(NAMESPACE_NOTE):] for note in getattr(error, "__notes__", ()) if str(note).startswith(NAMESPACE_NOTE)]
+    if helper:
+        failure["namespace_helper"] = summary["namespace_helper"] = helper[0][:DIAGNOSTIC_TEXT_CHARS * 2]
+    print("activation_native_failure=" + json.dumps(summary, sort_keys=True), flush=True)
     fixture.save(output / "FAILURE.json", failure)
     return failure
 
