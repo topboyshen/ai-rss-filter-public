@@ -157,14 +157,16 @@ def test_harness_failure_export_does_not_claim_complete_inventory(tmp_path, monk
 
 
 @pytest.mark.parametrize("value", [{"ready": 1, "not_ready": 2}, {"ready": 0, "not_ready": 0}])
-def test_only_fixed_readiness_counts_are_exported(value):
-    assert host_native.safe_activation({"pg_readiness": value})["pg_readiness"] == value
+@pytest.mark.parametrize("key", ["pg_readiness", "sender_readiness"])
+def test_only_fixed_readiness_counts_are_exported(value, key):
+    assert host_native.safe_activation({key: value})[key] == value
 
 
 @pytest.mark.parametrize("value", [{"ready": True, "not_ready": 0}, {"ready": -1, "not_ready": 0},
     {"ready": 1, "not_ready": 10001}, {"ready": 1, "not_ready": 0, "raw": "secret"}, None])
-def test_unsafe_readiness_counts_are_not_exported(value):
-    assert host_native.safe_activation({"pg_readiness": value})["pg_readiness"] is None
+@pytest.mark.parametrize("key", ["pg_readiness", "sender_readiness"])
+def test_unsafe_readiness_counts_are_not_exported(value, key):
+    assert host_native.safe_activation({key: value})[key] is None
 
 
 def test_drain_observation_alone_never_completes_native_proof(tmp_path, monkeypatch):

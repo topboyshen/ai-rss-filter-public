@@ -11,6 +11,7 @@ import argparse
 import base64
 from contextlib import nullcontext
 import hashlib
+import ipaddress
 import json
 import re
 import os
@@ -72,6 +73,45 @@ def require_rejected(function):
 PG_READINESS_PROBE = r'''pg_isready -U synthetic -d synthetic_pause >/dev/null 2>&1
 rc=$?
 printf '{"schema":1,"probe":"pg_isready","nonce":"%s","returncode":%s}\n' "$1" "$rc"
+'''
+
+SENDER_READINESS_PROBE = r'''import errno,ipaddress,json,re,sys,urllib.error,urllib.request
+p=json.load(sys.stdin)
+if (type(p) is not dict or set(p)!={'nonce','auth','sender_ip'}
+    or type(p['nonce']) is not str or re.fullmatch(r'[0-9a-f]{64}',p['nonce']) is None
+    or type(p['auth']) is not str or not 0<len(p['auth'])<=2048
+    or type(p['sender_ip']) is not str):
+ raise ValueError('fixed sender readiness input required')
+address=ipaddress.IPv4Address(p['sender_ip'])
+if str(address)!=p['sender_ip'] or address.is_loopback or address.is_unspecified or address.is_multicast:
+ raise ValueError('owned sender IPv4 required')
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+ def redirect_request(self,req,fp,code,msg,headers,newurl): return None
+opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),NoRedirect())
+request=urllib.request.Request('http://'+str(address)+':8080/healthcheck',
+ headers={'Authorization':p['auth']},method='GET')
+status,reason='unknown','unknown'
+try:
+ with opener.open(request,timeout=12) as response:
+  body=response.read(1048576).decode()
+  if response.status==200:
+   if not body: status,reason='not_ready','http200_empty'
+   else:
+    try: value=json.loads(body)
+    except json.JSONDecodeError: value=body
+    status,reason=('ready','http200') if value else ('not_ready','http200_falsey')
+  elif response.status==503: status,reason='not_ready','http503'
+except urllib.error.HTTPError as error:
+ if error.code==503: status,reason='not_ready','http503'
+ error.close()
+except urllib.error.URLError as error:
+ if isinstance(error.reason,OSError) and type(error.reason.errno) is int and error.reason.errno==errno.ECONNREFUSED:
+  status,reason='not_ready','econnrefused'
+except Exception:
+ # The parent rejects this unknown completion and preserves sticky uncertainty.
+ pass
+print(json.dumps({'schema':1,'probe':'sender_healthcheck','nonce':p['nonce'],
+ 'status':status,'reason':reason},separators=(',',':')))
 '''
 
 
@@ -145,6 +185,11 @@ class ActivationHarness(Harness):
         if name == "pg" and self.private_host_context is not None:
             gate._require(not hasattr(self, "pg_launch_identity"), "PostgreSQL launch identity already bound")
             self.pg_launch_identity = self._pg_readiness_identity(row)
+        if name in {"fixture", "sender"} and self.private_host_context is not None:
+            bindings = getattr(self, "sender_readiness_launch_identities", {})
+            gate._require(name not in bindings, "sender readiness launch identity already bound")
+            bindings[name] = self._sender_readiness_identity(row, name)
+            self.sender_readiness_launch_identities = bindings
         return row
 
     def _pg_readiness_identity(self, row):
@@ -207,6 +252,91 @@ class ActivationHarness(Harness):
             counts[record["status"]] += 1
             self.pg_readiness_counts = counts
             return rc == 0
+        except BaseException as error:
+            context.commands.uncertain_mutation = True
+            try:
+                self._preserve_command_failure(observation)
+            except BaseException as diagnostic_error:
+                error.add_note("command failure diagnostic unavailable: " + type(diagnostic_error).__name__)
+            raise
+
+    def _sender_readiness_identity(self, row, role):
+        gate._require(role in {"fixture", "sender"}, "fixed sender readiness role required")
+        resource_checks(row, self.images[role], self.owner, self.network, memory=768 * 1024**2, pids=256)
+        state, networks = row["State"], row["NetworkSettings"]["Networks"]
+        gate._require(type(networks) is dict and set(networks) == {self.network},
+                      "sender readiness requires the sole owned network")
+        network = networks[self.network]
+        address = ipaddress.IPv4Address(network["IPAddress"])
+        gate._require(re.fullmatch(r"[0-9a-f]{64}", row["Id"]) and row["Name"] == "/" + self.names[role]
+                      and re.fullmatch(r"[0-9a-f]{64}", network["NetworkID"])
+                      and str(address) == network["IPAddress"] and not address.is_loopback
+                      and not address.is_unspecified and not address.is_multicast
+                      and state["Running"] is True and state["Dead"] is False and state["Restarting"] is False
+                      and type(state["Pid"]) is int and state["Pid"] > 0
+                      and type(row["RestartCount"]) is int and row["RestartCount"] >= 0
+                      and type(state["StartedAt"]) is str and len(state["StartedAt"]) <= 64
+                      and state["StartedAt"] not in {"", "0001-01-01T00:00:00Z"}
+                      and type(row["Created"]) is str and 0 < len(row["Created"]) <= 64,
+                      "owned running sender readiness identity required")
+        return {key: row[key] for key in ("Id", "Name", "Image", "Created", "RestartCount")} | {
+            "Pid": state["Pid"], "StartedAt": state["StartedAt"],
+            "NetworkID": network["NetworkID"], "IPAddress": str(address)}
+
+    def sender_ready(self):
+        context = getattr(self, "private_host_context", None)
+        if context is None:
+            return super().sender_ready()
+        expected, observation = {}, {}
+        try:
+            from scripts import production_host_ingress_native as host
+            from scripts.production_activation_host_native import remaining
+            context.check()
+            bound, before = self.sender_readiness_launch_identities, {}
+            for role in ("fixture", "sender"):
+                before[role] = self._sender_readiness_identity(
+                    json.loads(self.command(["inspect", bound[role]["Id"]]))[0], role)
+                gate._require(all(before[role][key] == bound[role][key]
+                                  for key in ("Id", "Name", "Image", "Created", "NetworkID")),
+                              "sender readiness target changed after launch")
+            gate._require(before["fixture"]["NetworkID"] == before["sender"]["NetworkID"],
+                          "sender readiness endpoints must share the bound network")
+            nonce = os.urandom(32).hex()
+            raw = Harness.command(self, ["exec", "-i", bound["fixture"]["Id"], "python", "-B", "-c", SENDER_READINESS_PROBE],
+                                  stdin=json.dumps({"nonce": nonce, "auth": self.auth,
+                                                    "sender_ip": before["sender"]["IPAddress"]}),
+                                  timeout=min(15, remaining(context.plan["active_deadline"])), allowed_failure=True,
+                                  command_result=expected, command_observation=observation)
+            sequence = self.sequence
+            saved = read_command_result(self.output / f"command-{sequence:04d}.json", sequence, expected)
+            gate._require(saved["returncode"] == 0 and type(raw) is str and len(raw.encode()) <= 512,
+                          "sender readiness transport unconfirmed")
+            result = json.loads(raw)
+            gate._require(type(result) is dict and set(result) == {"schema", "probe", "nonce", "status", "reason"}
+                          and type(result["schema"]) is int and result["schema"] == 1
+                          and result["probe"] == "sender_healthcheck" and result["nonce"] == nonce
+                          and (result["status"], result["reason"]) in {
+                              ("ready", "http200"), ("not_ready", "http200_empty"),
+                              ("not_ready", "http200_falsey"), ("not_ready", "http503"), ("not_ready", "econnrefused")},
+                          "sender readiness completion unconfirmed")
+            gate._require(raw == json.dumps({"schema": 1, "probe": "sender_healthcheck", "nonce": nonce,
+                                            "status": result["status"], "reason": result["reason"]},
+                                           separators=(",", ":")) + "\n",
+                          "sender readiness completion encoding changed")
+            after = {role: self._sender_readiness_identity(
+                json.loads(self.command(["inspect", bound[role]["Id"]]))[0], role) for role in ("fixture", "sender")}
+            context.check()
+            gate._require(after == before, "sender readiness identity changed during probe")
+            record = {"schema": 1, "probe": "sender_healthcheck", "sequence": sequence,
+                      "status": result["status"], "reason": result["reason"], "transport_returncode": 0,
+                      "nonce_sha256": hashlib.sha256(nonce.encode()).hexdigest(),
+                      "containers_sha256": hashlib.sha256(private.encoded(before)).hexdigest(),
+                      "command_original_sha256": saved["original"]["sha256"]}
+            host.durable(self.output / f"SENDER_READINESS_{sequence:04d}.json", record)
+            counts = getattr(self, "sender_readiness_counts", {"ready": 0, "not_ready": 0})
+            counts[record["status"]] += 1
+            self.sender_readiness_counts = counts
+            return result["status"] == "ready"
         except BaseException as error:
             context.commands.uncertain_mutation = True
             try:
@@ -939,6 +1069,7 @@ def execute(repo, source, image_id, binary, output, *, private_host_context=None
         "status": "passed" if failure is None and not evidence_errors else "failed_or_evidence_insufficient",
         "failure": failure, "private_commands": commands,
         "pg_readiness": getattr(harness, "pg_readiness_counts", None),
+        "sender_readiness": getattr(harness, "sender_readiness_counts", None),
         "evidence_errors": evidence_errors, "elapsed_seconds": time.monotonic() - harness.started,
         "last_stage": harness.current_stage,
         "synthetic_only": True, "production_access": False, "existing_126_modified": False, "real_models": 0,

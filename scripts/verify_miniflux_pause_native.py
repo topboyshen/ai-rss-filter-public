@@ -370,6 +370,9 @@ class Harness:
     def postgres_ready(self):
         return self.command(["exec", self.names["pg"], "pg_isready", "-U", "synthetic", "-d", "synthetic_pause"])
 
+    def sender_ready(self):
+        return self.http("sender", "/healthcheck")
+
     def prepare(self):
         info = json.loads(self.command(["info", "--format", "{{json .}}"]))
         native_host(info)
@@ -430,7 +433,7 @@ class Harness:
         save(self.output / "SENDER_BINDING.json", {"image_id": self.image_id, "binary_sha256": sha(copied),
              "lock_sha256": sha(self.repo / "ops/miniflux/pause-source-lock.json"), "manifest": manifest,
              "patched_files_sha256": lock["patched_files_sha256"], "production_access": False, "models": 0})
-        self.wait(lambda: self.http("sender", "/healthcheck"), readiness=True)
+        self.wait(self.sender_ready, readiness=True)
 
     def case(self, name, value):
         save(self.output / ("CASE_" + name + ".json"), {"status": "passed", "observed_utc": datetime.now(timezone.utc).isoformat(), **value})
@@ -567,7 +570,7 @@ class Harness:
         self.sample_memory("sender", "before_restart")
         self.command(["stop", "--time=15", self.names["sender"]], timeout=20)
         self.command(["start", self.names["sender"]])
-        self.wait(lambda: self.http("sender", "/healthcheck"), readiness=True)
+        self.wait(self.sender_ready, readiness=True)
         self.refresh(expected=503)
         result = self.wait(lambda: self.query_closed(closed))
         after = json.loads(self.command(["inspect", self.names["sender"]]))[0]
@@ -647,7 +650,7 @@ class Harness:
         self.sample_memory("sender", "before_draining_restart")
         self.command(["stop", "--time=15", self.names["sender"]], timeout=20)
         self.command(["start", self.names["sender"]])
-        self.wait(lambda: self.http("sender", "/healthcheck"), readiness=True)
+        self.wait(self.sender_ready, readiness=True)
         self.refresh(expected=503)
         restarted = self.checked_draining(self.private_control("/operations/" + operation), operation)
         freeze = hashlib.sha256(b"native:stop-new-drain:freeze").hexdigest()
