@@ -349,6 +349,11 @@ def namespace_helper_summary(path, repo):
     literal = source_literal(value.get("error_message_literal"), repo)
     if literal is not None:
         fields.append("error_message=" + literal)
+    interfaces = value.get("error_interfaces")
+    if isinstance(interfaces, dict) and type(interfaces.get("count")) is int and isinstance(interfaces.get("names"), list):
+        names = [name for name in interfaces["names"][:32]
+                 if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_.@<>-]{1,15}", name)]
+        fields.append("interfaces=%d:%s" % (interfaces["count"], "/".join(names)))
     return ",".join(fields) or "no_status_fields"
 
 
@@ -666,7 +671,7 @@ def record_failure(error, repo, output, stage):
         failure["message_literal"] = summary["message_literal"] = literal
     helper = [note[len(NAMESPACE_NOTE):] for note in getattr(error, "__notes__", ()) if str(note).startswith(NAMESPACE_NOTE)]
     if helper:
-        failure["namespace_helper"] = summary["namespace_helper"] = helper[0][:DIAGNOSTIC_TEXT_CHARS * 2]
+        failure["namespace_helper"] = summary["namespace_helper"] = helper[0][:DIAGNOSTIC_TEXT_CHARS * 4]
     print("activation_native_failure=" + json.dumps(summary, sort_keys=True), flush=True)
     fixture.save(output / "FAILURE.json", failure)
     return failure

@@ -289,6 +289,15 @@ def _literal_message(error):
     return None
 
 
+def _interface_names(error):
+    value = getattr(error, "interface_names", None)
+    if not (isinstance(value, dict) and type(value.get("count")) is int and isinstance(value.get("names"), list)):
+        return None
+    names = [name if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_.@-]{1,15}", name) else "<invalid>"
+             for name in value["names"][:32]]
+    return {"count": value["count"], "names": names}
+
+
 def run_report(options, token):
     """Both success and failure produce a bounded safe stdout evidence packet."""
     try:
@@ -297,6 +306,9 @@ def run_report(options, token):
         result = {"status": "unconfirmed", "error_type": type(error).__name__,
                   "error_sha256": hashlib.sha256(str(error).encode()).hexdigest(),
                   "error_message_literal": _literal_message(error)}
+        interfaces = _interface_names(error)
+        if interfaces is not None:
+            result["error_interfaces"] = interfaces
     try:
         packet = safe_export(options, token)
     except BaseException as error:

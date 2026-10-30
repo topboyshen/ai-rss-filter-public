@@ -380,6 +380,20 @@ def preserve_namespace_observation(path, observed, *, primary=None):
         raise
 
 
+INTERFACE_NAME_RE = re.compile(r"[A-Za-z0-9_.@-]{1,15}")
+
+
+def interface_names(links, limit=32):
+    """Diagnostic only: Linux interface names (<=15 safe chars) seen in a rejected namespace; never addresses."""
+    if not isinstance(links, list):
+        return None
+    names = []
+    for row in links[:limit]:
+        name = row.get("ifname") if isinstance(row, dict) else None
+        names.append(name if isinstance(name, str) and INTERFACE_NAME_RE.fullmatch(name) else "<invalid>")
+    return {"count": len(links), "names": names}
+
+
 def namespace_snapshot(commands, *, bridge=None, evidence_path=None):
     observed = {"schema": 1, "netns": os.stat("/proc/self/ns/net").st_ino, "bridge": bridge,
                 "links": [], "routes_by_family": {}, "components": {}, "status": "capture_incomplete"}
@@ -399,6 +413,8 @@ def namespace_snapshot(commands, *, bridge=None, evidence_path=None):
                 "external_interface": "unexpected external interface in private host", "route_bound": "namespace route bound",
                 "route_shape": "namespace route shape", "external_route": "external namespace route"}
     failure = ProofError(messages[violation["reason"]]) if violation else None
+    if failure is not None:
+        failure.interface_names = interface_names(observed.get("links"))
     preserve_namespace_observation(evidence_path, observed, primary=failure)
     if failure is not None:
         raise failure
