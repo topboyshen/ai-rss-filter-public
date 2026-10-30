@@ -289,6 +289,7 @@ class Harness:
         row = json.loads(self.command(["inspect", actual]))[0]
         checks = resource_checks(row, image_id, self.owner, self.network, memory, pids)
         save(self.output / ("PROFILE_" + name + ".json"), {"checks": checks, "inspect": self.safe_inspect(row)})
+        return row
 
     def safe_inspect(self, row):
         return {key: row.get(key) for key in ("Id", "Name", "Image", "Created", "State", "HostConfig", "Mounts", "RestartCount")}
@@ -366,6 +367,9 @@ class Harness:
             raise ValueError(f"private control {path}: {status} != {expected}")
         return result
 
+    def postgres_ready(self):
+        return self.command(["exec", self.names["pg"], "pg_isready", "-U", "synthetic", "-d", "synthetic_pause"])
+
     def prepare(self):
         info = json.loads(self.command(["info", "--format", "{{json .}}"]))
         native_host(info)
@@ -384,7 +388,7 @@ class Harness:
         self.launch("pg", pg_id, ["--mount", "type=volume,src=" + volume + ",dst=/var/lib/postgresql/data",
                     "-e", "POSTGRES_USER=synthetic", "-e", "POSTGRES_DB=synthetic_pause",
                     "-e", "POSTGRES_PASSWORD=" + self.password], memory=384 * 1024 * 1024, pids=64)
-        self.wait(lambda: self.command(["exec", self.names["pg"], "pg_isready", "-U", "synthetic", "-d", "synthetic_pause"]), readiness=True)
+        self.wait(self.postgres_ready, readiness=True)
         evidence = self.output / "fixture"
         evidence.mkdir(mode=0o700)
         self.launch("fixture", self.python_id, ["--read-only", "--cap-drop=ALL", "--user", f"{os.getuid()}:{os.getgid()}",
@@ -705,7 +709,7 @@ class Harness:
         if unavailable.get("confirmed") is not False:
             raise ValueError("database unavailable returned confirmed stop")
         self.command(["start", self.names["pg"]])
-        self.wait(lambda: self.command(["exec", self.names["pg"], "pg_isready", "-U", "synthetic", "-d", "synthetic_pause"]), readiness=True)
+        self.wait(self.postgres_ready, readiness=True)
         after = self.wait(lambda: self.query_closed(closed))
         self.refresh(expected=503)
         self.case("POSTGRES_RESTART_CLOSED_DURABLE", {"before": before, "unavailable": unavailable, "after": after,

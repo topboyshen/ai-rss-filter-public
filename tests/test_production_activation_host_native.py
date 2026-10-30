@@ -631,8 +631,8 @@ def test_outer_failure_preserves_live_holder_without_any_signal(tmp_path, monkey
 
 
 @pytest.mark.parametrize("state", ["uncertain", "running"])
-def test_unknown_or_running_resources_never_authorize_daemon_signal(monkeypatch, state):
-    context = SimpleNamespace(check=lambda **kw: None, plan={"deadline": 600},
+def test_unknown_or_running_resources_never_authorize_daemon_signal(tmp_path, monkeypatch, state):
+    context = SimpleNamespace(root=tmp_path, check=lambda **kw: None, plan={"deadline": 600},
         commands=SimpleNamespace(deadline=580, docker=lambda args: "a" * 64 if state == "running" else "", uncertain_mutation=state == "uncertain"))
     process = SimpleNamespace(send_signal=lambda *_: pytest.fail("must retain unknown resources"))
     with pytest.raises(gate.AdmissionError):

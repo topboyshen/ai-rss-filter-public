@@ -495,6 +495,8 @@ def stop_daemon(context, process, logs):
     context.check(final=True)
     context.commands.deadline = context.plan["deadline"]
     ids = context.commands.docker(["ps", "--quiet", "--no-trunc"]).splitlines()
+    record(context.root / "DRAIN_OBSERVATION.json", {"schema": 1, "running_count": len(ids),
+        "uncertain_mutation": context.commands.uncertain_mutation})
     gate._require(ids == [] and not context.commands.uncertain_mutation, "running or uncertain containers: retain private daemon")
     host.check_peer(process.pid, context.daemon)
     process.send_signal(signal.SIGTERM)
@@ -818,6 +820,9 @@ def safe_activation(value):
                                         and re.fullmatch(r"[ -~]+", item) and not re.search(r"[0-9a-fA-F]{32,}", item) else None)
     from scripts import private_release_diagnostics as command_diagnostics
     result["private_commands"] = command_diagnostics.safe_summary(value.get("private_commands"))
+    readiness = value.get("pg_readiness")
+    result["pg_readiness"] = (dict(readiness) if type(readiness) is dict and set(readiness) == {"ready", "not_ready"}
+        and all(type(item) is int and 0 <= item <= 10000 for item in readiness.values()) else None)
     errors = value.get("evidence_errors")
     result["evidence_error_count"] = len(errors) if isinstance(errors, list) else None
     result["evidence_error_codes"] = [safe_preservation_code(item) for item in errors[:16]] if isinstance(errors, list) else []
@@ -945,7 +950,7 @@ def safe_inventory(root, deadline):
     expected = {hashlib.sha256(name.encode()).hexdigest() for name in required}
     complete = expected <= {row["path_sha256"] for row in records}
     profiles = {}
-    for name in ("inner/activation/HARNESS_COMMAND_FAILURE.json", "inner/activation/FAILURE.json", "inner/activation/RESULT.json", "inner/INNER_RESULT.json", "inner/DAEMON_STOP.json", "inner/RESOURCES_FINAL.json"):
+    for name in ("inner/activation/HARNESS_COMMAND_FAILURE.json", "inner/activation/FAILURE.json", "inner/activation/RESULT.json", "inner/INNER_RESULT.json", "inner/DRAIN_OBSERVATION.json", "inner/DAEMON_STOP.json", "inner/RESOURCES_FINAL.json"):
         remaining(deadline)
         path = root / name
         if path.exists():
@@ -961,6 +966,13 @@ def safe_inventory(root, deadline):
                 profiles[name] = safe_activation(value)
             elif name.endswith("INNER_RESULT.json"):
                 profiles[name] = safe_inner_result(value)
+            elif name.endswith("DRAIN_OBSERVATION.json"):
+                profiles[name] = ({"schema": 1, "running_count": value["running_count"],
+                    "uncertain_mutation": value["uncertain_mutation"]} if type(value) is dict
+                    and set(value) == {"schema", "running_count", "uncertain_mutation"}
+                    and type(value["schema"]) is int and value["schema"] == 1
+                    and type(value["running_count"]) is int and 0 <= value["running_count"] <= 256
+                    and type(value["uncertain_mutation"]) is bool else None)
             elif name.endswith("DAEMON_STOP.json"):
                 profiles[name] = {key: value.get(key) for key in ("all_containers_stopped", "forced_kill", "removed")
                                   if type(value.get(key)) is bool}

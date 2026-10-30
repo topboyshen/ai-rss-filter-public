@@ -30,7 +30,7 @@ from scripts import verify_production_startup_native as startup_native  # noqa: 
 from scripts import production_gateway_native as gateway_native  # noqa: E402
 from scripts import production_native_deadline as native_deadline  # noqa: E402
 from scripts import private_release_diagnostics as command_diagnostics  # noqa: E402
-from scripts.verify_miniflux_pause_native import Harness, CLIENT, image_checks, source_binding, sha, read_command_result  # noqa: E402
+from scripts.verify_miniflux_pause_native import Harness, CLIENT, image_checks, source_binding, sha, read_command_result, resource_checks  # noqa: E402
 from scripts.miniflux_host_joint_native import component  # noqa: E402
 from scripts.miniflux_handoff_adapter import source_sha256 as bridge_source, CutoverError  # noqa: E402
 from production_sender_driver import SenderActivationDriver, PostgresReader, sources as sender_sources  # noqa: E402
@@ -65,6 +65,14 @@ def require_rejected(function):
     except (ValueError, gate.AdmissionError, CutoverError, FileNotFoundError):
         return
     raise AssertionError("unsafe synthetic request unexpectedly accepted")
+
+
+# The exec CLI's status is not the probe's status. A fixed wrapper emits one
+# fresh, bounded completion marker only after the actual probe has returned.
+PG_READINESS_PROBE = r'''pg_isready -U synthetic -d synthetic_pause >/dev/null 2>&1
+rc=$?
+printf '{"schema":1,"probe":"pg_isready","nonce":"%s","returncode":%s}\n' "$1" "$rc"
+'''
 
 
 class ActivationHarness(Harness):
@@ -131,6 +139,81 @@ class ActivationHarness(Harness):
             os.fsync(directory)
         finally:
             os.close(directory)
+
+    def launch(self, name, *args, **kwargs):
+        row = super().launch(name, *args, **kwargs)
+        if name == "pg" and self.private_host_context is not None:
+            gate._require(not hasattr(self, "pg_launch_identity"), "PostgreSQL launch identity already bound")
+            self.pg_launch_identity = self._pg_readiness_identity(row)
+        return row
+
+    def _pg_readiness_identity(self, row):
+        resource_checks(row, self.images["pg"], self.owner, self.network, memory=384 * 1024**2, pids=64)
+        state = row["State"]
+        gate._require(re.fullmatch(r"[0-9a-f]{64}", row["Id"]) and row["Name"] == "/" + self.names["pg"]
+                      and state["Running"] is True and state["Dead"] is False and state["Restarting"] is False
+                      and type(state["Pid"]) is int and state["Pid"] > 0
+                      and type(row["RestartCount"]) is int and row["RestartCount"] >= 0
+                      and type(state["StartedAt"]) is str and len(state["StartedAt"]) <= 64
+                      and state["StartedAt"] not in {"", "0001-01-01T00:00:00Z"}
+                      and type(row["Created"]) is str and 0 < len(row["Created"]) <= 64,
+                      "owned running PostgreSQL identity required")
+        return {key: row[key] for key in ("Id", "Name", "Image", "Created", "RestartCount")} | {
+            "Pid": state["Pid"], "StartedAt": state["StartedAt"]}
+
+    def postgres_ready(self):
+        context = getattr(self, "private_host_context", None)
+        if context is None:
+            return super().postgres_ready()
+        expected, observation = {}, {}
+        try:
+            from scripts import production_host_ingress_native as host
+            from scripts.production_activation_host_native import remaining
+            context.check()
+            bound = self.pg_launch_identity
+            before = self._pg_readiness_identity(json.loads(self.command(["inspect", bound["Id"]]))[0])
+            gate._require(all(before[key] == bound[key] for key in ("Id", "Name", "Image", "Created")),
+                          "PostgreSQL readiness target changed after launch")
+            # Only this exact read-only program may classify a known nonzero
+            # result. Arbitrary exec/allowed_failure keep the ordinary rules.
+            nonce = os.urandom(32).hex()
+            raw = Harness.command(self, ["exec", bound["Id"], "/bin/sh", "-c", PG_READINESS_PROBE, "pg-readiness", nonce],
+                            timeout=min(30, remaining(context.plan["active_deadline"])), allowed_failure=True,
+                            command_result=expected, command_observation=observation)
+            sequence = self.sequence
+            saved = read_command_result(self.output / f"command-{sequence:04d}.json", sequence, expected)
+            gate._require(saved["returncode"] == 0 and type(raw) is str and len(raw.encode()) <= 512,
+                          "PostgreSQL readiness transport unconfirmed")
+            result = json.loads(raw)
+            gate._require(type(result) is dict and set(result) == {"schema", "probe", "nonce", "returncode"}
+                          and type(result["schema"]) is int and result["schema"] == 1
+                          and result["probe"] == "pg_isready" and result["nonce"] == nonce
+                          and type(result["returncode"]) is int and result["returncode"] in {0, 1, 2},
+                          "PostgreSQL readiness completion unconfirmed")
+            gate._require(raw == json.dumps({"schema": 1, "probe": "pg_isready", "nonce": nonce,
+                          "returncode": result["returncode"]}, separators=(",", ":")) + "\n",
+                          "PostgreSQL readiness completion encoding changed")
+            after = self._pg_readiness_identity(json.loads(self.command(["inspect", bound["Id"]]))[0])
+            context.check()
+            gate._require(after == before, "PostgreSQL identity changed during readiness probe")
+            rc = result["returncode"]
+            record = {"schema": 1, "probe": "pg_isready", "sequence": sequence, "returncode": rc,
+                      "status": "ready" if rc == 0 else "not_ready", "transport_returncode": 0,
+                      "nonce_sha256": hashlib.sha256(nonce.encode()).hexdigest(),
+                      "container_sha256": hashlib.sha256(private.encoded(before)).hexdigest(),
+                      "command_original_sha256": saved["original"]["sha256"]}
+            host.durable(self.output / f"PG_READINESS_{sequence:04d}.json", record)
+            counts = getattr(self, "pg_readiness_counts", {"ready": 0, "not_ready": 0})
+            counts[record["status"]] += 1
+            self.pg_readiness_counts = counts
+            return rc == 0
+        except BaseException as error:
+            context.commands.uncertain_mutation = True
+            try:
+                self._preserve_command_failure(observation)
+            except BaseException as diagnostic_error:
+                error.add_note("command failure diagnostic unavailable: " + type(diagnostic_error).__name__)
+            raise
 
     def prepare_network(self):
         if self.private_host_context is None:
@@ -855,6 +938,7 @@ def execute(repo, source, image_id, binary, output, *, private_host_context=None
     report = {"schema": "production-activation-native-v1", "source_sha": binding["revision"],
         "status": "passed" if failure is None and not evidence_errors else "failed_or_evidence_insufficient",
         "failure": failure, "private_commands": commands,
+        "pg_readiness": getattr(harness, "pg_readiness_counts", None),
         "evidence_errors": evidence_errors, "elapsed_seconds": time.monotonic() - harness.started,
         "last_stage": harness.current_stage,
         "synthetic_only": True, "production_access": False, "existing_126_modified": False, "real_models": 0,
