@@ -43,6 +43,9 @@ def selected(path, patterns):
     "scripts/production_sender_native_bridge.py", "tests/test_sender_external_postgres_identity.py",
     "tests/production_admission_environment_support.py",
     "scripts/verify_production_activation_native.py", "scripts/production_activation_fixture.py",
+    "scripts/verify_miniflux_pause_native.py", "tests/test_outer_build_diagnostics.py",
+    "tests/test_production_activation_command_evidence.py", "tests/test_production_host_ingress_diagnostics.py",
+    "tests/test_production_activation_preserve_diagnostics.py",
     "scripts/release.sh", "tests/test_production_release_lock.py",
     "tests/test_private_release_control_subpaths.py", "tests/test_controlled_production_release.py",
     "tests/test_controlled_release_finalize.py", "tests/test_controlled_finalize_cli.py", "tests/test_controlled_release_shell.py",
@@ -62,6 +65,8 @@ def test_each_real_adapter_path_triggers_native(event, path):
     "scripts/production_activation_host_native.py.bak", "scripts/nested/production_activation_host_native.py",
     "scripts/production_offline_registry.py.bak", "scripts/nested/production_offline_registry.py",
     "scripts/production_native_deadline.py.bak", "scripts/nested/production_native_deadline.py",
+    "scripts/verify_miniflux_pause_native.py.bak", "scripts/nested/verify_miniflux_pause_native.py",
+    "tests/test_outer_build_diagnostics.py.bak", "tests/nested/test_outer_build_diagnostics.py",
     "tests/nested/test_controlled_release_finalize.py", "tests/test_unrelated.py",
 ])
 def test_unrelated_and_lookalike_paths_do_not_trigger(event, path):

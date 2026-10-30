@@ -8,6 +8,7 @@ retains originals and live resources; it never force-stops unknown containers.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import ipaddress
@@ -43,6 +44,21 @@ IMAGE_BYTES, OUTPUT_BYTES, MAX_PROCESSES = 256 * 1024**2, 2 * 1024**2, 8192
 LABEL = "ai-filter.synthetic-host-ingress"
 LIVE_DAEMONS = []
 RETAINERS = {}
+DIAGNOSTIC_RESERVE_SECONDS = 5
+DIAGNOSTICS = None
+DIAGNOSTIC_STAGES = {"initial_validation", "host_tools", "source_image", "image_save", "source_binding",
+                     "namespace_launch", "namespace_setup", "daemon_start", "image_load", "network_create",
+                     "container_create", "container_start", "host_observation", "cleanup", "source_readback"}
+DIAGNOSTIC_ERRORS = {"ProofError", "AdmissionError", "AdmissionUncertain", "ContractError", "TimeoutError",
+                     "TimeoutExpired", "OSError", "FileNotFoundError", "FileExistsError", "PermissionError",
+                     "ProcessLookupError", "ValueError", "TypeError", "KeyError", "JSONDecodeError", "RuntimeError"}
+DIAGNOSTIC_LITERALS = {"gateway blocking operation deadline; outcome unknown", "command deadline; outcome unknown",
+                       "shared deadline expired", "command failed; outcome retained", "daemon logs EOF unknown",
+                       "private daemon shutdown unconfirmed", "unexpected private daemon inventory; retained",
+                       "unresolved mutation prevents daemon stop despite empty inventory"}
+DIAGNOSTIC_OPERATIONS = {"docker_image_save", "docker_image_load", "docker_network_create", "docker_network_inspect",
+                         "docker_create", "docker_start", "docker_inspect", "docker_logs", "docker_kill",
+                         "docker_ps", "docker_info", "docker_other", "namespace_launch", "host_tool", "git", "other"}
 CONFIG = b"""worker_processes 1;
 pid /tmp/nginx.pid;
 events { worker_connections 16; }
@@ -129,6 +145,101 @@ def bounded_deadline(value, now=None):
     return min(value, now + 180)
 
 
+def active_deadline(deadline):
+    # Reserve inside the original 180 seconds, never start a fresh timeout.
+    end = deadline - DIAGNOSTIC_RESERVE_SECONDS
+    require(time.monotonic() < end, "original proof has no active budget after diagnostic reserve")
+    return end
+
+
+@contextmanager
+def active_phase(deadline):
+    """On active timeout, re-arm the original limit before failure unwinding."""
+    end, started = active_deadline(deadline), time.monotonic()
+    outer_handler = signal.getsignal(signal.SIGALRM)
+    outer_timer = signal.getitimer(signal.ITIMER_REAL)
+    require(callable(outer_handler) and outer_timer[0] > 0 and outer_timer[1] == 0,
+            "original total deadline must enclose active phase")
+    inherited_end = min(deadline, started + outer_timer[0])
+
+    def restore():
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, outer_handler)
+        signal.setitimer(signal.ITIMER_REAL, max(0.001, inherited_end - time.monotonic()))
+
+    def expired(signum, frame):
+        # A blocking fsync in an exception's finally must still hit the original
+        # total deadline. Restoring only after yield unwinds would be too late.
+        restore()
+        if inherited_end <= end:
+            outer_handler(signum, frame)
+        raise gateway.gate.AdmissionUncertain("gateway blocking operation deadline; outcome unknown")
+
+    signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, max(0.001, min(end, inherited_end) - time.monotonic()))
+    try:
+        yield
+    finally:
+        if signal.getsignal(signal.SIGALRM) is expired:
+            restore()
+
+
+def diagnostic_stage(stage):
+    if DIAGNOSTICS is not None:
+        require(stage in DIAGNOSTIC_STAGES, "unknown host-entry diagnostic stage")
+        DIAGNOSTICS["stage"] = stage
+
+
+def diagnostic_error(error):
+    text = str(error)
+    return {"type": type(error).__name__ if type(error).__name__ in DIAGNOSTIC_ERRORS else "unrecognized",
+            "sha256": hashlib.sha256(text.encode()).hexdigest(),
+            "literal": text if text in DIAGNOSTIC_LITERALS else None}
+
+
+def diagnostic_operation(args):
+    if args[:len(DOCKER)] == DOCKER:
+        action = args[len(DOCKER):]
+        candidate = "docker_" + "_".join(action[:2]) if action[:1] in (["image"], ["network"]) else "docker_" + (action[0] if action else "other")
+        return candidate if candidate in DIAGNOSTIC_OPERATIONS else "docker_other"
+    if args[:1] == [str(TOOLS["unshare"])]:
+        return "namespace_launch"
+    if args[:1] == ["/usr/bin/git"]:
+        return "git"
+    return "host_tool" if args and args[0] in {str(path) for path in TOOLS.values()} else "other"
+
+
+def diagnostic_command(args, sequence, record=None, error=None):
+    if DIAGNOSTICS is None:
+        return
+    elapsed = record.get("elapsed") if record else None
+    code = record.get("returncode") if record else None
+    DIAGNOSTICS["last_command"] = {
+        "sequence": sequence, "operation": diagnostic_operation(args),
+        "state": "failed" if error else "completed" if record else "started",
+        "elapsed_seconds": round(elapsed, 6) if type(elapsed) in {int, float} and math.isfinite(elapsed) and elapsed >= 0 else None,
+        "returncode": code if type(code) is int and -255 <= code <= 255 else None,
+        "error": diagnostic_error(error) if error else None}
+
+
+def failure_diagnostic(error):
+    current = DIAGNOSTICS or {"stage": "initial_validation", "last_command": None}
+    return {"schema": 1, "stage": current["stage"], "last_command": current["last_command"],
+            "error": diagnostic_error(error)}
+
+
+def retain_first_failure(root, error):
+    # Preserve before cleanup can change the last command or raise another error.
+    if DIAGNOSTICS is None or DIAGNOSTICS.get("first_failure") is not None:
+        return
+    value = failure_diagnostic(error)
+    DIAGNOSTICS["first_failure"] = value
+    try:
+        durable(root / "FIRST_FAILURE.json", value)
+    except BaseException as evidence_error:
+        error.add_note("first host-entry failure preservation failed: " + type(evidence_error).__name__)
+
+
 class Commands:
     def __init__(self, root, deadline):
         self.root, self.deadline, self.sequence, self.peer = root, deadline, 0, None
@@ -145,6 +256,7 @@ class Commands:
         end = self.deadline if transfer else min(self.deadline, time.monotonic() + 3)
         record = {"argv": args, "started_monotonic": time.monotonic(), "returncode": None,
                   "transfer": transfer, "deadline_monotonic": end}
+        diagnostic_command(args, self.sequence)
         source = os.open(input_path, os.O_RDONLY | os.O_NOFOLLOW) if input_path else subprocess.DEVNULL
         process, failure, result = None, None, None
         try:
@@ -179,6 +291,7 @@ class Commands:
             record["elapsed"] = time.monotonic() - record["started_monotonic"]
             if process:
                 record["returncode"] = process.poll()
+            diagnostic_command(args, self.sequence, record, failure)
             try:
                 durable(base.with_suffix(".json"), record)
             except BaseException as evidence_error:
@@ -847,7 +960,8 @@ def _stopped(commands, identifier):
 
 
 def inner_proof(root, plan):
-    commands = Commands(root, plan["deadline"])
+    commands = Commands(root, plan.get("active_deadline", plan["deadline"]))
+    diagnostic_stage("namespace_setup")
     current = proc_identity(os.getpid())
     require(current["netns"] != plan["parent"]["netns"] and current["mntns"] != plan["parent"]["mntns"]
             and current["cgroup"] == plan["cgroup"] + "/supervisor", "private namespaces/resources not entered")
@@ -855,7 +969,9 @@ def inner_proof(root, plan):
     daemon, actual, logs, result, failure = None, None, None, None, None
     try:
         restrict_private_ipv6(commands, root, plan, current)
+        diagnostic_stage("daemon_start")
         daemon, actual, logs = start_daemon(commands, root, plan)
+        diagnostic_stage("image_load")
         tar = root.parent / "image.tar"
         require(file_proof(tar) == plan["tar"], "offline archive changed before load")
         commands.docker(["image", "load"], transfer=True, input_path=tar, input_proof=plan["tar"])
@@ -864,6 +980,7 @@ def inner_proof(root, plan):
         durable(root / "LOADED_IMAGE.json", image)
         require(image_binding(image, outer=False) == plan["image"], "loaded config/rootfs/ID mismatch")
         bridge, network = "afh" + plan["owner"][:10], "isolated-host-network"
+        diagnostic_stage("network_create")
         network_id = commands.docker(["network", "create", "--driver", "bridge", "--label", LABEL + "=" + plan["owner"],
                                       "--opt", "com.docker.network.bridge.name=" + bridge, network])
         require(re.fullmatch(r"[0-9a-f]{64}", network_id), "network create ACK unknown")
@@ -877,21 +994,27 @@ def inner_proof(root, plan):
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
         durable(root / "nginx.conf", CONFIG)
+        diagnostic_stage("container_create")
         identifier = commands.docker(container_args(plan, root, network, port))
         require(re.fullmatch(r"[0-9a-f]{64}", identifier), "container create ACK unknown")
+        diagnostic_stage("container_start")
         commands.docker(["start", identifier])
+        diagnostic_stage("host_observation")
         result = observe_host(commands, root, plan, identifier, network, port, bridge)
     except BaseException as error:
         failure = error
+        retain_first_failure(root, error)
     finally:
         if daemon and actual:
             try:
+                diagnostic_stage("cleanup")
                 stop_owned(commands, root, plan, daemon, actual, logs)
             except BaseException as cleanup_error:
                 if failure:
                     failure.add_note("cleanup retained: " + type(cleanup_error).__name__)
                 else:
                     failure = cleanup_error
+                    retain_first_failure(root, cleanup_error)
         if failure:
             raise failure
     return {"schema": 1, "status": "passed", "scope": "independent_synthetic_host_namespace_only", **result,
@@ -918,15 +1041,20 @@ def outer_proof(root, deadline):
         (root / directory).mkdir(mode=0o700)
     owner = uuid.uuid4().hex
     cgroup = cgroup_setup(owner)
-    commands = Commands(root, deadline)
+    commands = Commands(root, active_deadline(deadline))
+    diagnostic_stage("host_tools")
     host_tools(root, commands)
+    diagnostic_stage("source_image")
     image = commands.inspect(gateway.NGINX_REF, image=True)
     durable(root / "SOURCE_IMAGE.json", image)
     binding = image_binding(image, outer=True)
+    diagnostic_stage("image_save")
     commands.docker(["image", "save", binding["Id"]], transfer=True, output_path=root / "image.tar")
     require(image_binding(commands.inspect(gateway.NGINX_REF, image=True), outer=True) == binding,
             "outer image changed during export")
-    plan = {"schema": 1, "owner": owner, "deadline": deadline, "cgroup": cgroup, "parent": proc_identity(os.getpid()),
+    diagnostic_stage("source_binding")
+    plan = {"schema": 1, "owner": owner, "deadline": deadline, "active_deadline": commands.deadline,
+            "cgroup": cgroup, "parent": proc_identity(os.getpid()),
             "image": binding, "tar": file_proof(root / "image.tar"), "script": file_proof(Path(__file__)),
             "source_sha": commands.run(["/usr/bin/git", "-C", str(ROOT), "rev-parse", "HEAD"]).decode().strip()}
     require(not commands.run(["/usr/bin/git", "-C", str(ROOT), "status", "--porcelain=v1", "--untracked-files=all"]).strip(),
@@ -934,9 +1062,11 @@ def outer_proof(root, deadline):
     durable(root / "PLAN.json", plan)
     args = [str(TOOLS["unshare"]), "--mount", "--net", "--fork", sys.executable, "-I", "-B", str(Path(__file__).resolve()),
             "--repo", str(ROOT), "--output", str(root / "inner"), "--inside"]
+    diagnostic_stage("namespace_launch")
     commands.run(args, transfer=True)
     result = json.loads((root / "inner/RESULT.json").read_bytes())
     require(result.get("status") == "passed" and file_proof(Path(__file__)) == plan["script"], "inner proof/source unconfirmed")
+    diagnostic_stage("source_readback")
     require(not commands.run(["/usr/bin/git", "-C", str(ROOT), "status", "--porcelain=v1", "--untracked-files=all"]).strip()
             and commands.run(["/usr/bin/git", "-C", str(ROOT), "rev-parse", "HEAD"]).decode().strip() == plan["source_sha"],
             "public source changed during proof")
@@ -1096,8 +1226,40 @@ def read_original_json(path):
         os.close(fd)
 
 
+def safe_failure_diagnostic(value):
+    require(isinstance(value, dict) and set(value) == {"schema", "stage", "last_command", "error"}
+            and type(value["schema"]) is int and value["schema"] == 1
+            and isinstance(value["stage"], str) and value["stage"] in DIAGNOSTIC_STAGES, "invalid first-failure diagnostic")
+
+    def checked_error(row):
+        require(isinstance(row, dict) and set(row) == {"type", "sha256", "literal"}
+                and isinstance(row["type"], str) and row["type"] in DIAGNOSTIC_ERRORS | {"unrecognized"}
+                and isinstance(row["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", row["sha256"])
+                and (row["literal"] is None or isinstance(row["literal"], str)
+                     and row["literal"] in DIAGNOSTIC_LITERALS
+                     and hashlib.sha256(row["literal"].encode()).hexdigest() == row["sha256"]), "invalid diagnostic error")
+        return dict(row)
+
+    command = value["last_command"]
+    if command is not None:
+        require(isinstance(command, dict) and set(command) == {
+            "sequence", "operation", "state", "elapsed_seconds", "returncode", "error"}, "invalid diagnostic command")
+        elapsed, code = command["elapsed_seconds"], command["returncode"]
+        require(type(command["sequence"]) is int and 0 < command["sequence"] <= 4096
+                and isinstance(command["operation"], str) and command["operation"] in DIAGNOSTIC_OPERATIONS
+                and isinstance(command["state"], str) and command["state"] in {"started", "completed", "failed"}
+                and (elapsed is None or type(elapsed) in {int, float} and math.isfinite(elapsed) and elapsed >= 0)
+                and (code is None or type(code) is int and -255 <= code <= 255), "invalid diagnostic command values")
+        command = {**command, "error": checked_error(command["error"]) if command["error"] is not None else None}
+    result = {"schema": 1, "stage": value["stage"], "last_command": command, "error": checked_error(value["error"])}
+    require(len(encoded(result)) <= 2048, "first-failure diagnostic byte bound")
+    return result
+
+
 def profile_for(path):
     name = path.name
+    if name == "FIRST_FAILURE.json":
+        return safe_failure_diagnostic(read_original_json(path))
     if name == "PRIVATE_IPV6_RESTRICTION.json":
         return safe_ipv6_restriction(read_original_json(path))
     if name in {"HTTP_AFTER.json", "PRESERVE_INSPECT.json", "STOPPED_INSPECT.json"}:
@@ -1165,7 +1327,26 @@ def evidence_packet(root):
     return packet
 
 
+def failure_evidence(root, deadline, failure):
+    """Prefer the original inner failure within the unchanged outer deadline."""
+    require(deadline is not None and time.monotonic() < deadline, "deadline expired; no further original reads")
+    with gateway._hard_deadline(min(3, deadline - time.monotonic())):
+        path = root / "inner" / "FIRST_FAILURE.json"
+        require(not path.parent.is_symlink(), "inner diagnostic directory must not be a link")
+        if path.exists() or path.is_symlink():
+            # Fixed file before the larger optional inventory; neither follows links.
+            failure["first_inner_failure"] = safe_failure_diagnostic(read_original_json(path))
+        else:
+            stop = path.with_name("STOP.json")
+            if stop.exists() or stop.is_symlink():
+                value = read_original_json(stop)
+                failure["first_inner_failure"] = safe_failure_diagnostic(value.get("diagnostics"))
+        require(time.monotonic() < deadline, "deadline expired; no further original reads")
+        failure["safe_evidence"] = evidence_packet(root)
+
+
 def _main(argv=None):
+    global DIAGNOSTICS
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
@@ -1174,6 +1355,7 @@ def _main(argv=None):
     parser.add_argument("--retain", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     root, result, deadline = args.output, None, None
+    previous_diagnostics = DIAGNOSTICS
     try:
         require(sys.platform == "linux" and os.geteuid() == 0 and args.repo == ROOT and ROOT == ROOT.resolve(),
                 "fixed Linux root-owned source required")
@@ -1182,6 +1364,7 @@ def _main(argv=None):
         if args.retain:
             require(not args.inside and args.deadline_monotonic is None, "retainer has no active operation arguments")
             return retain_pipes(root)
+        DIAGNOSTICS = {"stage": "initial_validation", "last_command": None, "first_failure": None}
         if args.inside:
             # Detach from the unshare client's group. An outer collector timeout
             # must not kill the namespace holder or the daemon group.
@@ -1192,10 +1375,13 @@ def _main(argv=None):
                     and proc_identity(os.getppid())["cgroup"] == plan["cgroup"] + "/supervisor"
                     and 0 < plan["deadline"] - time.monotonic() <= 180, "retained inner plan identity/deadline invalid")
             deadline = plan["deadline"]
+            require(plan.get("active_deadline") == deadline - DIAGNOSTIC_RESERVE_SECONDS,
+                    "inner active deadline must preserve original diagnostic reserve")
         else:
             deadline = bounded_deadline(args.deadline_monotonic)
         with gateway._hard_deadline(deadline - time.monotonic()):
-            result = inner_proof(root, plan) if args.inside else outer_proof(root, deadline)
+            with active_phase(deadline):
+                result = inner_proof(root, plan) if args.inside else outer_proof(root, deadline)
             if not args.inside:
                 result["safe_evidence"] = evidence_packet(root)
                 require(result["safe_evidence"]["complete"], "safe evidence incomplete")
@@ -1209,11 +1395,10 @@ def _main(argv=None):
                    "error_sha256": hashlib.sha256(str(error).encode()).hexdigest(), "cleanup_confirmed": False,
                    "next_action": "retain_originals_and_live_resources_no_retry_no_kill", "production_access": False,
                    "full_activation_verified": False}
+        failure["diagnostics"] = (DIAGNOSTICS and DIAGNOSTICS.get("first_failure")) or failure_diagnostic(error)
         if not args.inside and not args.retain and root.is_dir() and not root.is_symlink():
             try:
-                require(deadline is not None and time.monotonic() < deadline, "deadline expired; no further original reads")
-                with gateway._hard_deadline(min(3, deadline - time.monotonic())):
-                    failure["safe_evidence"] = evidence_packet(root)
+                failure_evidence(root, deadline, failure)
             except BaseException as export_error:
                 failure["safe_evidence"] = {"complete": False, "error_type": type(export_error).__name__,
                                             "error_sha256": hashlib.sha256(str(export_error).encode()).hexdigest()}
@@ -1224,6 +1409,8 @@ def _main(argv=None):
                 error.add_note("evidence failure: " + type(evidence_error).__name__)
         emit_failure(failure)
         return 1
+    finally:
+        DIAGNOSTICS = previous_diagnostics
 
 
 def emit_failure(failure):

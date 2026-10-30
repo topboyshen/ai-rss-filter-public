@@ -798,7 +798,11 @@ def test_full_activation_final_command_is_clamped_and_timeout_is_sticky(tmp_path
     def command(self, args, **kwargs):
         seen.append(kwargs["timeout"])
         self.sequence += 1
-        gate._write(self.output / f"command-{self.sequence:04d}.json", {"rc": None})
+        from scripts.verify_miniflux_pause_native import command_original_proof, retain_command_result
+        path = self.output / f"command-{self.sequence:04d}.json"
+        gate._write(path, {"rc": None})
+        assert kwargs["command_result"] == {}
+        kwargs["command_result"].update(retain_command_result(path, self.sequence, None, command_original_proof(path, sync=True)))
         return ""
     monkeypatch.setattr(activation.Harness, "command", command)
     assert harness.command(["stop", "owned"], final=True, timeout=30) == ""

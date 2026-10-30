@@ -28,7 +28,7 @@ from scripts import private_release_contract as private, production_activation_f
 from scripts import verify_production_startup_native as startup_native  # noqa: E402
 from scripts import production_gateway_native as gateway_native  # noqa: E402
 from scripts import production_native_deadline as native_deadline  # noqa: E402
-from scripts.verify_miniflux_pause_native import Harness, CLIENT, image_checks, source_binding, sha  # noqa: E402
+from scripts.verify_miniflux_pause_native import Harness, CLIENT, image_checks, source_binding, sha, read_command_result  # noqa: E402
 from scripts.miniflux_host_joint_native import component  # noqa: E402
 from scripts.miniflux_handoff_adapter import source_sha256 as bridge_source, CutoverError  # noqa: E402
 from production_sender_driver import SenderActivationDriver, PostgresReader, sources as sender_sources  # noqa: E402
@@ -79,16 +79,18 @@ class ActivationHarness(Harness):
 
     def command(self, *args, **kwargs):
         context = getattr(self, "private_host_context", None)
+        expected_result = {}
         if context is not None:
             context.check(final=kwargs.get("final", False))
             from scripts.production_activation_host_native import remaining
             end = context.plan["deadline"] if kwargs.get("final", False) else context.plan["active_deadline"]
             kwargs["timeout"] = min(kwargs.get("timeout", 30), remaining(end))
+            kwargs["command_result"] = expected_result
         try:
             result = super().command(*args, **kwargs)
             if context is not None:
-                saved = gate._read(self.output / f"command-{self.sequence:04d}.json")
-                if saved.get("rc") is None:
+                saved = read_command_result(self.output / f"command-{self.sequence:04d}.json", self.sequence, expected_result)
+                if saved["returncode"] is None:
                     context.commands.uncertain_mutation = True
                 context.check(final=kwargs.get("final", False))
             return result

@@ -16,6 +16,7 @@ from pathlib import Path
 import platform
 import re
 import secrets
+import stat
 import subprocess
 import time
 import uuid
@@ -28,6 +29,7 @@ LABEL = "ai-filter.synthetic-miniflux-pause"
 MEMORY = 768 * 1024 * 1024
 PIDS = 256
 MAX_SECONDS = 600
+COMMAND_EVIDENCE_BYTES = 8 * 1024**2  # Existing selected-original file bound, not the control-record bound.
 CLIENT = """
 import json,sys,urllib.request,urllib.error
 p=json.load(sys.stdin);headers={'Content-Type':'application/json'}
@@ -51,10 +53,66 @@ def error_category(value):
     return value if value in ERROR_CATEGORIES else "invalid"
 
 
-def save(path, value):
-    with path.open("x", encoding="utf-8") as stream:
+def save(path, value, *, retain_proof=False):
+    with path.open("x+" if retain_proof else "x", encoding="utf-8") as stream:
         json.dump(value, stream, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False)
         stream.write("\n")
+        if retain_proof:
+            stream.flush()
+            return command_original_proof(path, sync=True, fd=stream.fileno())
+
+
+def command_original_proof(path, *, sync=False, fd=None):
+    """A diagnostic original is not a small admission record; verify its exact FD."""
+    from scripts import production_host_ingress_native as host
+    from services import admission_fence as gate
+    owned = fd is None
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW) if owned else fd
+    try:
+        before = os.fstat(fd)
+        gate._require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1
+                      and before.st_uid == os.geteuid() and stat.S_IMODE(before.st_mode) == 0o600,
+                      "unsafe command original")
+        proof = host.file_proof(path, limit=COMMAND_EVIDENCE_BYTES, fd=fd)
+        if sync:
+            os.fsync(fd)
+            gate._sync_directory(path.parent)
+        gate._require(host.identity(os.fstat(fd)) == proof["identity"] == host.identity(path.lstat()),
+                      "command original changed during confirmation")
+        return proof
+    finally:
+        if owned:
+            os.close(fd)
+
+
+def retain_command_result(path, sequence, returncode, original):
+    """Publish small execution metadata only after the unchanged raw evidence is durable."""
+    from services import admission_fence as gate
+    from scripts import production_host_ingress_native as host
+    gate._require(type(sequence) is int and sequence > 0 and (returncode is None or type(returncode) is int),
+                  "invalid command result identity")
+    receipt = path.with_suffix(".result.json")
+    gate._require(not gate._present(receipt) and not gate._present(receipt.with_suffix(".json.pending")),
+                  "command result evidence already exists")
+    gate._require(gate._encoded(command_original_proof(path)) == gate._encoded(original), "command original changed after capture")
+    result = {"schema": 1, "sequence": sequence, "returncode": returncode, "original": original}
+    gate._require(len(host.encoded(result)) <= gate.MAX_RECORD_BYTES, "command result record byte limit")
+    host.durable(receipt, result)  # Exclusive creation; never replace a retained receipt.
+    return result
+
+
+def read_command_result(path, sequence, expected):
+    """The 16 KiB admission reader is used only for the small original-bound receipt."""
+    from services import admission_fence as gate
+    value = gate._read(path.with_suffix(".result.json"))
+    gate._require(set(value) == {"schema", "sequence", "returncode", "original"}
+                  and type(value["schema"]) is int and value["schema"] == 1
+                  and type(value["sequence"]) is int and value["sequence"] == sequence
+                  and (value["returncode"] is None or type(value["returncode"]) is int),
+                  "command result identity changed")
+    gate._require(gate._encoded(value) == gate._encoded(expected), "command result differs from actual execution")
+    gate._require(gate._encoded(command_original_proof(path)) == gate._encoded(value["original"]), "command original proof changed")
+    return value
 
 
 def sha(path):
@@ -159,7 +217,9 @@ class Harness:
             value = value.replace(secret, "<synthetic-secret>")
         return value
 
-    def command(self, args, *, stdin=None, timeout=30, final=False, allowed_failure=False):
+    def command(self, args, *, stdin=None, timeout=30, final=False, allowed_failure=False, command_result=None):
+        if command_result is not None and (type(command_result) is not dict or command_result):
+            raise ValueError("command result must be a fresh output mapping")
         self.sequence += 1
         path = self.output / f"command-{self.sequence:04d}.json"
         remaining = MAX_SECONDS - (time.monotonic() - self.started)
@@ -179,10 +239,12 @@ class Harness:
             stderr = error.stderr or ""
             stdout = stdout.decode(errors="replace") if isinstance(stdout, bytes) else stdout
             stderr = stderr.decode(errors="replace") if isinstance(stderr, bytes) else stderr
-        save(path, {"argv": [self.redacted(str(v)) for v in DOCKER + list(args)], "rc": rc,
+        original = save(path, {"argv": [self.redacted(str(v)) for v in DOCKER + list(args)], "rc": rc,
                     "stdin_sha256": hashlib.sha256((stdin or "").encode()).hexdigest(),
                     "elapsed_seconds": time.monotonic() - start, "utc": datetime.now(timezone.utc).isoformat(),
-                    "stdout": self.redacted(stdout), "stderr": self.redacted(stderr)})
+                    "stdout": self.redacted(stdout), "stderr": self.redacted(stderr)}, retain_proof=command_result is not None)
+        if command_result is not None:
+            command_result.update(retain_command_result(path, self.sequence, rc, original))
         if rc != 0 and not allowed_failure:
             raise RuntimeError(f"isolated command {self.sequence} failed rc={rc}")
         return stdout + stderr if args and args[0] == "logs" else stdout

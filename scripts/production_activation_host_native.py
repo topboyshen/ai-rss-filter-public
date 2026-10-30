@@ -757,6 +757,15 @@ def preserve_outer_outputs(process, root, plan, streams, primary):
         raise failures[0]
 
 
+def safe_preservation_code(value):
+    """Only fixed error classes and owned-role phase codes; never error text."""
+    if type(value) is not str:
+        return None
+    if value in ERROR_TYPES:
+        return value
+    return value if re.fullmatch(r"(?:pg|sender|fixture|redis):(?:inspect|observation|stop_unconfirmed)", value) else None
+
+
 def safe_activation(value):
     """Project report is still untrusted input to the public summary."""
     result = {"schema": "production-activation-native-v1", "status": value.get("status") if isinstance(value.get("status"), str) and value.get("status") in {
@@ -779,7 +788,10 @@ def safe_activation(value):
             item = failure.get(key)
             result["failure_" + key] = (item if isinstance(item, str) and 0 < len(item) <= limit
                                         and re.fullmatch(r"[ -~]+", item) and not re.search(r"[0-9a-fA-F]{32,}", item) else None)
-    result["evidence_error_count"] = len(value.get("evidence_errors", [])) if isinstance(value.get("evidence_errors"), list) else None
+    errors = value.get("evidence_errors")
+    result["evidence_error_count"] = len(errors) if isinstance(errors, list) else None
+    result["evidence_error_codes"] = [safe_preservation_code(item) for item in errors[:16]] if isinstance(errors, list) else []
+    result["evidence_error_codes_omitted"] = max(0, len(errors) - 16) if isinstance(errors, list) else None
     return result
 
 
