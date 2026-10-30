@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import nullcontext
 import hashlib
 import json
 import re
@@ -28,6 +29,7 @@ from scripts import private_release_contract as private, production_activation_f
 from scripts import verify_production_startup_native as startup_native  # noqa: E402
 from scripts import production_gateway_native as gateway_native  # noqa: E402
 from scripts import production_native_deadline as native_deadline  # noqa: E402
+from scripts import private_release_diagnostics as command_diagnostics  # noqa: E402
 from scripts.verify_miniflux_pause_native import Harness, CLIENT, image_checks, source_binding, sha, read_command_result  # noqa: E402
 from scripts.miniflux_host_joint_native import component  # noqa: E402
 from scripts.miniflux_handoff_adapter import source_sha256 as bridge_source, CutoverError  # noqa: E402
@@ -771,7 +773,7 @@ def source_literal(text, repo):
     return None
 
 
-def record_failure(error, repo, output, stage):
+def record_failure(error, repo, output, stage, *, private_commands=None):
     failure = {"type": type(error).__name__, "message_sha256": hashlib.sha256(str(error).encode()).hexdigest(),
 
                "locations": [{"file": Path(row.filename).name, "function": row.name, "line": row.lineno}
@@ -786,6 +788,9 @@ def record_failure(error, repo, output, stage):
     guardian = [note[len(GUARDIAN_NOTE):] for note in getattr(error, "__notes__", ()) if str(note).startswith(GUARDIAN_NOTE)]
     if guardian:
         failure["guardian_handoff"] = summary["guardian_handoff"] = guardian[0][:DIAGNOSTIC_TEXT_CHARS * 4]
+    commands = command_diagnostics.safe_summary(private_commands)
+    if commands is not None:
+        failure["private_commands"] = summary["private_commands"] = commands
     print("activation_native_failure=" + json.dumps(summary, sort_keys=True), flush=True)
     fixture.save(output / "FAILURE.json", failure)
     return failure
@@ -796,27 +801,34 @@ def execute(repo, source, image_id, binary, output, *, private_host_context=None
     harness = ActivationHarness(repo, source, image_id, binary, output, private_host_context=private_host_context)
     fixture.save(output / "SOURCE.json", binding)
     failure, evidence_errors = None, []
-    try:
-        harness.stage("actual_compose_parser_metadata")
-        harness.compose_parser_evidence()
-        harness.stage("bounded_internal_network_and_real_redis")
-        harness.prepare()
-        harness.redis()
-        scenario(harness, output)
-    except BaseException as error:
-        failure = record_failure(error, repo, output, harness.current_stage)
-    finally:
-        with native_deadline.final_phase():
-            if "pg" in harness.names:
-                try:
-                    harness.command(["exec", harness.names["pg"], "pg_dump", "-U", "synthetic", "-d", "synthetic_pause"],
-                                    timeout=30, final=True)
-                except Exception as error:
-                    evidence_errors.append(type(error).__name__)
-            evidence_errors.extend(harness.preserve())
+    # Only the attested isolated host scenario opts in; default/production calls
+    # do not create a collector or a file/environment-based diagnostic switch.
+    context = command_diagnostics.scope() if private_host_context is not None else nullcontext(None)
+    with context as observation:
+        try:
+            harness.stage("actual_compose_parser_metadata")
+            harness.compose_parser_evidence()
+            harness.stage("bounded_internal_network_and_real_redis")
+            harness.prepare()
+            harness.redis()
+            scenario(harness, output)
+        except BaseException as error:
+            failure = record_failure(error, repo, output, harness.current_stage,
+                                     private_commands=observation.summary() if observation else None)
+        finally:
+            with native_deadline.final_phase():
+                if "pg" in harness.names:
+                    try:
+                        harness.command(["exec", harness.names["pg"], "pg_dump", "-U", "synthetic", "-d", "synthetic_pause"],
+                                        timeout=30, final=True)
+                    except Exception as error:
+                        evidence_errors.append(type(error).__name__)
+                evidence_errors.extend(harness.preserve())
+        commands = observation.summary() if observation else None
     report = {"schema": "production-activation-native-v1", "source_sha": binding["revision"],
         "status": "passed" if failure is None and not evidence_errors else "failed_or_evidence_insufficient",
-        "failure": failure, "evidence_errors": evidence_errors, "elapsed_seconds": time.monotonic() - harness.started,
+        "failure": failure, "private_commands": commands,
+        "evidence_errors": evidence_errors, "elapsed_seconds": time.monotonic() - harness.started,
         "last_stage": harness.current_stage,
         "synthetic_only": True, "production_access": False, "existing_126_modified": False, "real_models": 0,
         "limits": ["unknown_before_T0_no_replay", "old_binary_not_executed", "no_power_loss_proof", "no_model_quality_proof"],

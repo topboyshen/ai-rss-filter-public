@@ -9,6 +9,7 @@ on:
     branches: [master, 'codex/**']
     paths:
       - 'scripts/private_release_contract.py'
+      - 'scripts/private_release_diagnostics.py'
       - 'scripts/production_native_deadline.py'
       - 'scripts/verify_private_release_native.py'
       - 'scripts/release.sh'

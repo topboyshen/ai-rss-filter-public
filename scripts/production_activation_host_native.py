@@ -788,6 +788,8 @@ def safe_activation(value):
             item = failure.get(key)
             result["failure_" + key] = (item if isinstance(item, str) and 0 < len(item) <= limit
                                         and re.fullmatch(r"[ -~]+", item) and not re.search(r"[0-9a-fA-F]{32,}", item) else None)
+    from scripts import private_release_diagnostics as command_diagnostics
+    result["private_commands"] = command_diagnostics.safe_summary(value.get("private_commands"))
     errors = value.get("evidence_errors")
     result["evidence_error_count"] = len(errors) if isinstance(errors, list) else None
     result["evidence_error_codes"] = [safe_preservation_code(item) for item in errors[:16]] if isinstance(errors, list) else []
@@ -915,12 +917,17 @@ def safe_inventory(root, deadline):
     expected = {hashlib.sha256(name.encode()).hexdigest() for name in required}
     complete = expected <= {row["path_sha256"] for row in records}
     profiles = {}
-    for name in ("inner/activation/RESULT.json", "inner/INNER_RESULT.json", "inner/DAEMON_STOP.json", "inner/RESOURCES_FINAL.json"):
+    for name in ("inner/activation/FAILURE.json", "inner/activation/RESULT.json", "inner/INNER_RESULT.json", "inner/DAEMON_STOP.json", "inner/RESOURCES_FINAL.json"):
         remaining(deadline)
         path = root / name
         if path.exists():
             value = original(path)[0] if name.endswith("INNER_RESULT.json") else host.read_original_json(path)
-            if name.endswith("activation/RESULT.json"):
+            if name.endswith("activation/FAILURE.json"):
+                # First failure is recorded before final preservation. It cannot
+                # substitute for any required completion/daemon-stop record.
+                profiles[name] = safe_activation({"status": "failed_or_evidence_insufficient",
+                    "failure": value, "private_commands": value.get("private_commands")})
+            elif name.endswith("activation/RESULT.json"):
                 profiles[name] = safe_activation(value)
             elif name.endswith("INNER_RESULT.json"):
                 profiles[name] = safe_inner_result(value)

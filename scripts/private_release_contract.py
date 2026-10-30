@@ -27,6 +27,7 @@ import time
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts import production_native_deadline as native_deadline  # noqa: E402
+from scripts import private_release_diagnostics as command_diagnostics  # noqa: E402
 
 
 SCHEMA = "ai-filter-private-release-v1"
@@ -136,30 +137,63 @@ def run(args, *, env=None):
     # completion would permit unbounded memory before reaching the size check.
     output = bytearray()
     total = 0
-    deadline = time.monotonic() + native_deadline.clamp(120)
-    with native_deadline.process(subprocess.Popen, args, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                 start_new_session=True) as process:
-        try:
-            with selectors.DefaultSelector() as selector:
-                selector.register(process.stdout, selectors.EVENT_READ, True)
-                selector.register(process.stderr, selectors.EVENT_READ, False)
-                while selector.get_map():
-                    remaining = deadline - time.monotonic()
-                    require(remaining > 0, "private release subprocess timed out")
-                    for key, _events in selector.select(min(remaining, 1)):
-                        chunk = os.read(key.fileobj.fileno(), 65536)
-                        if not chunk:
-                            selector.unregister(key.fileobj)
-                            continue
-                        total += len(chunk)
-                        require(total <= MAX_BYTES, "private release output too large")
-                        if key.data:
-                            output.extend(chunk)
-                require(process.wait(timeout=max(0.001, deadline - time.monotonic())) == 0,
-                        "private release subprocess failed")
-        except BaseException as error:
-            native_deadline.finish_client(process, error)
-            raise
+    observation = command_diagnostics.begin(args, sys._getframe(1))
+    process, phase = None, "budget"
+    stdout_eof = stderr_eof = False
+    stdout_bytes = stderr_bytes = 0
+
+    def observed(error):
+        command_diagnostics.finish(observation, error=error, phase=phase, process=process,
+                                   stdout_eof=stdout_eof, stderr_eof=stderr_eof,
+                                   stdout_bytes=stdout_bytes, stderr_bytes=stderr_bytes)
+
+    try:
+        # Keep the original evaluation order and use the one actual clamp result.
+        started = time.monotonic()
+        seconds = native_deadline.clamp(120)
+        deadline = started + seconds
+        command_diagnostics.applied(observation, seconds)
+        phase = "spawn"
+        with native_deadline.process(subprocess.Popen, args, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     start_new_session=True) as process:
+            try:
+                phase = "stream"
+                with selectors.DefaultSelector() as selector:
+                    selector.register(process.stdout, selectors.EVENT_READ, True)
+                    selector.register(process.stderr, selectors.EVENT_READ, False)
+                    while selector.get_map():
+                        remaining = deadline - time.monotonic()
+                        require(remaining > 0, "private release subprocess timed out")
+                        for key, _events in selector.select(min(remaining, 1)):
+                            chunk = os.read(key.fileobj.fileno(), 65536)
+                            if not chunk:
+                                selector.unregister(key.fileobj)
+                                if key.data:
+                                    stdout_eof = True
+                                else:
+                                    stderr_eof = True
+                                continue
+                            total += len(chunk)
+                            if key.data:
+                                stdout_bytes += len(chunk)
+                            else:
+                                stderr_bytes += len(chunk)
+                            require(total <= MAX_BYTES, "private release output too large")
+                            if key.data:
+                                output.extend(chunk)
+                    phase = "wait"
+                    require(process.wait(timeout=max(0.001, deadline - time.monotonic())) == 0,
+                            "private release subprocess failed")
+            except BaseException as error:
+                observed(error)  # Freeze the first failure before the existing client cleanup.
+                native_deadline.finish_client(process, error)
+                raise
+            phase = "close"
+        phase = "complete"
+    except BaseException as error:
+        observed(error)
+        raise
+    observed(None)
     return bytes(output)
 
 

@@ -25,6 +25,7 @@ def selected(path, patterns):
 @pytest.mark.parametrize("path", [
     "services/production_release_lock.py", "services/production_admission_lifecycle.py",
     "services/admission_fence.py", "services/production_activation_control.py",
+    "scripts/private_release_diagnostics.py", "tests/test_private_release_diagnostics.py",
     "scripts/private_control_subpaths.py", "scripts/controlled_production_release.py",
     "scripts/controlled_release_finalize.py", "scripts/private_release_contract.py",
     "scripts/sender_namespace_http.py", "scripts/production_gateway_switch.py",
@@ -59,6 +60,8 @@ def test_each_real_adapter_path_triggers_native(event, path):
 @pytest.mark.parametrize("event", ["push", "pull_request"])
 @pytest.mark.parametrize("path", [
     "docs/production-release.md", "README.md", "core/scorer.py",
+    "scripts/private_release_diagnostics.py.bak", "scripts/nested/private_release_diagnostics.py",
+    "tests/test_private_release_diagnostics.py.bak", "tests/nested/test_private_release_diagnostics.py",
     "scripts/controlled_production_release.py.bak", "scripts/nested/private_control_subpaths.py",
     "scripts/production_receiver_bootstrap.py.bak", "scripts/nested/production_receiver_bootstrap_native.py",
     "scripts/production_host_ingress_native.py.bak", "scripts/nested/production_host_ingress_native.py",
@@ -84,6 +87,22 @@ def test_unrelated_and_lookalike_paths_do_not_trigger(event, path):
 ])
 def test_shared_native_deadline_selects_both_consumers_without_expanding_scope(workflow_name, event, path, expected):
     workflow = yaml.load((ROOT / ".github/workflows" / workflow_name).read_text(), Loader=yaml.BaseLoader)
+    assert selected(path, workflow["on"][event]["paths"]) is expected
+
+
+@pytest.mark.parametrize("workflow_name", ["cutover-completion.yml", "private-release-config.yml"])
+@pytest.mark.parametrize("event", ["push", "pull_request"])
+@pytest.mark.parametrize("path,expected", [
+    ("scripts/private_release_diagnostics.py", True), ("tests/test_private_release_diagnostics.py", True),
+    ("scripts/private_release_diagnostics.py.bak", False), ("scripts/nested/private_release_diagnostics.py", False),
+    ("tests/test_private_release_diagnostics.py.bak", False), ("tests/nested/test_private_release_diagnostics.py", False),
+])
+def test_command_diagnostics_select_both_consumers(workflow_name, event, path, expected):
+    workflow = yaml.load((ROOT / ".github/workflows" / workflow_name).read_text(), Loader=yaml.BaseLoader)
+    # private-release-config's existing master push glob already covers every
+    # release helper, including lookalike suffixes. Do not silently narrow it.
+    if workflow_name == "private-release-config.yml" and event == "push" and path == "scripts/private_release_diagnostics.py.bak":
+        expected = True
     assert selected(path, workflow["on"][event]["paths"]) is expected
 
 
