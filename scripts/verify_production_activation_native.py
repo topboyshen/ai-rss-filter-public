@@ -533,8 +533,17 @@ def complete_native_supervision(harness, p, active, native_driver, migration_roo
     fixture.save(p["directory"] / "ACTUAL_RESTRICTIVE_STOP.json", stopped)
     child = p["watchdog_child"]
     gate._require(child.pid == live["owner"]["pid"], "native guardian child differs from actual live owner")
-    status = child.wait(timeout=guardian_exit_seconds())
-    gate._require(status == 0, "actual guardian did not exit after confirmed original controlled stop")
+    waited = time.monotonic()
+    try:
+        status = child.wait(timeout=guardian_exit_seconds())
+        gate._require(status == 0, "actual guardian did not exit after confirmed original controlled stop")
+    except BaseException as error:
+        code = child.poll()
+        exit_fact = ("exit_code=%d" % code if type(code) is int and code >= 0
+                     else "exit_signal=%d" % -code if type(code) is int else "exit=none")
+        error.add_note(GUARDIAN_NOTE + "phase=exit_wait,%s,waited_s=%.1f,bound_s=%d," % (
+            exit_fact, time.monotonic() - waited, guardian_exit_seconds()) + guardian_handoff_summary(active, child))
+        raise
     fixture.save(p["directory"] / "ACTUAL_GUARDIAN_EXIT.json", {"pid": live["owner"]["pid"], "exit_code": status,
                  "actual_child_reaped": True, "forced_kill": False})
     harness.stage("actual_fixed_network_namespace_transport")
@@ -713,6 +722,25 @@ def guardian_handoff_summary(active, child=None):
                 fields.append("wd_parent_same=0:" + type(error).__name__)
     tick = supervisor_root / "supervisor.tick.json"
     fields.append("sup_tick=%d" % int(tick.exists()))
+    tick_value = _guardian_json(tick)
+    if tick_value is not None and isinstance(tick_value.get("result"), dict):
+        fields.append("sup_tick_status=" + _guardian_word(tick_value["result"].get("status")))
+        trigger = tick_value["result"].get("trigger")
+        if isinstance(trigger, dict):
+            fields.append("sup_tick_trigger=" + _guardian_word(trigger.get("type")))
+            digest = str(trigger.get("message_sha256", ""))
+            if re.fullmatch(r"[0-9a-f]{64}", digest):
+                fields.append("sup_tick_trigger_sha12=" + digest[:12])
+        clock = tick_value.get("clock") if isinstance(tick_value.get("clock"), dict) else {}
+        if type(clock.get("wall")) in (int, float):
+            fields.append("sup_tick_age_s=%.1f" % (now - clock["wall"]))
+    sup_failed = _guardian_json(supervisor_root / "supervisor.failed.json")
+    fields.append("sup_failed=%d" % int(sup_failed is not None or (supervisor_root / "supervisor.failed.json").exists()))
+    if sup_failed is not None and isinstance(sup_failed.get("error"), dict):
+        fields.append("sup_failed_error=" + _guardian_word(sup_failed["error"].get("type")))
+        digest = str(sup_failed["error"].get("message_sha256", ""))
+        if re.fullmatch(r"[0-9a-f]{64}", digest):
+            fields.append("sup_failed_sha12=" + digest[:12])
     if child is not None:
         try:
             code = child.poll()

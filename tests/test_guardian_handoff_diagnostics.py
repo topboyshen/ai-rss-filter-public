@@ -95,3 +95,63 @@ def test_guard_still_rejects_present_and_pending_stop(tmp_path):
         with pytest.raises(gate.AdmissionError, match="^" + LITERAL + "$"):
             release._actual_child_receipt(SimpleNamespace(poll=lambda: None), lambda: {}, 2,
                                           stop_paths=(root / "STOP.json",))
+
+
+EXIT_LITERAL = "actual guardian did not exit after confirmed original controlled stop"
+
+
+def _exit_setup(tmp_path, monkeypatch, child):
+    active, wd, sup = _roots(tmp_path)
+    monkeypatch.setattr(release, "_handoff", lambda _active: {"owner": {"pid": child.pid}})
+    monkeypatch.setattr(native, "_restrictive_stop", lambda *a: {"status": "producers_stopped_drain_pending"})
+    monkeypatch.setattr(native.fixture, "save", lambda *a, **k: None)
+    monkeypatch.setattr(native, "guardian_exit_seconds", lambda: 3)
+    p = {"watchdog_child": child, "directory": tmp_path}
+    return active, wd, sup, p
+
+
+class Child:
+    def __init__(self, code=None, expire=False):
+        self.pid, self.code, self.expire = 4242, code, expire
+
+    def wait(self, timeout):
+        if self.expire:
+            raise native.subprocess.TimeoutExpired("guardian", timeout)
+        return self.code
+
+    def poll(self):
+        return self.code
+
+
+def test_nonzero_guardian_exit_still_fails_and_records_supervisor_facts(tmp_path, monkeypatch, capsys):
+    child = Child(code=1)
+    active, wd, sup, p = _exit_setup(tmp_path, monkeypatch, child)
+    _write(sup / "supervisor.tick.json", {"result": {"status": "stop_unconfirmed",
+           "trigger": {"type": "TimeoutError", "message_sha256": "d" * 64}}, "clock": {"wall": time.time() - 2}})
+    _write(sup / "supervisor.failed.json", {"error": {"type": "AdmissionError", "message_sha256": "e" * 64}})
+    with pytest.raises(gate.AdmissionError, match="^" + EXIT_LITERAL) as caught:
+        native.complete_native_supervision(SimpleNamespace(stage=lambda name: None), p, active, None, None)
+    failure = native.record_failure(caught.value, REPO, tmp_path, "actual_restrictive_stop_without_false_drain")
+    capsys.readouterr()
+    text = failure["guardian_handoff"]
+    assert text.startswith("phase=exit_wait,exit_code=1,waited_s=") and ",bound_s=3," in text
+    for item in ("sup_tick_status=stop_unconfirmed", "sup_tick_trigger=TimeoutError", "sup_tick_trigger_sha12=" + "d" * 12,
+                 "sup_failed=1", "sup_failed_error=AdmissionError", "sup_failed_sha12=" + "e" * 12, "child_alive=0"):
+        assert item in text
+    assert host_native.safe_activation({"failure": failure})["failure_guardian_handoff"] == text
+
+
+def test_signal_exit_reported_as_signal(tmp_path, monkeypatch, capsys):
+    child = Child(code=-9)
+    active, _, _, p = _exit_setup(tmp_path, monkeypatch, child)
+    with pytest.raises(gate.AdmissionError) as caught:
+        native.complete_native_supervision(SimpleNamespace(stage=lambda name: None), p, active, None, None)
+    assert any("exit_signal=9" in note for note in caught.value.__notes__)
+
+
+def test_non_exiting_guardian_still_fails_with_timeout(tmp_path, monkeypatch):
+    child = Child(code=None, expire=True)
+    active, _, _, p = _exit_setup(tmp_path, monkeypatch, child)
+    with pytest.raises(native.subprocess.TimeoutExpired) as caught:
+        native.complete_native_supervision(SimpleNamespace(stage=lambda name: None), p, active, None, None)
+    assert any("exit=none" in note and "child_alive=1" in note for note in caught.value.__notes__)
