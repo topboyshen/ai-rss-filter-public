@@ -54,3 +54,51 @@ def test_helper_report_and_summary_include_interface_names(tmp_path, monkeypatch
     summary = native.namespace_helper_summary(path, REPO)
     assert summary == ("status=unconfirmed,error_type=ProofError,error_message=namespace interface bound,"
                        "interfaces=11:lo/" + BRIDGE + "/veth0000/<invalid>")
+
+
+def _snapshot(links, registered, routes=()):
+    return ingress.namespace_snapshot(FamilyNetworkCommands(links, ipv4=list(routes)), bridge=BRIDGE, registered=registered)
+
+
+def test_nine_interfaces_rejected_unregistered_accepted_with_exactly_seven_endpoints(namespace_stat):
+    with pytest.raises(ingress.ProofError, match="^namespace interface bound$"):
+        ingress.namespace_snapshot(FamilyNetworkCommands(_links(7)), bridge=BRIDGE)
+    assert len(_snapshot(_links(7), 7)["links"]) == 9
+
+
+@pytest.mark.parametrize("registered", [6, 8, 0])
+def test_registered_count_mismatch_rejected(namespace_stat, registered):
+    with pytest.raises(ingress.ProofError, match="^namespace interface bound$"):
+        _snapshot(_links(7), registered)
+
+
+def test_unregistered_extra_veth_rejected(namespace_stat):
+    links = _links(3) + [{"ifname": "vethx", "master": "other0", "linkinfo": {"info_kind": "veth"}}]
+    with pytest.raises(ingress.ProofError, match="^namespace interface bound$"):
+        _snapshot(links, 3)
+
+
+@pytest.mark.parametrize("extra", [{"ifname": "eth0"}, {"ifname": "dummy0", "linkinfo": {"info_kind": "dummy"}},
+                                   {"ifname": "lo"}, {"ifname": BRIDGE, "linkinfo": {"info_kind": "bridge"}}])
+def test_non_veth_extra_rejected_even_if_count_matches(namespace_stat, extra):
+    with pytest.raises(ingress.ProofError):
+        _snapshot(_links(3) + [extra], 4)
+
+
+def test_more_than_32_rejected(namespace_stat):
+    with pytest.raises(ingress.ProofError, match="^namespace interface bound$"):
+        _snapshot(_links(31), 31)
+    assert len(_snapshot(_links(30), 30)["links"]) == 32
+
+
+@pytest.mark.parametrize("route,reason", [({"dst": "default", "dev": BRIDGE}, "^external namespace route$"),
+                                          ({"dst": "10.0.0.0/8", "dev": BRIDGE, "gateway": "10.0.0.1"}, "^external namespace route$"),
+                                          ({"dst": "10.0.0.0/8", "dev": "eth9"}, "^external namespace route$")])
+def test_routes_still_checked_with_registered_endpoints(namespace_stat, route, reason):
+    with pytest.raises(ingress.ProofError, match=reason):
+        _snapshot(_links(7), 7, [route])
+
+
+def test_registered_requires_owned_bridge(namespace_stat):
+    with pytest.raises(ingress.ProofError, match="^namespace interface bound$"):
+        ingress.namespace_snapshot(FamilyNetworkCommands([{"ifname": "lo"}]), registered=0)

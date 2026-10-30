@@ -460,11 +460,15 @@ def test_private_ipv6_fd_failures_do_not_turn_into_success(proc_sysctl_file, mon
         native.ipv6_sysctl("all", write=fault == "short_write")
 
 
+# Re-pinned for option A: the fixed 1..8 interface bound now applies only when no registered
+# endpoint count is supplied; with an owned bridge, the shape must be exactly one lo, one owned
+# bridge and one owned veth per Docker-registered endpoint (<= 32 total). All per-interface and
+# route checks below the bound are unchanged.
 def test_namespace_guard_stays_byte_identical_to_07f282a():
     source = Path(native.__file__).read_text()
     node = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name == "namespace_violation")
     segment = "\n".join(source.splitlines()[node.lineno - 1:node.end_lineno]) + "\n"
-    assert hashlib.sha256(segment.encode()).hexdigest() == "ae25bf0641ba998dfdb17a43cf686305762e49192969cf14eea3256c5a730fa9"
+    assert hashlib.sha256(segment.encode()).hexdigest() == "cf87558bc9708ea3131926363ffa260e954e5dd9df048761efa532404b24f4e9"
 
 
 @pytest.mark.parametrize("row", [

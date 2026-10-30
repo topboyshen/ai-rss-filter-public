@@ -331,7 +331,8 @@ def network_proof():
     proof = {"holder": holder, "bridge": "afa" + "a" * 10, "network_id": "f" * 64,
              "network_name": "synthetic", "owner": "a" * 32}
     row = {"Id": proof["network_id"], "Name": "synthetic", "Internal": False, "Driver": "bridge", "Scope": "local",
-           "Labels": {native.LABEL: proof["owner"]}, "Options": {"com.docker.network.bridge.name": proof["bridge"]}}
+           "Labels": {native.LABEL: proof["owner"]}, "Options": {"com.docker.network.bridge.name": proof["bridge"]},
+           "Containers": {"c" * 64: {}}}
     return proof, row
 
 
@@ -357,6 +358,24 @@ def test_private_network_records_unique_route_observation(tmp_path, monkeypatch)
     native.validate_network(proof, row, proof["owner"], commands)
     native.validate_network(proof, row, proof["owner"], commands)
     assert seen == [tmp_path / "NAMESPACE_CHECK_0001.json", tmp_path / "NAMESPACE_CHECK_0004.json"]
+
+
+def test_private_network_passes_registered_endpoint_count(tmp_path, monkeypatch):
+    proof, row = network_proof()
+    row["Containers"] = {format(i, "064x"): {} for i in range(7)}
+    seen = []
+    monkeypatch.setattr(native.host, "namespace_snapshot", lambda commands, **kw: seen.append(kw["registered"]) or {"netns": 17})
+    native.validate_network(proof, row, proof["owner"], SimpleNamespace(root=tmp_path, sequence=1))
+    assert seen == [7]
+
+
+@pytest.mark.parametrize("endpoints", [None, [], {"not-an-id": {}}])
+def test_private_network_requires_exact_endpoint_ids(tmp_path, monkeypatch, endpoints):
+    proof, row = network_proof()
+    row["Containers"] = endpoints
+    monkeypatch.setattr(native.host, "namespace_snapshot", lambda *a, **k: pytest.fail("must not snapshot"))
+    with pytest.raises(gate.AdmissionError, match="endpoints"):
+        native.validate_network(proof, row, proof["owner"], SimpleNamespace(root=tmp_path, sequence=1))
 
 
 @pytest.mark.parametrize("candidate", [None, object(), SimpleNamespace(check_network=lambda *_: None)])

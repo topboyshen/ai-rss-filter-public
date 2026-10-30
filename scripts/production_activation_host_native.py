@@ -194,7 +194,11 @@ def validate_network(proof, row, owner, commands):
                   and row["Options"].get("com.docker.network.bridge.name") == proof["bridge"]
                   and re.fullmatch(r"[0-9a-f]{64}", row["Id"]), "exact private host network binding required")
     observation = commands.root / ("NAMESPACE_CHECK_%04d.json" % commands.sequence)
-    state = host.namespace_snapshot(commands, bridge=proof["bridge"], evidence_path=observation)
+    endpoints = row.get("Containers")
+    gate._require(isinstance(endpoints, dict) and all(re.fullmatch(r"[0-9a-f]{64}", key) for key in endpoints),
+                  "exact private host network endpoints required")
+    # Every veth on the owned bridge must correspond to an endpoint Docker registered on this network.
+    state = host.namespace_snapshot(commands, bridge=proof["bridge"], evidence_path=observation, registered=len(endpoints))
     gate._require(state["netns"] == proof["holder"]["netns"], "private host network namespace changed")
 
 

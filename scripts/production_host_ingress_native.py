@@ -326,12 +326,28 @@ def process_snapshot(plan, netns, *, container_pid=None):
     return rows
 
 
-def namespace_violation(observed, bridge):
+MAX_REGISTERED_LINKS = 32
+
+
+def registered_interface_bound(links, bridge, registered):
+    """Exact shape for an owned bridge: one lo, one owned bridge, one owned veth per registered endpoint."""
+    if not (bridge and type(registered) is int and 0 <= registered <= MAX_REGISTERED_LINKS - 2
+            and len(links) == registered + 2 <= MAX_REGISTERED_LINKS and all(isinstance(row, dict) for row in links)):
+        return False
+    kinds = [(row.get("ifname"), row.get("linkinfo", {}).get("info_kind") if isinstance(row.get("linkinfo", {}), dict) else None,
+              row.get("master")) for row in links]
+    return (sum(1 for name, _, _ in kinds if name == "lo") == 1
+            and sum(1 for name, kind, _ in kinds if name == bridge and kind == "bridge") == 1
+            and sum(1 for name, kind, master in kinds if kind == "veth" and master == bridge and name not in {"lo", bridge}) == registered)
+
+
+def namespace_violation(observed, bridge, registered=None):
     """Return a fixed reason/location; do not weaken the original route guard."""
     if observed.get("netns_after") != observed["netns"]:
         return {"reason": "namespace_identity", "section": "namespace", "index": None}
     links = observed["links"]
-    if not isinstance(links, list) or not 0 < len(links) <= 8:
+    if not isinstance(links, list) or not (registered_interface_bound(links, bridge, registered) if registered is not None
+                                           else 0 < len(links) <= 8):
         return {"reason": "interface_bound", "section": "links", "index": None}
     for index, row in enumerate(links):
         if not isinstance(row, dict) or not isinstance(row.get("linkinfo", {}), dict):
@@ -394,8 +410,8 @@ def interface_names(links, limit=32):
     return {"count": len(links), "names": names}
 
 
-def namespace_snapshot(commands, *, bridge=None, evidence_path=None):
-    observed = {"schema": 1, "netns": os.stat("/proc/self/ns/net").st_ino, "bridge": bridge,
+def namespace_snapshot(commands, *, bridge=None, evidence_path=None, registered=None):
+    observed = {"schema": 1, "netns": os.stat("/proc/self/ns/net").st_ino, "bridge": bridge, "registered": registered,
                 "links": [], "routes_by_family": {}, "components": {}, "status": "capture_incomplete"}
     try:
         capture_namespace(commands, observed)
@@ -405,7 +421,7 @@ def namespace_snapshot(commands, *, bridge=None, evidence_path=None):
         observed["error_sha256"] = hashlib.sha256(str(error).encode()).hexdigest()
         preserve_namespace_observation(evidence_path, observed, primary=error)
         raise
-    violation = namespace_violation(observed, bridge)
+    violation = namespace_violation(observed, bridge, registered)
     observed["status"] = "rejected" if violation else "validated"
     observed["violation"] = violation
     messages = {"namespace_identity": "network namespace identity changed during capture",
