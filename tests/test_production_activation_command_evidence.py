@@ -330,3 +330,57 @@ def test_large_successful_dump_does_not_fabricate_final_evidence_failure(tmp_pat
     result = native.execute(Path("/synthetic-repo"), tmp_path, "sha256:" + "b" * 64, tmp_path / "binary", output)
     assert result["status"] == "passed" and result["failure"] is None and result["evidence_errors"] == []
     assert len(calls) == 1
+
+
+def test_timeout_exports_bounded_actual_command_facts(harness, monkeypatch):
+    from scripts import production_activation_host_native as host_native
+    calls = []
+    def timeout(args, **kwargs):
+        calls.append(kwargs["timeout"])
+        raise subprocess.TimeoutExpired(args, kwargs["timeout"], output=b"secret-body", stderr=b"secret-error")
+    monkeypatch.setattr(common.subprocess, "run", timeout)
+    with pytest.raises(RuntimeError, match="failed rc=None"):
+        harness.command(["run", "--env", "TOKEN=secret-token", "private-image"])
+    path = harness.output / "HARNESS_COMMAND_FAILURE.json"
+    value = json.loads(path.read_bytes())
+    assert value == host_native.safe_harness_failure(value)
+    assert value["operation"] == "docker_run" and value["sequence"] == 1
+    assert value["outcome"] == "timeout" and value["returncode"] is None
+    assert value["timeout_seconds"] == calls[0]
+    assert 0 <= value["elapsed_seconds"] < 2
+    assert 0 < value["harness_remaining_seconds"] <= 600
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert len(path.read_bytes()) < 1024 and b"secret" not in path.read_bytes()
+    first = path.read_bytes()
+    with pytest.raises(RuntimeError, match="failed rc=None"):
+        harness.command(["inspect", "another-private-name"])
+    assert path.read_bytes() == first
+    assert harness.private_host_context.commands.uncertain_mutation
+
+
+def test_diagnostic_write_failure_does_not_mask_original_or_clear_uncertainty(harness, monkeypatch):
+    response(monkeypatch, returncode=7)
+    def unavailable(*args):
+        raise OSError("private diagnostic path")
+    monkeypatch.setattr(harness, "_preserve_command_failure", unavailable)
+    with pytest.raises(RuntimeError, match="failed rc=7") as caught:
+        harness.command(["inspect", "private-container"])
+    assert caught.value.__notes__ == ["command failure diagnostic unavailable: OSError"]
+    assert harness.private_host_context.commands.uncertain_mutation
+    assert not (harness.output / "HARNESS_COMMAND_FAILURE.json").exists()
+
+
+def test_existing_command_failure_original_is_not_overwritten(harness, monkeypatch):
+    path = harness.output / "HARNESS_COMMAND_FAILURE.json"
+    path.write_bytes(b"preserve original")
+    response(monkeypatch, returncode=9)
+    with pytest.raises(RuntimeError, match="failed rc=9") as caught:
+        harness.command(["inspect", "private-container"])
+    assert path.read_bytes() == b"preserve original"
+    assert caught.value.__notes__ == ["command failure diagnostic unavailable: FileExistsError"]
+
+
+def test_success_does_not_create_command_failure(harness, monkeypatch):
+    response(monkeypatch)
+    harness.command(["inspect", "private-container"])
+    assert not (harness.output / "HARNESS_COMMAND_FAILURE.json").exists()

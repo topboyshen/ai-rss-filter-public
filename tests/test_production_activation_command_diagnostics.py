@@ -124,3 +124,33 @@ def test_isolated_execution_captures_first_failure_even_if_cleanup_raises(tmp_pa
     assert original["message_literal"] == "private release subprocess timed out"
     assert original["private_commands"] == evidence
     assert not (tmp_path / "RESULT.json").exists()
+
+
+def harness_failure():
+    return {"schema": 1, "sequence": 175, "operation": "docker_run", "timeout_seconds": 15,
+            "harness_remaining_seconds": 21, "elapsed_seconds": 15.01,
+            "returncode": None, "outcome": "timeout"}
+
+
+@pytest.mark.parametrize("key,bad", [
+    ("schema", True), ("sequence", False), ("sequence", 0), ("sequence", 1000001),
+    ("operation", "secret-image"), ("operation", []), ("timeout_seconds", True),
+    ("timeout_seconds", -1), ("timeout_seconds", 601), ("elapsed_seconds", float("nan")),
+    ("harness_remaining_seconds", float("inf")), ("returncode", False),
+    ("returncode", 1), ("outcome", "returned"), ("outcome", "secret"),
+    ("argv", "secret-token")])
+def test_harness_failure_profile_rejects_unbounded_or_unknown_fields(key, bad):
+    value = harness_failure()
+    value[key] = bad
+    assert host_native.safe_harness_failure(value) is None
+
+
+def test_harness_failure_export_does_not_claim_complete_inventory(tmp_path, monkeypatch):
+    root = tmp_path / "inner" / "activation"
+    root.mkdir(parents=True)
+    value = harness_failure()
+    (root / "HARNESS_COMMAND_FAILURE.json").write_text(json.dumps(value))
+    monkeypatch.setattr(host_native, "remaining", lambda *a, **k: 10)
+    packet = host_native.safe_inventory(tmp_path, 600)
+    assert packet["profiles"]["inner/activation/HARNESS_COMMAND_FAILURE.json"] == value
+    assert packet["complete"] is False and packet["full_raw_archive_verified"] is False

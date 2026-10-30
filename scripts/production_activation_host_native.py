@@ -766,6 +766,34 @@ def safe_preservation_code(value):
     return value if re.fullmatch(r"(?:pg|sender|fixture|redis):(?:inspect|observation|stop_unconfirmed)", value) else None
 
 
+def safe_harness_failure(value):
+    """Only bounded execution facts, never a fixture command or its output."""
+    from scripts.verify_miniflux_pause_native import OBSERVED_DOCKER_OPERATIONS
+    keys = {"schema", "sequence", "operation", "timeout_seconds", "harness_remaining_seconds",
+            "elapsed_seconds", "returncode", "outcome"}
+    try:
+        if type(value) is not dict or set(value) != keys or type(value["schema"]) is not int or value["schema"] != 1:
+            return None
+        if type(value["sequence"]) is not int or not 1 <= value["sequence"] <= 1000000:
+            return None
+        if value["operation"] not in {"unknown", *("docker_" + name for name in OBSERVED_DOCKER_OPERATIONS)}:
+            return None
+        for key, low in (("timeout_seconds", 0), ("harness_remaining_seconds", -600), ("elapsed_seconds", 0)):
+            item = value[key]
+            if item is not None and not (type(item) in {int, float} and math.isfinite(item) and low <= item <= 600):
+                return None
+        rc = value["returncode"]
+        if rc is not None and (type(rc) is not int or not -255 <= rc <= 255):
+            return None
+        if value["outcome"] not in {"returned", "timeout", "unconfirmed"}:
+            return None
+        if (value["outcome"] == "returned" and rc is None) or (value["outcome"] != "returned" and rc is not None):
+            return None
+        return dict(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def safe_activation(value):
     """Project report is still untrusted input to the public summary."""
     result = {"schema": "production-activation-native-v1", "status": value.get("status") if isinstance(value.get("status"), str) and value.get("status") in {
@@ -917,12 +945,14 @@ def safe_inventory(root, deadline):
     expected = {hashlib.sha256(name.encode()).hexdigest() for name in required}
     complete = expected <= {row["path_sha256"] for row in records}
     profiles = {}
-    for name in ("inner/activation/FAILURE.json", "inner/activation/RESULT.json", "inner/INNER_RESULT.json", "inner/DAEMON_STOP.json", "inner/RESOURCES_FINAL.json"):
+    for name in ("inner/activation/HARNESS_COMMAND_FAILURE.json", "inner/activation/FAILURE.json", "inner/activation/RESULT.json", "inner/INNER_RESULT.json", "inner/DAEMON_STOP.json", "inner/RESOURCES_FINAL.json"):
         remaining(deadline)
         path = root / name
         if path.exists():
             value = original(path)[0] if name.endswith("INNER_RESULT.json") else host.read_original_json(path)
-            if name.endswith("activation/FAILURE.json"):
+            if name.endswith("activation/HARNESS_COMMAND_FAILURE.json"):
+                profiles[name] = safe_harness_failure(value)
+            elif name.endswith("activation/FAILURE.json"):
                 # First failure is recorded before final preservation. It cannot
                 # substitute for any required completion/daemon-stop record.
                 profiles[name] = safe_activation({"status": "failed_or_evidence_insufficient",

@@ -224,7 +224,7 @@ def _assert_full_activation_contract(run):
     root, output, args, result = [_single_assignment(tree, name) for name in ("root", "output", "args", "result")]
     _same_expression(root.value, "pathlib.Path(os.environ['AI_FILTER_NATIVE_BOOTSTRAP_STAGE'])")
     _same_expression(output.value, "pathlib.Path(os.environ['RUNNER_TEMP']) / 'production-startup-source' / 'ACTIVATION_HOST_PROCESS'")
-    _same_expression(args.value, "['/usr/bin/sudo', '-n', '--', sys.executable, '-I', '-B', "
+    _same_expression(args.value, "['/usr/bin/sudo', '-n', '--', '/usr/bin/env', 'STARTUP_PIP_INDEX_URL=https://pypi.org/simple', sys.executable, '-I', '-B', "
         "str(root / 'source/scripts/production_activation_host_native.py'), '--repo', str(root / 'source'), "
         "'--source', str(root / 'miniflux'), '--binary', str(root / 'miniflux-binary'), "
         "'--image-id', os.environ['AI_FILTER_NATIVE_BOOTSTRAP_IMAGE'], '--output', str(root / 'activation-originals')]")

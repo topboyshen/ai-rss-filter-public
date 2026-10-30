@@ -81,13 +81,14 @@ class ActivationHarness(Harness):
 
     def command(self, *args, **kwargs):
         context = getattr(self, "private_host_context", None)
-        expected_result = {}
+        expected_result, observation = {}, {}
         if context is not None:
             context.check(final=kwargs.get("final", False))
             from scripts.production_activation_host_native import remaining
             end = context.plan["deadline"] if kwargs.get("final", False) else context.plan["active_deadline"]
             kwargs["timeout"] = min(kwargs.get("timeout", 30), remaining(end))
             kwargs["command_result"] = expected_result
+            kwargs["command_observation"] = observation
         try:
             result = super().command(*args, **kwargs)
             if context is not None:
@@ -100,10 +101,36 @@ class ActivationHarness(Harness):
             if context is not None:
                 context.commands.uncertain_mutation = True
                 try:
+                    self._preserve_command_failure(observation)
+                except BaseException as diagnostic_error:
+                    error.add_note("command failure diagnostic unavailable: " + type(diagnostic_error).__name__)
+                try:
                     context.check(final=kwargs.get("final", False))
                 except BaseException as drift:
                     error.add_note("private host identity observation failed: " + type(drift).__name__)
             raise
+
+    def _preserve_command_failure(self, observation):
+        from scripts.production_activation_host_native import safe_harness_failure
+        value = safe_harness_failure(observation)
+        if value is None or (value["outcome"] == "returned" and value["returncode"] == 0):
+            return
+        if getattr(self, "command_failure_attempted", False):
+            return
+        self.command_failure_attempted = True
+        raw = private.encoded(value)
+        path = self.output / "HARNESS_COMMAND_FAILURE.json"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            gate._require(os.write(fd, raw) == len(raw), "command diagnostic short write")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        directory = os.open(self.output, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
 
     def prepare_network(self):
         if self.private_host_context is None:

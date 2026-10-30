@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -44,6 +45,20 @@ print(json.dumps(value))
 
 
 ERROR_CATEGORIES = frozenset({"unconfirmed", "deadline", "uncertain", "conflict", "closed", "no_rows", "lock", "db", "other"})
+OBSERVED_DOCKER_OPERATIONS = frozenset({"inspect", "run", "exec", "logs", "ps", "image", "network", "volume",
+    "start", "stop", "kill", "rm", "rmi", "build", "images", "info", "load", "save", "create", "wait"})
+
+
+def _command_observation(args, sequence, timeout, remaining):
+    operation = args[0] if type(args) in (list, tuple) and args and type(args[0]) is str else None
+
+    def seconds(value):
+        return value if type(value) in (int, float) and math.isfinite(value) and -600 <= value <= 600 else None
+
+    return {"schema": 1, "sequence": sequence,
+            "operation": "docker_" + operation if operation in OBSERVED_DOCKER_OPERATIONS else "unknown",
+            "timeout_seconds": seconds(timeout), "harness_remaining_seconds": seconds(remaining),
+            "elapsed_seconds": None, "returncode": None, "outcome": "unconfirmed"}
 
 
 def error_category(value):
@@ -217,9 +232,12 @@ class Harness:
             value = value.replace(secret, "<synthetic-secret>")
         return value
 
-    def command(self, args, *, stdin=None, timeout=30, final=False, allowed_failure=False, command_result=None):
+    def command(self, args, *, stdin=None, timeout=30, final=False, allowed_failure=False, command_result=None,
+                command_observation=None):
         if command_result is not None and (type(command_result) is not dict or command_result):
             raise ValueError("command result must be a fresh output mapping")
+        if command_observation is not None and (type(command_observation) is not dict or command_observation):
+            raise ValueError("command observation must be a fresh output mapping")
         self.sequence += 1
         path = self.output / f"command-{self.sequence:04d}.json"
         remaining = MAX_SECONDS - (time.monotonic() - self.started)
@@ -228,17 +246,28 @@ class Harness:
         if remaining <= 0 and not final:
             raise TimeoutError("bounded isolated rehearsal elapsed")
         start = time.monotonic()
+        effective_timeout = timeout if final else min(timeout, remaining)
+        if command_observation is not None:
+            command_observation.update(_command_observation(args, self.sequence, effective_timeout, remaining))
         try:
             result = subprocess.run(DOCKER + list(map(str, args)), input=stdin, text=True,
-                                    capture_output=True, timeout=timeout if final else min(timeout, remaining),
+                                    capture_output=True, timeout=effective_timeout,
                                     check=False, env=self.env)
             rc, stdout, stderr = result.returncode, result.stdout, result.stderr
+            if command_observation is not None:
+                command_observation.update(returncode=rc, outcome="returned")
         except subprocess.TimeoutExpired as error:
             rc = None
             stdout = error.stdout or ""
             stderr = error.stderr or ""
             stdout = stdout.decode(errors="replace") if isinstance(stdout, bytes) else stdout
             stderr = stderr.decode(errors="replace") if isinstance(stderr, bytes) else stderr
+            if command_observation is not None:
+                command_observation["outcome"] = "timeout"
+        finally:
+            if command_observation is not None:
+                elapsed = time.monotonic() - start
+                command_observation["elapsed_seconds"] = elapsed if math.isfinite(elapsed) and 0 <= elapsed <= 600 else None
         original = save(path, {"argv": [self.redacted(str(v)) for v in DOCKER + list(args)], "rc": rc,
                     "stdin_sha256": hashlib.sha256((stdin or "").encode()).hexdigest(),
                     "elapsed_seconds": time.monotonic() - start, "utc": datetime.now(timezone.utc).isoformat(),
