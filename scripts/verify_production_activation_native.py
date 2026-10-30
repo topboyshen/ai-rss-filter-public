@@ -521,7 +521,11 @@ def _restrictive_stop(harness, p, native_driver, migration_root):
 def complete_native_supervision(harness, p, active, native_driver, migration_root):
     from scripts.controlled_production_release import _handoff
     harness.stage("actual_same_guardian_handoff_and_live_tick")
-    live = _handoff(active)
+    try:
+        live = _handoff(active)
+    except BaseException as error:
+        error.add_note(GUARDIAN_NOTE + guardian_handoff_summary(active, p.get("watchdog_child")))
+        raise
     fixture.save(p["directory"] / "ACTUAL_SUPERVISOR_TICK.json", {"tick": live, "same_guardian_pid": True,
         "actual_go_and_pg": True, "transport_scope": "synthetic_loopback_to_owned_go", "production_access": False})
     harness.stage("actual_restrictive_stop_without_false_drain")
@@ -641,6 +645,83 @@ def scenario(harness, output):
 DIAGNOSTIC_HEX_RE = re.compile(r"[0-9a-fA-F]{32,}")
 DIAGNOSTIC_TEXT_CHARS = 200
 NAMESPACE_NOTE = "namespace helper: "
+GUARDIAN_NOTE = "guardian handoff: "
+GUARDIAN_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,80}")
+
+
+def _guardian_json(path):
+    try:
+        value = json.loads(Path(path).read_bytes()[:65536])
+        return value if isinstance(value, dict) else None
+    except BaseException:  # noqa: BLE001 - diagnostics only
+        return None
+
+
+def _guardian_word(value, allowed=None):
+    if not isinstance(value, str) or not GUARDIAN_WORD.fullmatch(value):
+        return "other"
+    return value if allowed is None or value in allowed else "other"
+
+
+def guardian_handoff_summary(active, child=None):
+    """Fixed-vocabulary facts only (presence bits, enum words, rounded seconds, 12-hex prefixes); never raises."""
+    fields = []
+    try:
+        watchdog_root = Path(active["watchdog"]["plan_path"]).parent
+        supervisor_root = Path(active["supervisor"]["plan_path"]).parent
+    except BaseException as error:  # noqa: BLE001
+        return "roots_unreadable=" + type(error).__name__
+    for label, root in (("sup", supervisor_root), ("wd", watchdog_root)):
+        for suffix, name in (("stop", "STOP.json"), ("stop_pending", "STOP.json.pending")):
+            fields.append("%s_%s=%d" % (label, suffix, int((root / name).exists())))
+    stop = _guardian_json(watchdog_root / "STOP.json")
+    if stop is not None:
+        fields.append("wd_stop_reason=" + _guardian_word(stop.get("reason"), {"parent_or_preopen_window_lost"}))
+    result = _guardian_json(watchdog_root / "result.json")
+    if result is not None:
+        fields.append("wd_result_status=" + _guardian_word(result.get("status")))
+        errors = result.get("errors") if isinstance(result.get("errors"), dict) else {}
+        for key in ("marker", "sender", "receiver"):
+            if isinstance(errors.get(key), dict):
+                fields.append("wd_result_error_%s=%s" % (key, _guardian_word(errors[key].get("type"))))
+    fields.append("wd_handoff=%d" % int((watchdog_root / "handoff.json").exists()))
+    failed = _guardian_json(watchdog_root / "handoff.failed.json")
+    fields.append("wd_handoff_failed=%d" % int(failed is not None or (watchdog_root / "handoff.failed.json").exists()))
+    if failed is not None and isinstance(failed.get("error"), dict):
+        fields.append("wd_handoff_error=" + _guardian_word(failed["error"].get("type")))
+        digest = str(failed["error"].get("message_sha256", ""))
+        if re.fullmatch(r"[0-9a-f]{64}", digest):
+            fields.append("wd_handoff_message_sha12=" + digest[:12])
+    now = time.time()
+    pulse = _guardian_json(watchdog_root / "pulse.json")
+    if pulse is not None:
+        fields.append("wd_pulse_phase=" + _guardian_word(pulse.get("phase"), {"preopen", "supervising"}))
+        wall = (pulse.get("clock") or {}).get("wall") if isinstance(pulse.get("clock"), dict) else None
+        if type(wall) in (int, float):
+            fields.append("wd_pulse_age_s=%.1f" % (now - wall))
+    plan = _guardian_json(watchdog_root / "plan.json")
+    if plan is not None:
+        clock = plan.get("clock") if isinstance(plan.get("clock"), dict) else {}
+        if type(clock.get("expires_at")) in (int, float):
+            fields.append("wd_window_remaining_s=%.1f" % (clock["expires_at"] - now))
+        parent = plan.get("parent") if isinstance(plan.get("parent"), dict) else {}
+        if type(parent.get("pid")) is int:
+            try:
+                from services.production_startup import process_identity
+                fields.append("wd_parent_same=%d" % int(process_identity(parent["pid"]) == parent))
+            except BaseException as error:  # noqa: BLE001
+                fields.append("wd_parent_same=0:" + type(error).__name__)
+    tick = supervisor_root / "supervisor.tick.json"
+    fields.append("sup_tick=%d" % int(tick.exists()))
+    if child is not None:
+        try:
+            code = child.poll()
+            fields.append("child_alive=%d" % int(code is None))
+            if type(code) is int:
+                fields.append("child_returncode=%d" % code)
+        except BaseException as error:  # noqa: BLE001
+            fields.append("child_poll=" + type(error).__name__)
+    return ",".join(fields)
 
 
 def source_literal(text, repo):
@@ -672,6 +753,9 @@ def record_failure(error, repo, output, stage):
     helper = [note[len(NAMESPACE_NOTE):] for note in getattr(error, "__notes__", ()) if str(note).startswith(NAMESPACE_NOTE)]
     if helper:
         failure["namespace_helper"] = summary["namespace_helper"] = helper[0][:DIAGNOSTIC_TEXT_CHARS * 4]
+    guardian = [note[len(GUARDIAN_NOTE):] for note in getattr(error, "__notes__", ()) if str(note).startswith(GUARDIAN_NOTE)]
+    if guardian:
+        failure["guardian_handoff"] = summary["guardian_handoff"] = guardian[0][:DIAGNOSTIC_TEXT_CHARS * 4]
     print("activation_native_failure=" + json.dumps(summary, sort_keys=True), flush=True)
     fixture.save(output / "FAILURE.json", failure)
     return failure
