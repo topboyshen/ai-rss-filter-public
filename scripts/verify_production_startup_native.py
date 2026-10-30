@@ -440,13 +440,21 @@ def archive_command(args, path, *, seconds=120, limit=8 * 1024**2, child_umask=-
                                 else:
                                     captured[index].extend(chunk)
                     complete = True
-                    private.require(process.wait(timeout=max(0.01, deadline - time.monotonic())) == 0,
-                                    "synthetic command failed; original evidence retained")
+                    returncode = process.wait(timeout=max(0.01, deadline - time.monotonic()))
+                    if returncode != 0:
+                        error = private.ContractError("synthetic command failed; original evidence retained")
+                        error.returncode = returncode
+                        raise error
             finally:
                 if process.poll() is None:
                     native_deadline.finish_client(process, sys.exc_info()[1])
     except BaseException as error:
         failure = error
+        if getattr(error, "command", None) is None:
+            try:
+                error.command = Path(path).name  # Fixed evidence stem only; never argv or output.
+            except (AttributeError, TypeError):
+                pass
         raise
     finally:
         _finish_archive_outputs(files, path, failure, captured, complete)

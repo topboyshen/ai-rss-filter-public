@@ -644,6 +644,9 @@ def build_requested_candidate(root, plan, commands):
     except BaseException as error:
         failure = error
         result.update(error_type=type(error).__name__, error_sha256=hashlib.sha256(str(error).encode()).hexdigest())
+        command, returncode = getattr(error, "command", None), getattr(error, "returncode", None)
+        result.update(failed_command=command if command in OUTER_BUILD_COMMANDS else None,
+                      returncode=returncode if type(returncode) is int else None)
     try:
         record(root / "BUILD_RESULT.json", result, sealed=True)
     except BaseException as evidence_error:
@@ -786,6 +789,46 @@ def safe_inner_result(value):
 
 GATEWAY_COMMAND_RE = re.compile(r"inner/activation/receiver/gateway-native/switch/[a-z][a-z-]{0,40}\.(?:stderr|command\.json)")
 GATEWAY_TEXT_CAP, GATEWAY_TEXT_BUDGET = 64 * 1024, 160 * 1024
+OUTER_BUILD_COMMANDS = ("git-archive", "archive-extract", "application-build", "bounded-image-inspect")
+OUTER_BUILD_COMMAND_RE = re.compile(r"outer-build/(?:" + "|".join(OUTER_BUILD_COMMANDS) + r")\.stderr")
+OUTER_BUILD_TEXT_CAP, OUTER_BUILD_TEXT_BUDGET = 16 * 1024, 48 * 1024
+
+
+def outer_build_command_exports(items, deadline):
+    """Tail of failed outer build command stderr: capped, per-line redacted, size+hash bound to the original."""
+    from scripts.capture_release_diagnostics import redact_text
+
+    exports, used = [], 0
+    for path, relative, proof in sorted(items, key=lambda item: item[1]):
+        remaining(deadline)
+        row = {"tag": "outer_build_command_stderr", "path": relative, "bytes": proof["size"], "sha256": proof["sha256"],
+               "truncated": proof["size"] > OUTER_BUILD_TEXT_CAP, "text": None}
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            os.lseek(fd, max(0, proof["size"] - OUTER_BUILD_TEXT_CAP), os.SEEK_SET)
+            tail = os.read(fd, OUTER_BUILD_TEXT_CAP)
+        finally:
+            os.close(fd)
+        lines = tail.decode("utf-8", errors="replace").split("\n")
+        text = "\n".join(re.sub(r"[0-9a-fA-F]{32,}", "<hex>", redact_text(line)) for line in lines)
+        row["line_count"] = len(lines)
+        if row["truncated"]:
+            text = f"[TRUNCATED: last {len(tail)} of {proof['size']} bytes]\n" + text
+        size = len(host.encoded(text))
+        if used + size > OUTER_BUILD_TEXT_BUDGET:
+            row["reason"] = "export_budget_exhausted"
+        else:
+            used, row["text"] = used + size, text
+        exports.append(row)
+    return exports
+
+
+def safe_build_result(value):
+    command, returncode, kind = value.get("failed_command"), value.get("returncode"), value.get("error_type")
+    return {"status": value.get("status") if value.get("status") in {"built", "failed"} else None,
+            "error_type": kind if isinstance(kind, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]{0,80}", kind) else None,
+            "failed_command": command if command in OUTER_BUILD_COMMANDS else None,
+            "returncode": returncode if type(returncode) is int else None}
 
 
 def gateway_command_exports(items, deadline):
@@ -817,7 +860,7 @@ def gateway_command_exports(items, deadline):
 
 def safe_inventory(root, deadline):
     """Hash bounded originals; explicitly exclude storage trees and raw payloads."""
-    records, omissions, total, gateway_texts = [], [], 0, []
+    records, omissions, total, gateway_texts, outer_build_texts = [], [], 0, [], []
     excluded = {root / "inner/data", root / "inner/exec", root / "inner/run", root / "bundle/objects",
                 root / "outer-build/context"}
     for directory, dirs, files in os.walk(root, followlinks=False):
@@ -850,6 +893,8 @@ def safe_inventory(root, deadline):
             records.append({**entry, "sha256": proof["sha256"], "bytes": proof["size"]})
             if GATEWAY_COMMAND_RE.fullmatch(relative):
                 gateway_texts.append((path, relative, proof))
+            if OUTER_BUILD_COMMAND_RE.fullmatch(relative) and proof["size"]:
+                outer_build_texts.append((path, relative, proof))
     required = {"inner/INNER_RESULT.json", "inner/activation/RESULT.json", "inner/DAEMON_STOP.json", "inner/RESOURCES_FINAL.json"}
     expected = {hashlib.sha256(name.encode()).hexdigest() for name in required}
     complete = expected <= {row["path_sha256"] for row in records}
@@ -869,10 +914,14 @@ def safe_inventory(root, deadline):
                 profiles[name]["daemon_returncode"] = value.get("daemon_returncode") if type(value.get("daemon_returncode")) is int else None
             else:
                 profiles[name] = {key: value.get(key) for key in SUPERVISOR if value.get(key) == SUPERVISOR[key]}
+    if (root / "BUILD_RESULT.json").exists():
+        remaining(deadline)
+        profiles["BUILD_RESULT.json"] = safe_build_result(host.read_original_json(root / "BUILD_RESULT.json"))
     packet = {"schema": 1, "scope": "selected_sanitized_original_hash_inventory", "complete": complete,
               "originals": records, "omissions": omissions, "hashed_original_bytes": total,
               "profiles": profiles, "full_raw_archive_verified": False, "raw_originals_preserved_privately": True,
-              "gateway_command_stderr": gateway_command_exports(gateway_texts, deadline)}
+              "gateway_command_stderr": gateway_command_exports(gateway_texts, deadline),
+              "outer_build_command_stderr": outer_build_command_exports(outer_build_texts, deadline)}
     gate._require(len(host.encoded(packet)) <= 384 * 1024, "selected full-host evidence encoding bound")
     remaining(deadline)
     return packet
