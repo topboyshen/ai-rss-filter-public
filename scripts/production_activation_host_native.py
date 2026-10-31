@@ -448,8 +448,47 @@ def prepare_mounts(commands, root):
     commands.run([str(host.TOOLS["ip"]), "link", "set", "lo", "up"])
 
 
+def _private_run_identity(root, plan, *, final=False):
+    """The fixed PID path is permitted only inside the actual owned /run bind."""
+    frozen, _ = original(root.parent / "PLAN.json")
+    current = host.proc_identity(os.getpid())
+    gate._require(frozen == plan and plan.get("gateway_custody") is True
+                  and os.geteuid() == 0 and current["netns"] != plan["parent"]["netns"]
+                  and current["mntns"] != plan["parent"]["mntns"]
+                  and current["cgroup"] == plan["cgroup"] + "/supervisor"
+                  and host.proc_identity(plan["parent"]["pid"]) == plan["parent"]
+                  and host.file_proof(Path(__file__)) == plan["wrapper_source"],
+                  "fixed archive PID requires the frozen live private host")
+    remaining(plan["deadline"] if final else plan["active_deadline"])
+    actual, owned = os.lstat("/run"), os.lstat(root / "run")
+    gate._require(all(stat.S_ISDIR(info.st_mode) and info.st_uid == info.st_gid == 0
+                      and stat.S_IMODE(info.st_mode) == 0o700 for info in (actual, owned))
+                  and (actual.st_dev, actual.st_ino) == (owned.st_dev, owned.st_ino)
+                  and Path("/var/run").resolve() == Path("/run"),
+                  "fixed archive PID requires the actual private run bind")
+    return actual.st_dev, actual.st_ino, actual.st_mode, actual.st_uid, actual.st_gid
+
+
+def _private_daemon_pidfile(root, plan, run_identity, pid, expected=None, *, final=False):
+    # Reuse the unchanged production authority's bounded NOFOLLOW reader;
+    # publishing an observation never substitutes for its own live checks.
+    from scripts import retained_gateway_configuration as configuration
+    gate._require(_private_run_identity(root, plan, final=final) == run_identity,
+                  "private run bind changed after daemon launch")
+    raw, metadata = configuration._small(configuration.PIDFILE, 32)
+    gate._require(raw in {str(pid).encode(), (str(pid) + "\n").encode()} and metadata[4] == 0
+                  and (expected is None or (raw, metadata) == expected),
+                  "actual private daemon PID file differs")
+    return raw, metadata
+
+
 def start_daemon(commands, root, plan, mirror):
     config = {**host.daemon_config(root, plan), "registry-mirrors": [mirror]}
+    run_identity, pidfile = None, None
+    if plan.get("gateway_custody") is True:
+        run_identity = _private_run_identity(root, plan)
+        gate._require(not os.path.lexists("/run/docker.pid"), "private archive PID file already exists")
+        config["pidfile"] = "/run/docker.pid"
     record(root / "daemon.json", config)
     process, logs = host.launch_daemon(commands, root, plan)
     host.retain_daemons(deadline=commands.deadline)
@@ -466,11 +505,18 @@ def start_daemon(commands, root, plan, mirror):
         return True
 
     host.wait_until(ready, min(commands.deadline, time.monotonic() + 10))
+    if run_identity is not None:
+        pidfile = _private_daemon_pidfile(root, plan, run_identity, process.pid)
 
     def peer():
         logs.check()
         gate._require(host.retainer_confirmed(process), "live daemon FD retainer absent")
         host.check_peer(process.pid, actual)
+        if run_identity is not None:
+            gate._require(commands.deadline in {plan["active_deadline"], plan["deadline"]},
+                          "private daemon authority cannot replace the shared deadline")
+            _private_daemon_pidfile(root, plan, run_identity, process.pid, pidfile,
+                                    final=commands.deadline == plan["deadline"])
 
     commands.peer = peer
     record(root / "DAEMON_INFO.json", json.loads(commands.docker(["info", "--format", "{{json .}}"])))
