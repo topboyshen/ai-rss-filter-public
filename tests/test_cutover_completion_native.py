@@ -560,9 +560,11 @@ def test_fixed_partition_keeps_every_file_once_and_programs_bind_collection():
     from collections import Counter
     runner.validate_groups()
     assert [(name, len(files)) for name, files in runner.TEST_GROUPS] == [
-        ("foundation", 22), ("activation", 13), ("adapters", 37)]
+        ("foundation", 22), ("activation", 14), ("adapters", 36)]
     assert "tests/test_production_sender_bootstrap_direct131.py" in dict(runner.TEST_GROUPS)["activation"]
     assert "tests/test_production_sender_bootstrap_direct131.py" not in dict(runner.TEST_GROUPS)["adapters"]
+    assert "tests/test_production_legacy_takeover.py" in dict(runner.TEST_GROUPS)["activation"]
+    assert "tests/test_production_legacy_takeover.py" not in dict(runner.TEST_GROUPS)["adapters"]
     selected = []
     for name, files in runner.TEST_GROUPS:
         program = runner.native_test_program(name)

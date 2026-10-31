@@ -2,6 +2,7 @@
 from copy import deepcopy
 import fcntl
 import hashlib
+from itertools import permutations
 import json
 import os
 from pathlib import Path
@@ -144,7 +145,7 @@ def test_stop_keeps_lock_exact_originals_and_term_only_without_drain_claim(case)
         os.close(fd)
 
 
-def test_mount_order_change_still_blocks_and_reports_only_fixed_field(case):
+def test_only_mount_order_change_keeps_complete_identity_without_changing_originals(case):
     p = case
     row = p.state.rows["sender"]
     row["Mounts"].append({"Source": "/synthetic/secret-mount", "Destination": "/app/config", "RW": False})
@@ -153,12 +154,113 @@ def test_mount_order_change_still_blocks_and_reports_only_fixed_field(case):
     row["Mounts"].reverse()
     plan_before, row_before = deepcopy(p.plan), deepcopy(row)
     with legacy.locked_takeover(p.path, p.evidence) as session:
-        with pytest.raises(gate.AdmissionError) as error:
-            session.stop()
-    assert str(error.value) == "old container identity changed: mounts_sha256"
-    assert "/synthetic/secret-mount" not in str(error.value)
+        observed = session._containers()
+    assert observed["sender"]["identity"] == p.plan["containers"]["sender"]
     assert p.plan == plan_before and row == row_before and p.state.calls == []
     assert not list(p.evidence.iterdir())
+
+
+def complete_mount_records():
+    first = {"Type": "bind", "Name": "", "Source": "/synthetic/data", "Destination": "/app/data",
+             "Driver": "local", "Mode": "rw", "RW": True, "Propagation": "rprivate",
+             "Unknown": {"nested": "\u5168\u90e8", "ordered": ["first", "second"]}}
+    second = {"Source": "/synthetic/config", "Destination": "/app/config", "RW": False}
+    return [first, second, deepcopy(first)]
+
+
+def test_complete_mount_multiset_permutations_preserve_unknown_nested_fields_and_duplicates():
+    rows = complete_mount_records()
+    original = deepcopy(rows)
+    expected = legacy._mounts_sha256(rows)
+    for ordered in permutations(rows):
+        candidate = deepcopy(list(ordered))
+        before = deepcopy(candidate)
+        assert legacy._mounts_sha256(candidate) == expected
+        assert candidate == before
+    assert rows == original
+    assert len(rows) == 3 and rows[0] == rows[2]
+
+
+@pytest.mark.parametrize("rows", [[], [{"Unknown": {"value": "kept"}}]])
+def test_zero_and_single_complete_mount_identity_are_deterministic(rows):
+    before = deepcopy(rows)
+    assert legacy._mounts_sha256(rows) == gate._hash(rows)
+    assert rows == before
+
+
+def test_mount_dictionary_key_order_is_canonical_but_nested_array_order_is_not():
+    rows = complete_mount_records()
+    reversed_keys = [dict(reversed(list(row.items()))) for row in deepcopy(rows)]
+    assert legacy._mounts_sha256(rows) == legacy._mounts_sha256(reversed_keys)
+    reversed_keys[0]["Unknown"]["ordered"].reverse()
+    assert legacy._mounts_sha256(rows) != legacy._mounts_sha256(reversed_keys)
+
+
+@pytest.mark.parametrize("change", [
+    "Source", "Destination", "Type", "Name", "Driver", "Mode", "RW", "Propagation", "bool-to-number",
+    "add-unknown", "remove-known", "remove-unknown", "nested-value", "nested-list-order",
+    "drop-duplicate", "add-duplicate", "same-destination-different-record",
+])
+def test_any_complete_mount_value_key_or_duplicate_count_change_still_blocks(case, change):
+    p = case
+    row = p.state.rows["sender"]
+    row["Mounts"] = complete_mount_records()
+    p.plan["containers"]["sender"] = legacy.container_identity(row)
+    save(p.path, p.plan)
+    mounts = row["Mounts"]
+    if change in {"Source", "Destination", "Type", "Name", "Driver", "Mode", "Propagation"}:
+        mounts[0][change] = "changed-full-value"
+    elif change == "RW":
+        mounts[0]["RW"] = False
+    elif change == "bool-to-number":
+        mounts[0]["RW"] = 1
+    elif change == "add-unknown":
+        mounts[0]["NewUnknown"] = {"preserved": True}
+    elif change == "remove-known":
+        del mounts[0]["Source"]
+    elif change == "remove-unknown":
+        del mounts[0]["Unknown"]
+    elif change == "nested-value":
+        mounts[0]["Unknown"]["nested"] = "changed"
+    elif change == "nested-list-order":
+        mounts[0]["Unknown"]["ordered"].reverse()
+    elif change == "drop-duplicate":
+        mounts.pop()
+    elif change == "add-duplicate":
+        mounts.append(deepcopy(mounts[0]))
+    else:
+        mounts[1]["Destination"] = mounts[0]["Destination"]
+    plan_before, row_before = deepcopy(p.plan), deepcopy(row)
+    with legacy.locked_takeover(p.path, p.evidence) as session:
+        with pytest.raises(gate.AdmissionError, match="^old container identity changed: mounts_sha256$"):
+            session.stop()
+    assert p.plan == plan_before and row == row_before and p.state.calls == []
+    assert not list(p.evidence.iterdir())
+
+
+@pytest.mark.parametrize("rows", [None, (), {}, "unknown", [None], [[]], ["unknown"], [True]])
+def test_unknown_mount_collection_or_record_shape_never_becomes_empty_or_success(rows):
+    with pytest.raises(gate.AdmissionError, match="^old container mount records uncertain$"):
+        legacy._mounts_sha256(rows)
+
+
+@pytest.mark.parametrize("value", [float("nan"), {"not-json"}])
+def test_non_json_mount_values_do_not_fall_back_to_ignored_or_stringified_values(value):
+    with pytest.raises((ValueError, TypeError)):
+        legacy._mounts_sha256([{"Unknown": value}])
+
+
+def test_plan_with_old_adapter_source_sha_stays_rejected_before_any_stop(case, monkeypatch):
+    p = case
+    p.plan["source_sha256"] = "f" * 64
+    save(p.path, p.plan)
+    def forbidden(*_args):
+        raise AssertionError("old source plan must not reach inspection")
+    monkeypatch.setattr(legacy.NativeTransport, "inspect", forbidden)
+    with pytest.raises(gate.AdmissionError, match="^exact legacy takeover plan required$"):
+        with legacy.locked_takeover(p.path, p.evidence):
+            raise AssertionError("old source plan must not obtain a live capability")
+    assert not p.state.calls and not list(p.evidence.iterdir())
 
 
 @pytest.mark.parametrize("field", tuple(legacy._CONTAINER_IDENTITY_ERRORS))

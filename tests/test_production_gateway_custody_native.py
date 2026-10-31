@@ -723,6 +723,9 @@ def mount_order_failure():
     from tests.test_production_legacy_takeover import container
     row = container(1, "sender")
     row["Mounts"] += [{"Source": "/synthetic/private", "Destination": "/config", "RW": False, "Extra": {"all": 1}}]
+    # Preserve the historical raw-list-hash rejection classifier. The new
+    # runtime canonical identity does not itself reject a mere permutation.
+    row["Mounts"] = sorted(row["Mounts"], key=gate._encoded)
     expected = native.legacy.container_identity(row)
     mounts = deepcopy(row["Mounts"])[::-1]
     observed = {**expected, "mounts_sha256": gate._hash(mounts)}

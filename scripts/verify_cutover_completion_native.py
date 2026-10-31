@@ -569,11 +569,11 @@ TESTS = ("tests/test_independent_drain_inventory.py", "tests/test_frozen_cutover
          "tests/test_production_sender_bootstrap_export.py",
          "tests/test_production_sender_bootstrap_pg_diagnostics.py",
          "tests/test_production_sender_bootstrap_host_native.py")
-# Keep the original three bounded groups. The direct-131 bootstrap checks belong
-# to activation; keeping them in adapters overflowed the unchanged 2,000-case
-# temporary-path limit after parametrized regression coverage grew.
-TEST_GROUPS = (("foundation", TESTS[:22]), ("activation", TESTS[22:34] + TESTS[59:60]),
-               ("adapters", TESTS[34:59] + TESTS[60:]))
+# Keep the original three bounded groups. Whole direct-131 and legacy-takeover
+# files belong to activation so adapters retain the unchanged 2,000-case limit
+# as full-identity regression coverage grows; no test file or case is omitted.
+TEST_GROUPS = (("foundation", TESTS[:22]), ("activation", TESTS[22:34] + TESTS[39:40] + TESTS[59:60]),
+               ("adapters", TESTS[34:39] + TESTS[40:59] + TESTS[60:]))
 MOUNTS = ("scripts", "tests", "services", "routes", "core", "db", "utils", "workers", "modules",
           "templates", "app.py", "worker_main.py", "sse_engine.py", "logging_bootstrap.py",
           "scoring_provenance.py", "scoring_explanation.py", "config.yaml", "docker-compose.yml",

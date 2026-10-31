@@ -180,13 +180,20 @@ def _disabled_cron(plan, before):
     return after
 
 
+def _mounts_sha256(rows):
+    """Hash complete mount records without treating their outer order as identity."""
+    gate._require(type(rows) is list and all(type(row) is dict for row in rows),
+                  "old container mount records uncertain")
+    return gate._hash(sorted(rows, key=gate._encoded))
+
+
 def container_identity(row):
     config, state, host = row["Config"], row["State"], row["HostConfig"]
     return {"id": row["Id"], "image_id": row["Image"], "revision": config.get("Labels", {}).get("org.opencontainers.image.revision"),
         "service": config.get("Labels", {}).get("com.docker.compose.service"), "started_at": state["StartedAt"],
         "restart_count": row["RestartCount"], "user": config.get("User", ""),
         "command_sha256": gate._hash({"entrypoint": config.get("Entrypoint"), "command": config.get("Cmd")}),
-        "environment_sha256": gate._hash(config.get("Env", [])), "mounts_sha256": gate._hash(row["Mounts"]),
+        "environment_sha256": gate._hash(config.get("Env", [])), "mounts_sha256": _mounts_sha256(row["Mounts"]),
         "network_sha256": gate._hash({"mode": host.get("NetworkMode"), "ports": host.get("PortBindings"),
                                        "networks": sorted(row["NetworkSettings"]["Networks"])}),
         "resources_sha256": gate._hash({key: host.get(key) for key in ("Memory", "MemorySwap", "PidsLimit", "NanoCpus")})}
