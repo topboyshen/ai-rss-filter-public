@@ -6,6 +6,7 @@ and never permission to repeat a mutation.
 """
 from __future__ import annotations
 
+import ctypes
 import http.client
 import json
 import os
@@ -13,6 +14,8 @@ from pathlib import Path
 import re
 import selectors
 import signal
+import socket
+import stat
 import subprocess
 import sys
 import time
@@ -23,6 +26,11 @@ MAX_HTTP = 65536
 MAX_OUTPUT = 131072
 TOTAL_SECONDS = 3
 HTTP_SECONDS = 2
+MAX_PROC_BYTES = 524288
+MAX_PROC_LINES = 4096
+MAX_PROC_TOTAL = 655360
+MAX_OWNER_FDS = 256
+PROC_SUPER_MAGIC = 0x9FA0
 
 
 class NamespaceUncertain(RuntimeError):
@@ -136,6 +144,153 @@ def _open_namespace(pid):
     return os.open(f"/proc/{pid}/ns/net", os.O_RDONLY)
 
 
+def _filesystem_type(fd):
+    library = ctypes.CDLL(None, use_errno=True)
+    function = library.fstatfs
+    function.argtypes = [ctypes.c_int, ctypes.c_void_p]
+    function.restype = ctypes.c_int
+    storage = ctypes.create_string_buffer(256)
+    require(function(fd, ctypes.byref(storage)) == 0)
+    return ctypes.cast(storage, ctypes.POINTER(ctypes.c_long)).contents.value
+
+
+def _duplicate_process_fd(pidfd, target_fd):
+    # Linux x86_64 and aarch64 both assign pidfd_getfd syscall number 438.
+    # Unsupported architectures and EPERM remain unknown; no weaker fallback.
+    require(os.uname().sysname == "Linux" and os.uname().machine in {"x86_64", "aarch64"})
+    library = ctypes.CDLL(None, use_errno=True)
+    function = library.syscall
+    function.argtypes = [ctypes.c_long, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+    function.restype = ctypes.c_int
+    fd = function(438, pidfd, target_fd, 0)
+    require(fd >= 0)
+    return fd
+
+
+class _PinnedListener:
+    """Live sender FD capability, held until the HTTP result is classified."""
+    def __init__(self, owner, port, deadline):
+        self.owner, self.port, self.deadline = owner, port, deadline
+        self.pidfd = self.listener = None
+        self.inode = self.sender_fd = None
+        self.read_bytes = 0
+
+    def _window(self):
+        require(time.monotonic() < self.deadline and _process_identity(self.owner["pid"]) == self.owner)
+
+    def _read_table(self, family):
+        require(family in ("tcp", "tcp6"))
+        self._window()
+        path = "/proc/self/net/" + family
+        before = os.lstat(path)
+        def fixed(value):
+            return tuple(getattr(value, key) for key in
+                ("st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_nlink", "st_size"))
+        require(before.st_mode == stat.S_IFREG | 0o444 and before.st_uid == before.st_gid == 0
+                and before.st_nlink == 1 and before.st_size == 0)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        try:
+            require(_filesystem_type(fd) == PROC_SUPER_MAGIC and fixed(os.fstat(fd)) == fixed(before))
+            raw = bytearray()
+            while len(raw) <= MAX_PROC_BYTES:
+                self._window()
+                block = os.read(fd, min(4096, MAX_PROC_BYTES + 1 - len(raw)))
+                if not block:
+                    break
+                raw.extend(block)
+                self.read_bytes += len(block)
+                require(self.read_bytes <= MAX_PROC_TOTAL)
+            require(len(raw) <= MAX_PROC_BYTES and fixed(os.fstat(fd)) == fixed(before)
+                    and fixed(os.lstat(path)) == fixed(before))
+            return bytes(raw)
+        finally:
+            os.close(fd)
+
+    def _table_listener(self):
+        found = []
+        for family in ("tcp", "tcp6"):
+            lines = self._read_table(family).decode("ascii", "strict").splitlines()
+            require(0 < len(lines) <= MAX_PROC_LINES)
+            header = lines[0].split()
+            require(header[:2] == ["sl", "local_address"] and header[2] in {"rem_address", "remote_address"}
+                    and header[3] == "st" and "inode" in header)
+            digits = 8 if family == "tcp" else 32
+            endpoint = re.compile(r"[0-9A-F]{" + str(digits) + r"}:[0-9A-F]{4}\Z")
+            for line in lines[1:]:
+                self._window()
+                fields = line.split()
+                require(len(fields) >= 10 and endpoint.fullmatch(fields[1])
+                        and endpoint.fullmatch(fields[2]) and re.fullmatch(r"[0-9A-F]{2}", fields[3]))
+                if int(fields[1].rsplit(":", 1)[1], 16) != self.port:
+                    continue
+                require(fields[3] in {"01", "02", "03", "04", "05", "06", "07", "08", "09", "0A", "0B", "0C"})
+                if fields[3] != "0A":
+                    continue
+                # Unknown/v6-only or wildcard same-port listeners are not adopted.
+                require(family == "tcp" and fields[1] == f"0100007F:{self.port:04X}"
+                        and fields[2] == "00000000:0000" and re.fullmatch(r"[1-9][0-9]{0,19}", fields[9]))
+                found.append(int(fields[9]))
+        require(len(found) == 1)
+        return found[0]
+
+    def _owned_fds(self, inode):
+        self._window()
+        found = []
+        with os.scandir(f"/proc/{self.owner['pid']}/fd") as entries:
+            for index, entry in enumerate(entries):
+                require(index < MAX_OWNER_FDS and re.fullmatch(r"0|[1-9][0-9]{0,9}", entry.name))
+                self._window()
+                if os.readlink(entry.path) == f"socket:[{inode}]":
+                    found.append(int(entry.name))
+        require(found)
+        self._window()
+        return sorted(found)
+
+    def confirm(self):
+        self._window()
+        require(self._table_listener() == self.inode)
+        require(self.sender_fd in self._owned_fds(self.inode))
+        require(self._table_listener() == self.inode)
+        require(os.readlink(f"/proc/{self.owner['pid']}/fd/{self.sender_fd}") == f"socket:[{self.inode}]")
+        require(os.fstat(self.listener.fileno()).st_ino == self.inode
+                and self.listener.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) == socket.SOCK_STREAM
+                and self.listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) == 1
+                and self.listener.getsockname() == ("127.0.0.1", self.port)
+                and self.listener.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT) == 0)
+        self._window()
+
+    def __enter__(self):
+        try:
+            self._window()
+            require(hasattr(os, "pidfd_open"))
+            self.pidfd = os.pidfd_open(self.owner["pid"], 0)
+            self.inode = self._table_listener()
+            self.sender_fd = self._owned_fds(self.inode)[0]
+            fd = _duplicate_process_fd(self.pidfd, self.sender_fd)
+            try:
+                self.listener = socket.socket(fileno=fd)
+            except BaseException:
+                os.close(fd)
+                raise
+            self.confirm()
+            return self
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+
+    def __exit__(self, *_args):
+        if self.listener is not None:
+            self.listener.close()
+            self.listener = None
+        if self.pidfd is not None:
+            os.close(self.pidfd)
+            self.pidfd = None
+
+
+def _listener_owner(owner, port, deadline):
+    return _PinnedListener(owner, port, deadline)
+
+
 def _validate_request(port, method, path, token, payload):
     require(isinstance(path, str) and isinstance(method, str))
     allowed = ((method == "GET" and (path in {"/registration", "/activation-registration"}
@@ -186,26 +341,30 @@ def _http(value):
     require((own.st_dev, own.st_ino) == (owner["network_device"], owner["network_inode"])
             and _process_identity(owner["pid"]) == owner)
     deadline = time.monotonic() + HTTP_SECONDS
-    connection = http.client.HTTPConnection("127.0.0.1", value["port"], timeout=HTTP_SECONDS)
-    try:
-        body = None if value["payload"] is None else _encoded(value["payload"])
-        connection.request(value["method"], value["path"], body=body,
-                           headers={"Authorization": "Bearer " + value["token"], "Content-Type": "application/json"})
-        response, raw = connection.getresponse(), bytearray()
-        while len(raw) <= MAX_HTTP:
-            require(time.monotonic() < deadline)
-            if connection.sock:
-                connection.sock.settimeout(max(0.001, deadline - time.monotonic()))
-            part = response.read1(min(4096, MAX_HTTP + 1 - len(raw)))
-            if not part:
-                break
-            raw.extend(part)
-        require(len(raw) <= MAX_HTTP and response.status in (200, 409) and time.monotonic() < deadline)
-        result = {"status": response.status, "body": _parsed(raw)}
-        require(isinstance(result["body"], dict) and len(_encoded(result)) <= MAX_OUTPUT)
-        return result
-    finally:
-        connection.close()
+    with _listener_owner(owner, value["port"], deadline) as guard:
+        remaining = deadline - time.monotonic()
+        require(remaining > 0)
+        connection = http.client.HTTPConnection("127.0.0.1", value["port"], timeout=remaining)
+        try:
+            body = None if value["payload"] is None else _encoded(value["payload"])
+            connection.request(value["method"], value["path"], body=body,
+                               headers={"Authorization": "Bearer " + value["token"], "Content-Type": "application/json"})
+            response, raw = connection.getresponse(), bytearray()
+            while len(raw) <= MAX_HTTP:
+                require(time.monotonic() < deadline)
+                if connection.sock:
+                    connection.sock.settimeout(max(0.001, deadline - time.monotonic()))
+                part = response.read1(min(4096, MAX_HTTP + 1 - len(raw)))
+                if not part:
+                    break
+                raw.extend(part)
+            require(len(raw) <= MAX_HTTP and response.status in (200, 409) and time.monotonic() < deadline)
+            result = {"status": response.status, "body": _parsed(raw)}
+            require(isinstance(result["body"], dict) and len(_encoded(result)) <= MAX_OUTPUT)
+            guard.confirm()
+            return result
+        finally:
+            connection.close()
 
 
 def main():

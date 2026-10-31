@@ -132,6 +132,21 @@ def validate_control_subpaths(manifest, review, apps):
         raise ContractError("reviewed control subpath identity or mapping differs") from None
 
 
+def retained_custody(contract, manifest):
+    """The optional exact variant never grants stop/create/switch authority."""
+    review = contract["review"]
+    if "retained_gateway_custody" not in review:
+        return None
+    spec = importlib.util.spec_from_file_location("private_retained_gateway_custody",
+        Path(__file__).with_name("retained_gateway_custody.py"))
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    try:
+        return helper, helper.load(review, manifest, contract["app_services"], read_private=private_file)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        raise ContractError("reviewed retained gateway custody differs") from None
+
+
 def run(args, *, env=None):
     # Stream a bounded total from both pipes. Checking capture_output only after
     # completion would permit unbounded memory before reaching the size check.
@@ -494,6 +509,7 @@ def validate_manifest(manifest, review, env_values, runtime_path):
         require(isinstance(names, list) and names and len(set(names)) == len(names)
                 and all(name in review["existing_topology"] for name in names), "invalid reviewed service mapping")
     validate_control_subpaths(manifest, review, apps)
+    retained_custody({"review": review, "app_services": apps}, manifest)
     require(used_env == set(env_values), "environment references must exactly match private environment")
     # No interpolation in command, mount, label, secret, config, etc. Embedded
     # Nginx dollar variables are allowed only when escaped for Compose.
@@ -558,6 +574,11 @@ def seal(root, config, manifest, environment, review, output):
             "private seal must be new and outside source checkout")
     deployment = json.loads(data["input-compose.json"])
     apps, refs = validate_manifest(deployment, policy, environment_values(data["environment"]), RUNTIME)
+    custody = retained_custody({"review": policy, "app_services": apps}, deployment)
+    if custody is not None:
+        _helper, held = custody
+        data.update(held["files"])
+        inputs.update(held["inputs"])
     # Freeze the complete manifest, with one controlled substitution only.
     for service in deployment["services"].values():
         for mount in service.get("volumes", []):
@@ -592,7 +613,8 @@ def load(path, root, *, require_fresh=False):
     data, _record = private_file(path, sealed=True)
     contract = json.loads(data)
     require(contract.get("schema") == SCHEMA, "unsupported private release contract")
-    require(set(contract["files"]) == {"runtime.yaml", "input-compose.json", "environment", "review.json", "compose.json"},
+    custody_files = {"custody-gateway-plan.json", "custody-configuration-proof.json"} if "retained_gateway_custody" in contract["review"] else set()
+    require(set(contract["files"]) == {"runtime.yaml", "input-compose.json", "environment", "review.json", "compose.json"} | custody_files,
             "invalid frozen file inventory")
     files = {}
     for name, digest in contract["files"].items():
@@ -600,10 +622,11 @@ def load(path, root, *, require_fresh=False):
         require(sha(files[name]) == digest, "frozen private input drift")
     require(json.loads(files["review.json"]) == contract["review"], "private review drift")
     for name, expected in contract["inputs"].items():
-        require(name in {"runtime.yaml", "input-compose.json", "environment", "review.json"}, "invalid input inventory")
+        require(name in {"runtime.yaml", "input-compose.json", "environment", "review.json"} | custody_files, "invalid input inventory")
         _data, actual = private_file(expected["path"])
         require(expected == actual, "private source input changed after sealing")
-    require(len(contract["inputs"]) == 4, "incomplete private input inventory")
+    require(set(contract["inputs"]) == {"runtime.yaml", "input-compose.json", "environment", "review.json"} | custody_files,
+            "incomplete private input inventory")
     for expected in contract["directory_refs"]:
         require(directory_identity(expected["path"]) == expected, "deployment directory identity drift")
     for expected in contract["secret_refs"]:
@@ -625,6 +648,11 @@ def load(path, root, *, require_fresh=False):
     require({item["path"] for item in contract["directory_refs"]} == expected_directories,
             "deployment directory inventory drift")
     require(apps == contract["app_services"] and refs == contract["secret_refs"], "private runtime contract drift")
+    custody = retained_custody(contract, manifest)
+    if custody is not None:
+        _helper, held = custody
+        require(all(held["files"][name] == files[name] and held["inputs"][name] == contract["inputs"][name]
+                    for name in custody_files), "frozen retained custody input drift")
     return contract, manifest, sha(data)
 
 
@@ -766,8 +794,19 @@ def preflight(contract, manifest):
     containers = inspect_project(contract)
     require(runtime_topology(containers) == contract["review"].get("existing_topology"),
             "reviewed existing service identity or topology drift")
+    custody = retained_custody(contract, manifest)
+    gateway_id = None
+    if custody is not None:
+        helper, held = custody
+        try:
+            helper.verify_records(held, contract["review"], containers)
+        except (ValueError, KeyError, TypeError, AttributeError):
+            raise ContractError("retained gateway runtime identity differs") from None
+        gateway_id = held["declaration"]["old_container_id"]
     writable, networks, ports = set(), set(), set()
     for container in containers:
+        if container["Id"] == gateway_id:
+            continue
         if container["Config"]["Labels"].get("com.docker.compose.oneoff", "False").lower() == "true":
             require(not container["State"]["Running"], "existing one-off producer is running")
             continue
@@ -789,6 +828,8 @@ def preflight(contract, manifest):
         for definition in definitions.values():
             info = json.loads(run(["docker", kind, "inspect", definition["name"]]))
             require(len(info) == 1 and info[0]["Name"] == definition["name"], "existing resource is missing")
+            if custody is not None and kind == "network" and definition["name"] in held["configuration"]["container_identity"]["networks"]:
+                require(info[0]["Id"] == held["configuration"]["network_id"], "retained gateway network identity differs")
 
 
 def memory_bytes(value):

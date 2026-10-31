@@ -60,23 +60,29 @@ def _checked_plan(plan):
     return plan
 
 
-def _component(name, item, *, allow_external_postgres=False):
+def _component(name, item, *, allow_external_postgres=False, allow_host_loopback_postgres=False):
     keys = {"id", "image", "revision", "started_at", "restart_count", "role", "user", "memory", "pids", "mounts"}
-    external = isinstance(item, dict) and "external_postgres" in item
+    policies = set(item) & {"external_postgres", "host_loopback_postgres"} if isinstance(item, dict) else set()
     require(CONTROL.fullmatch(name) and isinstance(item, dict)
-            and set(item) == keys | ({"external_postgres"} if external else set()), "exact component fields required")
-    require(not external or (allow_external_postgres and item["role"] == "miniflux"), "external PostgreSQL policy scope differs")
+            and len(policies) <= 1 and set(item) == keys | policies, "exact component fields required")
+    require("external_postgres" not in policies or (allow_external_postgres and item["role"] == "miniflux"),
+            "external PostgreSQL policy scope differs")
+    require("host_loopback_postgres" not in policies or (allow_host_loopback_postgres and item["role"] == "miniflux"),
+            "host-loopback PostgreSQL policy scope differs")
     require(HEX64.fullmatch(item["id"]) and re.fullmatch(r"sha256:[0-9a-f]{64}", item["image"])
             and re.fullmatch(r"[0-9a-f]{40}", item["revision"]) and isinstance(item["started_at"], str)
             and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,9})?Z", item["started_at"])
             and _integer(item["restart_count"]) and isinstance(item["role"], str) and item["role"]
             and isinstance(item["user"], str) and re.fullmatch(r"\d+(?::\d+)?", item["user"])
             and _integer(item["memory"], 1, 768 * 1024 * 1024) and _integer(item["pids"], 1, 256), "bad component identity/limits")
-    require(isinstance(item["mounts"], list) and (item["mounts"] == [] if external else 1 <= len(item["mounts"]) <= 16),
+    require(isinstance(item["mounts"], list) and (item["mounts"] == [] if policies else 1 <= len(item["mounts"]) <= 16),
             "bound shared mounts required")
-    if external:
+    if "external_postgres" in policies:
         from services.sender_drain_contract import validate_external_postgres
         validate_external_postgres(item["external_postgres"])
+    if "host_loopback_postgres" in policies:
+        from services.sender_drain_contract import validate_host_loopback_postgres
+        validate_host_loopback_postgres(item["host_loopback_postgres"])
     for mount in item["mounts"]:
         require(set(mount) == {"Type", "Source", "Destination", "RW"} and mount["Type"] in {"bind", "volume"}
                 and Path(mount["Source"]).is_absolute() and Path(mount["Destination"]).is_absolute()
@@ -152,7 +158,7 @@ def _cron_command(line, wrappers):
     return args[9], args[11]
 
 
-def inspect_binding(rows, expected, *, allow_external_postgres=False):
+def inspect_binding(rows, expected, *, allow_external_postgres=False, allow_host_loopback_postgres=False):
     require(isinstance(rows, list) and len(rows) == len(expected), "inspect component count differs")
     observed = {}
     for row in rows:
@@ -177,7 +183,17 @@ def inspect_binding(rows, expected, *, allow_external_postgres=False):
             require(row["Mounts"] == [] and role == "miniflux" and not env.get("DATABASE_URL_FILE"),
                     "actual external PostgreSQL mount policy differs")
             value["external_postgres"] = external_postgres_identity(env.get("DATABASE_URL"), row["HostConfig"].get("ReadonlyRootfs"))
-        _component(name, value, allow_external_postgres=allow_external_postgres)
+        if "host_loopback_postgres" in expected[name]:
+            from services.sender_drain_contract import host_loopback_postgres_identity
+            require(row["Mounts"] == [] and role == "miniflux" and not env.get("DATABASE_URL_FILE")
+                    and not any(key.startswith("PG") for key in env)
+                    and not row["HostConfig"].get("PortBindings")
+                    and set(row["NetworkSettings"]["Networks"]) == {"host"},
+                    "actual host-loopback PostgreSQL mount/network policy differs")
+            value["host_loopback_postgres"] = host_loopback_postgres_identity(
+                env.get("DATABASE_URL"), row["HostConfig"].get("ReadonlyRootfs"), row["HostConfig"].get("NetworkMode"))
+        _component(name, value, allow_external_postgres=allow_external_postgres,
+                   allow_host_loopback_postgres=allow_host_loopback_postgres)
         value["mounts"] = sorted(value["mounts"], key=lambda m: m["Destination"])
         bound = {**expected[name], "mounts": sorted(expected[name]["mounts"], key=lambda m: m["Destination"])}
         require(value == bound, "actual runtime image/role/mount/limits identity changed")

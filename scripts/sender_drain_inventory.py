@@ -123,15 +123,19 @@ def _row(value):
     return row, raw
 
 
-def freeze_bundle(connect, dsn, expected, binding, receipt, window, root):
+def freeze_bundle(connect, dsn, expected, binding, receipt, window, root, *, transport=None):
     """Actual bounded read-only PG snapshot. Never resample a partially written bundle."""
     validate_identity(expected)
     validate_binding(binding)
     validate_stop_receipt(receipt, binding)
+    require(("host_loopback_postgres" not in binding["component"]) or transport is not None,
+            "host-loopback original snapshot requires actual transport capability")
     root = Path(root)
     require(not root.exists() and not root.is_symlink(), "bundle already attempted; preserve original")
     private_directory(root, create=True)
     deadline = _deadline()
+    if transport is not None:
+        transport.check(dsn, deadline=deadline)
     connection = _connect(connect, dsn, deadline)
     try:
         connection.autocommit = True
@@ -141,6 +145,8 @@ def freeze_bundle(connect, dsn, expected, binding, receipt, window, root):
             cursor.execute("SET LOCAL lock_timeout='3000ms'")
             cursor.execute("SHOW transaction_read_only")
             require(cursor.fetchone()[0] == "on", "original snapshot not read-only")
+            if transport is not None:
+                transport.check_connection(cursor, expected)
             cursor.execute(IDENTITY_SQL)
             actual = dict(zip(IDENTITY_KEYS, cursor.fetchone()))
             require(actual == expected, "original PostgreSQL identity changed")
@@ -161,16 +167,20 @@ def freeze_bundle(connect, dsn, expected, binding, receipt, window, root):
                  "legacy_original_coverage": "registered_paths_since_instrumentation_only", "queue_checked": False, "switch_authorized": False}
         validate_manifest(value)
         require(time.monotonic() < deadline, "original snapshot wall budget")
+        if transport is not None:
+            transport.check(dsn, deadline=deadline)
         write_blob(root / "manifest.json", encoded(value), MAX_MANIFEST_BYTES)
         return value
     finally:
         connection.close()
 
 
-def observe(connect, dsn, expected, *, deadline=None, allow_uninitialized=False):
+def observe(connect, dsn, expected, *, deadline=None, allow_uninitialized=False, transport=None):
     """Fixed read-only SQL; returns counts plus actual gate, never a permit."""
     validate_identity(expected)
     deadline = _deadline(deadline)
+    if transport is not None:
+        transport.check(dsn, deadline=deadline)
     connection = _connect(connect, dsn, deadline)
     try:
         connection.autocommit = True
@@ -180,6 +190,8 @@ def observe(connect, dsn, expected, *, deadline=None, allow_uninitialized=False)
             cursor.execute("SET LOCAL lock_timeout='3000ms'")
             cursor.execute("SHOW transaction_read_only")
             require(cursor.fetchone()[0] == "on", "sender observation not read-only")
+            if transport is not None:
+                transport.check_connection(cursor, expected)
             cursor.execute(IDENTITY_SQL)
             actual = dict(zip(IDENTITY_KEYS, cursor.fetchone()))
             require(actual == expected, "sender PostgreSQL identity changed")
@@ -200,6 +212,8 @@ def observe(connect, dsn, expected, *, deadline=None, allow_uninitialized=False)
             require(type(operations) is int and 0 <= operations <= 10000, "operation capacity invalid")
             cursor.execute("ROLLBACK")
         require(time.monotonic() < deadline, "sender observation wall budget")
+        if transport is not None:
+            transport.check(dsn, deadline=deadline)
         return {**sample, "database_identity": actual, "read_only_transaction": True, "gate": gate,
                 "retained_leases": leases, "retained_operations": operations}
     finally:
@@ -208,13 +222,31 @@ def observe(connect, dsn, expected, *, deadline=None, allow_uninitialized=False)
 
 class PostgresReader:
     """Explicit private DSN with fixed psycopg read-only queries; no zero callback."""
-    def __init__(self, dsn_file, expected_identity):
+    def __init__(self, dsn_file, expected_identity, *, transport_binding=None):
         from scripts.durable_handoff_cutover import read_private
         self.path = Path(dsn_file)
         require(self.path.is_absolute(), "absolute private sender DSN reference required")
         self.expected = validate_identity(dict(expected_identity))
         self._read_private = read_private
         self._credential_sha256 = hashlib.sha256(encoded(self._credential())).hexdigest()
+        self.transport_binding = None
+        self.transport_guard = None
+        if transport_binding is not None:
+            from scripts.sender_host_loopback_pg import HostLoopbackPostgres
+            self.transport_guard = HostLoopbackPostgres(transport_binding)
+            self.transport_binding = self.transport_guard.binding
+            require(hashlib.sha256(self._dsn().encode()).hexdigest() == self.transport_binding["dsn_sha256"],
+                    "host-loopback reader and sealed DSN differ")
+
+    @classmethod
+    def from_plan(cls, dsn_file, plan):
+        component = plan["binding"]["component"]
+        local = "host_loopback_postgres" in component
+        require(local == ("postgres_transport" in plan), "sender transport capability missing or unexpected")
+        if local:
+            require(component["host_loopback_postgres"]["dsn_sha256"] == plan["postgres_transport"]["dsn_sha256"],
+                    "sender and PostgreSQL transport DSN identities differ")
+        return cls(dsn_file, plan["postgres_identity"], transport_binding=plan.get("postgres_transport"))
 
     def _credential(self):
         value = self._read_private(self.path)
@@ -229,17 +261,18 @@ class PostgresReader:
 
     def snapshot(self, *, deadline=None):
         import psycopg
-        return observe(psycopg.connect, self._dsn(), self.expected, deadline=deadline)
+        return observe(psycopg.connect, self._dsn(), self.expected, deadline=deadline, transport=self.transport_guard)
 
     def initial_snapshot(self):
         """Read actual135 identity even before the first gate row; never a permit."""
         import psycopg
         require(self.expected["schema_version"] == 135, "closed initialization requires schema135")
-        return observe(psycopg.connect, self._dsn(), self.expected, allow_uninitialized=True)
+        return observe(psycopg.connect, self._dsn(), self.expected, allow_uninitialized=True, transport=self.transport_guard)
 
     def freeze(self, binding, receipt, window, root):
         import psycopg
-        return freeze_bundle(psycopg.connect, self._dsn(), self.expected, binding, receipt, window, root)
+        return freeze_bundle(psycopg.connect, self._dsn(), self.expected, binding, receipt, window, root,
+                             transport=self.transport_guard)
 
     def locked(self, closed_operation_id, manifest):
         return FrozenPostgres(self, closed_operation_id, manifest)
@@ -257,12 +290,16 @@ class FrozenPostgres:
     def __enter__(self):
         import psycopg
         deadline = _deadline()
+        if self.reader.transport_guard is not None:
+            self.reader.transport_guard.check(self.reader._dsn(), deadline=deadline)
         self.connection = _connect(psycopg.connect, self.reader._dsn(), deadline)
         try:
             self.connection.autocommit = True
             with self.connection.cursor() as raw_cursor:
                 cursor = _TimedCursor(raw_cursor, deadline)
                 cursor.execute("SET lock_timeout='3000ms'")
+                if self.reader.transport_guard is not None:
+                    self.reader.transport_guard.check_connection(cursor, self.reader.expected)
                 cursor.execute(IDENTITY_SQL)
                 require(dict(zip(IDENTITY_KEYS, cursor.fetchone())) == self.reader.expected, "frozen PG identity differs")
                 oid = self.reader.expected["state_table_oid"]
@@ -304,8 +341,12 @@ class FrozenPostgres:
     def check(self, *, deadline=None):
         deadline = _deadline(deadline)
         require(self.connection is not None, "sender PG locks no longer held")
+        if self.reader.transport_guard is not None:
+            self.reader.transport_guard.check(self.reader._dsn(), deadline=deadline)
         with self.connection.cursor() as raw_cursor:
             cursor = _TimedCursor(raw_cursor, deadline)
+            if self.reader.transport_guard is not None:
+                self.reader.transport_guard.check_connection(cursor, self.reader.expected)
             cursor.execute(IDENTITY_SQL)
             require(dict(zip(IDENTITY_KEYS, cursor.fetchone())) == self.reader.expected, "locked PG identity changed")
             self._confirmed_operation(cursor)

@@ -215,6 +215,35 @@ def assert_runtime_image(value):
     check_shared_input(value)
 
 
+def test_retained_gateway_helpers_import_only_from_actual_copy_layout(shared_image_input):
+    """No host controller, Docker access, or ambient checkout may supply imports."""
+    value = shared_image_input
+    check_shared_input(value)
+    layout = value["layout"]
+    names = ("retained_gateway_configuration", "retained_gateway_custody")
+    assert all("scripts/" + name + ".py" in runtime_sources() for name in names)
+    assert not (layout / "scripts/private_release_contract.py").exists()
+    assert not (layout / "scripts/production_gateway_switch.py").exists()
+    program = """
+import importlib, json, pathlib, sys
+layout = pathlib.Path(sys.argv[1])
+sys.path.insert(0, str(layout))
+names = ('retained_gateway_configuration', 'retained_gateway_custody')
+for name in names:
+    module = importlib.import_module('scripts.' + name)
+    assert pathlib.Path(module.__file__) == layout / 'scripts' / (name + '.py')
+assert 'scripts.private_release_contract' not in sys.modules
+assert 'scripts.production_gateway_switch' not in sys.modules
+assert 'scripts.production_legacy_takeover' not in sys.modules
+print(json.dumps({'imported': list(names), 'host_controller_loaded': False}))
+"""
+    result = subprocess.run([sys.executable, "-I", "-B", "-c", program, str(layout)], cwd="/",
+                            capture_output=True, text=True, timeout=10, check=False)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"imported": list(names), "host_controller_loaded": False}
+    check_shared_input(value)
+
+
 def missing_projection(tmp_path, shared, missing):
     check_shared_input(shared)
     projection = tmp_path / "projection"

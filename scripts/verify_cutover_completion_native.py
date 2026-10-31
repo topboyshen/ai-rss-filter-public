@@ -49,6 +49,78 @@ def write_fixture_record(path, value):
     return hashlib.sha256(raw).hexdigest()
 
 
+def prepare_unstarted_evidence_roots(temporary_root, outcomes):
+    """Record only explicit skipped CI stages after their producers did not run.
+
+    This is archive context, never execution proof. Existing originals are not
+    touched, and a missing root after any non-skipped outcome still blocks.
+    """
+    required = {"storage", "startup", "activation"}
+    if (type(outcomes) is not dict or set(outcomes) != required
+            or any(type(value) is not str or value not in {"success", "failure", "cancelled", "skipped"}
+                   for value in outcomes.values())):
+        raise ValueError("exact known workflow stage outcomes required")
+    root = Path(temporary_root)
+    if not root.is_absolute() or root.resolve() != root:
+        raise ValueError("exact workflow evidence parent required")
+    parent = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        original = os.fstat(parent)
+        if original.st_uid != os.geteuid() or stat.S_IMODE(original.st_mode) & 0o022:
+            raise ValueError("private workflow evidence parent required")
+        fields = ("st_dev", "st_ino", "st_uid", "st_mode")
+        parent_identity = tuple(getattr(original, field) for field in fields)
+        mapping = {"cutover-completion": ("storage",), "production-startup": ("startup",),
+                   "production-startup-source": ("startup", "activation")}
+        observed, missing = {}, []
+        for name, stages in mapping.items():
+            try:
+                info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                if any(outcomes[stage] != "skipped" for stage in stages):
+                    raise ValueError("required evidence source missing after non-skipped stage") from None
+                missing.append((name, stages))
+                continue
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+                raise ValueError("existing workflow evidence source is unsafe")
+            observed[name] = "existing_originals_unmodified"
+        for name, stages in missing:
+            if (tuple(getattr(os.fstat(parent), field) for field in fields) != parent_identity
+                    or tuple(getattr(root.lstat(), field) for field in fields) != parent_identity):
+                raise ValueError("workflow evidence parent changed")
+            os.mkdir(name, mode=0o700, dir_fd=parent)
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            try:
+                info = os.fstat(child)
+                if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
+                        or stat.S_IMODE(info.st_mode) != 0o700):
+                    raise ValueError("new skipped workflow evidence source is unsafe")
+                value = {"schema": 1, "status": "not_started", "execution_proof": False, "stage_passed": False,
+                         "source": name, "step_outcomes": {stage: outcomes[stage] for stage in stages}}
+                raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+                fd = os.open("NOT_STARTED.json", os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o600, dir_fd=child)
+                try:
+                    if os.write(fd, raw) != len(raw):
+                        raise OSError("skipped workflow marker short write")
+                    os.fsync(fd)
+                    if os.pread(fd, len(raw) + 1, 0) != raw:
+                        raise ValueError("skipped workflow marker readback differs")
+                finally:
+                    os.close(fd)
+                os.fsync(child)
+            finally:
+                os.close(child)
+            os.fsync(parent)
+            observed[name] = "not_started_recorded"
+        if tuple(getattr(root.lstat(), field) for field in fields) != parent_identity:
+            raise ValueError("workflow evidence parent changed")
+        return {"status": "skipped_stage_context_only", "execution_proof": False, "stage_passed": False,
+                "sources": observed, "step_outcomes": dict(outcomes)}
+    finally:
+        os.close(parent)
+
+
 def create_fixture_storage(mount):
     """Create one new short root in an already-owned per-group evidence mount."""
     mount = Path(mount)
@@ -480,17 +552,38 @@ TESTS = ("tests/test_independent_drain_inventory.py", "tests/test_frozen_cutover
          "tests/test_production_receiver_bootstrap.py",
          "tests/test_production_receiver_bootstrap_native.py",
          "tests/test_production_sender_native_bridge.py",
-         "tests/test_sender_external_postgres_identity.py")
-TEST_GROUPS = (("foundation", TESTS[:22]), ("activation", TESTS[22:34]), ("adapters", TESTS[34:]))
+         "tests/test_sender_external_postgres_identity.py",
+         "tests/test_sender_host_loopback_pg.py",
+         "tests/test_sender_host_loopback_postgres_identity.py",
+         "tests/test_production_sender_host_loopback_plan.py",
+         "tests/test_production_sender_bootstrap_direct131.py",
+         "tests/test_sender_host_loopback_pg_inventory.py",
+         "tests/test_production_sender_bootstrap_host_pg.py",
+         "tests/test_sender_namespace_host_listener.py",
+         "tests/test_retained_gateway_configuration.py",
+         "tests/test_retained_gateway_custody.py",
+         "tests/test_production_gateway_custody_lifecycle.py",
+         "tests/test_production_gateway_custody_native.py",
+         "tests/test_legacy_gateway_configuration.py",
+         "tests/test_controlled_release_finalize_custody.py",
+         "tests/test_production_sender_bootstrap_export.py",
+         "tests/test_production_sender_bootstrap_pg_diagnostics.py",
+         "tests/test_production_sender_bootstrap_host_native.py")
+# Keep the original three bounded groups. Whole direct-131 and legacy-takeover
+# files belong to activation so adapters retain the unchanged 2,000-case limit
+# as full-identity regression coverage grows; no test file or case is omitted.
+TEST_GROUPS = (("foundation", TESTS[:22]), ("activation", TESTS[22:34] + TESTS[39:40] + TESTS[59:60]),
+               ("adapters", TESTS[34:39] + TESTS[40:59] + TESTS[60:]))
 MOUNTS = ("scripts", "tests", "services", "routes", "core", "db", "utils", "workers", "modules",
           "templates", "app.py", "worker_main.py", "sse_engine.py", "logging_bootstrap.py",
           "scoring_provenance.py", "scoring_explanation.py", "config.yaml", "docker-compose.yml",
           "ops/isolation", "ops/miniflux", ".github/workflows", "gunicorn.conf.py",
           "Dockerfile", "requirements-prod.txt", "start.sh")
 CONTAINER_TEST = r'''
-import json, os, pathlib, platform, sys, pytest
+import json, os, pathlib, platform, sys, pytest, psycopg
 from scripts.verify_cutover_completion_native import NativeDiagnostics, NativeShortPaths, native_short_path_plugin, create_fixture_storage, retain_fixture_storage, confirm_fixture_storage, verify_git_fixture
 assert platform.system() == 'Linux' and platform.machine() == 'x86_64'
+assert psycopg.__version__ == '3.3.6' and psycopg.pq.__impl__ == 'binary'
 fixture_mount = pathlib.Path('/tmp/cutover-fixtures')
 assert fixture_mount.samefile('/evidence/disk-fixtures')
 assert fixture_mount.stat().st_uid == os.getuid() and fixture_mount.stat().st_mode & 0o777 == 0o700
@@ -554,7 +647,23 @@ frozen_test_files = ('tests/test_independent_drain_inventory.py',
  'tests/test_production_receiver_bootstrap.py',
  'tests/test_production_receiver_bootstrap_native.py',
  'tests/test_production_sender_native_bridge.py',
- 'tests/test_sender_external_postgres_identity.py')
+ 'tests/test_sender_external_postgres_identity.py',
+ 'tests/test_sender_host_loopback_pg.py',
+ 'tests/test_sender_host_loopback_postgres_identity.py',
+ 'tests/test_production_sender_host_loopback_plan.py',
+ 'tests/test_production_sender_bootstrap_direct131.py',
+ 'tests/test_sender_host_loopback_pg_inventory.py',
+ 'tests/test_production_sender_bootstrap_host_pg.py',
+ 'tests/test_sender_namespace_host_listener.py',
+ 'tests/test_retained_gateway_configuration.py',
+ 'tests/test_retained_gateway_custody.py',
+ 'tests/test_production_gateway_custody_lifecycle.py',
+ 'tests/test_production_gateway_custody_native.py',
+ 'tests/test_legacy_gateway_configuration.py',
+ 'tests/test_controlled_release_finalize_custody.py',
+ 'tests/test_production_sender_bootstrap_export.py',
+ 'tests/test_production_sender_bootstrap_pg_diagnostics.py',
+ 'tests/test_production_sender_bootstrap_host_native.py')
 summary = NativeDiagnostics(frozen_test_files)
 short_paths = NativeShortPaths(fixtures, summary)
 try:

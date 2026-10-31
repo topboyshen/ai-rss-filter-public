@@ -71,15 +71,15 @@ def validate_binding(value):
             and type(value["generation"]) is int and 0 <= value["generation"] < 2**63 - 2
             and value["entrances"] == ["miniflux_scheduler", "miniflux_manual", "legacy_async_sender"], "invalid sender control identity")
     _component(value["component"])
-    require("external_postgres" not in value["component"] or value["control_id"] == "miniflux",
-            "external PostgreSQL mount policy is Miniflux-only")
+    require(not ({"external_postgres", "host_loopback_postgres"} & value["component"].keys())
+            or value["control_id"] == "miniflux", "PostgreSQL mount policy is Miniflux-only")
     return value
 
 
 def _component(value):
     keys = {"id", "image", "revision", "started_at", "restart_count", "role", "user", "memory", "pids", "mounts"}
-    external = isinstance(value, dict) and "external_postgres" in value
-    require(isinstance(value, dict) and set(value) == keys | ({"external_postgres"} if external else set()) and isinstance(value["id"], str) and HEX64.fullmatch(value["id"])
+    policies = set(value) & {"external_postgres", "host_loopback_postgres"} if isinstance(value, dict) else set()
+    require(isinstance(value, dict) and len(policies) <= 1 and set(value) == keys | policies and isinstance(value["id"], str) and HEX64.fullmatch(value["id"])
             and isinstance(value["image"], str) and re.fullmatch(r"sha256:[0-9a-f]{64}", value["image"])
             and isinstance(value["revision"], str) and re.fullmatch(r"[0-9a-f]{40}", value["revision"])
             and isinstance(value["started_at"], str) and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,9})?Z", value["started_at"])
@@ -87,10 +87,12 @@ def _component(value):
             and value["role"] == "miniflux" and isinstance(value["user"], str) and re.fullmatch(r"\d+(?::\d+)?", value["user"])
             and type(value["memory"]) is int and 0 < value["memory"] <= 768*1024**2
             and type(value["pids"]) is int and 0 < value["pids"] <= 256, "sender component binding differs")
-    require(isinstance(value["mounts"], list) and (value["mounts"] == [] if external else 1 <= len(value["mounts"]) <= 16),
+    require(isinstance(value["mounts"], list) and (value["mounts"] == [] if policies else 1 <= len(value["mounts"]) <= 16),
             "sender mount binding missing")
-    if external:
+    if "external_postgres" in policies:
         validate_external_postgres(value["external_postgres"])
+    if "host_loopback_postgres" in policies:
+        validate_host_loopback_postgres(value["host_loopback_postgres"])
     for mount in value["mounts"]:
         require(isinstance(mount, dict) and set(mount) == {"Type", "Source", "Destination", "RW"}
                 and mount["Type"] in {"bind", "volume"} and type(mount["RW"]) is bool
@@ -285,3 +287,35 @@ def external_postgres_identity(database_url, read_only_rootfs):
             "external PostgreSQL URI cannot override host/identity through options")
     return validate_external_postgres({"dsn_sha256": hashlib.sha256(database_url.encode()).hexdigest(),
                                       "host": _external_host(value.hostname), "read_only_rootfs": read_only_rootfs})
+
+
+def validate_host_loopback_postgres(value):
+    """Static Miniflux endpoint only; host/PG process proof is a separate capability."""
+    keys = {"dsn_sha256", "host", "port", "read_only_rootfs", "network_mode"}
+    require(isinstance(value, dict) and set(value) == keys
+            and isinstance(value["dsn_sha256"], str) and HEX64.fullmatch(value["dsn_sha256"])
+            and value["host"] == "127.0.0.1" and type(value["port"]) is int and value["port"] == 5432
+            and value["read_only_rootfs"] is True and value["network_mode"] == "host",
+            "exact read-only host-loopback PostgreSQL endpoint required")
+    return value
+
+
+def host_loopback_postgres_identity(database_url, read_only_rootfs, network_mode):
+    """Reconstruct only from actual Env/HostConfig; never accepts DNS/bridge aliases."""
+    require(isinstance(database_url, str) and 0 < len(database_url) <= 8192
+            and all(ord(character) > 32 and ord(character) != 127 for character in database_url)
+            and read_only_rootfs is True and network_mode == "host",
+            "actual read-only host-network sender and sealed loopback DSN required")
+    value = urlsplit(database_url)
+    require(value.scheme in {"postgres", "postgresql"} and value.hostname == "127.0.0.1"
+            and value.port in {None, 5432}
+            and value.netloc.rsplit("@", 1)[-1] in {"127.0.0.1", "127.0.0.1:5432"}
+            and value.path not in {"", "/"} and not value.fragment,
+            "canonical 127.0.0.1:5432 PostgreSQL URI required")
+    options = parse_qsl(value.query, keep_blank_values=True, strict_parsing=True)
+    require(len(options) == len(dict(options)) and all(key == "sslmode" and item in
+            {"disable", "allow", "prefer", "require", "verify-ca", "verify-full"} for key, item in options),
+            "host-loopback PostgreSQL URI cannot override host/identity through options")
+    return validate_host_loopback_postgres({"dsn_sha256": hashlib.sha256(database_url.encode()).hexdigest(),
+                                          "host": value.hostname, "port": 5432,
+                                          "read_only_rootfs": read_only_rootfs, "network_mode": network_mode})

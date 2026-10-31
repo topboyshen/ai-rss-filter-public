@@ -386,7 +386,7 @@ def test_main_command_diagnostic_never_turns_original_failure_into_success(monke
     arguments = _fallback_arguments(tmp_path)
     arguments[arguments.index("--output") + 1] = str(tmp_path)
     monkeypatch.setattr(native.sys, "argv", ["native", *arguments])
-    monkeypatch.setattr(native, "execute", lambda *_args: {"status": "unconfirmed"})
+    monkeypatch.setattr(native, "execute", lambda *_args, **_kwargs: {"status": "unconfirmed"})
     assert native.main() == 3
     captured = capsys.readouterr()
     assert not captured.err and "PRIVATE_" not in captured.out and "/private/" not in captured.out

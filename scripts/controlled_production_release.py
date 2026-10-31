@@ -87,6 +87,8 @@ def load_inputs(path, *, active=True):
     gate._require(permit["sender"]["closed_operation_id"] == final["sender_closed_operation_id"]
                   and permit["sender"]["expected_identity"] == sender_plan["postgres_identity"],
                   "sender migration and resume endpoints differ")
+    gate._require(permit["sender"].get("postgres_transport") == sender_plan.get("postgres_transport"),
+                  "migration and sender transport capabilities differ")
     gate._require(permit["locks"]["release"]["path"] == str(Path(final["registry_root"]) / "release.lock"),
                   "formal registry release lock differs")
     return plan, permit, final, policy, sender_plan
@@ -104,7 +106,7 @@ def _sender(plan, permit, sender_plan):
     config = plan["sender"]
     transport = NativeSenderActivationTransport(config["endpoint"], config["token"],
                                                 container_id=sender_plan["binding"]["component"]["id"])
-    reader = PostgresReader(Path(permit["sender"]["dsn_file"]), sender_plan["postgres_identity"])
+    reader = PostgresReader.from_plan(Path(permit["sender"]["dsn_file"]), sender_plan)
     return SenderActivationDriver(sender_plan, transport, reader, Path(config["evidence_root"]))
 
 
@@ -123,13 +125,15 @@ def _wait(query, expected, plan):
     raise gate.AdmissionUncertain("production readiness query budget exhausted")
 
 
-def closed_phase(plan, permit, release_lock):
+def closed_phase(plan, permit, release_lock, legacy=None):
     """Actual M1 and exact created IDs only, with the outer release flock held."""
     with migration.locked_session(plan["migration_root"], permit, release_lock=release_lock) as session:
         session.authorize()
         completed = session.migrate()
         args = (session, plan["runtime_root"], plan["state"], plan["lifecycle_root"])
         kwargs = {"operation_id": plan["lifecycle_operation_id"]}
+        if legacy is not None:
+            kwargs["legacy"] = legacy
         created = lifecycle.create(*args, **kwargs, paths=plan["runtime_paths"],
                                    web_workers=plan["web_workers"], threads=plan["threads"])
         started = lifecycle.start(*args, **kwargs)
@@ -172,7 +176,7 @@ def _actual_child_receipt(child, query, seconds, *, receipt_path=None, stop_path
     raise gate.AdmissionUncertain("bound guardian did not prove readiness")
 
 
-def active_phase(plan, permit, final, policy, sender, release_lock):
+def active_phase(plan, permit, final, policy, sender, release_lock, legacy=None):
     from scripts import controlled_release_finalize as registration
     from scripts import production_admission_supervisor as supervisor, production_admission_watchdog as watchdog
     from scripts.production_gateway_switch import GatewaySwitch
@@ -184,18 +188,23 @@ def active_phase(plan, permit, final, policy, sender, release_lock):
         receiver.prepare()
         _wait(receiver.query, "business_prepared", plan)
         receiver.confirm()
-        gateway = GatewaySwitch(receiver, _file(plan["gateway"]["plan"]), plan["gateway"]["evidence_root"]).switch()
+        gateway_adapter = GatewaySwitch(receiver, _file(plan["gateway"]["plan"]), plan["gateway"]["evidence_root"])
+        gateway = gateway_adapter.switch()
         prepared = watchdog.prepare(receiver, sender)
         gate._write(root / "watchdog-prepared.json", prepared)
         ready = _watchdog_ready(prepared)
         try:
             opened = receiver.resume()
-            verified = lifecycle.verify_active(receiver, plan["lifecycle_root"], operation_id=plan["lifecycle_operation_id"])
+            verification = {"operation_id": plan["lifecycle_operation_id"]}
+            if legacy is not None:
+                verification.update(legacy=legacy, gateway=gateway_adapter)
+            verified = lifecycle.verify_active(receiver, plan["lifecycle_root"], **verification)
             resumed = sender.production_resume(final["sender_closed_operation_id"], final["sender_generation"], receiver)
             authority = lifetime.initialize(receiver, sender, policy)
             ongoing = supervisor.prepare(receiver, sender)
             gate._write(root / "supervisor-prepared.json", ongoing)
-            result = registration.finalize(receiver, sender, final, root / "registration")
+            capabilities = {} if legacy is None else {"legacy": legacy, "gateway": gateway_adapter}
+            result = registration.finalize(receiver, sender, final, root / "registration", **capabilities)
             return {"receiver": opened, "runtime": verified, "sender": resumed, "gateway": gateway,
                     "admission_authority": authority, "release": result,
                     "watchdog": prepared, "watchdog_ready": ready, "supervisor": ongoing}
@@ -288,9 +297,9 @@ def _execute_bound(path):
                 gate._sync_directory(root)
                 sender = _sender(plan, permit, sender_plan)
                 sender.query_initialize_closed(final["sender_closed_operation_id"])
-                closed = closed_phase(plan, permit, release_lock)
+                closed = closed_phase(plan, permit, release_lock, legacy)
                 gate._write(root / "closed-phase.json", closed)
-                active = active_phase(plan, permit, final, policy, sender, release_lock)
+                active = active_phase(plan, permit, final, policy, sender, release_lock, legacy)
                 legacy.check_stopped()
                 release_lock.check()
         live = _handoff(active)
@@ -343,7 +352,16 @@ def _query_bound(path):
         sender = _sender(plan, permit, sender_plan)
         with locked_activation(plan["migration_root"], plan["runtime_root"], plan["state"],
                                operation_id=plan["activation_operation_id"], release_lock=release_lock) as receiver:
-            value = registration.query(receiver, sender, final, root / "registration")
+            gateway_plan = _file(plan["gateway"]["plan"])
+            if gateway_plan.get("old_config", {}).get("kind") == "retained_container_config_archive":
+                from scripts.production_gateway_switch import GatewaySwitch
+                with _legacy(plan) as legacy:
+                    legacy.check_stopped()
+                    gateway = GatewaySwitch(receiver, gateway_plan, plan["gateway"]["evidence_root"])
+                    value = registration.query(receiver, sender, final, root / "registration", legacy=legacy, gateway=gateway)
+                    legacy.check_stopped()
+            else:
+                value = registration.query(receiver, sender, final, root / "registration")
             if gate._present(root / "STOP.json"):
                 value = {**value, "status": "registered_but_release_stopped", "release_stop": gate._read(root / "STOP.json"),
                          "current_business_live_claimed": False}

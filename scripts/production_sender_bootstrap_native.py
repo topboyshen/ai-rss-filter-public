@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import nullcontext
+from datetime import datetime
 import hashlib
 import json
 import math
@@ -30,9 +32,15 @@ from scripts import production_sender_bootstrap as bootstrap  # noqa: E402
 from scripts import production_legacy_takeover as legacy  # noqa: E402
 from scripts import production_namespace_native as export  # noqa: E402
 from scripts import production_receiver_bootstrap_native as receiver_native  # noqa: E402
-from scripts.verify_miniflux_pause_native import Harness, source_binding, sha, image_checks, memory_evidence  # noqa: E402
+from scripts.verify_miniflux_pause_native import (  # noqa: E402
+    Harness, source_binding, sha, image_checks, memory_evidence, resource_checks, LABEL,
+)
+from scripts import sender_host_loopback_pg as local_pg  # noqa: E402
 
-SAFE_FILES = ("SOURCE.json", "SEED132.json", "LEGACY_STOP.json", "CREATED.json", "STARTED.json",
+SAFE_FILES = ("SOURCE.json", "SEED131.json", "SEED132.json", "DIRECT131_RESTART.json", "DIRECT131_OLD_LIMIT.json",
+              "DIRECT131_OLD_PROBE.json",
+              "HOST_LOOPBACK.json", "LOOPBACK_PG_CHECKS.json",
+              "LEGACY_STOP.json", "CREATED.json", "STARTED.json",
               "CLOSED.json", "QUERY.json", "PROOF.json", "RESULT.json", "FAILURE.json", "CANDIDATE_FINAL.json",
               "RECEIVER_OLD_STORAGE.json", "RECEIVER_BOOTSTRAP_PROOF.json", "RECEIVER_SQLITE_PRESERVED.json")
 MAX_SECONDS = 180
@@ -42,6 +50,160 @@ OLD_PROCESS = ("import signal,sys,time; signal.signal(signal.SIGTERM,lambda *_:s
 TERM_READY = ("from pathlib import Path; import signal; "
               "rows=dict(line.split(':',1) for line in Path('/proc/1/status').read_text().splitlines()); "
               "print(int(bool(int(rows['SigCgt'].strip(),16)&(1<<(signal.SIGTERM-1)))))")
+
+
+class HostLoopbackHarness(Harness):
+    """Only an explicitly selected owned daemon-host namespace fixture.
+
+    PG keeps its private bridge and exact 127.0.0.1:5432 publication. Only the
+    old sender fixture uses host networking; other old roles remain unchanged.
+    No conflict recovery, alternate port, alias on host or wider bind exists.
+    """
+    host_loopback = True
+
+    def __init__(self, *args, private_host_context=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.private_host_context = private_host_context
+        if private_host_context is not None:
+            from scripts.production_sender_bootstrap_host_native import native_host_identity
+            native_host_identity(private_host_context)
+            self.started = private_host_context.plan["started"]
+
+    def command(self, *args, **kwargs):
+        context = getattr(self, "private_host_context", None)
+        if context is None:
+            return super().command(*args, **kwargs)
+        context.check(final=kwargs.get("final", False))
+        end = context.plan["deadline"] if kwargs.get("final", False) else context.plan["active_deadline"]
+        from scripts.production_activation_host_native import remaining
+        kwargs["timeout"] = min(kwargs.get("timeout", 30), remaining(end))
+        try:
+            value = super().command(*args, **kwargs)
+            context.check(final=kwargs.get("final", False))
+            return value
+        except BaseException:
+            context.commands.uncertain_mutation = True
+            raise
+
+    def prepare_network(self):
+        context = self.private_host_context
+        if context is None:
+            return super().prepare_network()
+        row = context.prepare_network(self)
+        _save(self.output / "NETWORK.json", row)
+
+    def launch(self, name, image_id, extra=(), command=(), *, memory=768 * 1024**2, pids=256):
+        if name not in {"pg", "old-sender"}:
+            return super().launch(name, image_id, extra, command, memory=memory, pids=pids)
+        actual = self.prefix + "-" + name
+        self.names[name], self.images[name] = actual, image_id
+        self.created.append(name)
+        network = "host" if name == "old-sender" else self.network
+        topology = ["--network", network]
+        if name == "pg":
+            topology += ["--network-alias", name, "--publish", "127.0.0.1:5432:5432",
+                "--health-cmd", "pg_isready -U synthetic -d synthetic_pause",
+                "--health-interval", "1s", "--health-timeout", "1s", "--health-retries", "5"]
+        self.command(["run", "-d", "--pull=never", "--platform=linux/amd64", "--name", actual,
+            "--label", LABEL + "=" + self.owner, *topology,
+            "--memory", str(memory), "--memory-swap", str(memory), "--pids-limit", str(pids),
+            "--cpus=1", "--security-opt=no-new-privileges", *extra, image_id, *command])
+        row = json.loads(self.command(["inspect", actual]))[0]
+        if name == "pg":
+            checks = loopback_pg_resources(row, image_id, self.owner, self.network, memory, pids,
+                                           diagnostic_root=self.output)
+            if getattr(self, "private_host_context", None) is not None:
+                self.pg_launch_identity = self._pg_readiness_identity(row)
+        else:
+            checks = resource_checks(row, image_id, self.owner, "host", memory, pids)
+            gate._require(row["NetworkSettings"]["Networks"].keys() == {"host"}, "old sender is not exact host network")
+        _save(self.output / ("PROFILE_" + name + ".json"), {"checks": checks, "inspect": self.safe_inspect(row)})
+        return row
+
+    def postgres_ready(self):
+        if getattr(self, "private_host_context", None) is not None:
+            from scripts.verify_production_activation_native import ActivationHarness
+            if not ActivationHarness.postgres_ready(self):
+                return False
+            row = json.loads(self.command(["inspect", self.names["pg"]]))[0]
+            health = row["State"].get("Health", {}).get("Status")
+            gate._require(health in {"starting", "healthy"}, "real PG health failed or unrecognized")
+            return health == "healthy"
+        ready = super().postgres_ready()
+        row = json.loads(self.command(["inspect", self.names["pg"]]))[0]
+        gate._require(row["State"].get("Health", {}).get("Status") == "healthy", "real PG health not ready")
+        return ready
+
+    def _pg_readiness_identity(self, row):
+        loopback_pg_resources(row, self.images["pg"], self.owner, self.network, 384 * 1024**2, 64)
+        state = row["State"]
+        gate._require(re.fullmatch(r"[0-9a-f]{64}", row["Id"]) and row["Name"] == "/" + self.names["pg"]
+                      and state["Running"] is True and state["Dead"] is False and state["Restarting"] is False
+                      and type(state["Pid"]) is int and state["Pid"] > 0
+                      and type(row["RestartCount"]) is int and row["RestartCount"] >= 0
+                      and type(state["StartedAt"]) is str and 0 < len(state["StartedAt"]) <= 64
+                      and not state["StartedAt"].startswith("0001-")
+                      and type(row["Created"]) is str and 0 < len(row["Created"]) <= 64,
+                      "owned running loopback PostgreSQL identity required")
+        return {key: row[key] for key in ("Id", "Name", "Image", "Created", "RestartCount")} | {
+            "Pid": state["Pid"], "StartedAt": state["StartedAt"]}
+
+    def _preserve_command_failure(self, observation):
+        from scripts.verify_production_activation_native import ActivationHarness
+        return ActivationHarness._preserve_command_failure(self, observation)
+
+
+def loopback_pg_resources(row, image_id, owner, network, memory, pids, *, diagnostic_root=None):
+    """An exact alternative topology guard, never normalize an inspect to pass."""
+    host = row["HostConfig"]
+    ports = {"5432/tcp": [{"HostIp": "127.0.0.1", "HostPort": "5432"}]}
+    checks = {"actual_fixed_image": row["Image"] == image_id,
+        "owned_label": row["Config"]["Labels"].get(LABEL) == owner,
+        "private_bridge": host["NetworkMode"] == network and row["NetworkSettings"]["Networks"].keys() == {network},
+        "exact_loopback_port": host.get("PortBindings") == row["NetworkSettings"].get("Ports") == ports,
+        "memory": memory == 384 * 1024**2 and host["Memory"] == host["MemorySwap"] == memory,
+        "pids": pids == 64 and host["PidsLimit"] == pids, "cpu": host["NanoCpus"] == 1_000_000_000,
+        "not_privileged": host["Privileged"] is False,
+        "no_new_privileges": any(x in {"no-new-privileges", "no-new-privileges:true"} for x in host.get("SecurityOpt", [])),
+        "not_oom": row["State"]["OOMKilled"] is False,
+        "real_healthcheck": row["Config"].get("Healthcheck") == {"Test": ["CMD-SHELL", "pg_isready -U synthetic -d synthetic_pause"],
+            "Interval": 1_000_000_000, "Timeout": 1_000_000_000, "Retries": 5}}
+    if diagnostic_root is not None:
+        # Preserve only fixed boolean predicates before the original refusal.
+        # A rejected actual inspect must never be copied to a public diagnostic.
+        _save(Path(diagnostic_root) / "LOOPBACK_PG_CHECKS.json", {
+            "schema": 1, "scope": "loopback_pg_resource_predicates_only", "checks": checks,
+            "port_diagnostics": _loopback_port_diagnostics(row, ports),
+            "passed": all(checks.values()), "execution_proof": False})
+    gate._require(all(checks.values()), "exact loopback PG resource/topology binding differs")
+    return checks
+
+
+def _loopback_port_diagnostics(row, expected):
+    """Classify this same inspect without exporting values or adding commands.
+
+    These predicates explain a refusal. They neither normalize the actual
+    mappings nor replace the exact resource/topology guard above.
+    """
+    requested = row["HostConfig"].get("PortBindings")
+    runtime = row["NetworkSettings"].get("Ports")
+    requested_mapping, runtime_mapping = type(requested) is dict, type(runtime) is dict
+    return {
+        "requested_expected": requested_mapping and requested == expected,
+        "runtime_expected": runtime_mapping and runtime == expected,
+        "requested_runtime_equal": requested == runtime,
+        "requested_is_null": requested is None,
+        "runtime_is_null": runtime is None,
+        "requested_empty_mapping": requested_mapping and not requested,
+        "runtime_empty_mapping": runtime_mapping and not runtime,
+        "runtime_only_pg_null": runtime_mapping and set(runtime) == {"5432/tcp"} and runtime["5432/tcp"] is None,
+        "requested_has_extra_ports": requested_mapping and bool(set(requested) - {"5432/tcp"}),
+        "runtime_has_extra_ports": runtime_mapping and bool(set(runtime) - {"5432/tcp"}),
+        "requested_invalid_type": requested is not None and not requested_mapping,
+        "runtime_invalid_type": runtime is not None and not runtime_mapping,
+        "pg_running": row["State"].get("Running") is True,
+        "pg_created": row["State"].get("Status") == "created",
+    }
 
 
 def build_records(directory, image_id, revision):
@@ -118,8 +280,8 @@ def _base_image(repo):
     return matches[0]
 
 
-def seed132(harness):
-    """Actual fixed upstream131 followed by the exact locked132 transaction."""
+def seed131(harness):
+    """Run only the real fixed upstream binary migration; never synthesize 131."""
     reference = _base_image(harness.repo)
     # BuildKit FROM resolution does not prove this Engine reference exists.
     # One explicit preparation stays inside command's original shared deadline.
@@ -135,14 +297,24 @@ def seed132(harness):
     code = harness.command(["wait", harness.names["seed131"]], timeout=30).strip()
     gate._require(code == "0" and harness.sql("SELECT version FROM schema_version;").strip() == "131",
                   "actual upstream synthetic schema131 required")
+    record = {"upstream_image": image["Id"], "upstream_reference": reference,
+        "upstream_entrypoint": config["Entrypoint"], "upstream_cmd": config["Cmd"],
+        "seed_container_id": json.loads(harness.command(["inspect", harness.names["seed131"]]))[0]["Id"],
+        "schema": 131, "marker_rewritten": False, "synthetic_only": True,
+        "production_compatibility_proven": False, "historical_raw_coverage": "unknown_before_T0_no_replay"}
+    _save(harness.output / "SEED131.json", record)
+    return record
+
+
+def seed132(harness):
+    """Actual fixed upstream131 followed by the exact locked132 transaction."""
+    original = seed131(harness)
     sql, source_hash = _sql132(harness.repo, harness.source)
     harness.sql("BEGIN; SET LOCAL statement_timeout='3000ms'; " + sql
                 + " UPDATE schema_version SET version='132' WHERE version='131'; COMMIT;")
     gate._require(harness.sql("SELECT version FROM schema_version;").strip() == "132", "actual132 transaction failed")
-    _save(harness.output / "SEED132.json", {"upstream_image": image["Id"], "upstream_reference": reference,
-        "upstream_entrypoint": config["Entrypoint"], "upstream_cmd": config["Cmd"],
-        "seed_container_id": json.loads(harness.command(["inspect", harness.names["seed131"]]))[0]["Id"],
-        "prior_schema": 131, "schema": 132, "actual_sql_source_sha256": source_hash,
+    _save(harness.output / "SEED132.json", {**original,
+        "prior_schema": 131, "schema": 132, "marker_rewritten": True, "actual_sql_source_sha256": source_hash,
         "sql_sha256": hashlib.sha256(sql.encode()).hexdigest(), "marker_and_sql_same_transaction": True,
         "synthetic_only": True, "production_compatibility_proven": False})
 
@@ -204,16 +376,25 @@ def prepare_legacy(harness, directory, daemon, receiver_data):
     return path
 
 
-def postgres_before(dsn):
+def postgres_before(dsn, *, expected_schema=132, postgres_transport=None):
+    gate._require(type(expected_schema) is int and expected_schema in (131, 132), "explicit synthetic predecessor required")
     import psycopg
+    deadline = time.monotonic() + 10
+    transport = local_pg.HostLoopbackPostgres(postgres_transport) if postgres_transport is not None else None
+    if transport is not None:
+        transport.check(dsn, deadline=deadline)
     with psycopg.connect(dsn, autocommit=True, connect_timeout=3) as connection:
         connection.execute("SET statement_timeout='3000ms'")
         connection.execute("BEGIN READ ONLY")
         try:
             identity = dict(zip(bootstrap.PG_KEYS, connection.execute(bootstrap.PG_SQL).fetchone()))
             rows = connection.execute("SELECT version FROM schema_version LIMIT 2").fetchall()
-            gate._require(rows == [("132",)], "synthetic predecessor must be actual132")
-            return {**identity, "schema_version": 132}
+            gate._require(rows == [(str(expected_schema),)], "synthetic predecessor must match actual fixed seed")
+            if transport is not None:
+                with connection.cursor() as cursor:
+                    transport.check_connection(cursor, identity)
+                transport.check(dsn, deadline=deadline)
+            return {**identity, "schema_version": expected_schema}
         finally:
             connection.execute("ROLLBACK")
 
@@ -221,40 +402,57 @@ def postgres_before(dsn):
 def prepare_bootstrap(harness, directory, stopped, binding, records):
     operation = gate._hash({"synthetic-bootstrap": harness.owner})
     service, project = "sender_" + operation[:16], "bootstrap_" + harness.owner[:16]
-    network = json.loads(harness.command(["network", "inspect", harness.network]))[0]
+    host_loopback = getattr(harness, "host_loopback", False)
+    network = json.loads(harness.command(["network", "inspect", "host" if host_loopback else harness.network]))[0]
     pg = json.loads(harness.command(["inspect", harness.names["pg"]]))[0]
     address = pg["NetworkSettings"]["Networks"][harness.network]["IPAddress"]
-    dsn = f"postgres://synthetic:{harness.password}@{address}:5432/synthetic_pause?sslmode=disable"
+    dsn_host = "127.0.0.1" if host_loopback else address
+    dsn = f"postgres://synthetic:{harness.password}@{dsn_host}:5432/synthetic_pause?sslmode=disable"
     _save(directory / "dsn.json", {"dsn": dsn})
     _save(directory / "token.json", {"token": harness.token})
     manifest = gate._hash({"synthetic-owner": harness.owner, "image": harness.image_id})
     env = {"DATABASE_URL": dsn, "RUN_MIGRATIONS": "1", "CREATE_ADMIN": "0", "HANDOFF_ENABLED": "1",
         "WEBHOOK_OUTBOX": "1", "HANDOFF_MANIFEST": manifest, "WEBHOOK_OUTBOX_CONTRACT": "synthetic-bootstrap-no-model",
         "HANDOFF_CONTROL_TOKEN": harness.token, "HANDOFF_CONTROL_ADDR": "127.0.0.1:8787",
-        "LISTEN_ADDR": "0.0.0.0:8080", "WORKER_POOL_SIZE": "1", "POLLING_FREQUENCY": "60"}
+        "LISTEN_ADDR": "127.0.0.1:8080" if host_loopback else "0.0.0.0:8080", "WORKER_POOL_SIZE": "1", "POLLING_FREQUENCY": "60"}
     spec = {"image": harness.image_id, "environment": {key: "${" + key + ":?}" for key in env}, "user": "65534:65534",
         "mem_limit": 768 * 1024**2, "memswap_limit": 768 * 1024**2, "pids_limit": 256, "cpus": 1,
         "cap_drop": ["ALL"], "security_opt": ["no-new-privileges:true"], "restart": "no", "read_only": True,
         "volumes": [], "ports": [], "networks": ["sender"], "platform": "linux/amd64", "healthcheck": {"disable": True},
         "labels": {"org.opencontainers.image.revision": binding["revision"], "io.ai-filter.handoff.role": "miniflux",
                    "io.ai-filter.sender.bootstrap": operation}}
+    if host_loopback:
+        spec.pop("networks")
+        spec["network_mode"] = "host"
+        capability = local_pg.observe(dsn, pg["Id"])
+        before = postgres_before(dsn, expected_schema=131, postgres_transport=capability)
+    else:
+        before = (postgres_before(dsn, expected_schema=131) if getattr(harness, "predecessor_schema", 132) == 131
+                  else postgres_before(dsn))
     build_evidence = _save(directory / "build-evidence.json", records, 0o400)
     build = {"schema": "reviewed-miniflux-offline-build-v1", "revision": binding["revision"],
         "upstream_revision": binding["upstream_revision"], "pause_lock_sha256": sha(harness.repo / "ops/miniflux/pause-source-lock.json"),
         "dockerfile_sha256": sha(harness.repo / "ops/miniflux/Dockerfile"), "binary_sha256": binding["binary_sha256"],
         "image_id": harness.image_id, "go_version": "go1.26.4", "build_evidence_sha256": build_evidence["sha256"]}
     now = int(time.time())
-    return {"schema": bootstrap.SCHEMA, "operation_id": operation, "source_sha256": bootstrap.source_sha256(),
+    plan = {"schema": bootstrap.SCHEMA, "operation_id": operation, "source_sha256": bootstrap.source_sha256(),
         "revision": binding["revision"], "project": project, "service": service,
         "compose": _save(directory / "compose.json", {"services": {service: spec},
-                    "networks": {"sender": {"name": harness.network, "external": True}}}, 0o400),
+                    "networks": {} if host_loopback else {"sender": {"name": harness.network, "external": True}}}, 0o400),
         "environment": _save(directory / "environment", "".join(key + "=" + value + "\n" for key, value in env.items()).encode(), 0o400),
         "build": _save(directory / "build.json", build, 0o400), "build_evidence": build_evidence, "mount_identities": {},
         "legacy_operation_id": stopped["operation_id"], "legacy_plan_sha256": stopped["plan_sha256"],
         "network": {key: network[key] for key in ("Name", "Id", "Driver", "Scope", "Internal", "Options", "IPAM")},
-        "postgres_before": postgres_before(dsn), "dsn_file": str(directory / "dsn.json"), "token_file": str(directory / "token.json"),
+        "postgres_before": before, "dsn_file": str(directory / "dsn.json"), "token_file": str(directory / "token.json"),
         "control_url": "http://127.0.0.1:8787", "manifest": manifest, "contract": env["WEBHOOK_OUTBOX_CONTRACT"],
         "window": {"not_before": now - 1, "expires_at": now + 120}}
+    if host_loopback:
+        plan["postgres_transport"] = capability
+        _save(harness.output / "HOST_LOOPBACK.json", {"scope": "owned_synthetic_daemon_host_only",
+            "capability": capability, "old_sender_network_mode": "host", "candidate_network_mode": "host",
+            "pg_network": harness.network, "pg_published": "127.0.0.1:5432", "business_listener": "127.0.0.1:8080",
+            "schema_before": before["schema_version"], "production_access": False})
+    return plan
 
 
 def _ready(plan, created):
@@ -279,16 +477,196 @@ def rejected_original(function, *, expected_cutover_message=None):
 
 
 def closed_http(harness, actual):
-    address = actual["NetworkSettings"]["Networks"][harness.network]["IPAddress"]
-    command = ("import urllib.request,urllib.error;\ntry: urllib.request.urlopen(urllib.request.Request('http://"
+    if getattr(harness, "host_loopback", False):
+        import http.client
+        connection = http.client.HTTPConnection("127.0.0.1", 8080, timeout=3)
+        try:
+            connection.request("POST", "/login", body=b"username=bad&password=bad",
+                               headers={"Content-Type": "application/x-www-form-urlencoded"})
+            status = str(connection.getresponse().status)
+        finally:
+            connection.close()  # No proxy environment, redirects, response body or alternate target.
+    else:
+        address = actual["NetworkSettings"]["Networks"][harness.network]["IPAddress"]
+        command = ("import urllib.request,urllib.error;\ntry: urllib.request.urlopen(urllib.request.Request('http://"
                + address + ":8080/login',data=b'username=bad&password=bad',method='POST'),timeout=3)\n"
                + "except urllib.error.HTTPError as e: print(e.code)")
-    status = harness.command(["exec", harness.names["fixture"], "python", "-I", "-c", command])
+        status = harness.command(["exec", harness.names["fixture"], "python", "-I", "-c", command])
     gate._require(status.strip() == "503", "login business request did not remain closed")
     gate._require(harness.sql("SELECT count(*) FROM handoff_leases;").strip() == "0",
                   "closed login unexpectedly retained a business admission lease")
     return {"method": "POST", "path": "/login", "status": 503, "business_leases_after": 0,
             "credentials": "deliberately_invalid_synthetic_no_user_created"}
+
+
+DIRECT131_BODY = b'{"synthetic":"post-migration-retained-original","entry":{"id":1}}'
+OLD131_LOG_BYTES = 16 * 1024
+OLD131_SOURCE_REVISION = "51f2e0d8199ea8fa305081f6e175bba64b0ef94b"
+DIRECT131_ORIGINAL_SQL = """SELECT json_build_object(
+ 'schema',(SELECT version FROM schema_version),
+ 'gate',(SELECT json_build_object('manifest',manifest,'generation',generation,'phase',phase,
+                                 'current_operation',current_operation) FROM handoff_state WHERE id=1),
+ 'retained',(SELECT json_build_object('delivery_id',delivery_id,'body_sha256',body_sha256,
+   'body_hex',encode(body,'hex'),'signature',signature,'state',state,'contract',contract)
+   FROM webhook_legacy_originals WHERE target_url='http://fixture:8080/direct131-retained'))::text;"""
+
+
+def direct131_snapshot(harness, operation):
+    """Read one owned synthetic original, not all business rows or production data."""
+    value = json.loads(harness.sql(DIRECT131_ORIGINAL_SQL))
+    digest = hashlib.sha256(DIRECT131_BODY).hexdigest()
+    retained = {"delivery_id": digest, "body_sha256": digest, "body_hex": DIRECT131_BODY.hex(),
+                "signature": "a" * 64, "state": "held", "contract": "synthetic-bootstrap-no-model"}
+    gate._require(set(value) == {"schema", "gate", "retained"} and value["schema"] == "135"
+                  and value["gate"] == {"manifest": harness.manifest, "generation": 0,
+                      "phase": "closed", "current_operation": operation}
+                  and value["retained"] == retained, "direct131 retained original or closed state differs")
+    return value
+
+
+def _old131_log_diagnostic(harness, logs):
+    """Export only fixed source literals; retain bounded redacted text privately.
+
+    The literal catalogue describes the reviewed source, not a guarantee that a
+    particular image emitted it. Unknown text is never copied into the packet.
+    """
+    raw = logs.encode()
+    bounded = raw[:OLD131_LOG_BYTES].decode(errors="replace")
+    redacted = harness.redacted(bounded)
+    safe, private, unknown = [], [], []
+    for line in redacted.splitlines():
+        migration = re.fullmatch(r'(?:(?:time=[0-9T:Z+.-]{20,40} )?level=INFO )?(?:msg=)?"?Running database migrations"? '
+                                r'current_version=(\d{1,6}) latest_version=(\d{1,6})', line)
+        stale = re.search(r"the database schema is not up to date: current=v(\d{1,6}) expected=v(\d{1,6})(?:\W|$)", line)
+        if migration:
+            safe.append({"literal": "Running database migrations", "current_version": int(migration[1]),
+                         "latest_version": int(migration[2])})
+        elif stale:
+            safe.append({"literal": "the database schema is not up to date", "current_version": int(stale[1]),
+                         "expected_version": int(stale[2])})
+        else:
+            unknown.append(hashlib.sha256(line.encode()).hexdigest())
+        if re.search(r"(?i)password|passwd|\bpwd\b|token|secret|dsn|credential|authorization|bearer|private.?key|database_url|\bPG[A-Z_]+", line):
+            line = "<sensitive line retained only by SHA256 " + hashlib.sha256(line.encode()).hexdigest() + ">"
+        private.append(re.sub(r"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s]+", "<redacted-uri>", line))
+    private_raw = ("\n".join(private) + "\n").encode()[:OLD131_LOG_BYTES]
+    _save(harness.output / "DIRECT131_OLD_LOG_REDACTED.log", private_raw)
+    return {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
+        "capture_scope": "docker_logs_tail_64", "bounded_complete": len(raw) <= OLD131_LOG_BYTES and len(logs.splitlines()) < 64,
+        "reviewed_source_revision": OLD131_SOURCE_REVISION, "source_literals": safe[:8],
+        "literal_entries_truncated": len(safe) > 8, "unknown_line_count": len(unknown),
+        "unknown_line_sha256": unknown[:8], "private_redacted_file": "DIRECT131_OLD_LOG_REDACTED.log",
+        "private_redacted_bytes": len(private_raw), "private_redacted_sha256": hashlib.sha256(private_raw).hexdigest(),
+        "raw_log_exported": False}
+
+
+def _old131_probe(harness, seed):
+    """Save actual wait, image lifecycle and safe log observations before refusal."""
+    dsn = f"postgres://synthetic:{harness.password}@pg:5432/synthetic_pause?sslmode=disable"
+    launched = harness.launch("old131-after135", seed["upstream_image"],
+        ["--read-only", "--cap-drop=ALL", "-e", "DATABASE_URL=" + dsn], ["/usr/bin/miniflux", "-migrate"])
+    container_id = launched["Id"]
+    code = harness.command(["wait", container_id], timeout=15).strip()
+    logs = harness.command(["logs", "--tail=64", container_id], timeout=3)
+    actual = json.loads(harness.command(["inspect", container_id], timeout=3))[0]
+    state = actual.get("State", {})
+    started, finished = _old131_timestamp(state.get("StartedAt")), _old131_timestamp(state.get("FinishedAt"))
+    checks = {"same_id": actual.get("Id") == container_id, "same_image": actual.get("Image") == seed["upstream_image"],
+        "complete_id": bool(re.fullmatch(r"[0-9a-f]{64}", container_id)),
+        "complete_image_id": bool(re.fullmatch(r"sha256:[0-9a-f]{64}", seed["upstream_image"])),
+        "same_created": actual.get("Created") == launched.get("Created") and _old131_timestamp(actual.get("Created")) is not None,
+        "same_started": state.get("StartedAt") == launched.get("State", {}).get("StartedAt"),
+        "same_execution": all(actual.get(key) == launched.get(key) for key in ("Config", "HostConfig", "Mounts")),
+        "same_owner": actual.get("Config", {}).get("Labels", {}).get(LABEL) == harness.owner,
+        "same_name": actual.get("Name") == "/" + harness.names["old131-after135"],
+        "fixed_executable": actual.get("Config", {}).get("Entrypoint") is None
+            and actual.get("Config", {}).get("Cmd") == ["/usr/bin/miniflux", "-migrate"],
+        "read_only": actual.get("HostConfig", {}).get("ReadonlyRootfs") is True,
+        "all_capabilities_dropped": actual.get("HostConfig", {}).get("CapDrop") == ["ALL"],
+        "zero_mounts": actual.get("Mounts") == [],
+        "status_exited": state.get("Status") == "exited", "not_running": state.get("Running") is False,
+        "not_paused": state.get("Paused") is False, "not_restarting": state.get("Restarting") is False,
+        "not_dead": state.get("Dead") is False, "not_oom": state.get("OOMKilled") is False,
+        "no_restart": actual.get("RestartCount") == 0,
+        "wait_matches_inspect": code in {"0", "1"} and type(state.get("ExitCode")) is int and str(state["ExitCode"]) == code,
+        "finished_at_recorded": started is not None and finished is not None and finished >= started}
+    log = _old131_log_diagnostic(harness, logs)
+    _save(harness.output / "DIRECT131_OLD_PROBE.json", {"status": "observed_not_accepted", "synthetic_only": True,
+        "container_id": container_id, "old_image_id": seed["upstream_image"], "checks": checks,
+        "wait_code": code if code in {"0", "1", "137", "143"} else None,
+        "wait_code_sha256": hashlib.sha256(code.encode()).hexdigest(),
+        "inspect_exit_code": state.get("ExitCode") if type(state.get("ExitCode")) is int else None,
+        "inspect_state": {key: state.get(key) if type(state.get(key)) is bool else None
+            for key in ("Running", "Paused", "Restarting", "Dead", "OOMKilled")},
+        "inspect_status": state.get("Status") if state.get("Status") in {"created", "running", "paused",
+            "restarting", "removing", "exited", "dead"} else None,
+        "logs": log,
+        "old_image_direct_rollback_safe": False, "production_compatibility_proven": False})
+    gate._require(all(checks.values()) and log["bounded_complete"], "old fixed image lifecycle or bounded diagnostic unconfirmed")
+    resource_checks(actual, seed["upstream_image"], harness.owner, harness.network)
+    expected = {"literal": "Running database migrations", "current_version": 135, "latest_version": 131}
+    gate._require(code == "0" and log["source_literals"] == [expected] and log["unknown_line_count"] == 0
+                  and not log["literal_entries_truncated"], "old fixed image migration no-op not confirmed")
+    return log
+
+
+def _old131_timestamp(value):
+    if type(value) is not str or not re.fullmatch(
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z", value):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00").timestamp()
+    except ValueError:
+        return None
+    return parsed if parsed > 0 else None
+
+
+def direct131_restart_and_old_limit(harness, plan, created, cap, evidence):
+    """Owned synthetic restart/rollback check; no production or historical raw claim."""
+    digest = hashlib.sha256(DIRECT131_BODY).hexdigest()
+    harness.manifest = plan["manifest"]
+    harness.sql("INSERT INTO webhook_legacy_originals(delivery_id,body_sha256,event_type,user_id,feed_id,entry_id,"
+        "target_url,signature,contract,body) VALUES ('" + digest + "','" + digest
+        + "','save_entry',1,1,1,'http://fixture:8080/direct131-retained','" + "a" * 64
+        + "','synthetic-bootstrap-no-model',decode('" + DIRECT131_BODY.hex() + "','hex'));")
+    original = direct131_snapshot(harness, plan["operation_id"])
+    before = bootstrap._inspect(created["container_id"])
+    harness.command(["stop", "--time=8", created["container_id"]], timeout=10)
+    exited = bootstrap._inspect(created["container_id"])
+    gate._require(exited["State"]["Running"] is False and exited["State"]["ExitCode"] in (0, 143)
+                  and exited["State"].get("OOMKilled") is False, "owned candidate normal TERM unconfirmed")
+    harness.command(["start", created["container_id"]])
+    harness.wait(lambda: _ready(plan, created), seconds=15, readiness=True)
+    after = bootstrap._inspect(created["container_id"])
+    gate._require(before["Id"] == after["Id"] == created["container_id"]
+                  and before["Image"] == after["Image"] == harness.image_id
+                  and before["State"]["StartedAt"] != after["State"]["StartedAt"]
+                  and after["State"]["Running"] is True, "actual same-image candidate restart unconfirmed")
+    gate._require(direct131_snapshot(harness, plan["operation_id"]) == original,
+                  "restart changed retained original")
+    denied = closed_http(harness, after)
+    # A changed StartedAt must not be silently rebound to the retained release plan.
+    rejected_original(lambda: bootstrap.query(cap, plan, evidence))
+    _save(harness.output / "DIRECT131_RESTART.json", {"status": "passed", "synthetic_only": True,
+        "before_id": before["Id"], "after_id": after["Id"], "image_id": after["Image"],
+        "before_started_at": before["State"]["StartedAt"], "after_started_at": after["State"]["StartedAt"],
+        "normal_exit_code": exited["State"]["ExitCode"], "business_http_status": denied["status"],
+        "closed_and_original_snapshot_sha256": gate._hash(original), "original_body_sha256": digest,
+        "stale_release_binding_rejected": True, "historical_raw_coverage": "unknown_before_T0_no_replay",
+        "retained_fixture_created_after_migration": True, "power_loss_durability_proven": False})
+    seed = json.loads((harness.output / "SEED131.json").read_bytes())
+    log = _old131_probe(harness, seed)
+    gate._require(direct131_snapshot(harness, plan["operation_id"]) == original,
+                  "old fixed image changed migrated data")
+    _save(harness.output / "DIRECT131_OLD_LIMIT.json", {"status": "no_op_not_schema_refusal",
+        "synthetic_only": True, "old_image_id": seed["upstream_image"], "schema": 135,
+        "exit_code": 0, "migration_log_sha256": log["sha256"], "schema_refusal_observed": False,
+        "originals_unchanged": True, "old_image_direct_rollback_safe": False,
+        "requires_separate_reviewed_database_restore_or_forward_recovery": True,
+        "historical_raw_coverage": "unknown_before_T0_no_replay"})
+    return {"candidate_restart_closed": True, "retained_original_unchanged": True,
+            "old_image_migration_no_op": True, "old_image_schema_refusal": False, "old_image_direct_rollback_safe": False,
+            "production_compatibility_proven": False}
 
 
 def exercise(harness, binding, daemon, records):
@@ -333,11 +711,14 @@ def exercise_locked(harness, binding, daemon, records, receiver, release):
         driver = bootstrap._driver(cap, plan, evidence, recovery=True)
         receiver_proof = receiver_native.exercise(root, receiver, cap, release, driver, binding["revision"])
         _deadline(harness)
+        direct131 = (direct131_restart_and_old_limit(harness, plan, created, cap, evidence)
+                     if plan["postgres_before"]["schema_version"] == 131 else None)
+        _deadline(harness)
         proof = {"status": "passed", "synthetic_only": True, "production_access": False, "real_models": 0,
-            "container_id": actual["Id"], "image_id": actual["Image"], "actual_mounts": [], "schema_before": 132,
+            "container_id": actual["Id"], "image_id": actual["Image"], "actual_mounts": [], "schema_before": plan["postgres_before"]["schema_version"],
             "schema_after": identity["schema_version"], "postgres_identity": identity, "closed_receipt": closed["pg_receipt"],
             "business_http_status": 503, "business_request": denied, "open_actions": 0, "namespace_transport": True,
-            "duplicate_create_start_initialize_rejected": True,
+            "duplicate_create_start_initialize_rejected": True, "direct131_checks": direct131,
             "receiver_metadata_bootstrap": {"operation_id": receiver_proof["result"]["operation_id"],
                                             "proof_sha256": gate._hash(receiver_proof)},
             "old_retained": cap.check_stopped(), "cron_scope": "synthetic_file_command_not_system_cron",
@@ -441,7 +822,13 @@ def _command_error_class(stderr, rc):
 
 def _command_summary(fd, sequence, budget):
     name = f"command-{sequence:04d}.json"
-    original, raw = export._export_file(fd, name, budget)
+    try:
+        original, raw = export._export_file(fd, name, budget)
+    except Exception as error:
+        # No second open/read, chmod, or relaxed original-reader limit. This is
+        # only a nofollow path observation after failure, not the rejected FD.
+        error._bootstrap_command_metadata = _failed_command_metadata(fd, sequence)
+        raise
     def unique(pairs):
         value = {}
         for key, item in pairs:
@@ -466,6 +853,38 @@ def _command_summary(fd, sequence, budget):
             "stderr_bytes": len(stderr.encode()), "error_class": _command_error_class(stderr, rc), "execution_proof": False}
 
 
+def _failed_command_metadata(fd, sequence):
+    gate._require(type(sequence) is int and 1 <= sequence <= 9999, "bounded command sequence required")
+    name = f"command-{sequence:04d}.json"
+    result = {"schema": 1, "command_sequence": sequence, "file_name": name,
+              "observation": "nofollow_path_after_export_failure_not_original_fd",
+              "content_read_for_diagnostic": False, "original_failure_condition_confirmed": False}
+    try:
+        info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+    except OSError:
+        return {**result, "metadata_state": "unavailable"}
+    checks = {"regular_file": stat.S_ISREG(info.st_mode), "single_link": info.st_nlink == 1,
+              "current_uid": info.st_uid == os.geteuid(), "private_mode_0600": stat.S_IMODE(info.st_mode) == 0o600,
+              "original_file_byte_limit": info.st_size <= export.EXPORT_FILE_BYTES}
+    return {**result, "metadata_state": "observed", "size": info.st_size, "mode": stat.S_IMODE(info.st_mode),
+            "uid": info.st_uid, "nlink": info.st_nlink, "failed_observed_conditions": [k for k, ok in checks.items() if not ok]}
+
+
+def _partial_export(packet):
+    # Failure output is proof-only, even for small already-validated originals:
+    # file identity does not validate the privacy of arbitrary JSON fields.
+    # No raw_root, argv, message or credential content crosses this boundary.
+    files = {}
+    for name in ("RESULT.json", "FAILURE.json"):
+        if name in packet["files"]:
+            record = packet["files"][name]
+            files[name] = {key: record[key] for key in ("sha256", "metadata")}
+    value = {"complete": False, "originals_modified": False, "execution_proof": False,
+             "scope": "already_validated_result_failure_proofs_only", "files": files}
+    gate._require(len(gate._encoded(value)) <= 256 * 1024, "bounded partial failure export required")
+    return value
+
+
 def _command_summaries(fd, files, budget):
     result = files["RESULT.json"]["content"]
     failure = files.get("FAILURE.json", {}).get("content")
@@ -482,21 +901,32 @@ def _command_summaries(fd, files, budget):
     return summaries
 
 
-def execute(repo, source, image_id, binary, output, build_evidence):
+def execute(repo, source, image_id, binary, output, build_evidence, *, predecessor_schema=132, host_loopback=False,
+            private_host_context=None):
     gate._require(sys.platform == "linux" and os.geteuid() == 0, "native bootstrap requires Linux root")
+    gate._require(type(predecessor_schema) is int and predecessor_schema in (131, 132), "explicit synthetic predecessor required")
+    gate._require(type(host_loopback) is bool and (not host_loopback or predecessor_schema == 131),
+                  "host-loopback native proof requires explicit actual131 predecessor")
+    gate._require(private_host_context is None or (host_loopback and local_pg._NATIVE_HOST.get() is private_host_context),
+                  "private daemon host requires the exact active live native scope")
+    if host_loopback:
+        local_pg._host()  # Hard fail before Docker unless this is the real daemon host namespace.
     gate._require(repo == ROOT and output.is_absolute() and not output.exists(), "fixed source and fresh synthetic output required")
     bootstrap.private.safe_path(output.parent)
     gate._require(output.parent.stat().st_uid == 0 and stat.S_IMODE(output.parent.stat().st_mode) == 0o700,
                   "new native originals must stay inside a private root-owned parent")
     binding = source_binding(repo, source, binary)
     records = build_records(build_evidence, image_id, binding["revision"])
-    harness = Harness(repo, source, image_id, binary, output)
-    harness.phase_deadline = harness.started + MAX_SECONDS
+    options = {"private_host_context": private_host_context} if private_host_context is not None else {}
+    harness = (HostLoopbackHarness if host_loopback else Harness)(repo, source, image_id, binary, output, **options)
+    harness.phase_deadline = (private_host_context.plan["active_deadline"] if private_host_context is not None
+                              else harness.started + MAX_SECONDS)
+    harness.predecessor_schema = predecessor_schema
     _save(output / "SOURCE.json", binding)
     daemon, failure, errors = None, None, []
     try:
         harness.prepare()
-        seed132(harness)
+        (seed131 if predecessor_schema == 131 else seed132)(harness)
         daemon = subprocess.Popen([sys.executable, "-I", "-B", "-c", "import time; time.sleep(600)"],
                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         exercise(harness, binding, daemon, records)
@@ -508,28 +938,30 @@ def execute(repo, source, image_id, binary, output, build_evidence):
                           for row in traceback.extract_tb(error.__traceback__) if Path(row.filename).resolve().is_relative_to(repo)]}
         _save(output / "FAILURE.json", failure)
     finally:
-        errors.extend(preserve_candidate(harness))
-        if "pg" in harness.names:
-            try:
-                harness.command(["exec", harness.names["pg"], "pg_dump", "-U", "synthetic", "-d", "synthetic_pause"],
-                                timeout=15, final=True)
-            except BaseException as error:
-                errors.append({"stage": "postgres_dump", "type": type(error).__name__, **_command_reference(harness, error)})
-        # Preserve owned synthetic containers; no KILL fallback or deletion.
-        for role in reversed(harness.created):
-            try:
-                errors.extend(preserve_owned(harness, role))
-            except BaseException as error:
-                errors.append({"stage": role, "type": type(error).__name__, **_command_reference(harness, error)})
-        if daemon is not None:
-            daemon.terminate()
-            try:
-                daemon.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                errors.append({"stage": "owned_daemon", "type": "TERM_unconfirmed"})
+        from scripts import production_native_deadline as native_budget
+        with native_budget.final_phase() if private_host_context is not None else nullcontext():
+            errors.extend(preserve_candidate(harness))
+            if "pg" in harness.names:
+                try:
+                    harness.command(["exec", harness.names["pg"], "pg_dump", "-U", "synthetic", "-d", "synthetic_pause"],
+                                    timeout=15, final=True)
+                except BaseException as error:
+                    errors.append({"stage": "postgres_dump", "type": type(error).__name__, **_command_reference(harness, error)})
+            # Preserve owned synthetic containers; no KILL fallback or deletion.
+            for role in reversed(harness.created):
+                try:
+                    errors.extend(preserve_owned(harness, role))
+                except BaseException as error:
+                    errors.append({"stage": role, "type": type(error).__name__, **_command_reference(harness, error)})
+            if daemon is not None:
+                daemon.terminate()
+                try:
+                    daemon.wait(timeout=native_budget.clamp(3) if private_host_context is not None else 3)
+                except subprocess.TimeoutExpired:
+                    errors.append({"stage": "owned_daemon", "type": "TERM_unconfirmed"})
     result = {"status": "passed" if failure is None and not errors else "unconfirmed", "source_sha": binding["revision"],
         "failure": failure, "errors": errors, "elapsed_seconds": time.monotonic() - harness.started,
-        "production_access": False, "real_models": 0, "system_cron_access": False, "raw_root": str(output),
+        "production_access": False, "real_models": 0, "system_cron_access": False, "raw_root": str(output), "predecessor_schema": predecessor_schema, "host_loopback": host_loopback,
         "limits": {"application_memory": 768 * 1024**2, "application_pids": 256,
                    "postgres_memory": 384 * 1024**2, "postgres_pids": 64, "operation_seconds": MAX_SECONDS}}
     _save(output / "RESULT.json", result)
@@ -554,33 +986,55 @@ def safe_export(root):
         gate._require(len(gate._encoded(packet)) <= 256 * 1024,
                       "bounded complete result export required")
         return packet
+    except Exception as error:
+        try:
+            error._bootstrap_partial_export = _partial_export(packet)
+        except Exception:
+            # A diagnostic cannot replace the original refusal or claim any
+            # content was exported when its bounded encoding failed.
+            error._bootstrap_partial_export = {"complete": False, "originals_modified": False,
+                "execution_proof": False, "scope": "partial_export_unavailable", "files": {}}
+        raise
     finally:
         os.close(fd)
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("repo", "source", "binary", "output", "build-evidence"):
-        parser.add_argument("--" + name, required=True, type=Path)
-    parser.add_argument("--image-id", required=True)
-    args = parser.parse_args()
+    previous_umask = os.umask(0o077)
     try:
-        result = execute(args.repo.resolve(), args.source.resolve(), args.image_id, args.binary.resolve(),
-                         args.output.resolve(), args.build_evidence.resolve())
-        packet = {"status": result["status"], "safe_evidence": safe_export(args.output.resolve())}
-        print(gate._encoded(packet).decode(), flush=True)
-        return 0 if packet["status"] == "passed" else 3
-    except BaseException as error:
-        locations = []
+        parser = argparse.ArgumentParser(description=__doc__)
+        for name in ("repo", "source", "binary", "output", "build-evidence"):
+            parser.add_argument("--" + name, required=True, type=Path)
+        parser.add_argument("--image-id", required=True)
+        parser.add_argument("--predecessor-schema", type=int, choices=(131, 132), default=132,
+                            help="explicit real fixed upstream131 or existing exact132 seed (default remains132)")
+        parser.add_argument("--host-loopback", action="store_true",
+                            help="real daemon host namespace only; exact loopback PG and explicit predecessor131")
+        args = parser.parse_args()
         try:
-            from scripts.verify_production_startup_native import public_exception_locations
-            locations = public_exception_locations(error, root=ROOT)
-        except Exception:
-            pass  # Keep the original fallback even if diagnostics are unavailable.
-        print(json.dumps({"status": "unconfirmed", "error_type": type(error).__name__,
-                          "error_sha256": hashlib.sha256(str(error).encode()).hexdigest(),
-                          "safe_export_complete": False, "locations": locations}), flush=True)
-        return 3
+            result = execute(args.repo.resolve(), args.source.resolve(), args.image_id, args.binary.resolve(),
+                             args.output.resolve(), args.build_evidence.resolve(), predecessor_schema=args.predecessor_schema, host_loopback=args.host_loopback)
+            packet = {"status": result["status"], "safe_evidence": safe_export(args.output.resolve())}
+            print(gate._encoded(packet).decode(), flush=True)
+            return 0 if packet["status"] == "passed" else 3
+        except BaseException as error:
+            locations = []
+            try:
+                from scripts.verify_production_startup_native import public_exception_locations
+                locations = public_exception_locations(error, root=ROOT)
+            except Exception:
+                pass  # Keep the original fallback even if diagnostics are unavailable.
+            failure = {"status": "unconfirmed", "error_type": type(error).__name__,
+                       "error_sha256": hashlib.sha256(str(error).encode()).hexdigest(),
+                       "safe_export_complete": False, "locations": locations}
+            if hasattr(error, "_bootstrap_partial_export"):
+                failure["safe_evidence"] = error._bootstrap_partial_export
+            if hasattr(error, "_bootstrap_command_metadata"):
+                failure["command_export_diagnostic"] = error._bootstrap_command_metadata
+            print(json.dumps(failure), flush=True)
+            return 3
+    finally:
+        os.umask(previous_umask)
 
 
 if __name__ == "__main__":

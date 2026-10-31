@@ -33,11 +33,30 @@ on:
       - 'scripts/controlled_production_release.py'
       - 'scripts/controlled_release_finalize.py'
       - 'scripts/sender_namespace_http.py'
+      - 'tests/test_sender_namespace_host_listener.py'
+      - 'scripts/sender_host_loopback_pg.py'
+      - 'tests/test_sender_host_loopback_pg.py'
+      - 'tests/test_sender_host_loopback_pg_inventory.py'
+      - 'tests/test_production_sender_bootstrap_host_pg.py'
+      - 'tests/test_sender_host_loopback_postgres_identity.py'
+      - 'tests/test_production_sender_host_loopback_plan.py'
+      - 'tests/test_production_sender_bootstrap_direct131.py'
       - 'scripts/production_admission_supervisor.py'
       - 'scripts/production_admission_watchdog.py'
       - 'scripts/production_legacy_takeover.py'
       - 'scripts/production_gateway_switch.py'
+      - 'scripts/retained_gateway_configuration.py'
+      - 'scripts/retained_gateway_custody.py'
+      - 'tests/test_retained_gateway_configuration.py'
+      - 'tests/test_retained_gateway_custody.py'
+      - 'tests/test_production_gateway_custody_lifecycle.py'
+      - 'tests/test_legacy_gateway_configuration.py'
+      - 'tests/test_controlled_release_finalize_custody.py'
+      - 'tests/test_production_sender_bootstrap_export.py'
+      - 'tests/test_production_sender_bootstrap_pg_diagnostics.py'
       - 'scripts/production_gateway_native.py'
+      - 'scripts/production_gateway_custody_native.py'
+      - 'tests/test_production_gateway_custody_native.py'
       - 'scripts/production_host_ingress_native.py'
       - 'scripts/production_activation_host_native.py'
       - 'scripts/production_offline_registry.py'
@@ -45,6 +64,8 @@ on:
       - 'scripts/production_namespace_native.py'
       - 'scripts/production_sender_bootstrap.py'
       - 'scripts/production_sender_bootstrap_native.py'
+      - 'scripts/production_sender_bootstrap_host_native.py'
+      - 'tests/test_production_sender_bootstrap_host_native.py'
       - 'scripts/production_receiver_bootstrap.py'
       - 'scripts/production_receiver_bootstrap_native.py'
       - 'scripts/production_sender_native_bridge.py'
@@ -132,11 +153,30 @@ on:
       - 'scripts/controlled_production_release.py'
       - 'scripts/controlled_release_finalize.py'
       - 'scripts/sender_namespace_http.py'
+      - 'tests/test_sender_namespace_host_listener.py'
+      - 'scripts/sender_host_loopback_pg.py'
+      - 'tests/test_sender_host_loopback_pg.py'
+      - 'tests/test_sender_host_loopback_pg_inventory.py'
+      - 'tests/test_production_sender_bootstrap_host_pg.py'
+      - 'tests/test_sender_host_loopback_postgres_identity.py'
+      - 'tests/test_production_sender_host_loopback_plan.py'
+      - 'tests/test_production_sender_bootstrap_direct131.py'
       - 'scripts/production_admission_supervisor.py'
       - 'scripts/production_admission_watchdog.py'
       - 'scripts/production_legacy_takeover.py'
       - 'scripts/production_gateway_switch.py'
+      - 'scripts/retained_gateway_configuration.py'
+      - 'scripts/retained_gateway_custody.py'
+      - 'tests/test_retained_gateway_configuration.py'
+      - 'tests/test_retained_gateway_custody.py'
+      - 'tests/test_production_gateway_custody_lifecycle.py'
+      - 'tests/test_legacy_gateway_configuration.py'
+      - 'tests/test_controlled_release_finalize_custody.py'
+      - 'tests/test_production_sender_bootstrap_export.py'
+      - 'tests/test_production_sender_bootstrap_pg_diagnostics.py'
       - 'scripts/production_gateway_native.py'
+      - 'scripts/production_gateway_custody_native.py'
+      - 'tests/test_production_gateway_custody_native.py'
       - 'scripts/production_host_ingress_native.py'
       - 'scripts/production_activation_host_native.py'
       - 'scripts/production_offline_registry.py'
@@ -144,6 +184,8 @@ on:
       - 'scripts/production_namespace_native.py'
       - 'scripts/production_sender_bootstrap.py'
       - 'scripts/production_sender_bootstrap_native.py'
+      - 'scripts/production_sender_bootstrap_host_native.py'
+      - 'tests/test_production_sender_bootstrap_host_native.py'
       - 'scripts/production_receiver_bootstrap.py'
       - 'scripts/production_receiver_bootstrap_native.py'
       - 'scripts/production_sender_native_bridge.py'
@@ -278,6 +320,156 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
+  native-host-loopback131:
+    # No shared service or runner-global bridge: the same fixed host131 fixture
+    # owns 127.0.0.1:5432 only inside its actual private daemon host namespace.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.4'
+          cache: false
+      - name: Fixed host-loopback controller dependencies
+        run: |
+          python -m pip install --only-binary=:all: -r requirements.txt -r requirements-ops.txt
+      - name: Prove real root daemon host namespace before fixture access
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -m 700 "$RUNNER_TEMP/host-loopback131"
+          source_sha="$(git rev-parse HEAD)"
+          native_stage="$(sudo -n mktemp -d /tmp/ai-filter-loopback131.XXXXXX)"
+          sudo -n git -c "safe.directory=$GITHUB_WORKSPACE" clone --no-local --no-hardlinks \
+            "$GITHUB_WORKSPACE" "$native_stage/source"
+          sudo -n test "$(sudo -n git -C "$native_stage/source" rev-parse HEAD)" = "$source_sha"
+          export AI_FILTER_NATIVE_LOOPBACK_STAGE="$native_stage"
+          python -I -B - <<'PY'
+          import importlib.util, json, os, pathlib, sys
+          spec = importlib.util.spec_from_file_location('loopback_archive', 'scripts/verify_production_startup_native.py')
+          archive = importlib.util.module_from_spec(spec); spec.loader.exec_module(archive)
+          root = pathlib.Path(os.environ['AI_FILTER_NATIVE_LOOPBACK_STAGE'])
+          output = pathlib.Path(os.environ['RUNNER_TEMP']) / 'host-loopback131' / 'HOST_NAMESPACE_PROCESS'
+          code = "import json,sys;sys.path.insert(0,sys.argv[1]);from scripts.sender_host_loopback_pg import _host;print(json.dumps({'status':'passed','host':_host()},sort_keys=True),flush=True)"
+          args = ['/usr/bin/sudo', '-n', '--', sys.executable, '-I', '-B', '-c', code, str(root / 'source')]
+          archive.archive_command(args, output, seconds=15, limit=16 * 1024, child_umask=0o077)
+          result = json.loads(pathlib.Path(str(output) + '.stdout').read_bytes())
+          assert result['status'] == 'passed' and set(result['host']) == {'boot_id', 'network_device', 'network_inode'}
+          PY
+          printf 'AI_FILTER_NATIVE_LOOPBACK_STAGE=%s\n' "$native_stage" >> "$GITHUB_ENV"
+      - name: Build locked sender from actual checkout for host131
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -m 700 "$RUNNER_TEMP/host-loopback131/build"
+          git clone --depth 1 --branch 2.3.2 https://github.com/miniflux/v2.git "$RUNNER_TEMP/loopback131-miniflux"
+          python -B scripts/apply_miniflux_pause.py --source "$RUNNER_TEMP/loopback131-miniflux" --apply \
+            | tee "$RUNNER_TEMP/host-loopback131/APPLY.json"
+          source_sha="$(git rev-parse HEAD)"
+          cd "$RUNNER_TEMP/loopback131-miniflux"
+          { go version; set -x; CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -p 1 -trimpath \
+            -ldflags "-X miniflux.app/v2/internal/version.Version=2.3.2 -X miniflux.app/v2/internal/version.Commit=${source_sha}" \
+            -o "$RUNNER_TEMP/host-loopback131/build/miniflux" .; } \
+            2>&1 | tee "$RUNNER_TEMP/host-loopback131/build/BUILD.log"
+          chmod 0755 "$RUNNER_TEMP/host-loopback131/build/miniflux"
+          cd "$GITHUB_WORKSPACE"
+          docker --host unix:///var/run/docker.sock build --platform=linux/amd64 --pull=false \
+            --label "org.opencontainers.image.revision=${source_sha}" \
+            -f ops/miniflux/Dockerfile -t "miniflux-host-loopback131:${GITHUB_SHA}" \
+            "$RUNNER_TEMP/host-loopback131/build" \
+            2>&1 | tee "$RUNNER_TEMP/host-loopback131/build/IMAGE_BUILD.log"
+          docker --host unix:///var/run/docker.sock image inspect "miniflux-host-loopback131:${GITHUB_SHA}" \
+            > "$RUNNER_TEMP/host-loopback131/build/IMAGE.json"
+          python -I -B - <<'PY'
+          import importlib.util, os, pathlib
+          spec = importlib.util.spec_from_file_location('loopback_archive', 'scripts/verify_production_startup_native.py')
+          archive = importlib.util.module_from_spec(spec); spec.loader.exec_module(archive)
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'host-loopback131'
+          for name, image in (
+              ('PYTHON_PULL', 'python:3.11.17-slim-trixie@sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e5767af9ea65f6ce'),
+              ('POSTGRES_PULL', 'postgres@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea')):
+              archive.archive_command(['/usr/bin/docker', '--host', 'unix:///var/run/docker.sock', 'pull',
+                  '--platform=linux/amd64', image], root / name, seconds=60, limit=128 * 1024, child_umask=0o077)
+          PY
+          image_id="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))[0]["Id"])' "$RUNNER_TEMP/host-loopback131/build/IMAGE.json")"
+          native_stage="$AI_FILTER_NATIVE_LOOPBACK_STAGE"
+          sudo -n cp -a --no-preserve=ownership -- "$RUNNER_TEMP/loopback131-miniflux" "$native_stage/miniflux"
+          sudo -n install -d -m 0700 "$native_stage/build"
+          sudo -n install -m 0400 "$RUNNER_TEMP/host-loopback131/build/BUILD.log" "$native_stage/build/BUILD.log"
+          sudo -n install -m 0400 "$RUNNER_TEMP/host-loopback131/build/IMAGE_BUILD.log" "$native_stage/build/IMAGE_BUILD.log"
+          sudo -n install -m 0400 "$RUNNER_TEMP/host-loopback131/build/IMAGE.json" "$native_stage/build/rawimage.json"
+          sudo -n install -m 0500 "$RUNNER_TEMP/host-loopback131/build/miniflux" "$native_stage/miniflux-binary"
+          printf 'AI_FILTER_NATIVE_LOOPBACK_IMAGE=%s\n' "$image_id" >> "$GITHUB_ENV"
+      - name: Real host-loopback131 CLOSED migration restart and old-image rollback boundary
+        run: |
+          set -euo pipefail
+          umask 077
+          python -I -B - <<'PY'
+          import importlib.util, json, os, pathlib, sys
+          spec = importlib.util.spec_from_file_location('loopback_archive', 'scripts/verify_production_startup_native.py')
+          archive = importlib.util.module_from_spec(spec); spec.loader.exec_module(archive)
+          root = pathlib.Path(os.environ['AI_FILTER_NATIVE_LOOPBACK_STAGE'])
+          output = pathlib.Path(os.environ['RUNNER_TEMP']) / 'host-loopback131' / 'HOST131_PROCESS'
+          args = ['/usr/bin/sudo', '-n', '--', sys.executable, '-I', '-B',
+                  str(root / 'source/scripts/production_sender_bootstrap_host_native.py'),
+                  '--repo', str(root / 'source'), '--source', str(root / 'miniflux'),
+                  '--binary', str(root / 'miniflux-binary'), '--image-id', os.environ['AI_FILTER_NATIVE_LOOPBACK_IMAGE'],
+                  '--build-evidence', str(root / 'build'), '--output', str(root / 'originals')]
+          archive.archive_command(args, output, seconds=240, limit=512 * 1024, child_umask=0o077)
+          result = json.loads(pathlib.Path(str(output) + '.stdout').read_bytes())
+          assert result['status'] == 'passed' and result['safe_evidence']['complete'] is True
+          files = result['safe_evidence']['files']
+          proof = files['RESULT.json']['content']
+          private_host = result['private_host']
+          inner = private_host['result']
+          assert private_host['mode'] == 'private-host-loopback131-v1' and private_host['operation_seconds'] == 180
+          assert private_host['failure'] is None and inner['status'] == 'passed'
+          assert inner['operation_seconds'] == 180 and 0 <= inner['elapsed_seconds'] <= 180
+          assert inner['bootstrap_result'] == proof and inner['error_type'] is None and inner['error_sha256'] is None
+          assert inner['daemon_stop'] == {'status': 'stopped', 'all_containers_stopped': True,
+              'daemon_returncode': 0, 'forced_kill': False, 'removed': False}
+          assert proof['host_loopback'] is True and proof['predecessor_schema'] == 131
+          assert proof['limits'] == {'application_memory': 768 * 1024**2, 'application_pids': 256,
+              'postgres_memory': 384 * 1024**2, 'postgres_pids': 64, 'operation_seconds': 180}
+          assert {'HOST_LOOPBACK.json', 'SEED131.json', 'DIRECT131_RESTART.json', 'DIRECT131_OLD_LIMIT.json'} <= files.keys()
+          pg_checks = files['LOOPBACK_PG_CHECKS.json']['content']
+          assert pg_checks['scope'] == 'loopback_pg_resource_predicates_only' and pg_checks['execution_proof'] is False
+          assert pg_checks['passed'] is True and set(pg_checks['checks']) == {
+              'actual_fixed_image', 'owned_label', 'private_bridge', 'exact_loopback_port', 'memory', 'pids',
+              'cpu', 'not_privileged', 'no_new_privileges', 'not_oom', 'real_healthcheck'}
+          assert all(value is True for value in pg_checks['checks'].values())
+          port_diagnostics = pg_checks['port_diagnostics']
+          assert set(port_diagnostics) == {
+              'requested_expected', 'runtime_expected', 'requested_runtime_equal', 'requested_is_null',
+              'runtime_is_null', 'requested_empty_mapping', 'runtime_empty_mapping', 'runtime_only_pg_null',
+              'requested_has_extra_ports', 'runtime_has_extra_ports', 'requested_invalid_type', 'runtime_invalid_type',
+              'pg_running', 'pg_created'}
+          assert all(type(value) is bool for value in port_diagnostics.values())
+          assert {key for key, value in port_diagnostics.items() if value} == {
+              'requested_expected', 'runtime_expected', 'requested_runtime_equal', 'pg_running'}
+          PY
+      - name: Prepare host131 evidence without following links
+        if: always()
+        run: |
+          python -I -B scripts/prepare_synthetic_evidence.py \
+            --source "host-loopback131=${RUNNER_TEMP}/host-loopback131" \
+            --output "${RUNNER_TEMP}/host-loopback131-upload"
+      - name: Preserve host131 evidence including failure
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: host-loopback131-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/host-loopback131-upload/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
   native-amd64:
     runs-on: ubuntu-24.04
     # Steps 1-8 take ~6.5 min; step 9 alone is bounded by 240 s bootstrap +
@@ -310,10 +502,12 @@ jobs:
         run: |
           python -m pip install --only-binary=:all: -r requirements.txt -r requirements-ops.txt
       - name: Real synthetic storage and frozen lifecycle at 768 MiB / 256 PID
+        id: frozen_storage
         run: |
           python -I -B scripts/verify_cutover_completion_native.py \
             --repo . --output "${RUNNER_TEMP}/cutover-completion"
       - name: Actual application image migration and closed multiworker startup
+        id: application_startup
         env:
           # Hosted runners can be refused by the production Tsinghua mirror.
           STARTUP_PIP_INDEX_URL: https://pypi.org/simple
@@ -337,6 +531,7 @@ jobs:
             --postgres-dsn-file "${RUNNER_TEMP}/startup-synthetic-dsn.json" \
             --miniflux-source "${RUNNER_TEMP}/startup-miniflux"
       - name: Build fixed sender and verify actual T0 activation
+        id: full_activation
         run: |
           set -euo pipefail
           umask 077
@@ -400,11 +595,13 @@ jobs:
                   str(root / 'source/scripts/production_activation_host_native.py'),
                   '--repo', str(root / 'source'), '--source', str(root / 'miniflux'),
                   '--binary', str(root / 'miniflux-binary'), '--image-id', os.environ['AI_FILTER_NATIVE_BOOTSTRAP_IMAGE'],
-                  '--output', str(root / 'activation-originals')]
+                  '--output', str(root / 'activation-originals'), '--gateway-custody']
           archive.archive_command(args, output, seconds=600, limit=512 * 1024, child_umask=0o077)
           result = json.loads(pathlib.Path(str(output) + '.stdout').read_bytes())
           assert result['status'] == 'passed' and result['safe_evidence']['complete'] is True
           assert result['full_activation_verified'] is True
+          assert result['activation']['gateway_custody'] is True
+          assert result['safe_evidence']['profiles']['ACTUAL_CUSTODY_PROOF.json']['status'] == 'passed'
           PY
       - name: Preserve actual synthetic PostgreSQL state on success or failure
         if: always()
@@ -429,6 +626,25 @@ jobs:
           preserve PG_MEMORY_EVENTS.txt docker --host unix:///var/run/docker.sock exec "$PG_ID" cat /sys/fs/cgroup/memory.events
           preserve SYNTHETIC_DATABASE.sql docker --host unix:///var/run/docker.sock exec "$PG_ID" pg_dump -U postgres -d synthetic_outbox
           exit "$failed"
+      - name: Record explicitly skipped native stages
+        if: always()
+        env:
+          STORAGE_OUTCOME: ${{ steps.frozen_storage.outcome }}
+          STARTUP_OUTCOME: ${{ steps.application_startup.outcome }}
+          ACTIVATION_OUTCOME: ${{ steps.full_activation.outcome }}
+        run: |
+          python -I -B - <<'PY'
+          import importlib.util, json, os
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location('completion_archive_context', 'scripts/verify_cutover_completion_native.py')
+          module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+          result = module.prepare_unstarted_evidence_roots(Path(os.environ['RUNNER_TEMP']), {
+              'storage': os.environ['STORAGE_OUTCOME'],
+              'startup': os.environ['STARTUP_OUTCOME'],
+              'activation': os.environ['ACTIVATION_OUTCOME'],
+          })
+          print(json.dumps(result, sort_keys=True))
+          PY
       - name: Prepare evidence without following fixture links
         if: always()
         run: |

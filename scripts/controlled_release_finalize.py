@@ -194,10 +194,13 @@ def check_contract(permit, finalize_plan, release_fd, *, health=False):
 
 
 class _Finalizer:
-    def __init__(self, receiver_session, sender_driver, plan, evidence_root):
+    def __init__(self, receiver_session, sender_driver, plan, evidence_root, *, legacy=None, gateway=None):
         gate._require(type(receiver_session) is activation.ReceiverActivationSession
                       and type(sender_driver) is sender.SenderActivationDriver, "real activation and sender capabilities required")
         self.receiver, self.sender, self.plan = receiver_session, sender_driver, _plan(plan)
+        # Keep process-local capabilities, never serialized readiness receipts.
+        # The lifecycle verifier performs the exact-type and fresh lock checks.
+        self.legacy, self.gateway = legacy, gateway
         self.root, self.registry = Path(evidence_root), Path(plan["registry_root"])
         self.paths = {"evidence": private.directory_identity(self.root),
                       "registry": private.directory_identity(self.registry)}
@@ -230,8 +233,10 @@ class _Finalizer:
                       and self.plan["sender_closed_operation_id"] == expected["closed_operation_id"],
                       "migration and sender PG/manifest/closed operation differ")
         proof = self.receiver.verification_proof(active=active)
-        value = lifecycle.verify_active(self.receiver, self.plan["lifecycle_root"],
-                                        operation_id=self.plan["lifecycle_operation_id"])
+        verification = {"operation_id": self.plan["lifecycle_operation_id"]}
+        if self.legacy is not None or self.gateway is not None:
+            verification.update(legacy=self.legacy, gateway=self.gateway)
+        value = lifecycle.verify_active(self.receiver, self.plan["lifecycle_root"], **verification)
         create = runtime.read_confirmed(Path(self.plan["lifecycle_root"]) / "create.intent.json")
         previous_images = {key: create["previous_containers"][key]["image"] for key in value["retained_previous_ids"]}
         original = runtime.read_confirmed(self.sender.control.root / "production_resume.intent.json")
@@ -250,6 +255,8 @@ class _Finalizer:
                   "sender_operation_id": original["operation_id"], "sender_intent_sha256": gate._hash(original),
                   "sender_binding_sha256": self.sender.control.binding_sha256,
                   "postgres_identity": self.sender.plan["postgres_identity"]}
+        if "retained_gateway_custody" in value:
+            stable["retained_gateway_custody"] = gate._parsed(gate._encoded(value["retained_gateway_custody"]))
         return stable
 
     def check(self, old, *, recovery=False):
@@ -417,7 +424,8 @@ def _result(intent):
             "historical_coverage": "unknown_before_T0_no_replay"}
 
 
-def _complete(f, intent):
+def _registry_transition(f, intent):
+    """Apply only the original CAS bytes; retain the recovery marker."""
     f.paths_current()
     _validate_intent(f, intent)
     marker = _marker(f, intent)
@@ -427,6 +435,13 @@ def _complete(f, intent):
         gate._write(f.marker, marker)
     for row in intent["entries"]:
         _replace(f, row)
+
+
+def _registration_result(f, intent):
+    # With retained gateway custody this is called only after the real gateway
+    # context's final route/control check returned successfully. A CAS may have
+    # happened before a failed postcheck, but it must not have a success receipt.
+    f.paths_current()
     result = _result(intent)
     gate._write(f.root / "result.json", result)
     gate._require(runtime.read_confirmed(f.root / "result.json") == result, "registration result durability uncertain")
@@ -435,8 +450,49 @@ def _complete(f, intent):
     return result
 
 
-def finalize(receiver_session, sender_driver, plan, evidence_root):
-    f = _Finalizer(receiver_session, sender_driver, plan, evidence_root)
+def _complete(f, intent, *, new_intent=False):
+    custody_proof = intent["actual"].get("retained_gateway_custody")
+    if custody_proof is None:
+        if new_intent:
+            gate._write(f.root / "intent.json", intent)
+            gate._require(runtime.read_confirmed(f.root / "intent.json") == intent,
+                          "original finalize intent durability uncertain")
+        _registry_transition(f, intent)
+        return _registration_result(f, intent)
+
+    contract, manifest, digest = private.load(f.contract_path, ROOT)
+    reviewed = private.retained_custody(contract, manifest)
+    gate._require(reviewed is not None, "original retained gateway declaration required")
+    helper, held = reviewed
+    try:
+        helper.verify_gateway(held, f.gateway, f.receiver)
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise gate.AdmissionError("real retained gateway finalize capability differs") from None
+    # Do not call lifecycle.verify_active inside this context: it independently
+    # acquires this same non-reentrant real flock. Its last full runtime/health
+    # verification has already completed; here the exact verified route proof
+    # is held across the original intent and registry CAS only.
+    with f.gateway.retained_verification(f.receiver) as receipt:
+        try:
+            expected = {"old_gateway_id": held["declaration"]["old_container_id"],
+                "declaration_sha256": held["sha256"],
+                "configuration_proof_sha256": held["declaration"]["old_configuration_proof_sha256"],
+                "gateway_receipt_sha256": helper.verify_receipt(held, receipt)}
+            gate._require(custody_proof == expected, "verified gateway changed before registry CAS")
+            row = helper.verify_records(held, contract["review"], private.inspect_project(contract))
+            helper.verify_legacy(held, row, f.legacy, private_digest=digest)
+        except (ValueError, KeyError, TypeError, AttributeError):
+            raise gate.AdmissionError("retained gateway registry custody differs") from None
+        if new_intent:
+            gate._write(f.root / "intent.json", intent)
+            gate._require(runtime.read_confirmed(f.root / "intent.json") == intent,
+                          "original finalize intent durability uncertain")
+        _registry_transition(f, intent)
+    return _registration_result(f, intent)
+
+
+def finalize(receiver_session, sender_driver, plan, evidence_root, *, legacy=None, gateway=None):
+    f = _Finalizer(receiver_session, sender_driver, plan, evidence_root, legacy=legacy, gateway=gateway)
     gate._require(not any(f.root.iterdir()) and not gate._present(f.marker)
                   and not gate._present(f.marker.with_suffix(".json.pending")), "finalize attempted; query original operation only")
     context = f.context(active=True)
@@ -454,12 +510,15 @@ def finalize(receiver_session, sender_driver, plan, evidence_root):
     entries = _retain(f, before, _targets(f, old, before, stamp))
     intent = {"schema": 1, "plan": f.plan, "paths": f.paths, "context": context, "actual": actual,
               "old": old, "target": f.target, "check": check, "entries": entries, "created_at": stamp}
+    if "retained_gateway_custody" in actual:
+        return _complete(f, intent, new_intent=True)
+    # Keep the existing non-custody intent/complete boundary unchanged.
     gate._write(f.root / "intent.json", intent)
     return _complete(f, runtime.read_confirmed(f.root / "intent.json"))
 
 
-def query(receiver_session, sender_driver, plan, evidence_root):
-    f = _Finalizer(receiver_session, sender_driver, plan, evidence_root)
+def query(receiver_session, sender_driver, plan, evidence_root, *, legacy=None, gateway=None):
+    f = _Finalizer(receiver_session, sender_driver, plan, evidence_root, legacy=legacy, gateway=gateway)
     intent = runtime.read_confirmed(f.root / "intent.json")
     gate._require(intent["plan"] == f.plan and intent["paths"] == f.paths
                   and intent["context"] == f.context(active=False), "query original finalize/source/registry only")
@@ -502,7 +561,7 @@ def _cli_call(request, action):
         transport = sender.NativeSenderActivationTransport(s["url"], s["token_file"],
             container_id=container_id)
         driver = sender.SenderActivationDriver(sender_plan, transport,
-            sender.PostgresReader(s["dsn_file"], sender_plan["postgres_identity"]), s["evidence_root"])
+            sender.PostgresReader.from_plan(s["dsn_file"], sender_plan), s["evidence_root"])
         with activation.locked_activation(r["migration_root"], r["runtime_root"], r["state"],
                                           operation_id=r["operation_id"]) as session:
             return (finalize if action == "finalize" else query)(session, driver, request["plan"], request["evidence_root"])

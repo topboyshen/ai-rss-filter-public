@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+from copy import deepcopy
+from datetime import datetime, timezone
 import fcntl
 import hashlib
 import ipaddress
@@ -45,6 +47,7 @@ LABEL = "ai-filter.synthetic-host-ingress"
 LIVE_DAEMONS = []
 RETAINERS = {}
 DIAGNOSTIC_RESERVE_SECONDS = 5
+DIAGNOSTIC_TEXT_BYTES = 16 * 1024
 DIAGNOSTICS = None
 DIAGNOSTIC_STAGES = {"initial_validation", "host_tools", "source_image", "image_save", "source_binding",
                      "namespace_launch", "namespace_setup", "daemon_start", "image_load", "network_create",
@@ -925,38 +928,74 @@ def stop_owned(commands, root, plan, daemon, daemon_identity, logs):
                 "unexpected private daemon inventory; retained")
         for identifier in identifiers:
             row = commands.inspect(identifier)
-            require(row["Config"]["Labels"].get(LABEL) == plan["owner"] and row["Image"] == plan["image"]["Id"],
+            require(row["Id"] == identifier and row["Config"]["Labels"].get(LABEL) == plan["owner"]
+                    and row["Image"] == plan["image"]["Id"],
                     "unowned container prevents daemon stop")
+            expected = _cleanup_identity(row)
             durable(root / "PRESERVE_INSPECT.json", row)
             commands.docker(["logs", identifier])
+            term_requested = False
             if row["State"]["Running"]:
+                require(row["State"]["Status"] == "running" and all(type(row["State"].get(key)) is bool
+                        and row["State"][key] is False for key in ("Paused", "Dead", "Restarting", "OOMKilled")),
+                        "unknown container state prevents TERM")
                 commands.docker(["kill", "--signal", "TERM", identifier])
-            row = wait_until(lambda: _stopped(commands, identifier), end)
+                term_requested = True
+            row = wait_until(lambda: _stopped(commands, identifier, expected, term_requested=term_requested), end)
             durable(root / "STOPPED_INSPECT.json", row)
             stopped.append(identifier)
         require(not commands.docker(["ps", "--no-trunc", "--quiet"]), "live containers prevent daemon stop")
         require(not commands.uncertain_mutation, "unresolved mutation prevents daemon stop despite empty inventory")
         durable(root / "RESOURCES_FINAL.json", resource_snapshot(plan["cgroup"]))
         check_peer(daemon.pid, daemon_identity)
+        retainer = RETAINERS.get(daemon.pid)
+        require(retainer is not None and retainer_confirmed(daemon), "live daemon pipe retainer disappeared")
         daemon.send_signal(signal.SIGTERM)
         wait_until(lambda: daemon.poll() is not None, end)
         require(daemon.returncode == 0, "private daemon shutdown unconfirmed")
         logs.finish(end)
-        retainer = RETAINERS.get(daemon.pid)
-        if retainer:
-            wait_until(lambda: retainer[0].poll() is not None, end)
-            require(retainer[0].returncode == 0, "retainer pipe release unknown")
+        require(RETAINERS.get(daemon.pid) is retainer, "retainer pipe release unknown")
+        wait_until(lambda: retainer[0].poll() is not None, end)
+        require(retainer[0].returncode == 0, "retainer pipe release unknown")
         durable(root / "CLEANUP.json", {"all_containers_stopped": True, "ids": stopped, "daemon_returncode": daemon.returncode,
+                                       "retainer_returncode": retainer[0].returncode,
                                        "removed": False, "forced_kill": False})
         return True
     finally:
         commands.deadline = old
 
 
-def _stopped(commands, identifier):
+def _cleanup_identity(row):
+    keys = ("Id", "Name", "Image", "Created", "Config", "HostConfig", "Mounts", "RestartCount")
+    require(all(key in row for key in keys) and type(row["RestartCount"]) is int and row["RestartCount"] == 0
+            and type(row["State"].get("Running")) is bool, "complete original cleanup identity required")
+    return deepcopy({key: row[key] for key in keys} | {"StartedAt": row["State"].get("StartedAt")})
+
+
+def _stopped(commands, identifier, expected, *, term_requested=False):
     row = commands.inspect(identifier)
-    require(not row["State"].get("OOMKilled"), "gateway OOM during stop")
-    return row if not row["State"]["Running"] and row["State"]["Status"] in {"exited", "created"} else None
+    require(row["Id"] == identifier and _cleanup_identity(row) == expected,
+            "gateway cleanup identity changed")
+    state = row["State"]
+    require(all(type(state.get(key)) is bool and state[key] is False
+                for key in ("OOMKilled", "Paused", "Dead", "Restarting")), "gateway abnormal state during stop")
+    if state["Running"]:
+        require(state["Status"] == "running", "gateway running state unknown")
+        return None
+    require(state["Status"] == "exited" and type(state.get("ExitCode")) is int
+            and state["ExitCode"] in ({0, 143} if term_requested else {0}), "gateway normal exit unconfirmed")
+    moments = []
+    for name in ("StartedAt", "FinishedAt"):
+        value = state.get(name)
+        require(type(value) is str and 0 < len(value) <= 64 and value.endswith("Z"), "gateway exit time unconfirmed")
+        try:
+            moment = datetime.fromisoformat(value[:-1] + "+00:00")
+            require(moment.tzinfo == timezone.utc and moment.timestamp() > 0, "gateway exit time unconfirmed")
+            moments.append(moment)
+        except (ValueError, OverflowError) as error:
+            raise ProofError("gateway exit time unconfirmed") from error
+    require(moments[1] >= moments[0], "gateway exit order unconfirmed")
+    return row
 
 
 def inner_proof(root, plan):
@@ -1256,8 +1295,120 @@ def safe_failure_diagnostic(value):
     return result
 
 
+def diagnostic_text_original(path):
+    """A bounded derivative of one fixed log; the private original is unchanged."""
+    from scripts.capture_release_diagnostics import SENSITIVE_KEY_RE, redact_text
+
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        proof = file_proof(path, limit=OUTPUT_BYTES, fd=fd)
+        os.lseek(fd, max(0, proof["size"] - DIAGNOSTIC_TEXT_BYTES), os.SEEK_SET)
+        raw = os.read(fd, DIAGNOSTIC_TEXT_BYTES)
+        require(len(raw) == min(proof["size"], DIAGNOSTIC_TEXT_BYTES)
+                and file_proof(path, limit=OUTPUT_BYTES, fd=fd) == proof,
+                "diagnostic original changed during export")
+    finally:
+        os.close(fd)
+    # A tail may begin inside a credential value whose key was outside the
+    # captured window. Never publish that first partial line.
+    if proof["size"] > DIAGNOSTIC_TEXT_BYTES:
+        boundary = raw.find(b"\n")
+        raw = raw[boundary + 1:] if boundary >= 0 else b""
+    # Known secret syntax is removed first. Paths and long opaque identities
+    # are unnecessary for this daemon-start diagnostic and stay private too.
+    lines, long_line = [], False
+    for line in raw.decode("utf-8", errors="replace").split("\n"):
+        long_line |= len(line) > 4096  # redact_text's existing per-field limit.
+        # Daemon logs are unstructured. CLI flags, environment names and bare
+        # Bearer values need not have the assignment syntax understood by the
+        # general redactor; publish no text from such a line.
+        if SENSITIVE_KEY_RE.search(line):
+            lines.append("<sensitive-line-redacted>")
+            continue
+        text = redact_text(line)
+        text = re.sub(r"[0-9a-fA-F]{32,}", "<hex>", text)
+        text = re.sub(r"(?<![A-Za-z0-9])/(?:[A-Za-z0-9_.:@+-]+/)*[A-Za-z0-9_.:@+-]+", "<path>", text)
+        lines.append(text)
+    text = "\n".join(lines)
+    rendered = text.encode("utf-8")
+    truncated = proof["size"] > DIAGNOSTIC_TEXT_BYTES or long_line or len(rendered) > DIAGNOSTIC_TEXT_BYTES
+    text = rendered[:DIAGNOSTIC_TEXT_BYTES].decode("utf-8", errors="ignore")
+    return {"bytes": proof["size"], "sha256": proof["sha256"], "text": text,
+            "truncated": truncated, "source_window": "tail", "redacted": True,
+            "execution_proof": False}
+
+
+def info_command_profile(path):
+    value = read_original_json(path)
+    if type(value) is not dict or value.get("argv") != [*DOCKER, "info", "--format", "{{json .}}"]:
+        return None
+    code, elapsed = value.get("returncode"), value.get("elapsed")
+    require((code is None or type(code) is int and -255 <= code <= 255)
+            and type(elapsed) in {int, float} and math.isfinite(elapsed) and 0 <= elapsed <= 180,
+            "invalid fixed Docker info receipt")
+    return {"operation": "docker_info", "returncode": code, "elapsed_seconds": elapsed,
+            "client_term_sent": value.get("client_term_sent") is True,
+            "outcome": "unknown" if code is None else "completed" if code == 0 else "failed",
+            "execution_proof": False}
+
+
+def safe_stop_profile(value):
+    require(type(value) is dict and value.get("status") == "unconfirmed", "invalid retained STOP profile")
+    error_type, digest = value.get("error_type"), value.get("error_sha256")
+    return {"status": "unconfirmed", "cleanup_claimed": value.get("cleanup_confirmed") is True,
+            "cleanup_confirmed": False, "execution_proof": False,
+            "error_type": error_type if error_type in DIAGNOSTIC_ERRORS else None,
+            "error_sha256": digest if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest) else None,
+            "diagnostics": safe_failure_diagnostic(value["diagnostics"]) if "diagnostics" in value else None}
+
+
+def cleanup_completed(value):
+    return (value.get("all_containers_stopped") is True
+        and type(value.get("daemon_returncode")) is int and value["daemon_returncode"] == 0
+        and type(value.get("retainer_returncode")) is int and value["retainer_returncode"] == 0
+        and value.get("removed") is False and value.get("forced_kill") is False)
+
+
+def daemon_start_profiles(root, first):
+    """Fixed local reads only, before a larger optional export can fail."""
+    command = first.get("last_command")
+    if first.get("stage") != "daemon_start" or not command or command["operation"] != "docker_info":
+        return None
+    name = "command-%04d" % command["sequence"]
+    result = {}
+    for filename in ("daemon.stderr", name + ".json", name + ".stderr", "STOP.json", "CLEANUP.json"):
+        try:
+            path = root / filename
+            proof = file_proof(path, limit=OUTPUT_BYTES)
+            value = profile_for(path)
+            require(file_proof(path, limit=OUTPUT_BYTES) == proof, "startup diagnostic original changed")
+            require(value is not None, "fixed startup diagnostic profile missing")
+            result[filename] = {"status": "available", "original": {"bytes": proof["size"], "sha256": proof["sha256"]},
+                                "profile": value}
+        except FileNotFoundError:
+            result[filename] = {"status": "not_present"}
+        except (OSError, ValueError, TypeError, KeyError, ProofError) as error:
+            result[filename] = {"status": "evidence_insufficient", "error": diagnostic_error(error)}
+    require(len(encoded(result)) <= 40 * 1024, "startup diagnostic byte bound")
+    return result
+
+
 def profile_for(path):
     name = path.name
+    if name == "daemon.stderr":
+        return diagnostic_text_original(path)
+    if re.fullmatch(r"command-[0-9]{4}\.json", name):
+        return info_command_profile(path)
+    if re.fullmatch(r"command-[0-9]{4}\.stderr", name):
+        try:
+            receipt = info_command_profile(path.with_suffix(".json"))
+        except FileNotFoundError:
+            return None
+        if receipt is not None:
+            return diagnostic_text_original(path)
+        return None
+    if name == "STOP.json":
+        return safe_stop_profile(read_original_json(path))
     if name == "FIRST_FAILURE.json":
         return safe_failure_diagnostic(read_original_json(path))
     if name == "PRIVATE_IPV6_RESTRICTION.json":
@@ -1266,7 +1417,7 @@ def profile_for(path):
         return safe_container(read_original_json(path))
     if name == "CLEANUP.json":
         value = read_original_json(path)
-        return {key: value.get(key) for key in ("all_containers_stopped", "daemon_returncode", "removed", "forced_kill")
+        return {key: value.get(key) for key in ("all_containers_stopped", "daemon_returncode", "retainer_returncode", "removed", "forced_kill")
                 if type(value.get(key)) in {int, bool}}
     if name in {"NAMESPACE_BEFORE.json", "NAMESPACE_AFTER.json"}:
         return safe_namespace(read_original_json(path))
@@ -1319,7 +1470,8 @@ def evidence_packet(root):
     ipv6 = profiles.get("inner/PRIVATE_IPV6_RESTRICTION.json", {})
     restricted = (ipv6.get("status") == "restricted" and ipv6.get("writes") == ["all", "default"]
                   and ipv6.get("after", {}).get("default") == ipv6.get("after", {}).get("lo") == "1")
-    packet = {"schema": 1, "complete": complete and required <= hashes.keys() and restricted,
+    cleanup = cleanup_completed(profiles.get("inner/CLEANUP.json", {}))
+    packet = {"schema": 1, "complete": complete and required <= hashes.keys() and restricted and cleanup,
               "scope": "selected_sanitized_metadata_and_original_hashes", "originals": hashes, "profiles": profiles,
               "omitted_raw_data": ["image_tar_bytes", "daemon_storage_and_socket_trees", "raw_private_text_and_config_values"],
               "full_raw_archive_verified": False}
@@ -1341,8 +1493,14 @@ def failure_evidence(root, deadline, failure):
             if stop.exists() or stop.is_symlink():
                 value = read_original_json(stop)
                 failure["first_inner_failure"] = safe_failure_diagnostic(value.get("diagnostics"))
+        if "first_inner_failure" in failure:
+            profiles = daemon_start_profiles(path.parent, failure["first_inner_failure"])
+            if profiles is not None:
+                failure["daemon_start_evidence"] = profiles
         require(time.monotonic() < deadline, "deadline expired; no further original reads")
         failure["safe_evidence"] = evidence_packet(root)
+        cleanup = failure["safe_evidence"].get("profiles", {}).get("inner/CLEANUP.json", {})
+        failure["cleanup_confirmed"] = cleanup_completed(cleanup)
 
 
 def _main(argv=None):

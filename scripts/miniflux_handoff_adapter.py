@@ -46,8 +46,10 @@ def checked_binding(value, *, scope="isolation"):
     require(value["source_sha256"] == source_sha256() and type(value["generation"]) is int
             and 0 <= value["generation"] < 2**63 - 2, "source or generation differs")
     require(value["entrances"] == list(ENTRANCES), "Miniflux bridge only covers its three named producer groups")
-    require("external_postgres" not in value["component"] or value["control_id"] == "miniflux", "external PostgreSQL requires miniflux control")
-    _component(value["component_name"], value["component"], allow_external_postgres=scope == "instrumented_sender_only")
+    require(not ({"external_postgres", "host_loopback_postgres"} & value["component"].keys())
+            or value["control_id"] == "miniflux", "PostgreSQL policy requires miniflux control")
+    _component(value["component_name"], value["component"], allow_external_postgres=scope == "instrumented_sender_only",
+               allow_host_loopback_postgres=scope == "instrumented_sender_only")
     return value
 
 
@@ -110,7 +112,8 @@ class MinifluxPauseControl:
         checked_binding(self.binding, scope=self._scope)
         require(sha(self.binding) == self.binding_sha256, "frozen binding mutated")
         inspect_binding(self.inspect_current(), {self.binding["component_name"]: self.binding["component"]},
-                        allow_external_postgres=self._scope == "instrumented_sender_only")
+                        allow_external_postgres=self._scope == "instrumented_sender_only",
+                        allow_host_loopback_postgres=self._scope == "instrumented_sender_only")
 
     def _exchange(self, method, path, payload=None):
         self._identity()

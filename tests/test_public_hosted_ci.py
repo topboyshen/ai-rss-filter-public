@@ -15,7 +15,8 @@ WORKFLOWS = Path(__file__).resolve().parents[1] / ".github" / "workflows"
 EXPECTED_JOBS = {
     "ci.yml": {"lint": "ubuntu-latest", "test": "ubuntu-latest"},
     "admission-fence.yml": {"native-amd64": "ubuntu-24.04"},
-    "cutover-completion.yml": {"isolated-host-ingress": "ubuntu-24.04", "native-amd64": "ubuntu-24.04"},
+    "cutover-completion.yml": {"isolated-host-ingress": "ubuntu-24.04", "native-amd64": "ubuntu-24.04",
+                               "native-host-loopback131": "ubuntu-24.04"},
     "handoff-operations.yml": {"native-amd64": "ubuntu-24.04"},
     "miniflux-outbox.yml": {"fixed-source": "ubuntu-latest"},
     "miniflux-pause.yml": {"native-fixed-image": "ubuntu-latest"},
@@ -24,7 +25,7 @@ EXPECTED_JOBS = {
 }
 EXPECTED_TIMEOUTS = {
     "admission-fence.yml": {"native-amd64": 8},
-    "cutover-completion.yml": {"isolated-host-ingress": 5, "native-amd64": 25},
+    "cutover-completion.yml": {"isolated-host-ingress": 5, "native-amd64": 25, "native-host-loopback131": 12},
     "handoff-operations.yml": {"native-amd64": 8},
     "miniflux-outbox.yml": {"fixed-source": 15},
     "miniflux-pause.yml": {"native-fixed-image": 20},
@@ -45,7 +46,7 @@ def _workflow(name):
 
 def test_all_existing_workflows_and_job_names_are_preserved():
     assert {path.name for path in WORKFLOWS.glob("*.yml")} == set(EXPECTED_JOBS)
-    assert sum(len(jobs) for jobs in EXPECTED_JOBS.values()) == 10
+    assert sum(len(jobs) for jobs in EXPECTED_JOBS.values()) == 11
 
 
 def _assert_hosted_jobs(name, source, workflow):
@@ -157,7 +158,7 @@ def test_independent_ingress_deadline_does_not_replace_complete_native_budget():
     _assert_postgres_contract("cutover-completion.yml", workflow)
 
 
-@pytest.mark.parametrize("first", ["isolated-host-ingress", "native-amd64"])
+@pytest.mark.parametrize("first", ["isolated-host-ingress", "native-amd64", "native-host-loopback131"])
 def test_named_cutover_contracts_are_independent_of_job_order(first):
     name = "cutover-completion.yml"
     source, workflow = _workflow(name)
@@ -169,7 +170,7 @@ def test_named_cutover_contracts_are_independent_of_job_order(first):
     _assert_isolated_ingress_contract(workflow)
 
 
-@pytest.mark.parametrize("mutation", ["extra", "missing-original", "missing-independent", "self-hosted",
+@pytest.mark.parametrize("mutation", ["extra", "missing-original", "missing-independent", "missing-host131", "self-hosted",
                                      "dynamic-runner", "container", "environment", "skip"])
 def test_cutover_job_contract_rejects_unapproved_jobs_and_execution_paths(mutation):
     name = "cutover-completion.yml"
@@ -182,6 +183,8 @@ def test_cutover_job_contract_rejects_unapproved_jobs_and_execution_paths(mutati
         del jobs["native-amd64"]
     elif mutation == "missing-independent":
         del jobs["isolated-host-ingress"]
+    elif mutation == "missing-host131":
+        del jobs["native-host-loopback131"]
     elif mutation == "self-hosted":
         isolated["runs-on"] = ["self-hosted", "linux"]
     elif mutation == "dynamic-runner":
@@ -196,7 +199,7 @@ def test_cutover_job_contract_rejects_unapproved_jobs_and_execution_paths(mutati
         _assert_hosted_jobs(name, source, workflow)
 
 
-@pytest.mark.parametrize("job", ["native-amd64", "isolated-host-ingress"])
+@pytest.mark.parametrize("job", ["native-amd64", "isolated-host-ingress", "native-host-loopback131"])
 @pytest.mark.parametrize("replacement", [1, 15, 16, 24, 26, "15", "25", None, 5.0, 15.0, 25.0])
 def test_cutover_each_named_timeout_is_exact(job, replacement):
     _, workflow = _workflow("cutover-completion.yml")
@@ -294,6 +297,10 @@ def test_private_release_workflow_covers_its_tests_without_unrelated_paths(event
     ("cutover-completion.yml", "config.yaml", True),
     ("cutover-completion.yml", "scripts/production_startup_pg_fixture.py", True),
     ("cutover-completion.yml", "scripts/production_startup_fixture.py", True),
+    ("cutover-completion.yml", "scripts/production_sender_bootstrap_host_native.py", True),
+    ("cutover-completion.yml", "tests/test_production_sender_bootstrap_host_native.py", True),
+    ("cutover-completion.yml", "scripts/production_sender_bootstrap_host_native.py.bak", False),
+    ("cutover-completion.yml", "scripts/nested/production_sender_bootstrap_host_native.py", False),
     ("cutover-completion.yml", "scripts/private_release_contract.py", True),
     ("cutover-completion.yml", "scripts/check_release_container_lifecycle.py", True),
     ("cutover-completion.yml", "scripts/release.sh", True),
@@ -375,6 +382,56 @@ def test_host_postgres_driver_is_pinned_without_changing_application_dependencie
     for name in ("cutover-completion.yml", "miniflux-pause.yml"):
         source, _ = _workflow(name)
         assert "--only-binary=:all: -r requirements.txt -r requirements-ops.txt" in source
+
+
+def _assert_main_ops_install(workflow):
+    steps = workflow["jobs"]["test"]["steps"]
+    installs = [step for step in steps if step.get("name") == "Install dependencies"]
+    assert len(installs) == 1 and "if" not in installs[0]
+    assert [shlex.split(line) for line in installs[0]["run"].splitlines() if line.strip()] == [
+        ["python", "-m", "pip", "install", "--upgrade", "pip"],
+        ["pip", "install", "-r", "requirements.txt"],
+        ["pip", "install", "--only-binary=:all:", "-r", "requirements-ops.txt"],
+    ]
+    caches = [step for step in steps if step.get("name") == "Cache pip dependencies"]
+    assert len(caches) == 1 and caches[0]["with"]["key"] == (
+        "${{ runner.os }}-pip-${{ hashFiles('requirements.txt', 'requirements-prod.txt', 'requirements-ops.txt') }}"
+    )
+    test_index = next(index for index, step in enumerate(steps)
+                      if step.get("name") == "Run isolated full test suite with coverage")
+    assert steps.index(installs[0]) < test_index
+
+
+def test_main_ci_really_installs_pinned_ops_driver_before_the_complete_suite():
+    _, workflow = _workflow("ci.yml")
+    _assert_main_ops_install(workflow)
+
+
+@pytest.mark.parametrize("mutation", ["missing-ops", "source-build", "missing-app", "comment-only",
+                                     "conditional", "after-tests", "stale-cache"])
+def test_main_ci_ops_install_cannot_be_skipped_or_replaced(mutation):
+    _, workflow = _workflow("ci.yml")
+    steps = workflow["jobs"]["test"]["steps"]
+    install = next(step for step in steps if step.get("name") == "Install dependencies")
+    if mutation == "missing-ops":
+        install["run"] = install["run"].replace("pip install --only-binary=:all: -r requirements-ops.txt", "")
+    elif mutation == "source-build":
+        install["run"] = install["run"].replace(" --only-binary=:all:", "")
+    elif mutation == "missing-app":
+        install["run"] = install["run"].replace("pip install -r requirements.txt", "")
+    elif mutation == "comment-only":
+        install["run"] = install["run"].replace("pip install --only-binary=:all:", "# pip install --only-binary=:all:")
+    elif mutation == "conditional":
+        install["if"] = "${{ false }}"
+    elif mutation == "after-tests":
+        steps.remove(install)
+        steps.append(install)
+    else:
+        next(step for step in steps if step.get("name") == "Cache pip dependencies")["with"]["key"] = (
+            "${{ runner.os }}-pip-${{ hashFiles('requirements.txt', 'requirements-prod.txt') }}"
+        )
+    with pytest.raises(AssertionError):
+        _assert_main_ops_install(workflow)
 
 
 def test_frozen_cutover_merge_push_is_master_only_and_preserves_pr_scope():

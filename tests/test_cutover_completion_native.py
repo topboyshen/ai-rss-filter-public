@@ -64,7 +64,20 @@ class CompletionNativeGuards(unittest.TestCase):
                     "tests/test_production_sender_bootstrap_native.py", "tests/test_production_sender_native_bridge.py",
                     "tests/test_production_receiver_bootstrap.py",
                     "tests/test_production_receiver_bootstrap_native.py",
-                    "tests/test_sender_external_postgres_identity.py"}
+                    "tests/test_sender_external_postgres_identity.py",
+                    "tests/test_sender_host_loopback_pg.py", "tests/test_sender_host_loopback_postgres_identity.py",
+                    "tests/test_production_sender_host_loopback_plan.py", "tests/test_production_sender_bootstrap_direct131.py",
+                    "tests/test_sender_host_loopback_pg_inventory.py", "tests/test_production_sender_bootstrap_host_pg.py",
+                    "tests/test_sender_namespace_host_listener.py",
+                    "tests/test_retained_gateway_configuration.py",
+                    "tests/test_retained_gateway_custody.py",
+                    "tests/test_production_gateway_custody_lifecycle.py",
+                    "tests/test_production_gateway_custody_native.py",
+                    "tests/test_legacy_gateway_configuration.py",
+                    "tests/test_controlled_release_finalize_custody.py",
+                    "tests/test_production_sender_bootstrap_export.py",
+                    "tests/test_production_sender_bootstrap_pg_diagnostics.py",
+                    "tests/test_production_sender_bootstrap_host_native.py"}
         actual = {node.value for node in ast.walk(ast.parse(runner.CONTAINER_TEST))
                   if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.startswith("tests/")}
         self.assertEqual(set(runner.TESTS), expected)
@@ -459,6 +472,37 @@ def check_dependency_image_git(source):
     assert "--no-install-recommends" in source
 
 
+def check_dependency_image_postgres(source, probe):
+    assert "COPY requirements-prod.txt requirements.txt requirements-ops.txt /dependencies/" in source
+    assert "-r /dependencies/requirements.txt -r /dependencies/requirements-ops.txt" in source
+    tree = ast.parse(probe)
+    imports = {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
+    assert "psycopg" in imports
+    assert "psycopg.__version__ == '3.3.6' and psycopg.pq.__impl__ == 'binary'" in probe
+    assert probe.index("psycopg.__version__") < probe.index("pytest.main(")
+
+
+@pytest.mark.parametrize("drift", [None, "copy", "install", "import", "version", "implementation"])
+def test_disposable_native_image_installs_and_checks_actual_pinned_postgres_driver(drift):
+    source = (ROOT / "ops/isolation/Dockerfile.cutover-completion").read_text()
+    probe = runner.CONTAINER_TEST
+    if drift == "copy":
+        source = source.replace("requirements.txt requirements-ops.txt /dependencies/", "requirements.txt /dependencies/")
+    elif drift == "install":
+        source = source.replace(" -r /dependencies/requirements-ops.txt", "")
+    elif drift == "import":
+        probe = probe.replace(", pytest, psycopg", ", pytest")
+    elif drift == "version":
+        probe = probe.replace("psycopg.__version__ == '3.3.6'", "True")
+    elif drift == "implementation":
+        probe = probe.replace("psycopg.pq.__impl__ == 'binary'", "True")
+    if drift is None:
+        check_dependency_image_postgres(source, probe)
+    else:
+        with pytest.raises(AssertionError):
+            check_dependency_image_postgres(source, probe)
+
+
 @pytest.mark.parametrize("drift", [None, "git", "git-man", "version_check"])
 def test_dependency_image_requires_exact_git_pins_and_native_smoke_before_pytest(drift):
     source = (ROOT / "ops/isolation/Dockerfile.cutover-completion").read_text()
@@ -516,7 +560,11 @@ def test_fixed_partition_keeps_every_file_once_and_programs_bind_collection():
     from collections import Counter
     runner.validate_groups()
     assert [(name, len(files)) for name, files in runner.TEST_GROUPS] == [
-        ("foundation", 22), ("activation", 12), ("adapters", 22)]
+        ("foundation", 22), ("activation", 14), ("adapters", 36)]
+    assert "tests/test_production_sender_bootstrap_direct131.py" in dict(runner.TEST_GROUPS)["activation"]
+    assert "tests/test_production_sender_bootstrap_direct131.py" not in dict(runner.TEST_GROUPS)["adapters"]
+    assert "tests/test_production_legacy_takeover.py" in dict(runner.TEST_GROUPS)["activation"]
+    assert "tests/test_production_legacy_takeover.py" not in dict(runner.TEST_GROUPS)["adapters"]
     selected = []
     for name, files in runner.TEST_GROUPS:
         program = runner.native_test_program(name)
@@ -530,6 +578,169 @@ def test_fixed_partition_keeps_every_file_once_and_programs_bind_collection():
     assert Counter(selected) == Counter(runner.TESTS)
     with pytest.raises(ValueError, match="unknown"):
         runner.native_test_program("custom")
+
+
+EVIDENCE_ROOTS = ("cutover-completion", "production-startup", "production-startup-source")
+
+
+def workflow_parent(tmp_path):
+    root = tmp_path / "runner-temp"
+    root.mkdir(mode=0o700)
+    return root
+
+
+def test_only_explicitly_skipped_sources_receive_non_success_context(tmp_path):
+    root = workflow_parent(tmp_path)
+    original = root / "cutover-completion"
+    original.mkdir(mode=0o700)
+    failure = original / "FAILURE.json"
+    failure.write_bytes(b'{"status":"failed","original":true}')
+    before = failure.stat(), failure.read_bytes()
+    result = runner.prepare_unstarted_evidence_roots(root, {
+        "storage": "failure", "startup": "skipped", "activation": "skipped"})
+    assert result["status"] == "skipped_stage_context_only"
+    assert result["execution_proof"] is False and result["stage_passed"] is False
+    assert (failure.stat(), failure.read_bytes()) == before
+    assert not (original / "NOT_STARTED.json").exists()
+    for name in EVIDENCE_ROOTS[1:]:
+        path = root / name / "NOT_STARTED.json"
+        marker = json.loads(path.read_bytes())
+        assert marker["status"] == "not_started" and marker["source"] == name
+        assert marker["execution_proof"] is False and marker["stage_passed"] is False
+        assert set(marker["step_outcomes"].values()) == {"skipped"}
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+
+
+def test_all_skipped_missing_sources_are_context_only_and_existing_sources_never_change(tmp_path):
+    root = workflow_parent(tmp_path)
+    outcomes = dict.fromkeys(("storage", "startup", "activation"), "skipped")
+    first = runner.prepare_unstarted_evidence_roots(root, outcomes)
+    assert set(first["sources"].values()) == {"not_started_recorded"}
+    before = {name: ((root / name / "NOT_STARTED.json").stat(),
+                     (root / name / "NOT_STARTED.json").read_bytes()) for name in EVIDENCE_ROOTS}
+    second = runner.prepare_unstarted_evidence_roots(root, outcomes)
+    assert set(second["sources"].values()) == {"existing_originals_unmodified"}
+    assert {name: ((root / name / "NOT_STARTED.json").stat(),
+                   (root / name / "NOT_STARTED.json").read_bytes()) for name in EVIDENCE_ROOTS} == before
+    assert sorted(path.name for path in root.iterdir()) == sorted(EVIDENCE_ROOTS)
+
+
+@pytest.mark.parametrize("stage", ["storage", "startup", "activation"])
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancelled"])
+def test_missing_source_after_non_skipped_stage_blocks_before_any_creation(tmp_path, stage, outcome):
+    root = workflow_parent(tmp_path)
+    outcomes = dict.fromkeys(("storage", "startup", "activation"), "skipped")
+    outcomes[stage] = outcome
+    with pytest.raises(ValueError, match="missing after non-skipped"):
+        runner.prepare_unstarted_evidence_roots(root, outcomes)
+    assert not list(root.iterdir())
+
+
+@pytest.mark.parametrize("outcomes", [
+    {"storage": "unknown", "startup": "skipped", "activation": "skipped"},
+    {"storage": "skipped", "startup": "skipped"},
+    {"storage": "skipped", "startup": "skipped", "activation": "skipped", "extra": "skipped"},
+    {"storage": False, "startup": "skipped", "activation": "skipped"}, [],
+])
+def test_missing_or_unknown_step_outcomes_never_create_context(tmp_path, outcomes):
+    root = workflow_parent(tmp_path)
+    with pytest.raises(ValueError, match="exact known"):
+        runner.prepare_unstarted_evidence_roots(root, outcomes)
+    assert not list(root.iterdir())
+
+
+@pytest.mark.parametrize("unsafe", ["symlink", "file", "public-directory"])
+def test_existing_unsafe_root_is_not_replaced_or_followed(tmp_path, unsafe):
+    root = workflow_parent(tmp_path)
+    path = root / "production-startup"
+    if unsafe == "symlink":
+        target = tmp_path / "target"
+        target.mkdir(mode=0o700)
+        path.symlink_to(target, target_is_directory=True)
+    elif unsafe == "file":
+        path.write_bytes(b"original")
+    else:
+        path.mkdir(mode=0o755)
+        path.chmod(0o755)
+        assert stat.S_IMODE(path.stat().st_mode) == 0o755
+    before = path.lstat()
+    with pytest.raises(ValueError, match="existing workflow evidence source is unsafe"):
+        runner.prepare_unstarted_evidence_roots(root, dict.fromkeys(("storage", "startup", "activation"), "skipped"))
+    assert path.lstat() == before
+    assert not (root / "cutover-completion").exists()
+
+
+def test_evidence_parent_symlink_and_writable_mode_are_refused(tmp_path):
+    root = workflow_parent(tmp_path)
+    link = tmp_path / "alias"
+    link.symlink_to(root, target_is_directory=True)
+    outcomes = dict.fromkeys(("storage", "startup", "activation"), "skipped")
+    with pytest.raises(ValueError, match="exact workflow evidence parent"):
+        runner.prepare_unstarted_evidence_roots(link, outcomes)
+    root.chmod(0o777)
+    with pytest.raises(ValueError, match="private workflow evidence parent"):
+        runner.prepare_unstarted_evidence_roots(root, outcomes)
+    assert not list(root.iterdir())
+
+
+def test_archive_can_preserve_not_started_context_without_marking_native_stage_passed(tmp_path):
+    from scripts import prepare_synthetic_evidence as evidence
+    root = workflow_parent(tmp_path)
+    failed = root / "cutover-completion"
+    failed.mkdir(mode=0o700)
+    (failed / "FAILURE.json").write_bytes(b'{"status":"failed"}')
+    runner.prepare_unstarted_evidence_roots(root, {
+        "storage": "failure", "startup": "skipped", "activation": "skipped"})
+    (root / "production-startup-postgres").mkdir(mode=0o700)
+    sources = {name: root / name for name in (*EVIDENCE_ROOTS, "production-startup-postgres")}
+    report = evidence.prepare(sources, root / "upload")
+    assert report["complete"] is True and not report["errors"]
+    assert json.loads((root / "upload/files/cutover-completion/FAILURE.json").read_bytes())["status"] == "failed"
+    marker = json.loads((root / "upload/files/production-startup/NOT_STARTED.json").read_bytes())
+    assert marker["status"] == "not_started" and marker["stage_passed"] is False
+    assert not (root / "upload/files/production-startup/RESULT.json").exists()
+    # A separate missing source remains a collector STOP; no directory inference.
+    report = evidence.prepare({"production-startup": root / "missing"}, root / "stop-upload")
+    assert report["complete"] is False and (root / "stop-upload/STOP.json").is_file()
+    assert not (root / "stop-upload/COMPLETE.json").exists()
+    assert evidence.MAX_METADATA == 8 * 1024**2
+    assert evidence.NATIVE_GROUPS == ("native", "native-foundation", "native-activation", "native-adapters")
+
+
+def test_actual_collection_fits_three_original_case_budgets_without_nodeid_loss(tmp_path):
+    """Collect the same fixed files; do not execute their cases or any native work."""
+    report = tmp_path / "collection.json"
+    code = '''
+import collections,json,sys
+from pathlib import Path
+sys.path[:0]=[sys.argv[1],sys.argv[1]+'/scripts']
+import pytest
+from scripts import verify_cutover_completion_native as runner
+class Collector:
+ def pytest_collection_finish(self,session):
+  original=[item.nodeid for item in session.items]
+  grouped={name:[item.nodeid for item in session.items if item.nodeid.split('::')[0] in files]
+           for name,files in runner.TEST_GROUPS}
+  actual=[nodeid for group in grouped.values() for nodeid in group]
+  value={'original_count':len(original),'unique_count':len(set(original)),
+         'same_nodeid_counter':collections.Counter(original)==collections.Counter(actual),
+         'files':sorted({item.nodeid.split('::')[0] for item in session.items}),
+         'groups':{name:len(items) for name,items in grouped.items()}}
+  target=Path(sys.argv[2]);target.write_text(json.dumps(value));target.chmod(0o600)
+raise SystemExit(pytest.main(['--collect-only','-q','-o','addopts=','-p','no:cacheprovider',
+                            *runner.TESTS],plugins=[Collector()]))
+'''
+    result = subprocess.run([sys.executable, "-I", "-B", "-c", code, str(ROOT), str(report)],
+                            cwd=ROOT, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
+    actual = json.loads(report.read_bytes())
+    assert actual["original_count"] == actual["unique_count"] > 0
+    assert actual["same_nodeid_counter"] is True and actual["files"] == sorted(runner.TESTS)
+    assert set(actual["groups"]) == {"foundation", "activation", "adapters"}
+    assert all(0 < count <= runner.NativeShortPaths.MAX_CASES == 2000 for count in actual["groups"].values())
+    assert sum(actual["groups"].values()) == actual["original_count"]
+    assert runner.NativeShortPaths.MAX_BYTES == 1024 * 1024
 
 
 @pytest.mark.parametrize("drift", ["missing", "duplicate", "name", "empty"])
@@ -862,7 +1073,7 @@ def test_short_plugin_is_native_only_and_preserves_standard_factory_and_fixed_su
     source = Path(runner.__file__).read_text()
     assert 'path = factory.mktemp("t")' in source
     assert 'plugins=[summary, native_short_path_plugin(short_paths)]' in runner.CONTAINER_TEST
-    assert len(runner.TESTS) == 56 and sum(len(files) for _, files in runner.TEST_GROUPS) == 56
+    assert len(runner.TESTS) == 72 and sum(len(files) for _, files in runner.TEST_GROUPS) == 72
     assert '--basetemp=' in runner.CONTAINER_TEST and 'short_paths.confirm()' in runner.CONTAINER_TEST
     assert 'native_short_path_plugin' not in (ROOT / "tests/conftest.py").read_text()
     assert 'mktemp("runtime-image-input")' in (ROOT / "tests/test_production_admission_image_sources.py").read_text()

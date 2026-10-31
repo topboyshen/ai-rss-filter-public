@@ -172,7 +172,7 @@ def plan_keys_valid(plan, keys):
 def sender_from_plan(plan):
     return SenderActivationDriver(plan["sender_plan"], NativeSenderActivationTransport(plan["sender_url"], plan["token_file"], container_id=plan["sender_namespace_container_id"],
                                   timeout_seconds=plan.get(TIMEOUT_KEY)),
-                                  PostgresReader(plan["dsn_file"], plan["sender_plan"]["postgres_identity"]),
+                                  PostgresReader.from_plan(plan["dsn_file"], plan["sender_plan"]),
                                   Path(plan["sender_evidence_root"]))
 
 
@@ -211,12 +211,44 @@ def operator_stop_marked(root, authority):
 def _locked_step(plan, sender):
     with locked_activation(plan["migration_root"], plan["runtime_root"], plan["state"],
                            operation_id=plan["activation_operation"]) as session:
+        root = session.root / "continuation"
+        if gate._present(root / "STOP.json") or gate._present(root / "STOP.json.pending"):
+            authority = life._authority(root)
+            gate._require(operator_stop_marked(root, authority), "operator stop marker is not exact")
+            # The original operator may have crashed after writing its marker.
+            # Under the same locks, finish/query that exact restrictive action;
+            # never renew an OPEN lease or treat the marker alone as success.
+            return life.stop_new(session, sender, reason_code="operator")
         return life.supervise_step(session, sender)
+
+
+def _operator_stop_pending(plan, root, authority):
+    gate._require(operator_stop_marked(root, authority), "operator stop marker changed while lock busy")
+    old = runtime.read_confirmed(root / "supervisor.tick.json")
+    gate._require(old["schema"] == SCHEMA and old["plan_sha256"] == gate._hash(plan)
+                  and old["owner"] == process_identity(), "original same-owner supervisor tick required")
+    result = old["result"]
+    digest = gate._hash(authority)
+    if result["status"] == "live":
+        gate._require(result["authority_sha256"] == digest, "original live supervisor authority differs")
+        clock = old["clock"]
+    else:
+        gate._require(set(result) == {"status", "authority_sha256", "queue_checked", "drained", "pending_clock"}
+                      and result["status"] == "operator_stop_in_progress" and result["authority_sha256"] == digest
+                      and result["queue_checked"] is False and result["drained"] is False,
+                      "original pending operator stop differs")
+        clock = result["pending_clock"]
+    # Reuse the existing live-tick freshness bound. Pending ticks must never
+    # renew this anchor, an admission lease, or the original authority window.
+    life._clock(clock, min(clock["wall"] + 45, authority["policy"]["expires_at"]), active=True)
+    gate._require(operator_stop_marked(root, authority), "operator stop marker changed while lock busy")
+    return {"status": "operator_stop_in_progress", "authority_sha256": digest,
+            "queue_checked": False, "drained": False, "pending_clock": clock}
 
 
 def tick(plan_path):
     plan, root, authority = load(plan_path)
-    sender = None
+    sender, pending = None, False
     try:
         sender = sender_from_plan(plan)
         try:
@@ -224,13 +256,20 @@ def tick(plan_path):
         except gate.AdmissionBusy:
             # An exact operator STOP holds the controller lock: never race it with
             # an unlocked competing stop. Wait once more under the same existing
-            # lock bound, then re-check and stop through the normal locked path.
+            # lock bound. Persistent contention is explicitly unconfirmed and
+            # can only wait within the original live-tick freshness window.
             if not operator_stop_marked(root, authority):
                 raise
-            result = _locked_step(plan, sender)
+            try:
+                result = _locked_step(plan, sender)
+            except gate.AdmissionBusy:
+                pending = True
+                result = _operator_stop_pending(plan, root, authority)
     except Exception as exc:
         # Context unwinding releases the controller lock before independent stop.
-        result = restrictive_stop(plan_path, sender=sender)
+        result = ({"status": "stop_unconfirmed", "queue_checked": False, "drained": False,
+                   "errors": {"operator_stop": life._safe_error(exc)}} if pending
+                  else restrictive_stop(plan_path, sender=sender))
         result["trigger"] = life._safe_error(exc)
     value = {"schema": SCHEMA, "plan_sha256": gate._hash(plan), "owner": process_identity(),
              "clock": life._clock_now(), "result": result}
@@ -280,7 +319,7 @@ def run(plan_path):
                 # Preserve a bounded sanitized terminal result; never claim closed.
                 gate._write(root / "supervisor.failed.json", {"error": life._safe_error(exc), "stop_confirmed": False})
                 return 1
-            if value["result"]["status"] != "live":
+            if value["result"]["status"] not in {"live", "operator_stop_in_progress"}:
                 return 0 if value["result"]["status"] == "producers_stopped_drain_pending" else 1
             time.sleep(plan["interval_seconds"])
 

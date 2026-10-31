@@ -74,7 +74,7 @@ def _driver(plan):
     gate._require(isinstance(identifier, str) and gate.HEX64.fullmatch(identifier), "exact sender namespace required")
     transport = NativeSenderActivationTransport(spec["url"], spec["token"]["path"], container_id=identifier)
     return SenderActivationDriver(sender_plan, transport,
-        PostgresReader(spec["dsn"]["path"], sender_plan["postgres_identity"]), spec["evidence_root"])
+        PostgresReader.from_plan(spec["dsn"]["path"], sender_plan), spec["evidence_root"])
 
 
 def _validate(plan, root, legacy, release, driver, *, active):

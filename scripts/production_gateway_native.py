@@ -8,6 +8,7 @@ and never pulls images, changes resource budgets, or removes containers.
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import datetime, timezone
 import errno
 import hashlib
 import json
@@ -490,6 +491,31 @@ def bind_plan(p, permit):
     return template
 
 
+def _cleanup_identity(row):
+    """Stable original identity across TERM; process exit is checked separately."""
+    return {key: deepcopy(row[key]) for key in (
+        "Id", "Name", "Image", "Config", "HostConfig", "Mounts", "RestartCount")}, row["State"]["StartedAt"]
+
+
+def _normal_cleanup_exit(row, original, *, purpose):
+    gate._require(_cleanup_identity(row) == original, "owned cleanup identity changed")
+    state = row["State"]
+    finished = state.get("FinishedAt")
+    try:
+        parsed = datetime.fromisoformat(finished.replace("Z", "+00:00")) if isinstance(finished, str) else None
+        valid_time = (parsed is not None and parsed.tzinfo is not None
+                      and parsed.utcoffset() == timezone.utc.utcoffset(parsed)
+                      and parsed.timestamp() > 0)
+    except (ValueError, OverflowError, OSError):
+        valid_time = False
+    gate._require(state.get("Running") is False and state.get("Status") == "exited"
+                  and type(state.get("ExitCode")) is int
+                  and state["ExitCode"] in ({0} if purpose == "config-test" else {0, 143})
+                  and not any(state.get(key) for key in ("Paused", "Dead", "Restarting", "OOMKilled"))
+                  and valid_time, "normal owned process exit unconfirmed")
+    return state
+
+
 def preserve(harness, p):
     """Only this operation's gateways: capture then TERM, never rm or KILL."""
     if "gateway_native_root" not in p:
@@ -522,9 +548,14 @@ def preserve(harness, p):
             )
             rows.append((purpose, row))
     for purpose, row in rows:
+        original_identity = _cleanup_identity(row)
         gate._write(root / ("FINAL_" + purpose + ".json"), harness.safe_inspect(row))
         harness.command(["logs", row["Id"]], timeout=3, final=True)
-        if row["State"]["Running"]:
+        actual = _inspect(harness, row["Id"], final=True)
+        gate._require(_cleanup_identity(actual) == original_identity, "owned cleanup identity changed")
+        if actual["State"]["Running"]:
+            gate._require(not any(actual["State"].get(key) for key in ("Paused", "Dead", "Restarting", "OOMKilled")),
+                          "owned cleanup running state uncertain")
             term = root / ("OLD_TERM_INTENT.json" if purpose == "old" else "FINAL_TERM_" + purpose + ".json")
             if not gate._present(term) and not gate._present(term.with_suffix(".json.pending")):
                 gate._write(term, {"id": row["Id"], "signal": "TERM"})
@@ -534,9 +565,11 @@ def preserve(harness, p):
                 gate._require(time.monotonic() < deadline, "synthetic gateway preserve deadline")
                 actual = _inspect(harness, row["Id"], final=True)
                 gate._require(time.monotonic() < deadline, "synthetic gateway observation exceeded deadline")
+                gate._require(_cleanup_identity(actual) == original_identity, "owned cleanup identity changed")
                 if not actual["State"]["Running"]:
-                    gate._write(root / ("STOPPED_" + purpose + ".json"), actual["State"])
                     break
                 time.sleep(min(0.25, max(0, deadline - time.monotonic())))
             else:
                 raise gate.AdmissionUncertain("synthetic gateway stop unconfirmed; no forced cleanup")
+        state = _normal_cleanup_exit(actual, original_identity, purpose=purpose)
+        gate._write(root / ("STOPPED_" + purpose + ".json"), state)

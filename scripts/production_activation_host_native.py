@@ -67,7 +67,9 @@ ACTIVATION_STAGES = {"actual_finite_admission_lease", "actual_go_to_real_worker_
     "actual_fixed_network_namespace_transport", "never_opened_receiver_disk", "actual_go_schema135_first_closed",
     "retain_old_stopped_containers_and_seal", "build_exact_application_image", "probe_exact_application_image",
     "bind_exact_migration_permit", "actual_locked_migration_create_grant_start", "actual_compose_parser_metadata",
-    "bounded_internal_network_and_real_redis"}
+    "bounded_internal_network_and_real_redis", "custody_never_opened_synthetic_storage_not_actual125",
+    "custody_actual_sender_first_closed", "custody_same_project_zero_mount_originals_and_seal",
+    "custody_actual_source_bound_application_image"}
 
 
 def phase(root, name):
@@ -446,8 +448,47 @@ def prepare_mounts(commands, root):
     commands.run([str(host.TOOLS["ip"]), "link", "set", "lo", "up"])
 
 
+def _private_run_identity(root, plan, *, final=False):
+    """The fixed PID path is permitted only inside the actual owned /run bind."""
+    frozen, _ = original(root.parent / "PLAN.json")
+    current = host.proc_identity(os.getpid())
+    gate._require(frozen == plan and plan.get("gateway_custody") is True
+                  and os.geteuid() == 0 and current["netns"] != plan["parent"]["netns"]
+                  and current["mntns"] != plan["parent"]["mntns"]
+                  and current["cgroup"] == plan["cgroup"] + "/supervisor"
+                  and host.proc_identity(plan["parent"]["pid"]) == plan["parent"]
+                  and host.file_proof(Path(__file__)) == plan["wrapper_source"],
+                  "fixed archive PID requires the frozen live private host")
+    remaining(plan["deadline"] if final else plan["active_deadline"])
+    actual, owned = os.lstat("/run"), os.lstat(root / "run")
+    gate._require(all(stat.S_ISDIR(info.st_mode) and info.st_uid == info.st_gid == 0
+                      and stat.S_IMODE(info.st_mode) == 0o700 for info in (actual, owned))
+                  and (actual.st_dev, actual.st_ino) == (owned.st_dev, owned.st_ino)
+                  and Path("/var/run").resolve() == Path("/run"),
+                  "fixed archive PID requires the actual private run bind")
+    return actual.st_dev, actual.st_ino, actual.st_mode, actual.st_uid, actual.st_gid
+
+
+def _private_daemon_pidfile(root, plan, run_identity, pid, expected=None, *, final=False):
+    # Reuse the unchanged production authority's bounded NOFOLLOW reader;
+    # publishing an observation never substitutes for its own live checks.
+    from scripts import retained_gateway_configuration as configuration
+    gate._require(_private_run_identity(root, plan, final=final) == run_identity,
+                  "private run bind changed after daemon launch")
+    raw, metadata = configuration._small(configuration.PIDFILE, 32)
+    gate._require(raw in {str(pid).encode(), (str(pid) + "\n").encode()} and metadata[4] == 0
+                  and (expected is None or (raw, metadata) == expected),
+                  "actual private daemon PID file differs")
+    return raw, metadata
+
+
 def start_daemon(commands, root, plan, mirror):
     config = {**host.daemon_config(root, plan), "registry-mirrors": [mirror]}
+    run_identity, pidfile = None, None
+    if plan.get("gateway_custody") is True:
+        run_identity = _private_run_identity(root, plan)
+        gate._require(not os.path.lexists("/run/docker.pid"), "private archive PID file already exists")
+        config["pidfile"] = "/run/docker.pid"
     record(root / "daemon.json", config)
     process, logs = host.launch_daemon(commands, root, plan)
     host.retain_daemons(deadline=commands.deadline)
@@ -464,11 +505,18 @@ def start_daemon(commands, root, plan, mirror):
         return True
 
     host.wait_until(ready, min(commands.deadline, time.monotonic() + 10))
+    if run_identity is not None:
+        pidfile = _private_daemon_pidfile(root, plan, run_identity, process.pid)
 
     def peer():
         logs.check()
         gate._require(host.retainer_confirmed(process), "live daemon FD retainer absent")
         host.check_peer(process.pid, actual)
+        if run_identity is not None:
+            gate._require(commands.deadline in {plan["active_deadline"], plan["deadline"]},
+                          "private daemon authority cannot replace the shared deadline")
+            _private_daemon_pidfile(root, plan, run_identity, process.pid, pidfile,
+                                    final=commands.deadline == plan["deadline"])
 
     commands.peer = peer
     record(root / "DAEMON_INFO.json", json.loads(commands.docker(["info", "--format", "{{json .}}"])))
@@ -515,6 +563,7 @@ def stop_daemon(context, process, logs):
 def inner_execute(root, plan):
     from scripts import production_offline_registry as registry
     from scripts import verify_production_activation_native as activation
+    gate._require(type(plan.get("gateway_custody")) is bool, "frozen native gateway custody mode required")
     os.setsid()
     holder = host.proc_identity(os.getpid())
     commands = FullCommands(root, plan["active_deadline"])
@@ -535,8 +584,11 @@ def inner_execute(root, plan):
             phase(root, "full_activation")
             with native_deadline.scope(plan["active_deadline"], plan["deadline"]):
                 activation_result = activation.execute(Path(plan["repo"]), Path(plan["source"]), plan["sender"]["Id"],
-                                                       Path(plan["binary"]), root / "activation", private_host_context=context)
-            gate._require(activation_result["status"] == "passed", "original complete activation did not pass")
+                                                       Path(plan["binary"]), root / "activation", private_host_context=context,
+                                                       gateway_custody=plan["gateway_custody"])
+            gate._require(activation_result["status"] == "passed"
+                          and activation_result.get("gateway_custody") is plan["gateway_custody"],
+                          "original complete activation did not pass or mode differs")
             context.check()
     except BaseException as error:
         failure, failed_phase = error, PHASE
@@ -583,6 +635,7 @@ def references():
 def outer_plan(args, root, started):
     from scripts import production_offline_registry as registry
     from scripts.verify_miniflux_pause_native import image_checks, source_binding
+    gate._require(type(args.gateway_custody) is bool, "explicit native gateway custody mode required")
     deadline = started + MAX_SECONDS
     active_deadline = deadline - FINAL_SECONDS
     cgroup = cgroup_setup(uuid.uuid4().hex)
@@ -608,6 +661,7 @@ def outer_plan(args, root, started):
     phase(root, "offline_bundle")
     bundle = registry.prepare_bundle(root / "bundle", references(), active_deadline)
     plan = {"schema": CONTEXT_SCHEMA, "started": started, "deadline": deadline, "active_deadline": active_deadline,
+            "gateway_custody": args.gateway_custody,
             "repo": str(args.repo), "source": str(args.source), "binary": str(args.binary), "source_identity": source,
             "source_binding": binding, "wrapper_source": host.file_proof(Path(__file__)),
             "cgroup": cgroup, "parent": host.proc_identity(os.getpid()), "outer_peer": outer_peer,
@@ -717,6 +771,8 @@ def outer_execute(args, root, started):
     args_inner = [str(host.TOOLS["unshare"]), "--mount", "--net", "--fork", sys.executable, "-I", "-B", str(Path(__file__).resolve()),
                   "--repo", str(args.repo), "--source", str(args.source), "--binary", str(args.binary),
                   "--image-id", args.image_id, "--output", str(root / "inner"), "--inside"]
+    if plan["gateway_custody"]:
+        args_inner.append("--gateway-custody")
     (root / "inner").mkdir(mode=0o700)
     process, streams = None, []
     try:
@@ -796,12 +852,32 @@ def safe_harness_failure(value):
         return None
 
 
+def safe_failure_locations(value):
+    """Reviewed source basenames and line numbers only; never locals or text."""
+    if type(value) is not list or len(value) > 32:
+        return None
+    result = []
+    for item in value:
+        if type(item) is not dict or set(item) != {"file", "function", "line"}:
+            return None
+        name, line = item["file"], item["line"]
+        if (type(name) is not str or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,95}\.py", name)
+                or type(line) is not int or not 1 <= line <= 20000
+                or not any((ROOT / folder / name).is_file() for folder in ("scripts", "services"))):
+            return None
+        # The function name is deliberately omitted: unlike a reviewed source
+        # basename, caller-provided text must not enter the public diagnostic.
+        result.append({"file": name, "line": line})
+    return result
+
+
 def safe_activation(value):
     """Project report is still untrusted input to the public summary."""
     result = {"schema": "production-activation-native-v1", "status": value.get("status") if isinstance(value.get("status"), str) and value.get("status") in {
         "passed", "failed_or_evidence_insufficient"} else "unrecognized",
         "last_stage_sha256": hashlib.sha256(host.encoded(value.get("last_stage"))).hexdigest()}
     result["last_stage"] = value.get("last_stage") if isinstance(value.get("last_stage"), str) and value.get("last_stage") in ACTIVATION_STAGES else None
+    result["gateway_custody"] = value.get("gateway_custody") if type(value.get("gateway_custody")) is bool else None
     for key in ("source_sha",):
         result[key] = value.get(key) if re.fullmatch(r"[0-9a-f]{40}", str(value.get(key))) else None
     for key in ("elapsed_seconds", "app_memory_bytes", "app_pids", "pg_memory_bytes", "pg_pids", "real_models"):
@@ -809,6 +885,7 @@ def safe_activation(value):
         result[key] = item if type(item) in {int, float} and math.isfinite(item) and item >= 0 else None
     failure = value.get("failure")
     if isinstance(failure, dict):
+        result["failure_locations"] = safe_failure_locations(failure.get("locations"))
         result["failure_message_sha256"] = (failure.get("message_sha256") if
             re.fullmatch(r"[0-9a-f]{64}", str(failure.get("message_sha256"))) else None)
         result["failure_type_sha256"] = hashlib.sha256(host.encoded(failure.get("type"))).hexdigest()
@@ -910,8 +987,29 @@ def gateway_command_exports(items, deadline):
     return exports
 
 
-def safe_inventory(root, deadline):
+def custody_completion_profile(root, records, deadline):
+    name = "inner/activation/receiver/ACTUAL_CUSTODY_PROOF.json"
+    expected = hashlib.sha256(name.encode()).hexdigest()
+    recorded = [row for row in records if row["path_sha256"] == expected]
+    if len(recorded) != 1:
+        return None
+    remaining(deadline)
+    before = host.file_proof(root / name, limit=host.OUTPUT_BYTES)
+    value = host.read_original_json(root / name)
+    gate._require(before == host.file_proof(root / name, limit=host.OUTPUT_BYTES)
+                  and before["sha256"] == recorded[0]["sha256"], "custody completion original changed")
+    return {"status": "passed" if type(value) is dict and value.get("status") == "passed"
+            and type(value.get("schema")) is int and value["schema"] == 1
+            and type(value.get("old_project_roles")) is int and value["old_project_roles"] == 3
+            and type(value.get("old_gateway_mounts")) is int and value["old_gateway_mounts"] == 0
+            and value.get("actual_gateway_and_live_legacy") is True
+            and value.get("actual_125_compatibility_proven") is False else "unconfirmed",
+            "sha256": before["sha256"], "actual_125_compatibility_proven": False}
+
+
+def safe_inventory(root, deadline, *, gateway_custody=False):
     """Hash bounded originals; explicitly exclude storage trees and raw payloads."""
+    gate._require(type(gateway_custody) is bool, "exact inventory custody mode required")
     records, omissions, total, gateway_texts, outer_build_texts = [], [], 0, [], []
     excluded = {root / "inner/data", root / "inner/exec", root / "inner/run", root / "bundle/objects",
                 root / "outer-build/context"}
@@ -951,6 +1049,10 @@ def safe_inventory(root, deadline):
     expected = {hashlib.sha256(name.encode()).hexdigest() for name in required}
     complete = expected <= {row["path_sha256"] for row in records}
     profiles = {}
+    if gateway_custody:
+        profile = custody_completion_profile(root, records, deadline)
+        profiles["ACTUAL_CUSTODY_PROOF.json"] = profile
+        complete = complete and profile is not None and profile["status"] == "passed"
     for name in ("inner/activation/HARNESS_COMMAND_FAILURE.json", "inner/activation/FAILURE.json", "inner/activation/RESULT.json", "inner/INNER_RESULT.json", "inner/DRAIN_OBSERVATION.json", "inner/DAEMON_STOP.json", "inner/RESOURCES_FINAL.json"):
         remaining(deadline)
         path = root / name
@@ -998,6 +1100,7 @@ def _arguments(argv):
     for name in ("repo", "source", "binary", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--image-id", required=True)
+    parser.add_argument("--gateway-custody", action="store_true", help="Exercise the actual dedicated legacy gateway custody topology")
     parser.add_argument("--inside", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     gate._require(sys.platform == "linux" and os.uname().machine == "x86_64" and os.geteuid() == 0
@@ -1013,11 +1116,12 @@ def _arguments(argv):
 
 def _main(argv=None, *, _cli_started=None):
     started = time.monotonic() if _cli_started is None else cli_start(_cli_started)
-    result, failure, root, failed_phase = None, None, None, None
+    result, failure, root, failed_phase, gateway_custody = None, None, None, None, False
     try:
         if _cli_started is not None:
             cli_progress("arguments_before")
         args = _arguments(argv)
+        gateway_custody = getattr(args, "gateway_custody", False)
         if _cli_started is not None:
             cli_progress("arguments_verified")
         os.umask(0o077)
@@ -1027,6 +1131,7 @@ def _main(argv=None, *, _cli_started=None):
             plan, _ = original(root.parent / "PLAN.json")
             gate._require(root.name == "inner" and args.repo == Path(plan["repo"]) and args.source == Path(plan["source"])
                           and args.binary == Path(plan["binary"]) and args.image_id == plan["sender"]["Id"]
+                          and type(plan.get("gateway_custody")) is bool and args.gateway_custody is plan["gateway_custody"]
                           and host.file_proof(Path(__file__)) == plan["wrapper_source"], "inner frozen invocation differs")
             from scripts.production_gateway_switch import _hard_deadline
             with _hard_deadline(remaining(plan["deadline"])):
@@ -1046,7 +1151,8 @@ def _main(argv=None, *, _cli_started=None):
             from scripts.production_gateway_switch import _hard_deadline
             with _hard_deadline(remaining(started + MAX_SECONDS)):
                 phase(root, "evidence_export")
-                packet = safe_inventory(root, started + MAX_SECONDS)
+                packet = (safe_inventory(root, started + MAX_SECONDS, gateway_custody=True) if gateway_custody
+                          else safe_inventory(root, started + MAX_SECONDS))
                 record(root / "SAFE_INVENTORY.json", packet)
         except BaseException as error:
             if failure:

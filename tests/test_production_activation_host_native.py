@@ -30,6 +30,175 @@ def test_imported_cli_delegates_same_arguments_to_canonical_main(monkeypatch):
     assert observed[0] is arguments
 
 
+@pytest.fixture
+def private_run_case(tmp_path, monkeypatch):
+    import os
+    import stat
+    root = tmp_path / "inner"
+    root.mkdir()
+    parent = {"pid": os.getpid() + 1000, "netns": 1, "mntns": 2, "cgroup": "/outer"}
+    current = {"netns": 3, "mntns": 4, "cgroup": "/owned/supervisor"}
+    plan = {"parent": parent, "cgroup": "/owned", "gateway_custody": True,
+            "wrapper_source": {"exact": "source"}, "active_deadline": 580, "deadline": 600}
+    info = SimpleNamespace(st_dev=7, st_ino=8, st_mode=stat.S_IFDIR | 0o700, st_uid=0, st_gid=0)
+    rows = {"/run": info, str(root / "run"): deepcopy(info)}
+    real_lstat, real_resolve = os.lstat, Path.resolve
+    monkeypatch.setattr(native.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(native.os, "lstat", lambda path: rows[str(path)] if str(path) in rows else real_lstat(path))
+    monkeypatch.setattr(Path, "resolve", lambda path, *a, **kw:
+                        Path("/run") if str(path) == "/var/run" else real_resolve(path, *a, **kw))
+    monkeypatch.setattr(native, "original", lambda path: (deepcopy(plan), {}))
+    monkeypatch.setattr(native.host, "proc_identity", lambda pid: current if pid == os.getpid() else parent)
+    monkeypatch.setattr(native.host, "file_proof", lambda path: {"exact": "source"})
+    deadlines = []
+    monkeypatch.setattr(native, "remaining", lambda value: deadlines.append(value) or 10)
+    return SimpleNamespace(root=root, plan=plan, current=current, rows=rows, deadlines=deadlines)
+
+
+def test_fixed_pidfile_requires_real_private_run_and_keeps_both_original_deadlines(private_run_case):
+    case = private_run_case
+    identity = native._private_run_identity(case.root, case.plan)
+    assert identity[:2] == (7, 8)
+    assert native._private_run_identity(case.root, case.plan, final=True) == identity
+    assert case.deadlines == [580, 600]
+
+
+@pytest.mark.parametrize("fault", ["network", "mount", "cgroup", "parent", "source", "mode", "uid", "gid", "symlink", "different_bind"])
+def test_fixed_pidfile_refuses_namespace_source_or_run_drift(private_run_case, monkeypatch, fault):
+    import stat
+    case = private_run_case
+    if fault == "network":
+        case.current["netns"] = case.plan["parent"]["netns"]
+    elif fault == "mount":
+        case.current["mntns"] = case.plan["parent"]["mntns"]
+    elif fault == "cgroup":
+        case.current["cgroup"] = "/unrelated/supervisor"
+    elif fault == "parent":
+        monkeypatch.setattr(native.host, "proc_identity", lambda pid: case.current)
+    elif fault == "source":
+        monkeypatch.setattr(native.host, "file_proof", lambda path: {"exact": "changed"})
+    elif fault == "mode":
+        case.rows["/run"].st_mode = stat.S_IFDIR | 0o755
+    elif fault in {"uid", "gid"}:
+        setattr(case.rows["/run"], "st_" + fault, 1)
+    elif fault == "symlink":
+        case.rows["/run"].st_mode = stat.S_IFLNK | 0o700
+    else:
+        case.rows["/run"].st_ino += 1
+    with pytest.raises(gate.AdmissionError, match="fixed archive PID"):
+        native._private_run_identity(case.root, case.plan)
+
+
+@pytest.mark.parametrize("fault", ["root", "frozen", "custody", "deadline"])
+def test_private_run_authority_cannot_be_enabled_by_flag_or_new_clock(private_run_case, monkeypatch, fault):
+    case = private_run_case
+    if fault == "root":
+        monkeypatch.setattr(native.os, "geteuid", lambda: 1)
+    elif fault == "frozen":
+        monkeypatch.setattr(native, "original", lambda path: ({"another": "plan"}, {}))
+    elif fault == "custody":
+        case.plan["gateway_custody"] = False
+    else:
+        def expired(deadline):
+            assert deadline == case.plan["active_deadline"]
+            raise gate.AdmissionError("original full-host deadline expired")
+        monkeypatch.setattr(native, "remaining", expired)
+    with pytest.raises(gate.AdmissionError):
+        native._private_run_identity(case.root, case.plan)
+
+
+@pytest.mark.parametrize("raw", [b"123", b"123\n"])
+def test_private_pidfile_uses_unchanged_production_reader_and_exact_actual_pid(private_run_case, monkeypatch, raw):
+    from scripts import retained_gateway_configuration as configuration
+    case, calls = private_run_case, []
+    metadata = (7, 9, 0o100644, 0, 0, 1, len(raw), 10, 11)
+    monkeypatch.setattr(configuration, "_small", lambda path, limit: calls.append((path, limit)) or (raw, metadata))
+    run = native._private_run_identity(case.root, case.plan)
+    proof = native._private_daemon_pidfile(case.root, case.plan, run, 123)
+    assert proof == (raw, metadata) and calls == [("/run/docker.pid", 32)]
+    assert native._private_daemon_pidfile(case.root, case.plan, run, 123, proof, final=True) == proof
+    assert case.deadlines[-1] == 600
+
+
+@pytest.mark.parametrize("fault", ["wrong_pid", "gid", "metadata", "run", "missing"])
+def test_private_pidfile_missing_wrong_or_replaced_still_blocks(private_run_case, monkeypatch, fault):
+    from scripts import retained_gateway_configuration as configuration
+    case = private_run_case
+    run = native._private_run_identity(case.root, case.plan)
+    proof = (b"123", (7, 9, 0o100644, 0, 0, 1, 3, 10, 11))
+    raw, metadata = proof
+    if fault == "wrong_pid":
+        raw = b"124"
+    elif fault == "gid":
+        metadata = (*metadata[:4], 1, *metadata[5:])
+    elif fault == "metadata":
+        metadata = (*metadata[:-1], 12)
+    elif fault == "run":
+        case.rows["/run"].st_ino += 1
+    def read(path, limit):
+        if fault == "missing":
+            raise FileNotFoundError("synthetic missing PIDfile")
+        return raw, metadata
+    monkeypatch.setattr(configuration, "_small", read)
+    with pytest.raises((gate.AdmissionError, FileNotFoundError)):
+        native._private_daemon_pidfile(case.root, case.plan, run, 123, proof)
+
+
+@pytest.mark.parametrize("custody", [False, True])
+def test_daemon_pidfile_override_is_only_custody_and_rechecks_on_existing_peer(tmp_path, monkeypatch, custody):
+    calls, configs = [], []
+    plan = {"gateway_custody": custody, "active_deadline": 580, "deadline": 600}
+    commands = SimpleNamespace(deadline=580, peer=None)
+    process = SimpleNamespace(pid=123, poll=lambda: None)
+    logs = SimpleNamespace(check=lambda: calls.append("logs"))
+    run, metadata = (1, 2, 3, 0, 0), (b"123", ("fixed",))
+    monkeypatch.setattr(native.time, "monotonic", lambda: 100)
+    monkeypatch.setattr(native.host, "daemon_config", lambda *_a: {"pidfile": str(tmp_path / "daemon.pid")})
+    monkeypatch.setattr(native, "_private_run_identity", lambda *_a: calls.append("run") or run)
+    monkeypatch.setattr(native.os.path, "lexists", lambda path: False)
+    monkeypatch.setattr(native, "record", lambda path, data: configs.append((path, data)))
+    monkeypatch.setattr(native.host, "launch_daemon", lambda *_a: (process, logs))
+    monkeypatch.setattr(native.host, "retain_daemons", lambda **kw: calls.append(("retain", kw)))
+    monkeypatch.setattr(native.host, "retainer_confirmed", lambda value: value is process)
+    monkeypatch.setattr(native.host, "proc_identity", lambda pid: {"netns": 1, "mntns": 2, "cgroup": "/owned"})
+    monkeypatch.setattr(native.host, "check_peer", lambda *_a: calls.append("peer"))
+    monkeypatch.setattr(Path, "exists", lambda path: str(path) == "/var/run/docker.sock")
+    monkeypatch.setattr(native.host, "wait_until", lambda check, deadline: calls.append(("wait", deadline)) or check())
+    def verify(*args, **kwargs):
+        calls.append(("pidfile", args[3:], kwargs))
+        return metadata
+    monkeypatch.setattr(native, "_private_daemon_pidfile", verify)
+    def docker(args):
+        commands.peer()
+        return "{}"
+    commands.docker = docker
+    assert native.start_daemon(commands, tmp_path, plan, "http://127.0.0.1:3333")[0] is process
+    assert configs[0][1]["pidfile"] == ("/run/docker.pid" if custody else str(tmp_path / "daemon.pid"))
+    assert ("wait", 110) in calls and ("retain", {"deadline": 580}) in calls
+    if custody:
+        assert calls.count("run") == 1
+        assert ("pidfile", (123,), {}) in calls
+        assert ("pidfile", (123, metadata), {"final": False}) in calls
+        commands.deadline = 600
+        commands.peer()
+        assert calls[-1] == ("pidfile", (123, metadata), {"final": True})
+        commands.deadline = 601
+        with pytest.raises(gate.AdmissionError, match="replace the shared deadline"):
+            commands.peer()
+    else:
+        assert "run" not in calls and not any(isinstance(call, tuple) and call[0] == "pidfile" for call in calls)
+
+
+def test_existing_private_pidfile_never_reaches_config_or_launch(tmp_path, monkeypatch):
+    monkeypatch.setattr(native.host, "daemon_config", lambda *_a: {})
+    monkeypatch.setattr(native, "_private_run_identity", lambda *_a: (1, 2))
+    monkeypatch.setattr(native.os.path, "lexists", lambda path: True)
+    monkeypatch.setattr(native, "record", lambda *_a: pytest.fail("existing PIDfile reached config write"))
+    monkeypatch.setattr(native.host, "launch_daemon", lambda *_a: pytest.fail("existing PIDfile launched daemon"))
+    with pytest.raises(gate.AdmissionError, match="already exists"):
+        native.start_daemon(SimpleNamespace(), tmp_path, {"gateway_custody": True}, "http://127.0.0.1:3333")
+
+
 @pytest.mark.parametrize("fault", ["name", "spec_absent", "spec_name", "spec_origin", "file"])
 def test_cli_refuses_alternate_canonical_module_source_before_delegate(monkeypatch, fault):
     import scripts
@@ -322,7 +491,7 @@ def test_outer_supervisor_caps_precede_download_export_and_other_heavy_work(tmp_
         raise Stop
     monkeypatch.setattr(native.host, "host_tools", first_heavy)
     with pytest.raises(Stop):
-        native.outer_plan(SimpleNamespace(), tmp_path, 100)
+        native.outer_plan(SimpleNamespace(gateway_custody=False), tmp_path, 100)
     assert seen == ["caps_installed", "commands_created", "first_heavy_operation"]
 
 
@@ -612,16 +781,19 @@ def test_zero_exit_with_success_and_original_candidate_path_still_passes(tmp_pat
     assert native.observe_child(process, tmp_path, plan, None) == expected
 
 
-def test_outer_failure_preserves_live_holder_without_any_signal(tmp_path, monkeypatch):
+@pytest.mark.parametrize("custody", [False, True])
+def test_outer_failure_preserves_live_holder_without_any_signal(tmp_path, monkeypatch, custody):
     result = failed_child_result()
     plan = {"deadline": 600, "active_deadline": 580, "outer_peer": {"pid": 1}, "source_identity": {},
-            "wrapper_source": native.host.file_proof(Path(native.__file__))}
-    args = SimpleNamespace(repo=tmp_path, source=tmp_path, binary=tmp_path, image_id="sha256:" + "a" * 64)
+            "wrapper_source": native.host.file_proof(Path(native.__file__)), "gateway_custody": custody}
+    args = SimpleNamespace(repo=tmp_path, source=tmp_path, binary=tmp_path, image_id="sha256:" + "a" * 64,
+                           gateway_custody=custody)
     monkeypatch.setattr(native.time, "monotonic", lambda: 100)
     monkeypatch.setattr(native, "outer_plan", lambda *a: (plan, SimpleNamespace(env={})))
     monkeypatch.setattr(native, "peer_identity", lambda: {"pid": 1})
     monkeypatch.setattr(native.private, "source_identity", lambda *a: {})
-    def launch(*args, **kwargs):
+    def launch(argv, **kwargs):
+        assert argv.count("--gateway-custody") == int(custody)
         native.record(tmp_path / "inner/INNER_RESULT.json", result, sealed=True)
         return SimpleNamespace(poll=lambda: None, pid=123, send_signal=lambda *a: pytest.fail("never signal holder"))
     monkeypatch.setattr(native.subprocess, "Popen", launch)
@@ -695,8 +867,9 @@ def test_safe_profile_never_forwards_unrecognized_text():
 
 def test_actual_stage_allowlist_matches_frozen_source_not_arbitrary_text():
     import ast
-    tree = ast.parse(Path(activation.__file__).read_text())
-    actual = {node.args[0].value for node in ast.walk(tree) if isinstance(node, ast.Call)
+    from scripts import production_gateway_custody_native as custody
+    trees = [ast.parse(Path(module.__file__).read_text()) for module in (activation, custody)]
+    actual = {node.args[0].value for tree in trees for node in ast.walk(tree) if isinstance(node, ast.Call)
               and isinstance(node.func, ast.Attribute) and node.func.attr == "stage"
               and node.args and isinstance(node.args[0], ast.Constant)}
     assert actual == native.ACTIVATION_STAGES
@@ -707,6 +880,105 @@ def test_actual_stage_allowlist_matches_frozen_source_not_arbitrary_text():
 def test_unknown_error_class_is_not_forwarded():
     evil = type("SecretPasswordMustNotAppear", (Exception,), {})
     assert native.error_type(evil()) == "unrecognized_exception"
+
+
+@pytest.mark.parametrize("mode", [False, True])
+def test_inner_frozen_mode_reaches_actual_activation_without_new_budget(tmp_path, monkeypatch, mode):
+    from scripts import production_offline_registry as registry
+    observed, contexts = [], []
+    plan = {"active_deadline": 580, "deadline": 600, "bundle": {}, "parent": {}, "repo": str(tmp_path),
+            "source": str(tmp_path), "binary": str(tmp_path), "sender": {"Id": "sha256:" + "a" * 64},
+            "gateway_custody": mode}
+    monkeypatch.setattr(native.os, "setsid", lambda: None)
+    monkeypatch.setattr(native.host, "proc_identity", lambda *_a: {"netns": 10})
+    monkeypatch.setattr(native.host, "restrict_private_ipv6", lambda *_a: None)
+    monkeypatch.setattr(native, "prepare_mounts", lambda *_a: None)
+    monkeypatch.setattr(native, "phase", lambda *_a: None)
+    monkeypatch.setattr(native, "record", lambda *_a, **_k: None)
+    monkeypatch.setattr(native, "resource_check", lambda *_a: {})
+    monkeypatch.setattr(native, "load_dependencies", lambda *_a: None)
+    monkeypatch.setattr(native, "FullCommands", lambda *_a: SimpleNamespace())
+    monkeypatch.setattr(native.PrivateHostContext, "check", lambda *_a, **_k: None)
+    monkeypatch.setattr(native, "start_daemon", lambda *_a: (object(), {}, None))
+    monkeypatch.setattr(native, "stop_daemon", lambda *_a: {"status": "stopped"})
+    monkeypatch.setattr(registry, "serve_bundle", lambda *_a, **_k: nullcontext(SimpleNamespace(url="http://127.0.0.1:3333")))
+    monkeypatch.setattr(native.native_deadline, "scope", lambda *args: contexts.append(args) or nullcontext())
+    def execute(*args, **kwargs):
+        observed.append((args, kwargs))
+        return {"status": "passed", "gateway_custody": kwargs["gateway_custody"]}
+    monkeypatch.setattr(activation, "execute", execute)
+    result = native.inner_execute(tmp_path, plan)
+    assert result["status"] == "passed" and result["activation_result"]["gateway_custody"] is mode
+    assert contexts == [(580, 600)] and len(observed) == 1
+    assert observed[0][0] == (tmp_path, tmp_path, plan["sender"]["Id"], tmp_path, tmp_path / "activation")
+    assert type(observed[0][1]["private_host_context"]) is native.PrivateHostContext
+    assert observed[0][1]["gateway_custody"] is mode
+
+
+@pytest.mark.parametrize("mode", [None, 0, 1, "true", [], {}])
+def test_inner_missing_or_non_boolean_frozen_mode_stops_before_native_operations(monkeypatch, mode):
+    monkeypatch.setattr(native.os, "setsid", lambda: pytest.fail("invalid mode reached namespace"))
+    with pytest.raises(gate.AdmissionError, match="frozen native gateway custody"):
+        native.inner_execute(Path("/unused"), {"gateway_custody": mode})
+
+
+@pytest.mark.parametrize("mode", [None, 0, 1, "true", [], {}])
+def test_outer_non_boolean_mode_stops_before_host_or_cgroup_operations(tmp_path, monkeypatch, mode):
+    monkeypatch.setattr(native, "cgroup_setup", lambda *_a: pytest.fail("invalid mode reached cgroups"))
+    with pytest.raises(gate.AdmissionError, match="explicit native gateway custody"):
+        native.outer_plan(SimpleNamespace(gateway_custody=mode), tmp_path, 100)
+
+
+@pytest.mark.parametrize("cli_mode,plan_mode", [(False, True), (True, False), (False, 0), (True, 1)])
+def test_inner_cli_mode_must_exactly_match_sealed_plan(tmp_path, monkeypatch, capsys, cli_mode, plan_mode):
+    root = tmp_path / "inner"
+    root.mkdir(mode=0o700)
+    image_id = "sha256:" + "a" * 64
+    args = SimpleNamespace(output=root, inside=True, repo=tmp_path, source=tmp_path,
+                           binary=tmp_path, image_id=image_id, gateway_custody=cli_mode)
+    plan = {"repo": str(tmp_path), "source": str(tmp_path), "binary": str(tmp_path),
+            "sender": {"Id": image_id}, "gateway_custody": plan_mode,
+            "wrapper_source": native.host.file_proof(Path(native.__file__))}
+    monkeypatch.setattr(native, "_arguments", lambda *_a: args)
+    monkeypatch.setattr(native.private, "private_directory", lambda *_a: None)
+    monkeypatch.setattr(native, "original", lambda *_a: (plan, {}))
+    monkeypatch.setattr(native, "inner_execute", lambda *_a: pytest.fail("mismatch reached native activation"))
+    monkeypatch.setattr(native, "safe_inventory", lambda *_a: {"complete": False})
+    assert native._main([]) == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "failed_or_evidence_insufficient"
+    assert result["error_sha256"] == hashlib.sha256(b"inner frozen invocation differs").hexdigest()
+
+
+@pytest.mark.parametrize("value,expected", [(False, False), (True, True), (1, None), ("true", None), (None, None)])
+def test_safe_activation_reports_only_boolean_custody_mode(value, expected):
+    assert native.safe_activation({"gateway_custody": value})["gateway_custody"] is expected
+
+
+def test_public_failure_locations_retain_source_line_without_runtime_text():
+    failure = {"type": "RuntimeError", "locations": [{
+        "file": "production_gateway_custody_native.py", "function": "TOKEN=never-export", "line": 159}]}
+    result = native.safe_activation({"failure": failure})
+    assert result["failure_locations"] == [{"file": "production_gateway_custody_native.py", "line": 159}]
+    assert "never-export" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("change", [
+    {"file": "../secrets.py"}, {"file": "/private/secrets.py"}, {"file": "TOKEN_never_export.py"},
+    {"line": True}, {"line": 0}, {"line": 20001}, {"unexpected": "secret"},
+])
+def test_public_failure_locations_reject_unreviewed_or_malformed_fields(change):
+    row = {"file": "production_gateway_custody_native.py", "function": "prepare_and_seal", "line": 159}
+    row.update(change)
+    assert native.safe_failure_locations([row]) is None
+
+
+def test_public_failure_locations_are_bounded_and_not_execution_proof():
+    row = {"file": "production_gateway_custody_native.py", "function": "prepare_and_seal", "line": 159}
+    assert native.safe_failure_locations([row] * 32) == [{"file": row["file"], "line": 159}] * 32
+    assert native.safe_failure_locations([row] * 33) is None
+    assert native.safe_failure_locations(None) is None
+    assert native.safe_failure_locations([]) == []
 
 
 def test_failed_terminal_summary_reports_safe_child_phase_without_waiting_for_holder(tmp_path, monkeypatch, capsys):
@@ -778,6 +1050,49 @@ def test_inventory_budget_exhaustion_stops_before_hashing(tmp_path, monkeypatch)
     monkeypatch.setattr(native.host, "file_proof", lambda *a, **k: pytest.fail("cannot hash after original deadline"))
     with pytest.raises(gate.AdmissionError):
         native.safe_inventory(tmp_path, 600)
+
+
+@pytest.mark.parametrize("mutation", [None, "missing", "failed", "schema", "roles", "mounts", "legacy", "actual125"])
+def test_custody_inventory_requires_actual_safe_completion_profile_only_in_new_mode(tmp_path, monkeypatch, mutation):
+    monkeypatch.setattr(native.time, "monotonic", lambda: 100)
+    paths = ["inner/INNER_RESULT.json", "inner/activation/RESULT.json", "inner/DAEMON_STOP.json", "inner/RESOURCES_FINAL.json"]
+    for name in paths:
+        path = tmp_path / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        native.record(path, {}, sealed=name.endswith("INNER_RESULT.json"))
+    path = tmp_path / "inner/activation/receiver/ACTUAL_CUSTODY_PROOF.json"
+    value = {"schema": 1, "status": "passed", "old_project_roles": 3, "old_gateway_mounts": 0,
+             "actual_gateway_and_live_legacy": True, "actual_125_compatibility_proven": False,
+             "token": "raw-secret-must-not-export"}
+    for key, changed in {"failed": ("status", "failed"), "schema": ("schema", True), "roles": ("old_project_roles", 3.0),
+                         "mounts": ("old_gateway_mounts", False), "legacy": ("actual_gateway_and_live_legacy", False),
+                         "actual125": ("actual_125_compatibility_proven", True)}.items():
+        if mutation == key:
+            value[changed[0]] = changed[1]
+    if mutation != "missing":
+        path.parent.mkdir(mode=0o700)
+        native.record(path, value)
+    before = path.read_bytes() if path.exists() else None
+    old = native.safe_inventory(tmp_path, 600)
+    assert old["complete"] is True and "ACTUAL_CUSTODY_PROOF.json" not in old["profiles"]
+    new = native.safe_inventory(tmp_path, 600, gateway_custody=True)
+    assert new["complete"] is (mutation is None)
+    assert "raw-secret-must-not-export" not in json.dumps(new)
+    assert (path.read_bytes() if path.exists() else None) == before
+    if mutation is None:
+        assert new["profiles"]["ACTUAL_CUSTODY_PROOF.json"] == {
+            "status": "passed", "sha256": hashlib.sha256(before).hexdigest(), "actual_125_compatibility_proven": False}
+
+
+def test_custody_completion_cannot_use_different_bytes_after_inventory(tmp_path, monkeypatch):
+    name = "inner/activation/receiver/ACTUAL_CUSTODY_PROOF.json"
+    path = tmp_path / name
+    path.parent.mkdir(mode=0o700, parents=True)
+    native.record(path, {"status": "passed"})
+    records = [{"path_sha256": hashlib.sha256(name.encode()).hexdigest(), "sha256": "a" * 64}]
+    monkeypatch.setattr(native.time, "monotonic", lambda: 100)
+    with pytest.raises(gate.AdmissionError, match="completion original changed"):
+        native.custody_completion_profile(tmp_path, records, 600)
 
 
 def test_inventory_one_directory_cannot_exceed_entry_count(tmp_path, monkeypatch):
@@ -894,7 +1209,8 @@ def test_failed_inner_paths_preserve_live_daemon_and_never_term_even_if_ps_empty
         return {"status": "failed_or_evidence_insufficient"}
     monkeypatch.setattr(activation, "execute", execute)
     plan = {"active_deadline": 580, "deadline": 600, "bundle": {}, "parent": {}, "repo": str(tmp_path),
-            "source": str(tmp_path), "binary": str(tmp_path), "sender": {"Id": "sha256:" + "a" * 64}}
+            "source": str(tmp_path), "binary": str(tmp_path), "sender": {"Id": "sha256:" + "a" * 64},
+            "gateway_custody": False}
     result = native.inner_execute(tmp_path, plan)
     assert result["status"] == "failed_or_evidence_insufficient" and result["retained_live_daemon"] is True
     assert result["daemon_stop"] is None
