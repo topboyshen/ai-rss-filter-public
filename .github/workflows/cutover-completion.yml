@@ -45,7 +45,18 @@ on:
       - 'scripts/production_admission_watchdog.py'
       - 'scripts/production_legacy_takeover.py'
       - 'scripts/production_gateway_switch.py'
+      - 'scripts/retained_gateway_configuration.py'
+      - 'scripts/retained_gateway_custody.py'
+      - 'tests/test_retained_gateway_configuration.py'
+      - 'tests/test_retained_gateway_custody.py'
+      - 'tests/test_production_gateway_custody_lifecycle.py'
+      - 'tests/test_legacy_gateway_configuration.py'
+      - 'tests/test_controlled_release_finalize_custody.py'
+      - 'tests/test_production_sender_bootstrap_export.py'
+      - 'tests/test_production_sender_bootstrap_pg_diagnostics.py'
       - 'scripts/production_gateway_native.py'
+      - 'scripts/production_gateway_custody_native.py'
+      - 'tests/test_production_gateway_custody_native.py'
       - 'scripts/production_host_ingress_native.py'
       - 'scripts/production_activation_host_native.py'
       - 'scripts/production_offline_registry.py'
@@ -152,7 +163,18 @@ on:
       - 'scripts/production_admission_watchdog.py'
       - 'scripts/production_legacy_takeover.py'
       - 'scripts/production_gateway_switch.py'
+      - 'scripts/retained_gateway_configuration.py'
+      - 'scripts/retained_gateway_custody.py'
+      - 'tests/test_retained_gateway_configuration.py'
+      - 'tests/test_retained_gateway_custody.py'
+      - 'tests/test_production_gateway_custody_lifecycle.py'
+      - 'tests/test_legacy_gateway_configuration.py'
+      - 'tests/test_controlled_release_finalize_custody.py'
+      - 'tests/test_production_sender_bootstrap_export.py'
+      - 'tests/test_production_sender_bootstrap_pg_diagnostics.py'
       - 'scripts/production_gateway_native.py'
+      - 'scripts/production_gateway_custody_native.py'
+      - 'tests/test_production_gateway_custody_native.py'
       - 'scripts/production_host_ingress_native.py'
       - 'scripts/production_activation_host_native.py'
       - 'scripts/production_offline_registry.py'
@@ -406,6 +428,21 @@ jobs:
           assert proof['limits'] == {'application_memory': 768 * 1024**2, 'application_pids': 256,
               'postgres_memory': 384 * 1024**2, 'postgres_pids': 64, 'operation_seconds': 180}
           assert {'HOST_LOOPBACK.json', 'SEED131.json', 'DIRECT131_RESTART.json', 'DIRECT131_OLD_LIMIT.json'} <= files.keys()
+          pg_checks = files['LOOPBACK_PG_CHECKS.json']['content']
+          assert pg_checks['scope'] == 'loopback_pg_resource_predicates_only' and pg_checks['execution_proof'] is False
+          assert pg_checks['passed'] is True and set(pg_checks['checks']) == {
+              'actual_fixed_image', 'owned_label', 'private_bridge', 'exact_loopback_port', 'memory', 'pids',
+              'cpu', 'not_privileged', 'no_new_privileges', 'not_oom', 'real_healthcheck'}
+          assert all(value is True for value in pg_checks['checks'].values())
+          port_diagnostics = pg_checks['port_diagnostics']
+          assert set(port_diagnostics) == {
+              'requested_expected', 'runtime_expected', 'requested_runtime_equal', 'requested_is_null',
+              'runtime_is_null', 'requested_empty_mapping', 'runtime_empty_mapping', 'runtime_only_pg_null',
+              'requested_has_extra_ports', 'runtime_has_extra_ports', 'requested_invalid_type', 'runtime_invalid_type',
+              'pg_running', 'pg_created'}
+          assert all(type(value) is bool for value in port_diagnostics.values())
+          assert {key for key, value in port_diagnostics.items() if value} == {
+              'requested_expected', 'runtime_expected', 'requested_runtime_equal', 'pg_running'}
           PY
       - name: Prepare host131 evidence without following links
         if: always()
@@ -544,11 +581,13 @@ jobs:
                   str(root / 'source/scripts/production_activation_host_native.py'),
                   '--repo', str(root / 'source'), '--source', str(root / 'miniflux'),
                   '--binary', str(root / 'miniflux-binary'), '--image-id', os.environ['AI_FILTER_NATIVE_BOOTSTRAP_IMAGE'],
-                  '--output', str(root / 'activation-originals')]
+                  '--output', str(root / 'activation-originals'), '--gateway-custody']
           archive.archive_command(args, output, seconds=600, limit=512 * 1024, child_umask=0o077)
           result = json.loads(pathlib.Path(str(output) + '.stdout').read_bytes())
           assert result['status'] == 'passed' and result['safe_evidence']['complete'] is True
           assert result['full_activation_verified'] is True
+          assert result['activation']['gateway_custody'] is True
+          assert result['safe_evidence']['profiles']['ACTUAL_CUSTODY_PROOF.json']['status'] == 'passed'
           PY
       - name: Preserve actual synthetic PostgreSQL state on success or failure
         if: always()

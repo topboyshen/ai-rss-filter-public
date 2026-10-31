@@ -378,6 +378,45 @@ def test_activation_cannot_open_before_gateway_and_actual_watchdog(activation_ed
     assert (p.roots["evidence_root"] / "watchdog-prepared.json").exists()
 
 
+def test_activation_threads_same_legacy_and_gateway_objects_instead_of_their_receipts(activation_edges, monkeypatch):
+    from scripts import production_gateway_switch as gateway
+    p, _calls, sender, _registry = activation_edges
+    legacy = object()
+    receipt = {"status": "synthetic_route_proof"}
+    adapter = SimpleNamespace(switch=lambda: receipt)
+    monkeypatch.setattr(gateway, "GatewaySwitch", lambda *_a: adapter)
+    seen = []
+    def verify(_receiver, _evidence, **options):
+        assert options["legacy"] is legacy
+        assert options["gateway"] is adapter and options["gateway"] is not receipt
+        seen.append(True)
+        return {"status": "synthetic_runtime_proof"}
+    monkeypatch.setattr(deploy.lifecycle, "verify_active", verify)
+    result = deploy.active_phase(p.plan, p.permit, p.final, {}, sender, object(), legacy)
+    assert seen == [True] and result["gateway"] is receipt
+
+
+def test_closed_lifecycle_retains_the_same_legacy_capability_across_create_start_and_query(bound_plan, monkeypatch):
+    p, legacy, seen = bound_plan, object(), []
+    session = SimpleNamespace(authorize=lambda: None, migrate=lambda: {"status": "synthetic_migrated"})
+    @contextmanager
+    def locked(*_args, **_options):
+        yield session
+    monkeypatch.setattr(deploy.migration, "locked_session", locked)
+    def stage(name, result):
+        def invoke(actual_session, *_args, **options):
+            assert actual_session is session and options["legacy"] is legacy
+            seen.append(name)
+            return result
+        return invoke
+    monkeypatch.setattr(deploy.lifecycle, "create", stage("create", {}))
+    monkeypatch.setattr(deploy.lifecycle, "start", stage("start", {"status": "initializing"}))
+    monkeypatch.setattr(deploy.lifecycle, "query", stage("query", {"status": "closed_initialized"}))
+    monkeypatch.setattr(deploy, "arm", lambda *_a, **_kw: {"status": "synthetic_armed"})
+    result = deploy.closed_phase(p.plan, p.permit, object(), legacy)
+    assert seen == ["create", "start", "query"] and result["started"]["status"] == "closed_initialized"
+
+
 def test_watchdog_readiness_failure_never_opens_receiver_or_sender(activation_edges, monkeypatch):
     p, calls, sender, _registry = activation_edges
     def failed(_prepared):

@@ -542,12 +542,15 @@ def closed_initialization(harness, p):
     return driver
 
 
-def create_and_start(session, p):
+def create_and_start(session, p, *, legacy=None):
     from services import production_container_lifecycle as lifecycle
     paths = {"database": "/app/data/fixture.db", "config": "/app/config.yaml",
              "freeze": "/app/data/admission_fence", "state": "/app/data/startup_slots"}
     args = (session, p["paths"]["grants"], p["paths"]["slots"], p["paths"]["lifecycle"])
-    created = lifecycle.create(*args, operation_id=p["operation"], paths=paths, web_workers=2, threads=4)
+    capabilities = {} if legacy is None else {"legacy": legacy}
+    created = lifecycle.create(*args, operation_id=p["operation"], paths=paths, web_workers=2, threads=4, **capabilities)
+    if legacy is not None:
+        p["custody_new_containers"] = dict(created["containers"])
     original = private.run
     calls = []
     def dropped_start(command):
@@ -559,7 +562,7 @@ def create_and_start(session, p):
     try:
         private.run = dropped_start
         try:
-            lifecycle.start(*args, operation_id=p["operation"])
+            lifecycle.start(*args, operation_id=p["operation"], **capabilities)
         except LostAck:
             pass
         else:
@@ -568,10 +571,10 @@ def create_and_start(session, p):
         private.run = original
     deadline = time.monotonic() + 40
     while time.monotonic() < deadline:
-        result = lifecycle.query(*args, operation_id=p["operation"])
+        result = lifecycle.query(*args, operation_id=p["operation"], **capabilities)
         if result["status"] == "closed_initialized":
             gate._require(len(calls) == 1, "Docker start repeated")
-            require_rejected(lambda: lifecycle.start(*args, operation_id=p["operation"]))
+            require_rejected(lambda: lifecycle.start(*args, operation_id=p["operation"], **capabilities))
             return created, result
         time.sleep(0.1)
     raise TimeoutError("actual candidate startup did not confirm")
@@ -679,7 +682,7 @@ def _watchdog_window(p, harness, receiver, native_driver):
 
 
 
-def activate(harness, p, driver, migration_root, native_driver, *, release_lock=None):
+def activate(harness, p, driver, migration_root, native_driver, *, release_lock=None, legacy=None):
     from services.production_activation_control import locked_activation
     from services.production_container_lifecycle import verify_active
     with locked_activation(migration_root, p["paths"]["grants"], p["paths"]["slots"],
@@ -718,7 +721,8 @@ def activate(harness, p, driver, migration_root, native_driver, *, release_lock=
                      "actual_process": True, "transport_scope": "synthetic_loopback_to_owned_go"})
         harness.stage("receiver_resume_and_independent_runtime_verification")
         resumed = receiver.resume()
-        verified = verify_active(receiver, p["paths"]["lifecycle"], operation_id=p["operation"])
+        capabilities = {} if legacy is None else {"legacy": legacy, "gateway": gateway}
+        verified = verify_active(receiver, p["paths"]["lifecycle"], operation_id=p["operation"], **capabilities)
         harness.stage("sender_resume_lost_ack_exact_query")
         transport = p["sender_transport"]
         transport.drop.add("/production-resume")
@@ -794,7 +798,7 @@ def complete_native_supervision(harness, p, active, native_driver, migration_roo
     actual_namespace_transport(harness, p, stopped)
 
 
-def retained_native_phases(harness, p, driver, native_driver, permit, migration_root):
+def retained_native_phases(harness, p, driver, native_driver, permit, migration_root, *, legacy=None):
     from services import production_migration as migration
     from services.production_activation_control import arm
     from services.production_release_lock import retained_release_lock
@@ -802,7 +806,8 @@ def retained_native_phases(harness, p, driver, native_driver, permit, migration_
         with migration.locked_session(migration_root, permit, release_lock=release_lock) as session:
             session.authorize()
             completed = session.migrate()
-            created, started = create_and_start(session, p)
+            capabilities = {} if legacy is None else {"legacy": legacy}
+            created, started = create_and_start(session, p, **capabilities)
             web = created["containers"]["web"]
             gate._require(harness.receiver_http(web, "/refresh")["status"] == 503, "closed receiver performed business")
             from services.production_admission_lifecycle import source_sha256
@@ -817,7 +822,7 @@ def retained_native_phases(harness, p, driver, native_driver, permit, migration_
             fixture.save(p["directory"] / "CLOSED_LIFECYCLE.json", {"migration": completed, "created": created,
                 "started": started, "armed": armed, "old_container_ids": sorted(p["previous_containers"]),
                 "old_binary_execution_proven": False})
-        return activate(harness, p, driver, migration_root, native_driver, release_lock=release_lock)
+        return activate(harness, p, driver, migration_root, native_driver, release_lock=release_lock, **capabilities)
 
 
 def abort_native_guardian(p):
@@ -1051,7 +1056,9 @@ def record_failure(error, repo, output, stage, *, private_commands=None):
     return failure
 
 
-def execute(repo, source, image_id, binary, output, *, private_host_context=None):
+def execute(repo, source, image_id, binary, output, *, private_host_context=None, gateway_custody=False):
+    gate._require(type(gateway_custody) is bool and (not gateway_custody or private_host_context is not None),
+                  "custody opt-in requires the actual private host context")
     binding = source_binding(repo, source, binary)
     harness = ActivationHarness(repo, source, image_id, binary, output, private_host_context=private_host_context)
     fixture.save(output / "SOURCE.json", binding)
@@ -1066,7 +1073,11 @@ def execute(repo, source, image_id, binary, output, *, private_host_context=None
             harness.stage("bounded_internal_network_and_real_redis")
             harness.prepare()
             harness.redis()
-            scenario(harness, output)
+            if gateway_custody:
+                from scripts.production_gateway_custody_native import scenario as custody_scenario
+                custody_scenario(harness, output)
+            else:
+                scenario(harness, output)
         except BaseException as error:
             failure = record_failure(error, repo, output, harness.current_stage,
                                      private_commands=observation.summary() if observation else None)
@@ -1088,6 +1099,7 @@ def execute(repo, source, image_id, binary, output, *, private_host_context=None
         "evidence_errors": evidence_errors, "elapsed_seconds": time.monotonic() - harness.started,
         "last_stage": harness.current_stage,
         "synthetic_only": True, "production_access": False, "existing_126_modified": False, "real_models": 0,
+        "gateway_custody": gateway_custody, "actual_125_compatibility_proven": False,
         "limits": ["unknown_before_T0_no_replay", "old_binary_not_executed", "no_power_loss_proof", "no_model_quality_proof"],
         "app_memory_bytes": 768 * 1024**2, "app_pids": 256, "pg_memory_bytes": 384 * 1024**2, "pg_pids": 64}
     fixture.save(output / "RESULT.json", report)

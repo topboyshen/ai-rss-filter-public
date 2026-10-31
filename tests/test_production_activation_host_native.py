@@ -322,7 +322,7 @@ def test_outer_supervisor_caps_precede_download_export_and_other_heavy_work(tmp_
         raise Stop
     monkeypatch.setattr(native.host, "host_tools", first_heavy)
     with pytest.raises(Stop):
-        native.outer_plan(SimpleNamespace(), tmp_path, 100)
+        native.outer_plan(SimpleNamespace(gateway_custody=False), tmp_path, 100)
     assert seen == ["caps_installed", "commands_created", "first_heavy_operation"]
 
 
@@ -612,16 +612,19 @@ def test_zero_exit_with_success_and_original_candidate_path_still_passes(tmp_pat
     assert native.observe_child(process, tmp_path, plan, None) == expected
 
 
-def test_outer_failure_preserves_live_holder_without_any_signal(tmp_path, monkeypatch):
+@pytest.mark.parametrize("custody", [False, True])
+def test_outer_failure_preserves_live_holder_without_any_signal(tmp_path, monkeypatch, custody):
     result = failed_child_result()
     plan = {"deadline": 600, "active_deadline": 580, "outer_peer": {"pid": 1}, "source_identity": {},
-            "wrapper_source": native.host.file_proof(Path(native.__file__))}
-    args = SimpleNamespace(repo=tmp_path, source=tmp_path, binary=tmp_path, image_id="sha256:" + "a" * 64)
+            "wrapper_source": native.host.file_proof(Path(native.__file__)), "gateway_custody": custody}
+    args = SimpleNamespace(repo=tmp_path, source=tmp_path, binary=tmp_path, image_id="sha256:" + "a" * 64,
+                           gateway_custody=custody)
     monkeypatch.setattr(native.time, "monotonic", lambda: 100)
     monkeypatch.setattr(native, "outer_plan", lambda *a: (plan, SimpleNamespace(env={})))
     monkeypatch.setattr(native, "peer_identity", lambda: {"pid": 1})
     monkeypatch.setattr(native.private, "source_identity", lambda *a: {})
-    def launch(*args, **kwargs):
+    def launch(argv, **kwargs):
+        assert argv.count("--gateway-custody") == int(custody)
         native.record(tmp_path / "inner/INNER_RESULT.json", result, sealed=True)
         return SimpleNamespace(poll=lambda: None, pid=123, send_signal=lambda *a: pytest.fail("never signal holder"))
     monkeypatch.setattr(native.subprocess, "Popen", launch)
@@ -695,8 +698,9 @@ def test_safe_profile_never_forwards_unrecognized_text():
 
 def test_actual_stage_allowlist_matches_frozen_source_not_arbitrary_text():
     import ast
-    tree = ast.parse(Path(activation.__file__).read_text())
-    actual = {node.args[0].value for node in ast.walk(tree) if isinstance(node, ast.Call)
+    from scripts import production_gateway_custody_native as custody
+    trees = [ast.parse(Path(module.__file__).read_text()) for module in (activation, custody)]
+    actual = {node.args[0].value for tree in trees for node in ast.walk(tree) if isinstance(node, ast.Call)
               and isinstance(node.func, ast.Attribute) and node.func.attr == "stage"
               and node.args and isinstance(node.args[0], ast.Constant)}
     assert actual == native.ACTIVATION_STAGES
@@ -707,6 +711,79 @@ def test_actual_stage_allowlist_matches_frozen_source_not_arbitrary_text():
 def test_unknown_error_class_is_not_forwarded():
     evil = type("SecretPasswordMustNotAppear", (Exception,), {})
     assert native.error_type(evil()) == "unrecognized_exception"
+
+
+@pytest.mark.parametrize("mode", [False, True])
+def test_inner_frozen_mode_reaches_actual_activation_without_new_budget(tmp_path, monkeypatch, mode):
+    from scripts import production_offline_registry as registry
+    observed, contexts = [], []
+    plan = {"active_deadline": 580, "deadline": 600, "bundle": {}, "parent": {}, "repo": str(tmp_path),
+            "source": str(tmp_path), "binary": str(tmp_path), "sender": {"Id": "sha256:" + "a" * 64},
+            "gateway_custody": mode}
+    monkeypatch.setattr(native.os, "setsid", lambda: None)
+    monkeypatch.setattr(native.host, "proc_identity", lambda *_a: {"netns": 10})
+    monkeypatch.setattr(native.host, "restrict_private_ipv6", lambda *_a: None)
+    monkeypatch.setattr(native, "prepare_mounts", lambda *_a: None)
+    monkeypatch.setattr(native, "phase", lambda *_a: None)
+    monkeypatch.setattr(native, "record", lambda *_a, **_k: None)
+    monkeypatch.setattr(native, "resource_check", lambda *_a: {})
+    monkeypatch.setattr(native, "load_dependencies", lambda *_a: None)
+    monkeypatch.setattr(native, "FullCommands", lambda *_a: SimpleNamespace())
+    monkeypatch.setattr(native.PrivateHostContext, "check", lambda *_a, **_k: None)
+    monkeypatch.setattr(native, "start_daemon", lambda *_a: (object(), {}, None))
+    monkeypatch.setattr(native, "stop_daemon", lambda *_a: {"status": "stopped"})
+    monkeypatch.setattr(registry, "serve_bundle", lambda *_a, **_k: nullcontext(SimpleNamespace(url="http://127.0.0.1:3333")))
+    monkeypatch.setattr(native.native_deadline, "scope", lambda *args: contexts.append(args) or nullcontext())
+    def execute(*args, **kwargs):
+        observed.append((args, kwargs))
+        return {"status": "passed", "gateway_custody": kwargs["gateway_custody"]}
+    monkeypatch.setattr(activation, "execute", execute)
+    result = native.inner_execute(tmp_path, plan)
+    assert result["status"] == "passed" and result["activation_result"]["gateway_custody"] is mode
+    assert contexts == [(580, 600)] and len(observed) == 1
+    assert observed[0][0] == (tmp_path, tmp_path, plan["sender"]["Id"], tmp_path, tmp_path / "activation")
+    assert type(observed[0][1]["private_host_context"]) is native.PrivateHostContext
+    assert observed[0][1]["gateway_custody"] is mode
+
+
+@pytest.mark.parametrize("mode", [None, 0, 1, "true", [], {}])
+def test_inner_missing_or_non_boolean_frozen_mode_stops_before_native_operations(monkeypatch, mode):
+    monkeypatch.setattr(native.os, "setsid", lambda: pytest.fail("invalid mode reached namespace"))
+    with pytest.raises(gate.AdmissionError, match="frozen native gateway custody"):
+        native.inner_execute(Path("/unused"), {"gateway_custody": mode})
+
+
+@pytest.mark.parametrize("mode", [None, 0, 1, "true", [], {}])
+def test_outer_non_boolean_mode_stops_before_host_or_cgroup_operations(tmp_path, monkeypatch, mode):
+    monkeypatch.setattr(native, "cgroup_setup", lambda *_a: pytest.fail("invalid mode reached cgroups"))
+    with pytest.raises(gate.AdmissionError, match="explicit native gateway custody"):
+        native.outer_plan(SimpleNamespace(gateway_custody=mode), tmp_path, 100)
+
+
+@pytest.mark.parametrize("cli_mode,plan_mode", [(False, True), (True, False), (False, 0), (True, 1)])
+def test_inner_cli_mode_must_exactly_match_sealed_plan(tmp_path, monkeypatch, capsys, cli_mode, plan_mode):
+    root = tmp_path / "inner"
+    root.mkdir(mode=0o700)
+    image_id = "sha256:" + "a" * 64
+    args = SimpleNamespace(output=root, inside=True, repo=tmp_path, source=tmp_path,
+                           binary=tmp_path, image_id=image_id, gateway_custody=cli_mode)
+    plan = {"repo": str(tmp_path), "source": str(tmp_path), "binary": str(tmp_path),
+            "sender": {"Id": image_id}, "gateway_custody": plan_mode,
+            "wrapper_source": native.host.file_proof(Path(native.__file__))}
+    monkeypatch.setattr(native, "_arguments", lambda *_a: args)
+    monkeypatch.setattr(native.private, "private_directory", lambda *_a: None)
+    monkeypatch.setattr(native, "original", lambda *_a: (plan, {}))
+    monkeypatch.setattr(native, "inner_execute", lambda *_a: pytest.fail("mismatch reached native activation"))
+    monkeypatch.setattr(native, "safe_inventory", lambda *_a: {"complete": False})
+    assert native._main([]) == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "failed_or_evidence_insufficient"
+    assert result["error_sha256"] == hashlib.sha256(b"inner frozen invocation differs").hexdigest()
+
+
+@pytest.mark.parametrize("value,expected", [(False, False), (True, True), (1, None), ("true", None), (None, None)])
+def test_safe_activation_reports_only_boolean_custody_mode(value, expected):
+    assert native.safe_activation({"gateway_custody": value})["gateway_custody"] is expected
 
 
 def test_failed_terminal_summary_reports_safe_child_phase_without_waiting_for_holder(tmp_path, monkeypatch, capsys):
@@ -778,6 +855,49 @@ def test_inventory_budget_exhaustion_stops_before_hashing(tmp_path, monkeypatch)
     monkeypatch.setattr(native.host, "file_proof", lambda *a, **k: pytest.fail("cannot hash after original deadline"))
     with pytest.raises(gate.AdmissionError):
         native.safe_inventory(tmp_path, 600)
+
+
+@pytest.mark.parametrize("mutation", [None, "missing", "failed", "schema", "roles", "mounts", "legacy", "actual125"])
+def test_custody_inventory_requires_actual_safe_completion_profile_only_in_new_mode(tmp_path, monkeypatch, mutation):
+    monkeypatch.setattr(native.time, "monotonic", lambda: 100)
+    paths = ["inner/INNER_RESULT.json", "inner/activation/RESULT.json", "inner/DAEMON_STOP.json", "inner/RESOURCES_FINAL.json"]
+    for name in paths:
+        path = tmp_path / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        native.record(path, {}, sealed=name.endswith("INNER_RESULT.json"))
+    path = tmp_path / "inner/activation/receiver/ACTUAL_CUSTODY_PROOF.json"
+    value = {"schema": 1, "status": "passed", "old_project_roles": 3, "old_gateway_mounts": 0,
+             "actual_gateway_and_live_legacy": True, "actual_125_compatibility_proven": False,
+             "token": "raw-secret-must-not-export"}
+    for key, changed in {"failed": ("status", "failed"), "schema": ("schema", True), "roles": ("old_project_roles", 3.0),
+                         "mounts": ("old_gateway_mounts", False), "legacy": ("actual_gateway_and_live_legacy", False),
+                         "actual125": ("actual_125_compatibility_proven", True)}.items():
+        if mutation == key:
+            value[changed[0]] = changed[1]
+    if mutation != "missing":
+        path.parent.mkdir(mode=0o700)
+        native.record(path, value)
+    before = path.read_bytes() if path.exists() else None
+    old = native.safe_inventory(tmp_path, 600)
+    assert old["complete"] is True and "ACTUAL_CUSTODY_PROOF.json" not in old["profiles"]
+    new = native.safe_inventory(tmp_path, 600, gateway_custody=True)
+    assert new["complete"] is (mutation is None)
+    assert "raw-secret-must-not-export" not in json.dumps(new)
+    assert (path.read_bytes() if path.exists() else None) == before
+    if mutation is None:
+        assert new["profiles"]["ACTUAL_CUSTODY_PROOF.json"] == {
+            "status": "passed", "sha256": hashlib.sha256(before).hexdigest(), "actual_125_compatibility_proven": False}
+
+
+def test_custody_completion_cannot_use_different_bytes_after_inventory(tmp_path, monkeypatch):
+    name = "inner/activation/receiver/ACTUAL_CUSTODY_PROOF.json"
+    path = tmp_path / name
+    path.parent.mkdir(mode=0o700, parents=True)
+    native.record(path, {"status": "passed"})
+    records = [{"path_sha256": hashlib.sha256(name.encode()).hexdigest(), "sha256": "a" * 64}]
+    monkeypatch.setattr(native.time, "monotonic", lambda: 100)
+    with pytest.raises(gate.AdmissionError, match="completion original changed"):
+        native.custody_completion_profile(tmp_path, records, 600)
 
 
 def test_inventory_one_directory_cannot_exceed_entry_count(tmp_path, monkeypatch):
@@ -894,7 +1014,8 @@ def test_failed_inner_paths_preserve_live_daemon_and_never_term_even_if_ps_empty
         return {"status": "failed_or_evidence_insufficient"}
     monkeypatch.setattr(activation, "execute", execute)
     plan = {"active_deadline": 580, "deadline": 600, "bundle": {}, "parent": {}, "repo": str(tmp_path),
-            "source": str(tmp_path), "binary": str(tmp_path), "sender": {"Id": "sha256:" + "a" * 64}}
+            "source": str(tmp_path), "binary": str(tmp_path), "sender": {"Id": "sha256:" + "a" * 64},
+            "gateway_custody": False}
     result = native.inner_execute(tmp_path, plan)
     assert result["status"] == "failed_or_evidence_insufficient" and result["retained_live_daemon"] is True
     assert result["daemon_stop"] is None

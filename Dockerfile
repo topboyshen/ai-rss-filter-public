@@ -70,9 +70,11 @@ COPY scripts/observe_handoff_capacity.py ./scripts/observe_handoff_capacity.py
 COPY scripts/production_admission_supervisor.py ./scripts/production_admission_supervisor.py
 COPY scripts/production_admission_watchdog.py ./scripts/production_admission_watchdog.py
 COPY scripts/sender_namespace_http.py ./scripts/sender_namespace_http.py
+COPY scripts/retained_gateway_configuration.py ./scripts/retained_gateway_configuration.py
+COPY scripts/retained_gateway_custody.py ./scripts/retained_gateway_custody.py
 RUN chmod +x /app/start.sh && python -m py_compile app.py sse_engine.py worker_main.py gunicorn.conf.py scoring_provenance.py scoring_explanation.py core/*.py db/*.py utils/*.py routes/*.py services/*.py workers/*.py modules/*.py scripts/run_event_enrichment.py scripts/run_provenance_shadow.py scripts/export_score_gold_candidates.py scripts/import_score_gold_labels.py scripts/score_gold_metrics.py \
     && python -m py_compile scripts/run_controlled_startup.py \
-    && python -c "import scoring_explanation"
+    && python -c "import scoring_explanation; import scripts.retained_gateway_configuration; import scripts.retained_gateway_custody"
 HEALTHCHECK --interval=60s --timeout=5s --start-period=20s --retries=3 \
   CMD python -c "from urllib.request import urlopen; urlopen('http://127.0.0.1:5000/health', timeout=3).read()"
 # gunicorn 生产服务器（worker 进程用 command 覆盖为 worker_main.py）

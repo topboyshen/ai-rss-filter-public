@@ -86,11 +86,25 @@ def _old_binding(records):
             for row in records}
 
 
-def _before_create(contract, manifest, roles):
+def _custody(contract, manifest, records, *, legacy, private_digest):
+    reviewed = private.retained_custody(contract, manifest)
+    if reviewed is None:
+        return None
+    helper, held = reviewed
+    try:
+        row = helper.verify_records(held, contract["review"], records)
+        helper.verify_legacy(held, row, legacy, private_digest=private_digest)
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise gate.AdmissionError("retained gateway live custody differs") from None
+    return helper, held
+
+
+def _before_create(contract, manifest, roles, *, legacy=None, private_digest=None):
     private.preflight(contract, manifest)
     records = private.inspect_project(contract)
     gate._require(private.runtime_topology(records) == contract["review"]["existing_topology"],
                   "previous project changed before create")
+    _custody(contract, manifest, records, legacy=legacy, private_digest=private_digest)
     names = set(roles.values())
     gate._require(not names.intersection(_service(row) for row in records),
                   "candidate service names must not replace retained previous containers")
@@ -105,13 +119,17 @@ def _before_create(contract, manifest, roles):
     return records
 
 
-def _project(contract, intent):
+def _project(contract, intent, *, legacy=None, private_digest=None, manifest=None):
     records = private.inspect_project(contract)
     old_ids = set(intent["previous_containers"])
     old = [row for row in records if row["Id"] in old_ids]
     gate._require(len(old) == len(old_ids) and _old_binding(old) == intent["previous_containers"]
                   and private.runtime_topology(old) == contract["review"]["existing_topology"],
                   "retained previous runtime changed")
+    custody = _custody(contract, manifest, records, legacy=legacy, private_digest=private_digest)
+    gate._require((custody is None and "retained_gateway_custody" not in intent)
+                  or (custody is not None and intent.get("retained_gateway_custody") == custody[1]["sha256"]),
+                  "original retained gateway declaration changed")
     new = [row for row in records if row["Id"] not in old_ids]
     names = set(intent["roles"].values())
     gate._require(len(new) == 2 and {_service(row) for row in new} == names,
@@ -122,12 +140,16 @@ def _project(contract, intent):
     return by_role
 
 
-def _intent_binding(session, paths, operation_id, private_digest, roles, previous, workers, threads, runtime_paths):
-    return {"schema": 1, "operation_id": operation_id, "migration_permit_sha256": gate._hash(session.permit),
+def _intent_binding(session, paths, operation_id, private_digest, roles, previous, workers, threads, runtime_paths,
+                    *, custody=None):
+    result = {"schema": 1, "operation_id": operation_id, "migration_permit_sha256": gate._hash(session.permit),
             "private_contract_sha256": private_digest, "source": session.permit["source"],
             "runtime_root": str(paths[0]), "state": str(paths[1]), "roles": roles,
             "previous_containers": _old_binding(previous), "web_workers": workers, "threads": threads,
             "runtime_paths": runtime_paths, "business_open": False}
+    if custody is not None:
+        result["retained_gateway_custody"] = custody[1]["sha256"]
+    return result
 
 
 def _new_operation(evidence):
@@ -137,7 +159,7 @@ def _new_operation(evidence):
                       "lifecycle already attempted; query original operation only")
 
 
-def create(session, runtime_root, state, evidence, *, operation_id, paths, web_workers, threads=16):
+def create(session, runtime_root, state, evidence, *, operation_id, paths, web_workers, threads=16, legacy=None):
     """One create command; old candidates and ambiguous ACKs are never reused."""
     roots, directory, contract, manifest, private_digest = _inputs(
         session, runtime_root, state, evidence, operation_id)
@@ -150,16 +172,17 @@ def create(session, runtime_root, state, evidence, *, operation_id, paths, web_w
     _create_scope(manifest)
     _new_operation(evidence)
     roles = _roles(contract, manifest)
-    previous = _before_create(contract, manifest, roles)
+    previous = _before_create(contract, manifest, roles, legacy=legacy, private_digest=private_digest)
+    custody = _custody(contract, manifest, previous, legacy=legacy, private_digest=private_digest)
     intent = _intent_binding(session, roots, operation_id, private_digest, roles, previous,
-                             web_workers, threads, paths)
+                             web_workers, threads, paths, custody=custody)
     _save(evidence / "create.intent.json", intent)
     session.check(active=True)
     private.compose(contract, directory, session.permit["source"]["image_id"],
                     ["-f", str(directory / "compose.json"), "create", "--no-recreate", "--no-build",
                      "--pull", "never", *sorted(roles.values())])
     session.check(active=True)
-    candidates = _project(contract, intent)
+    candidates = _project(contract, intent, legacy=legacy, private_digest=private_digest, manifest=manifest)
     descriptor = startup.authorize(session, runtime_root, operation_id=operation_id,
                                    paths=paths, web_workers=web_workers, threads=threads)
     grants = {}
@@ -174,8 +197,8 @@ def create(session, runtime_root, state, evidence, *, operation_id, paths, web_w
         "grants": grants, "business_open": False, "durable": True})
 
 
-def _load(session, runtime_root, state, evidence, operation_id, *, active):
-    roots, _directory, contract, _manifest, digest = _inputs(
+def _load(session, runtime_root, state, evidence, operation_id, *, active, legacy=None):
+    roots, _directory, contract, manifest, digest = _inputs(
         session, runtime_root, state, evidence, operation_id, active=active)
     runtime_root, state, evidence = roots
     intent = gate._read(evidence / "create.intent.json")
@@ -188,7 +211,7 @@ def _load(session, runtime_root, state, evidence, operation_id, *, active):
                   and created["intent_sha256"] == gate._hash(intent)
                   and created["descriptor_sha256"] == gate._hash(descriptor)
                   and descriptor["operation_id"] == operation_id, "created/grant evidence differs")
-    candidates = _project(contract, intent)
+    candidates = _project(contract, intent, legacy=legacy, private_digest=digest, manifest=manifest)
     gate._require(created["containers"] == {role: row["Id"] for role, row in candidates.items()}
                   and set(created["grants"]) == set(descriptor["slots"]), "candidate container identity changed")
     for slot, grant in created["grants"].items():
@@ -198,10 +221,10 @@ def _load(session, runtime_root, state, evidence, operation_id, *, active):
     return evidence, descriptor, candidates, created
 
 
-def start(session, runtime_root, state, evidence, *, operation_id):
+def start(session, runtime_root, state, evidence, *, operation_id, legacy=None):
     """Start the exact granted IDs once; an unknown result allows query only."""
     evidence, descriptor, candidates, created = _load(
-        session, runtime_root, state, evidence, operation_id, active=True)
+        session, runtime_root, state, evidence, operation_id, active=True, legacy=legacy)
     intent = evidence / "start.intent.json"
     gate._require(not gate._present(intent) and not gate._present(intent.with_name(intent.name + ".pending")),
                   "candidate start already attempted; query original operation only")
@@ -212,13 +235,13 @@ def start(session, runtime_root, state, evidence, *, operation_id):
                    "container_ids": sorted(created["containers"].values())})
     session.check(active=True)
     private.run(["docker", "start", *sorted(created["containers"].values())])
-    return query(session, runtime_root, state, evidence, operation_id=operation_id)
+    return query(session, runtime_root, state, evidence, operation_id=operation_id, legacy=legacy)
 
 
-def query(session, runtime_root, state, evidence, *, operation_id):
+def query(session, runtime_root, state, evidence, *, operation_id, legacy=None):
     """Query this operation only; may durably confirm its completed receipt."""
     evidence, descriptor, candidates, created = _load(
-        session, runtime_root, state, evidence, operation_id, active=False)
+        session, runtime_root, state, evidence, operation_id, active=False, legacy=legacy)
     attempted = gate._read(evidence / "start.intent.json")
     gate._require(attempted == {"schema": 1, "operation_id": operation_id,
                   "created_sha256": gate._hash(created), "container_ids": sorted(created["containers"].values())},
@@ -246,7 +269,34 @@ def query(session, runtime_root, state, evidence, *, operation_id):
     return result
 
 
-def verify_active(session, evidence, *, operation_id):
+def verify_active(session, evidence, *, operation_id, legacy=None, gateway=None):
+    from services.production_activation_control import ReceiverActivationSession
+    gate._require(type(session) is ReceiverActivationSession, "real activation lock capability required")
+    contract_path = Path(session.permit["config"]["private_contract_path"])
+    loaded = private.load(contract_path, Path(__file__).resolve().parents[1])
+    contract, manifest, _digest = loaded
+    custody = private.retained_custody(contract, manifest)
+    if custody is None:
+        return _verify_active(session, evidence, operation_id=operation_id, legacy=legacy, loaded=loaded)
+    helper, held = custody
+    try:
+        helper.verify_gateway(held, gateway, session)
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise gate.AdmissionError("real retained gateway switch capability differs") from None
+    # The exact GatewaySwitch retains its actual control.lock, verifies the real
+    # original route before yield and rechecks that route after our receipt.
+    with gateway.retained_verification(session) as receipt:
+        try:
+            helper.verify_receipt(held, receipt)
+        except (ValueError, KeyError, TypeError, AttributeError):
+            raise gate.AdmissionError("retained gateway actual route differs") from None
+        result = _verify_active(session, evidence, operation_id=operation_id, legacy=legacy,
+                                gateway_receipt=receipt, persist=False)
+    # A failing post-yield route/control check must leave no success receipt.
+    return _save(Path(evidence) / "active-verified.json", result)
+
+
+def _verify_active(session, evidence, *, operation_id, legacy=None, gateway_receipt=None, persist=True, loaded=None):
     """Independent actual verification under the retained activation capability.
 
     Only exact retained previous application IDs are excluded from the normal
@@ -261,7 +311,7 @@ def verify_active(session, evidence, *, operation_id):
     created = gate._read(evidence / "created.json")
     closed = gate._read(evidence / "closed.json")
     contract_path = Path(session.permit["config"]["private_contract_path"])
-    contract, manifest, digest = private.load(contract_path, Path(__file__).resolve().parents[1])
+    contract, manifest, digest = loaded or private.load(contract_path, Path(__file__).resolve().parents[1])
     gate._require(intent["operation_id"] == operation_id == created["operation_id"] == closed["operation_id"]
                   and intent["migration_permit_sha256"] == proof["migration_permit_sha256"]
                   and intent["source"] == proof["source"] and intent["private_contract_sha256"] == digest
@@ -272,7 +322,7 @@ def verify_active(session, evidence, *, operation_id):
                   and closed["status"] == "closed_initialized" and closed["durable"] is True
                   and not closed["pending_slots"] and closed["containers"] == created["containers"],
                   "active runtime differs from original exact create/grant/start")
-    candidates = _project(contract, intent)
+    candidates = _project(contract, intent, legacy=legacy, private_digest=digest, manifest=manifest)
     gate._require(created["containers"] == {role: row["Id"] for role, row in candidates.items()}
                   and all(item["attempt"] == 0 for item in session.arm["slots"].values()),
                   "active candidate identity or startup attempt changed")
@@ -285,17 +335,29 @@ def verify_active(session, evidence, *, operation_id):
                       "active slot differs from original exact container grant")
     retained = {old for name in contract["app_services"] for old in contract["review"]["service_mapping"][name]}
     records = private.inspect_project(contract)
+    custody = _custody(contract, manifest, records, legacy=legacy, private_digest=digest)
     ignored = [row for row in records if row["Id"] in intent["previous_containers"] and _service(row) in retained]
     gate._require(ignored and all(not row["State"]["Running"] and not row["State"].get("Paused")
                   and not row["State"].get("Restarting") and not row["State"].get("Dead")
                   and row["State"]["Status"] in {"created", "exited"} for row in ignored),
                   "previous application is not retained stopped")
-    active = [row for row in records if row["Id"] not in {row["Id"] for row in ignored}]
+    ignored_ids = {row["Id"] for row in ignored}
+    custody_result = None
+    if custody is not None:
+        helper, held = custody
+        gate._require(gateway_receipt is not None, "retained gateway verification lock required")
+        ignored_ids.add(held["declaration"]["old_container_id"])
+        custody_result = {"old_gateway_id": held["declaration"]["old_container_id"],
+            "declaration_sha256": held["sha256"], "configuration_proof_sha256": held["declaration"]["old_configuration_proof_sha256"],
+            "gateway_receipt_sha256": helper.verify_receipt(held, gateway_receipt)}
+    active = [row for row in records if row["Id"] not in ignored_ids]
     private._verify_runtime_records(contract, manifest, contract_path.parent, proof["source"]["image_id"], active)
     gate._require(session.verification_proof(active=False) == proof, "activation changed during independent verify")
-    _project(contract, intent)
+    _project(contract, intent, legacy=legacy, private_digest=digest, manifest=manifest)
     result = {"schema": 1, "status": "actual_runtime_verified", "operation_id": operation_id,
         "activation_sha256": gate._hash(proof), "containers": created["containers"],
         "retained_previous_ids": sorted(row["Id"] for row in ignored), "business_open": True,
         "release_registered": False, "sender_resumed": False, "durable": True}
-    return _save(evidence / "active-verified.json", result)
+    if custody_result is not None:
+        result["retained_gateway_custody"] = custody_result
+    return _save(evidence / "active-verified.json", result) if persist else result

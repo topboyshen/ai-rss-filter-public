@@ -29,6 +29,15 @@ def selected(path, patterns):
     "scripts/private_control_subpaths.py", "scripts/controlled_production_release.py",
     "scripts/controlled_release_finalize.py", "scripts/private_release_contract.py",
     "scripts/sender_namespace_http.py", "scripts/production_gateway_switch.py",
+    "scripts/retained_gateway_configuration.py",
+    "scripts/retained_gateway_custody.py",
+    "tests/test_retained_gateway_configuration.py",
+    "tests/test_retained_gateway_custody.py",
+    "tests/test_production_gateway_custody_lifecycle.py",
+    "tests/test_legacy_gateway_configuration.py",
+    "tests/test_controlled_release_finalize_custody.py",
+    "tests/test_production_sender_bootstrap_export.py",
+    "tests/test_production_sender_bootstrap_pg_diagnostics.py",
     "tests/test_sender_namespace_host_listener.py",
     "scripts/sender_host_loopback_pg.py", "tests/test_sender_host_loopback_pg.py",
     "tests/test_sender_host_loopback_pg_inventory.py", "tests/test_production_sender_bootstrap_host_pg.py",
@@ -36,6 +45,7 @@ def selected(path, patterns):
     "tests/test_production_sender_bootstrap_direct131.py",
     "scripts/production_legacy_takeover.py", "scripts/production_admission_watchdog.py",
     "scripts/production_admission_supervisor.py", "tests/test_sender_namespace_http.py",
+    "scripts/production_gateway_custody_native.py", "tests/test_production_gateway_custody_native.py",
     "scripts/production_gateway_native.py", "scripts/production_namespace_native.py",
     "scripts/production_host_ingress_native.py", "tests/test_production_host_ingress_native.py",
     "scripts/production_activation_host_native.py", "tests/test_production_activation_host_native.py",
@@ -65,6 +75,26 @@ def test_each_real_adapter_path_triggers_native(event, path):
 @pytest.mark.parametrize("event", ["push", "pull_request"])
 @pytest.mark.parametrize("path", [
     "docs/production-release.md", "README.md", "core/scorer.py",
+    "scripts/production_gateway_custody_native.py.bak", "scripts/nested/production_gateway_custody_native.py",
+    "tests/test_production_gateway_custody_native.py.bak", "tests/nested/test_production_gateway_custody_native.py",
+    "scripts/retained_gateway_configuration.py.bak",
+    "scripts/nested/retained_gateway_configuration.py",
+    "scripts/retained_gateway_custody.py.bak",
+    "scripts/nested/retained_gateway_custody.py",
+    "tests/test_retained_gateway_configuration.py.bak",
+    "tests/nested/test_retained_gateway_configuration.py",
+    "tests/test_retained_gateway_custody.py.bak",
+    "tests/nested/test_retained_gateway_custody.py",
+    "tests/test_production_gateway_custody_lifecycle.py.bak",
+    "tests/nested/test_production_gateway_custody_lifecycle.py",
+    "tests/test_legacy_gateway_configuration.py.bak",
+    "tests/nested/test_legacy_gateway_configuration.py",
+    "tests/test_controlled_release_finalize_custody.py.bak",
+    "tests/nested/test_controlled_release_finalize_custody.py",
+    "tests/test_production_sender_bootstrap_export.py.bak",
+    "tests/nested/test_production_sender_bootstrap_export.py",
+    "tests/test_production_sender_bootstrap_pg_diagnostics.py.bak",
+    "tests/nested/test_production_sender_bootstrap_pg_diagnostics.py",
     "scripts/private_release_diagnostics.py.bak", "scripts/nested/private_release_diagnostics.py",
     "tests/test_private_release_diagnostics.py.bak", "tests/nested/test_private_release_diagnostics.py",
     "scripts/controlled_production_release.py.bak", "scripts/nested/private_control_subpaths.py",
@@ -88,6 +118,19 @@ def test_each_real_adapter_path_triggers_native(event, path):
 def test_unrelated_and_lookalike_paths_do_not_trigger(event, path):
     workflow = yaml.load((ROOT / PATH).read_text(), Loader=yaml.BaseLoader)
     assert not selected(path, workflow["on"][event]["paths"])
+
+
+@pytest.mark.parametrize("workflow_name", ["cutover-completion.yml", "private-release-config.yml"])
+@pytest.mark.parametrize("event", ["push", "pull_request"])
+@pytest.mark.parametrize("path", [
+    "scripts/retained_gateway_configuration.py", "scripts/retained_gateway_custody.py",
+    "tests/test_retained_gateway_configuration.py", "tests/test_retained_gateway_custody.py",
+])
+@pytest.mark.parametrize("variant", ["exact", "suffix", "nested"])
+def test_gateway_custody_source_selects_both_consumers_exactly(workflow_name, event, path, variant):
+    workflow = yaml.load((ROOT / ".github/workflows" / workflow_name).read_text(), Loader=yaml.BaseLoader)
+    candidate = path if variant == "exact" else path + ".bak" if variant == "suffix" else path.replace("/", "/nested/", 1)
+    assert selected(candidate, workflow["on"][event]["paths"]) is (variant == "exact")
 
 
 @pytest.mark.parametrize("workflow_name", ["cutover-completion.yml", "private-release-config.yml"])
@@ -240,7 +283,7 @@ def _assert_full_activation_contract(run):
     _same_expression(args.value, "['/usr/bin/sudo', '-n', '--', '/usr/bin/env', 'STARTUP_PIP_INDEX_URL=https://pypi.org/simple', sys.executable, '-I', '-B', "
         "str(root / 'source/scripts/production_activation_host_native.py'), '--repo', str(root / 'source'), "
         "'--source', str(root / 'miniflux'), '--binary', str(root / 'miniflux-binary'), "
-        "'--image-id', os.environ['AI_FILTER_NATIVE_BOOTSTRAP_IMAGE'], '--output', str(root / 'activation-originals')]")
+        "'--image-id', os.environ['AI_FILTER_NATIVE_BOOTSTRAP_IMAGE'], '--output', str(root / 'activation-originals'), '--gateway-custody']")
     calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
              and isinstance(node.func.value, ast.Name) and node.func.value.id == "archive" and node.func.attr == "archive_command"]
     assert len(calls) == 1 and any(isinstance(node, ast.Expr) and node.value is calls[0] for node in tree.body)
@@ -253,9 +296,11 @@ def _assert_full_activation_contract(run):
         _same_expression(keyword.value, {"seconds": "600", "limit": "512 * 1024", "child_umask": "0o077"}[keyword.arg])
     _same_expression(result.value, "json.loads(pathlib.Path(str(output) + '.stdout').read_bytes())")
     assertions = [node for node in tree.body if isinstance(node, ast.Assert)]
-    assert len(assertions) == 2 and all(node.msg is None for node in assertions)
+    assert len(assertions) == 4 and all(node.msg is None for node in assertions)
     _same_expression(assertions[0].test, "result['status'] == 'passed' and result['safe_evidence']['complete'] is True")
     _same_expression(assertions[1].test, "result['full_activation_verified'] is True")
+    _same_expression(assertions[2].test, "result['activation']['gateway_custody'] is True")
+    _same_expression(assertions[3].test, "result['safe_evidence']['profiles']['ACTUAL_CUSTODY_PROOF.json']['status'] == 'passed'")
     assert root.lineno < output.lineno < args.lineno < call.lineno < result.lineno < assertions[0].lineno < assertions[1].lineno
 
 
@@ -279,6 +324,9 @@ def _assert_private_clone_contract(run):
     ("str(output) + '.stdout'", "str(output) + '.stderr'"),
     ("result['safe_evidence']['complete'] is True", "result['safe_evidence']['complete'] is False"),
     ("result['full_activation_verified'] is True", "result['full_activation_verified'] is False"),
+    (", '--gateway-custody']", "]"),
+    ("result['activation']['gateway_custody'] is True", "result['activation']['gateway_custody'] is False"),
+    ("['ACTUAL_CUSTODY_PROOF.json']['status'] == 'passed'", "['ACTUAL_CUSTODY_PROOF.json']['status'] != 'failed'"),
 ])
 def test_full_activation_ast_rejects_actual_drift_with_expected_text_left_as_decoy(before, after):
     workflow = yaml.load((ROOT / PATH).read_text(), Loader=yaml.BaseLoader)
@@ -515,13 +563,27 @@ def _assert_host131_process(run):
     for keyword in call.keywords:
         _same_expression(keyword.value, {"seconds": "240", "limit": "512 * 1024", "child_umask": "0o077"}[keyword.arg])
     assertions = [node for node in tree.body if isinstance(node, ast.Assert)]
-    assert len(assertions) == 4
+    assert len(assertions) == 10
+    _same_expression(_single_assignment(tree, "pg_checks").value, "files['LOOPBACK_PG_CHECKS.json']['content']")
+    _same_expression(_single_assignment(tree, "port_diagnostics").value, "pg_checks['port_diagnostics']")
     for node, expected in zip(assertions, (
         "result['status'] == 'passed' and result['safe_evidence']['complete'] is True",
         "proof['host_loopback'] is True and proof['predecessor_schema'] == 131",
         "proof['limits'] == {'application_memory': 768 * 1024**2, 'application_pids': 256, "
         "'postgres_memory': 384 * 1024**2, 'postgres_pids': 64, 'operation_seconds': 180}",
         "{'HOST_LOOPBACK.json', 'SEED131.json', 'DIRECT131_RESTART.json', 'DIRECT131_OLD_LIMIT.json'} <= files.keys()",
+        "pg_checks['scope'] == 'loopback_pg_resource_predicates_only' and pg_checks['execution_proof'] is False",
+        "pg_checks['passed'] is True and set(pg_checks['checks']) == {'actual_fixed_image', 'owned_label', "
+        "'private_bridge', 'exact_loopback_port', 'memory', 'pids', 'cpu', 'not_privileged', 'no_new_privileges', "
+        "'not_oom', 'real_healthcheck'}",
+        "all(value is True for value in pg_checks['checks'].values())",
+        "set(port_diagnostics) == {'requested_expected', 'runtime_expected', 'requested_runtime_equal', "
+        "'requested_is_null', 'runtime_is_null', 'requested_empty_mapping', 'runtime_empty_mapping', "
+        "'runtime_only_pg_null', 'requested_has_extra_ports', 'runtime_has_extra_ports', 'requested_invalid_type', "
+        "'runtime_invalid_type', 'pg_running', 'pg_created'}",
+        "all(type(value) is bool for value in port_diagnostics.values())",
+        "{key for key, value in port_diagnostics.items() if value} == "
+        "{'requested_expected', 'runtime_expected', 'requested_runtime_equal', 'pg_running'}",
     ), strict=True):
         _same_expression(node.test, expected)
     assert args.lineno < call.lineno < _single_assignment(tree, "result").lineno < assertions[0].lineno
@@ -624,6 +686,16 @@ def test_host131_rejects_service_conflict_skip_dependency_emulation_or_time_drif
     ("'application_pids': 256", "'application_pids': 512"),
     ("result['safe_evidence']['complete'] is True", "result['safe_evidence']['complete'] is False"),
     ("'DIRECT131_OLD_LIMIT.json'", "'SEED132.json'"),
+    ("pg_checks['passed'] is True", "pg_checks['passed'] is False"),
+    ("pg_checks['execution_proof'] is False", "pg_checks['execution_proof'] is True"),
+    ("'real_healthcheck'", "'ignored_healthcheck'"),
+    ("all(value is True", "all(value is not False"),
+    ("files['LOOPBACK_PG_CHECKS.json']['content']", "{}"),
+    ("pg_checks['port_diagnostics']", "{}"),
+    ("'runtime_invalid_type'", "'ignored_invalid_type'"),
+    ("all(type(value) is bool", "all(type(value) is int"),
+    ("port_diagnostics.items() if value", "port_diagnostics.items() if not value"),
+    ("'requested_runtime_equal', 'pg_running'}", "'requested_runtime_equal', 'pg_created'}"),
 ])
 def test_host131_ast_rejects_changed_runtime_or_limits_even_with_comment_decoy(before, after):
     workflow = yaml.load((ROOT / PATH).read_text(), Loader=yaml.BaseLoader)

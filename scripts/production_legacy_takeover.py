@@ -29,6 +29,11 @@ ROLES = ("sender", "gateway", "api", "worker")
 MAX_CRON = 256 * 1024
 MAX_QUERIES = 32
 MAX_PROCESSES = 4096
+ARCHIVE_KIND = "retained_container_config_archive"
+
+
+def _archive_route(route):
+    return isinstance(route.get("original"), dict) and route["original"].get("kind") == ARCHIVE_KIND
 
 
 def source_sha256():
@@ -205,6 +210,25 @@ class NativeTransport:
         gate._require(len(value) == 2 and value[1] == target and gate.HEX64.fullmatch(value[0]), "old gateway config hash unavailable")
         return value[0]
 
+    def gateway_configuration(self, binary, route):
+        from scripts import retained_gateway_configuration as configuration
+        deadline = time.monotonic() + 3
+        identifier = route["container_id"]
+        def archive(actual_id, path, consumer):
+            gate._require(actual_id == identifier, "fixed retained gateway archive identity required")
+            return configuration.read_native_archive(actual_id, path, consumer, deadline=deadline)
+        def inspect(actual_id):
+            gate._require(actual_id == identifier and time.monotonic() < deadline,
+                          "fixed retained gateway inspection deadline or identity differs")
+            raw = bounded._capture([binary, "inspect", actual_id], deadline=deadline, max_bytes=MAX_CRON)
+            rows = json.loads(raw)
+            gate._require(isinstance(rows, list) and len(rows) == 1 and rows[0]["Id"] == identifier,
+                          "exact retained gateway container missing")
+            return rows[0]
+        result = configuration.verify(route["original"], inspect(identifier), inspect=inspect, archive=archive)
+        gate._require(time.monotonic() < deadline, "legacy gateway configuration deadline exceeded")
+        return result
+
     def cron_children(self, daemon):
         gate._require(_process(daemon["pid"]) == daemon, "root cron daemon identity changed")
         processes = {}
@@ -259,7 +283,9 @@ def load_plan(path):
     gate._require(all(type(value["restart_count"]) is int and value["restart_count"] >= 0 for value in identities),
                   "integer old restart identities required")
     route = plan["gateway"]
-    gate._require(set(route) == {"original", "container_id", "config_target", "candidate_service", "candidate_image_id", "private_contract_sha256"}
+    route_keys = {"original", "container_id", "config_target", "candidate_service", "candidate_image_id", "private_contract_sha256"}
+    archive_route = _archive_route(route)
+    gate._require(set(route) == (route_keys | {"gateway_plan_sha256"} if archive_route else route_keys)
                   and route["container_id"] == plan["containers"]["gateway"]["id"]
                   and route["config_target"] == "/etc/nginx/conf.d/default.conf"
                   and re.fullmatch(r"[a-z][a-z0-9_-]{0,62}", route["candidate_service"])
@@ -268,7 +294,14 @@ def load_plan(path):
     _bound(plan["docker"], executable=True)
     _writer_contract(plan)
     before = _bound(cron["before"])
-    _bound(route["original"])
+    if archive_route:
+        from scripts import retained_gateway_configuration as configuration
+        verified = configuration.validate(route["original"])
+        gate._require(gate.HEX64.fullmatch(str(route["gateway_plan_sha256"]))
+                      and verified["container_identity"]["id"] == route["container_id"],
+                      "archive route must bind exact old gateway and frozen gateway plan")
+    else:
+        _bound(route["original"])
     return plan, before, _disabled_cron(plan, before)
 
 
@@ -337,15 +370,23 @@ class LegacyTakeover:
         gate._write(self.root / "cron.confirmed.json", gate._read(self.root / "cron.intent.json"))
         self._wait(lambda: self.transport.cron_children(self.plan["cron"]["daemon"]), lambda value: not value)
 
+    def _gateway_original(self, *, retain=False):
+        route = self.plan["gateway"]
+        if _archive_route(route):
+            self.transport.gateway_configuration(self.plan["docker"]["path"], route)
+            if retain:
+                _raw_once(self.root / "gateway.configuration.original.json", gate._encoded(route["original"]))
+        elif retain:
+            gate._require(self.transport.gateway_config(self.plan["docker"]["path"], route["container_id"], route["config_target"])
+                          == route["original"]["sha256"], "actual old gateway config differs from retained original")
+            _raw_once(self.root / "gateway.original", _bound(route["original"]))
+
     def stop(self):
         self.check(active=True)
         gate._require(not list(self.root.iterdir()), "legacy stop already attempted; query original operation only")
         rows = self._containers()
         gate._require(all(row["running"] and row["status"] == "running" for row in rows.values()), "reviewed old runtime is not running")
-        route = self.plan["gateway"]
-        gate._require(self.transport.gateway_config(self.plan["docker"]["path"], route["container_id"], route["config_target"])
-                      == route["original"]["sha256"], "actual old gateway config differs from retained original")
-        _raw_once(self.root / "gateway.original", _bound(self.plan["gateway"]["original"]))
+        self._gateway_original(retain=True)
         _raw_once(self.root / "writer-inventory.original", _bound(self.plan["cron"]["writer_inventory"]))
         gate._write(self.root / "plan.json", self.plan)
         gate._write(self.root / "intent.json", {"schema": 1, "operation_id": self.plan["operation_id"],
@@ -385,6 +426,7 @@ class LegacyTakeover:
         cron = self.transport.cron_read(self.plan["cron"]["binary"]["path"])
         gate._require(cron in (self.before, self.after), "root cron changed outside original attempt")
         rows, children = self._containers(), self.transport.cron_children(self.plan["cron"]["daemon"])
+        self._gateway_original()
         stopped = cron == self.after and not children and all(not row["running"] and row["status"] == "exited" for row in rows.values())
         attempted = self._term_intents()
         value = {"schema": 1, "operation_id": self.plan["operation_id"], "plan_sha256": gate._hash(self.plan),
@@ -419,6 +461,7 @@ class LegacyTakeover:
                       and original["status"] == "registered_legacy_runtime_stopped" and self._term_intents(),
                       "original local stop is unconfirmed")
         rows = self._containers()
+        self._gateway_original()
         gate._require(all(not row["running"] and row["status"] == "exited" for row in rows.values())
                       and not self.transport.cron_children(self.plan["cron"]["daemon"])
                       and self.transport.cron_read(self.plan["cron"]["binary"]["path"]) == self.after,
