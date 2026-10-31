@@ -111,9 +111,37 @@ def loopback_pg_resources(row, image_id, owner, network, memory, pids, *, diagno
         # A rejected actual inspect must never be copied to a public diagnostic.
         _save(Path(diagnostic_root) / "LOOPBACK_PG_CHECKS.json", {
             "schema": 1, "scope": "loopback_pg_resource_predicates_only", "checks": checks,
+            "port_diagnostics": _loopback_port_diagnostics(row, ports),
             "passed": all(checks.values()), "execution_proof": False})
     gate._require(all(checks.values()), "exact loopback PG resource/topology binding differs")
     return checks
+
+
+def _loopback_port_diagnostics(row, expected):
+    """Classify this same inspect without exporting values or adding commands.
+
+    These predicates explain a refusal. They neither normalize the actual
+    mappings nor replace the exact resource/topology guard above.
+    """
+    requested = row["HostConfig"].get("PortBindings")
+    runtime = row["NetworkSettings"].get("Ports")
+    requested_mapping, runtime_mapping = type(requested) is dict, type(runtime) is dict
+    return {
+        "requested_expected": requested_mapping and requested == expected,
+        "runtime_expected": runtime_mapping and runtime == expected,
+        "requested_runtime_equal": requested == runtime,
+        "requested_is_null": requested is None,
+        "runtime_is_null": runtime is None,
+        "requested_empty_mapping": requested_mapping and not requested,
+        "runtime_empty_mapping": runtime_mapping and not runtime,
+        "runtime_only_pg_null": runtime_mapping and set(runtime) == {"5432/tcp"} and runtime["5432/tcp"] is None,
+        "requested_has_extra_ports": requested_mapping and bool(set(requested) - {"5432/tcp"}),
+        "runtime_has_extra_ports": runtime_mapping and bool(set(runtime) - {"5432/tcp"}),
+        "requested_invalid_type": requested is not None and not requested_mapping,
+        "runtime_invalid_type": runtime is not None and not runtime_mapping,
+        "pg_running": row["State"].get("Running") is True,
+        "pg_created": row["State"].get("Status") == "created",
+    }
 
 
 def build_records(directory, image_id, revision):

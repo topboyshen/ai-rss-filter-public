@@ -15,6 +15,11 @@ CHECKS = {
     "actual_fixed_image", "owned_label", "private_bridge", "exact_loopback_port", "memory", "pids",
     "cpu", "not_privileged", "no_new_privileges", "not_oom", "real_healthcheck",
 }
+PORT_DIAGNOSTICS = {
+    "requested_expected", "runtime_expected", "requested_runtime_equal", "requested_is_null", "runtime_is_null",
+    "requested_empty_mapping", "runtime_empty_mapping", "runtime_only_pg_null", "requested_has_extra_ports",
+    "runtime_has_extra_ports", "requested_invalid_type", "runtime_invalid_type", "pg_running", "pg_created",
+}
 
 
 def probe(row, root):
@@ -27,11 +32,13 @@ def read_diagnostic(root):
     path = root / "LOOPBACK_PG_CHECKS.json"
     value = json.loads(path.read_bytes())
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
-    assert set(value) == {"schema", "scope", "checks", "passed", "execution_proof"}
+    assert set(value) == {"schema", "scope", "checks", "port_diagnostics", "passed", "execution_proof"}
     assert value["schema"] == 1 and value["scope"] == "loopback_pg_resource_predicates_only"
     assert value["execution_proof"] is False
     assert set(value["checks"]) == CHECKS
     assert all(type(item) is bool for item in value["checks"].values())
+    assert set(value["port_diagnostics"]) == PORT_DIAGNOSTICS
+    assert all(type(item) is bool for item in value["port_diagnostics"].values())
     return value
 
 
@@ -114,3 +121,62 @@ def test_only_explicit_diagnostic_is_exported_not_actual_profile(tmp_path):
     assert set(packet["files"]) == {"RESULT.json", "LOOPBACK_PG_CHECKS.json"}
     assert packet["files"]["LOOPBACK_PG_CHECKS.json"]["content"] == read_diagnostic(tmp_path)
     assert "PRIVATE_INSPECT_TOKEN" not in json.dumps(packet)
+
+
+def test_exact_running_port_diagnostic_is_positive_without_changing_the_guard(tmp_path):
+    row = _host_pg_row()
+    row["State"].update(Running=True, Status="running")
+    original = deepcopy(row)
+    probe(row, tmp_path)
+    port = read_diagnostic(tmp_path)["port_diagnostics"]
+    assert {key for key, value in port.items() if value} == {
+        "requested_expected", "runtime_expected", "requested_runtime_equal", "pg_running"}
+    assert row == original
+
+
+@pytest.mark.parametrize("runtime, state, expected_true", [
+    ({"5432/tcp": None}, {"Running": True, "Status": "running"}, {"runtime_only_pg_null", "pg_running"}),
+    ({"5432/tcp": None}, {"Running": False, "Status": "created"}, {"runtime_only_pg_null", "pg_created"}),
+    ({}, {"Running": True, "Status": "running"}, {"runtime_empty_mapping", "pg_running"}),
+    (None, {"Running": False, "Status": "created"}, {"runtime_is_null", "pg_created"}),
+    ({"5432/tcp": [], "PRIVATE_PORT_TOKEN": None}, {"Running": True}, {"runtime_has_extra_ports", "pg_running"}),
+    ("PRIVATE_RAW_PORT_TOKEN", {"Running": True}, {"runtime_invalid_type", "pg_running"}),
+    (["PRIVATE_RAW_PORT_TOKEN"], {"Running": "PRIVATE_STATE_TOKEN"}, {"runtime_invalid_type"}),
+])
+def test_runtime_port_refusal_is_classified_from_same_inspect_without_values_or_commands(
+        tmp_path, runtime, state, expected_true):
+    row = _host_pg_row()
+    row["NetworkSettings"]["Ports"] = runtime
+    row["State"].update(state)
+    row["Config"]["Env"] = ["PRIVATE_SECRET_TOKEN"]
+    original = deepcopy(row)
+    harness = _host_harness(tmp_path, row)
+    with pytest.raises(gate.AdmissionError, match="^exact loopback PG resource/topology binding differs$"):
+        harness.launch("pg", row["Image"], memory=384 * 1024**2, pids=64)
+    diagnostic = read_diagnostic(tmp_path)
+    assert {key for key, value in diagnostic["port_diagnostics"].items() if value} == {
+        "requested_expected", *expected_true}
+    assert diagnostic["checks"]["exact_loopback_port"] is False and diagnostic["passed"] is False
+    assert row == original and "PRIVATE_" not in json.dumps(diagnostic)
+    assert [args[0] for args in harness.commands] == ["run", "inspect"]
+    assert not (tmp_path / "PROFILE_pg.json").exists()
+
+
+@pytest.mark.parametrize("value, expected_true", [
+    (None, {"requested_is_null", "runtime_is_null", "requested_runtime_equal"}),
+    ({}, {"requested_empty_mapping", "runtime_empty_mapping", "requested_runtime_equal"}),
+    ({"5432/tcp": None}, {"runtime_only_pg_null", "requested_runtime_equal"}),
+    ({"5432/tcp": [], "PRIVATE_PORT_TOKEN": []},
+     {"requested_has_extra_ports", "runtime_has_extra_ports", "requested_runtime_equal"}),
+    ("PRIVATE_RAW_TOKEN", {"requested_invalid_type", "runtime_invalid_type", "requested_runtime_equal"}),
+])
+def test_matching_but_unsafe_port_maps_remain_refused(tmp_path, value, expected_true):
+    row = _host_pg_row()
+    row["HostConfig"]["PortBindings"] = deepcopy(value)
+    row["NetworkSettings"]["Ports"] = deepcopy(value)
+    with pytest.raises(gate.AdmissionError, match="resource/topology"):
+        probe(row, tmp_path)
+    diagnostic = read_diagnostic(tmp_path)
+    assert {key for key, item in diagnostic["port_diagnostics"].items() if item} == expected_true
+    assert diagnostic["passed"] is False and diagnostic["checks"]["exact_loopback_port"] is False
+    assert "PRIVATE_" not in json.dumps(diagnostic)
