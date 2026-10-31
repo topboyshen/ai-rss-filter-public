@@ -107,7 +107,7 @@ def outer_plan(args, root, started):
     commands.docker(["image", "save", args.image_id], transfer=True, output_path=root / "sender.tar")
     gate._require(host.image_binding(commands.inspect(args.image_id, image=True), outer=False) == sender,
                   "sender changed during export")
-    bundle = registry.prepare_bundle(root / "bundle", references(), commands.deadline)
+    bundle = registry.prepare_bundle(root / "bundle", references(), commands.deadline, profile="host-loopback131")
     plan = {"schema": isolated.CONTEXT_SCHEMA, "bootstrap_mode": MODE, "gateway_custody": False,
         "started": started, "deadline": end, "active_deadline": end - FINAL_SECONDS,
         "repo": str(args.repo), "source": str(args.source), "binary": str(args.binary),

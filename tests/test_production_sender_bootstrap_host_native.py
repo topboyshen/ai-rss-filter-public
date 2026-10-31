@@ -219,6 +219,43 @@ def test_offline_bundle_also_contains_the_real_fixed_upstream131_binary():
     assert len(set(native.references())) == 3
 
 
+def test_outer_plan_selects_exact_host131_profile_with_original_deadline(monkeypatch, tmp_path):
+    from scripts import production_offline_registry as registry
+    from scripts import verify_miniflux_pause_native as pause
+    image_id, seen = "sha256:" + "a" * 64, []
+    monkeypatch.setattr(native.isolated, "cgroup_setup", lambda *a: "/owned")
+    monkeypatch.setattr(native.host, "host_tools", lambda *a: None)
+    monkeypatch.setattr(pause, "source_binding", lambda *a: {})
+    monkeypatch.setattr(pause, "image_checks", lambda *a: None)
+    monkeypatch.setattr(native.private, "source_identity", lambda *a: {})
+    monkeypatch.setattr(native.isolated, "peer_identity", lambda: {"pid": 1})
+    monkeypatch.setattr(native.isolated, "record", lambda *a, **kw: None)
+    monkeypatch.setattr(native.host, "image_binding", lambda *a, **kw: {"Id": image_id})
+    monkeypatch.setattr(native.host, "file_proof", lambda *a, **kw: {})
+
+    class Commands:
+        def __init__(self, root, end):
+            self.deadline = end
+
+        def inspect(self, *a, **kw):
+            return {}
+
+        def docker(self, *a, **kw):
+            return ""
+
+    monkeypatch.setattr(native.isolated, "FullCommands", Commands)
+
+    def prepare(root, refs, end, *, profile="default"):
+        seen.append((tuple(refs), end, profile))
+        raise RuntimeError("stop at exact bundle binding")
+
+    monkeypatch.setattr(registry, "prepare_bundle", prepare)
+    args = SimpleNamespace(repo=native.ROOT, source=tmp_path, binary=tmp_path / "binary", image_id=image_id)
+    with pytest.raises(RuntimeError, match="stop at exact bundle binding"):
+        native.outer_plan(args, tmp_path, 100)
+    assert seen == [(registry.profile_references("host-loopback131"), 260, "host-loopback131")]
+
+
 def test_only_live_context_delegates_network_creation_to_the_private_daemon(tmp_path):
     harness = object.__new__(native.bootstrap.HostLoopbackHarness)
     harness.output = tmp_path
