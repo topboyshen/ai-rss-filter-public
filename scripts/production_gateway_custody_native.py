@@ -32,7 +32,7 @@ from services import admission_fence as gate
 
 HOSTS = ("127.0.0.1", "127.0.0.2")
 OLD_SERVICE = "previous-gateway"
-NGINX_CONFIG = b"""user root;
+FOUR_NGINX_CONFIG = b"""user root;
 worker_processes 1;
 pid /tmp/nginx.pid;
 events { worker_connections 16; }
@@ -44,6 +44,9 @@ http {
 }
 """
 DEFAULT_CONFIG = b"server { listen 5000; location = /health { return 200 'OLD'; } }\n"
+# The retained predecessor starts in the observed production include shape.
+# Inactive image files are neither inferred absent nor admitted to this proof.
+NGINX_CONFIG = FOUR_NGINX_CONFIG.replace(b"  include /etc/nginx/conf.d/*.conf;", b"  " + DEFAULT_CONFIG.rstrip())
 
 
 def require_private_host(harness):
@@ -64,11 +67,9 @@ def old_manifest(p, python_image, nginx_image):
         service["entrypoint"] = ["python", "-I", "-B", "-c", bootstrap_native.OLD_PROCESS]
         service["command"] = []
         service["labels"] = {LABEL: p["custody_owner"], "io.ai-filter.synthetic-custody": p["custody_owner"]}
-    encoded = [base64.b64encode(raw).decode("ascii") for raw in (NGINX_CONFIG, DEFAULT_CONFIG)]
-    initialize = ("printf '%s' " + encoded[0] + " | base64 -d > /etc/nginx/nginx.conf; "
-                  "printf '%s' " + encoded[1] + " | base64 -d > /etc/nginx/conf.d/default.conf; "
-                  "chmod 0644 /etc/nginx/nginx.conf /etc/nginx/conf.d/default.conf; "
-                  "exec nginx -g 'daemon off;'")
+    encoded = base64.b64encode(NGINX_CONFIG).decode("ascii")
+    initialize = ("printf '%s' " + encoded + " | base64 -d > /etc/nginx/nginx.conf; "
+                  "chmod 0644 /etc/nginx/nginx.conf; exec nginx -g 'daemon off;'")
     previous["services"][OLD_SERVICE] = {
         "image": nginx_image, "container_name": p["custody_old_name"], "user": "0:0",
         "entrypoint": ["/bin/sh", "-ec"], "command": [initialize],
@@ -141,8 +142,75 @@ def _running_old(p, rows):
     return by_service
 
 
+def verify_four_archive_profile(harness, p, image_id, network_id):
+    """One no-port config-test: retain the default profile's real four archives.
+
+    This is not another switch. It uses the original inherited absolute budget,
+    exact fixed image and owned private network, and never publishes a port.
+    The exited container stays in the existing owned evidence/cleanup inventory.
+    """
+    gate._require(native_deadline.STATE.get() is not None,
+                  "default archive case must inherit the private-host deadline")
+    root = p["gateway_native_root"] / "default-four-profile"
+    root.mkdir(mode=0o700)
+    encoded = [base64.b64encode(raw).decode("ascii") for raw in (FOUR_NGINX_CONFIG, DEFAULT_CONFIG)]
+    initialize = ("printf '%s' " + encoded[0] + " | base64 -d > /etc/nginx/nginx.conf; "
+                  "printf '%s' " + encoded[1] + " | base64 -d > /etc/nginx/conf.d/default.conf; "
+                  "chmod 0644 /etc/nginx/nginx.conf /etc/nginx/conf.d/default.conf; exec nginx -t")
+    role = "gateway-four-profile"
+    row = harness.launch(role, image_id, ["--entrypoint", "/bin/sh", "--user", "0:0", "--cap-drop=ALL",
+                                        "--restart", "no"], ["-ec", initialize], memory=128 * 1024**2, pids=64)
+    gate._require(row["Config"].get("User") == "0:0" and row["HostConfig"].get("CapDrop") == ["ALL"]
+                  and row["Config"].get("Entrypoint") == ["/bin/sh"]
+                  and row["Config"].get("Cmd") == ["-ec", initialize],
+                  "default archive config-test execution protection changed")
+    original = ordinary_gateway._cleanup_identity(row)
+    identifier = row["Id"]
+
+    def exited():
+        current = _inspect(harness, identifier)
+        gate._require(ordinary_gateway._cleanup_identity(current) == original and current["Mounts"] == []
+                      and not current["HostConfig"].get("PortBindings")
+                      and not any(current["NetworkSettings"].get("Ports", {}).values()),
+                      "default archive config-test identity or zero-port boundary changed")
+        state = current["State"]
+        if state.get("Running") is True and state.get("Status") == "running":
+            gate._require(not any(state.get(flag) for flag in ("Paused", "Dead", "Restarting", "OOMKilled")),
+                          "default archive config-test entered an uncertain running state")
+            return False
+        ordinary_gateway._normal_cleanup_exit(current, original, purpose="config-test")
+        return current
+
+    stopped = harness.wait(exited, seconds=3)
+    from scripts.verify_miniflux_pause_native import resource_checks
+    checks = resource_checks(stopped, image_id, harness.owner, harness.network, 128 * 1024**2, 64)
+    transport = gateway.NativeTransport()
+    transport.deadline = min(transport.deadline, time.monotonic() + native_deadline.clamp(10))
+    archives = {}
+    for number, path in enumerate(configuration.ARCHIVE_PATHS):
+        archives[path] = root / ("archive-%02d.tar" % number)
+        capture_archive(transport, identifier, path, archives[path])
+    proof = configuration.describe(stopped, network_id, archives)
+    configuration.verify(proof, _inspect(harness, identifier),
+                         inspect=lambda exact: _inspect(harness, exact), archive=transport.archive)
+    # An archive proof alone never substitutes for confirmed normal exit.
+    ordinary_gateway._normal_cleanup_exit(_inspect(harness, identifier), original, purpose="config-test")
+    fixture.save(root / "CONFIGURATION.json", proof)
+    result = {"schema": 1, "status": "passed", "profile": configuration.DEFAULT_PROFILE,
+              "container_id": identifier, "configuration_sha256": gate._hash(proof),
+              "archive_count": len(proof["archives"]),
+              "ports": [binding for rows in (stopped["HostConfig"].get("PortBindings") or {}).values() for binding in rows],
+              "mounts": stopped["Mounts"],
+              "normal_exit_code": stopped["State"]["ExitCode"], "resource_checks": checks,
+              "memory": stopped["HostConfig"]["Memory"], "pids": stopped["HostConfig"]["PidsLimit"],
+              "synthetic_only": True}
+    fixture.save(root / "RESULT.json", result)
+    p["custody_default_profile"] = result
+    return result
+
+
 def prepare_and_seal(harness, p):
-    """Make real old runtime and retain four actual archives before private seal."""
+    """Retain actual mime-only old runtime plus the default four-file proof."""
     require_private_host(harness)
     p["custody_owner"], p["custody_old_name"] = harness.owner, harness.prefix + "-gateway-old"
     network = json.loads(harness.command(["network", "inspect", harness.network], timeout=3))[0]
@@ -156,6 +224,7 @@ def prepare_and_seal(harness, p):
     root = p["directory"] / "gateway-native"
     root.mkdir(mode=0o700)
     p["gateway_native_root"] = root
+    verify_four_archive_profile(harness, p, image["Id"], network["Id"])
     evidence = root / "switch"
     evidence.mkdir(mode=0o700)
     now = int(time.time())
@@ -207,10 +276,10 @@ def prepare_and_seal(harness, p):
         harness.wait(healthy, seconds=3)
     old = by_service[OLD_SERVICE]
     archives = {}
-    for number, path in enumerate(configuration.ARCHIVE_PATHS):
+    for number, path in enumerate(configuration.archive_paths(configuration.MIME_ONLY_PROFILE)):
         archives[path] = root / ("archive-%02d.tar" % number)
         capture_archive(transport, old["Id"], path, archives[path])
-    proof = configuration.describe(old, network["Id"], archives)
+    proof = configuration.describe(old, network["Id"], archives, profile=configuration.MIME_ONLY_PROFILE)
     configuration.verify(proof, _inspect(harness, old["Id"]), inspect=lambda identifier: _inspect(harness, identifier),
                          archive=transport.archive)
     proof_path = root / "CONFIGURATION.json"
@@ -254,6 +323,7 @@ def prepare_and_seal(harness, p):
     fixture.save(root / "SEALED_TOPOLOGY.json", {"old_ids": sorted(p["previous_containers"]),
         "old_gateway_mount_count": 0, "old_gateway_ports": ports, "same_project_old_roles": 3,
         "new_app_services": sorted(manifest["services"]), "actual_archives": True,
+        "closure_profile": configuration.MIME_ONLY_PROFILE, "default_four_profile": p["custody_default_profile"],
         "legacy_stop_proven": False, "synthetic_only": True, "actual_125_compatibility_proven": False})
     return sealed
 
@@ -307,7 +377,7 @@ def legacy_plan(harness, p, daemon, private_digest, candidate_image):
         "docker": legacy._record(Path("/usr/bin/docker"), executable=True)[0], "wait_seconds": 5, "max_polls": 20,
         "containers": {role: legacy.container_identity(value) for role, value in p["custody_roles"].items()},
         "gateway": {"original": p["gateway_plan"]["old_config"], "container_id": p["gateway_plan"]["old_gateway_id"],
-            "config_target": "/etc/nginx/conf.d/default.conf", "candidate_service": "ai-filter-api",
+            "config_target": configuration.legacy_config_target(p["gateway_plan"]["old_config"]), "candidate_service": "ai-filter-api",
             "candidate_image_id": candidate_image, "private_contract_sha256": private_digest,
             "gateway_plan_sha256": private.sha((p["gateway_native_root"] / "PLAN.json").read_bytes())},
         "cron": {"lock": legacy._lock_identity(lock), "binary": binary, "flock": flock, "writer": writer,
@@ -366,6 +436,12 @@ def completed_proof(p, capability):
     verified = gate._read(p["paths"]["lifecycle"] / "active-verified.json")
     old_gateway = p["gateway_plan"]["old_gateway_id"]
     old_apps = sorted(set(p["previous_containers"]) - {old_gateway})
+    default_profile = p["custody_default_profile"]
+    gate._require(p["gateway_plan"]["old_config"].get("profile") == configuration.MIME_ONLY_PROFILE
+                  and default_profile["status"] == "passed" and default_profile["profile"] == configuration.DEFAULT_PROFILE
+                  and default_profile["archive_count"] == 4 and default_profile["normal_exit_code"] == 0
+                  and default_profile["ports"] == [] and default_profile["mounts"] == [],
+                  "actual default four-archive profile proof missing")
     gate._require(stopped["writer_lock_held"] is True and len(old_apps) == 2
                   and verified["status"] == "actual_runtime_verified" and verified["durable"] is True
                   and verified["containers"] == p["custody_new_containers"]
@@ -376,6 +452,7 @@ def completed_proof(p, capability):
         "old_app_ids": old_apps, "old_gateway_id": old_gateway, "old_gateway_mounts": 0,
         "old_gateway_ports": gateway._ports(p["custody_roles"]["gateway"]),
         "actual_configuration_closure_sha256": p["gateway_plan"]["old_config"]["closure_sha256"],
+        "closure_profile": configuration.MIME_ONLY_PROFILE, "default_four_profile": default_profile,
         "legacy_stop_sha256": gate._hash(stopped), "active_runtime_proof_sha256": gate._hash(verified),
         "new_app_containers": p["custody_new_containers"], "actual_gateway_and_live_legacy": True,
         "synthetic_only": True, "actual_125_compatibility_proven": False, "system_cron_access": False,

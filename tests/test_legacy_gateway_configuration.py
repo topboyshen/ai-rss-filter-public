@@ -125,3 +125,42 @@ def test_native_gateway_inspects_and_all_four_archives_share_one_deadline(monkey
     assert result == {"status": "synthetic_exact"}
     assert [kind for kind, _deadline in seen] == ["inspect", "inspect", *["archive"] * 4, "inspect"]
     assert {deadline for _kind, deadline in seen} == {13.0}
+
+
+def mime_case(p):
+    from test_retained_gateway_configuration import mime_archive_map
+    p.data = mime_archive_map()
+    paths = {}
+    for index, (target, raw) in enumerate(p.data.items()):
+        path = p.path.parent / f"mime-archive-{index}.tar"
+        path.write_bytes(raw)
+        path.chmod(0o600)
+        paths[target] = path
+    row = p.state.rows["gateway"]
+    p.plan["gateway"]["original"] = configuration.describe(row, "e" * 64, paths,
+                                                          profile=configuration.MIME_ONLY_PROFILE)
+    p.plan["gateway"]["config_target"] = configuration.FILE_PATHS[0]
+    save(p.path, p.plan)
+    return p
+
+
+def test_explicit_mime_route_rechecks_exact_two_before_and_after_stop(archive_case):
+    p = mime_case(archive_case)
+    with legacy.locked_takeover(p.path, p.evidence) as session:
+        assert session.stop()["status"] == "registered_legacy_runtime_stopped"
+        assert session.check_stopped()["writer_lock_held"] is True
+    assert p.archive_calls == [True, False, False]
+    retained = gate._read(p.evidence / "gateway.configuration.original.json")
+    assert retained["profile"] == configuration.MIME_ONLY_PROFILE
+    assert set(retained["archives"]) == set(configuration.MIME_ONLY_PATHS)
+
+
+@pytest.mark.parametrize("profile", [configuration.DEFAULT_PROFILE, configuration.MIME_ONLY_PROFILE])
+def test_configuration_route_target_is_exact_to_its_profile(archive_case, profile):
+    p = mime_case(archive_case) if profile == configuration.MIME_ONLY_PROFILE else archive_case
+    p.plan["gateway"]["config_target"] = (configuration.FILE_PATHS[2]
+        if profile == configuration.MIME_ONLY_PROFILE else configuration.FILE_PATHS[0])
+    save(p.path, p.plan)
+    with pytest.raises(gate.AdmissionError):
+        legacy.load_plan(p.path)
+    assert p.state.calls == [] and p.archive_calls == []

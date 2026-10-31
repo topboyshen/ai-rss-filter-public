@@ -1,6 +1,7 @@
 """Exact retained-container Nginx configuration, never an image-baked claim.
 
-Only three regular files and one fixed directory are readable. Archive members
+The default closure reads three files and one fixed directory. The explicitly
+named mime-only closure reads exactly its two active files. Archive members
 are examined before their payload is requested; no extraction or link following
 is used. A static proof is not a live custody or mutation capability.
 """
@@ -28,6 +29,9 @@ KIND = "retained_container_config_archive"
 FILE_PATHS = ("/etc/nginx/nginx.conf", "/etc/nginx/mime.types", "/etc/nginx/conf.d/default.conf")
 DIRECTORY_PATH = "/etc/nginx/conf.d"
 ARCHIVE_PATHS = (*FILE_PATHS, DIRECTORY_PATH)
+DEFAULT_PROFILE = "fixed-four-archive-v1"
+MIME_ONLY_PROFILE = "mime-only-two-file-v1"
+MIME_ONLY_PATHS = FILE_PATHS[:2]
 MAX_FILE = 64 * 1024
 MAX_ARCHIVE = 128 * 1024
 # Preserve the exact image ID already observed for the retained production gateway.
@@ -224,18 +228,49 @@ def _includes(raw):
     return includes
 
 
-def _closure(archives):
-    files = {path: archives[path]["contents"][Path(path).name] for path in FILE_PATHS}
-    directory = archives[DIRECTORY_PATH]
-    gate._require(directory["contents"]["conf.d/default.conf"] == files[FILE_PATHS[2]]
-                  and directory["members"]["conf.d/default.conf"] == archives[FILE_PATHS[2]]["members"]["default.conf"],
-                  "gateway singleton and directory disagree")
-    gate._require(_includes(files[FILE_PATHS[0]]) == [FILE_PATHS[1], DIRECTORY_PATH + "/*.conf"]
-                  and not _includes(files[FILE_PATHS[1]]) and not _includes(files[FILE_PATHS[2]]),
-                  "gateway include closure differs from fixed whitelist")
+def archive_paths(profile=DEFAULT_PROFILE):
+    """Only these two reviewed complete sets exist; never a generic subset."""
+    gate._require(profile in {DEFAULT_PROFILE, MIME_ONLY_PROFILE}, "unknown gateway closure profile")
+    return MIME_ONLY_PATHS if profile == MIME_ONLY_PROFILE else ARCHIVE_PATHS
+
+
+def _proof_profile(proof):
+    gate._require(isinstance(proof, dict), "exact retained gateway archive proof required")
+    if set(proof) == PROOF_FIELDS:
+        return DEFAULT_PROFILE
+    gate._require(set(proof) == PROOF_FIELDS | {"profile"} and proof["profile"] == MIME_ONLY_PROFILE,
+                  "exact named gateway closure profile required")
+    return MIME_ONLY_PROFILE
+
+
+def legacy_config_target(proof):
+    """Fixed route metadata selector; this alone grants no archive authority."""
+    return FILE_PATHS[0] if _proof_profile(proof) == MIME_ONLY_PROFILE else FILE_PATHS[2]
+
+
+def _closure(archives, *, profile=DEFAULT_PROFILE):
+    paths = archive_paths(profile)
+    gate._require(isinstance(archives, dict) and set(archives) == set(paths),
+                  "gateway archive closure must exactly match its named profile")
+    files = {path: archives[path]["contents"][Path(path).name]
+             for path in (MIME_ONLY_PATHS if profile == MIME_ONLY_PROFILE else FILE_PATHS)}
+    if profile == MIME_ONLY_PROFILE:
+        gate._require(_includes(files[FILE_PATHS[0]]) == [FILE_PATHS[1]]
+                      and not _includes(files[FILE_PATHS[1]]),
+                      "gateway mime-only include closure differs from fixed whitelist")
+    else:
+        directory = archives[DIRECTORY_PATH]
+        gate._require(directory["contents"]["conf.d/default.conf"] == files[FILE_PATHS[2]]
+                      and directory["members"]["conf.d/default.conf"] == archives[FILE_PATHS[2]]["members"]["default.conf"],
+                      "gateway singleton and directory disagree")
+        gate._require(_includes(files[FILE_PATHS[0]]) == [FILE_PATHS[1], DIRECTORY_PATH + "/*.conf"]
+                      and not _includes(files[FILE_PATHS[1]]) and not _includes(files[FILE_PATHS[2]]),
+                      "gateway include closure differs from fixed whitelist")
     closure = {"files": {path: hashlib.sha256(raw).hexdigest() for path, raw in files.items()},
                "archives": {path: {key: value[key] for key in ("sha256", "bytes", "members")}
                             for path, value in archives.items()}}
+    if profile == MIME_ONLY_PROFILE:
+        closure["profile"] = profile
     return files, gate._hash(closure)
 
 
@@ -292,29 +327,33 @@ def _validate_identity(value):
 
 def validate(proof):
     """Load only sealed local raw archives; never Docker, sockets or mutation."""
-    gate._require(isinstance(proof, dict) and set(proof) == PROOF_FIELDS
-                  and type(proof["schema"]) is int and proof["schema"] == 1 and proof["kind"] == KIND
+    profile = _proof_profile(proof)
+    paths = archive_paths(profile)
+    gate._require(type(proof["schema"]) is int and proof["schema"] == 1 and proof["kind"] == KIND
                   and proof["source_sha256"] == source_sha256() and gate.HEX64.fullmatch(str(proof["network_id"]))
-                  and isinstance(proof["archives"], dict) and set(proof["archives"]) == set(ARCHIVE_PATHS)
+                  and isinstance(proof["archives"], dict) and set(proof["archives"]) == set(paths)
                   and gate.HEX64.fullmatch(str(proof["closure_sha256"])), "exact retained gateway archive proof required")
     _validate_identity(proof["container_identity"])
-    gate._require(len({record.get("path") for record in proof["archives"].values()}) == 4,
+    gate._require(len({record.get("path") for record in proof["archives"].values()}) == len(paths),
                   "private gateway archives must be distinct")
-    archives = {path: _local(proof["archives"][path], path)[0] for path in ARCHIVE_PATHS}
-    files, closure = _closure(archives)
+    archives = {path: _local(proof["archives"][path], path)[0] for path in paths}
+    files, closure = _closure(archives, profile=profile)
     gate._require(closure == proof["closure_sha256"], "retained gateway include proof changed")
     return {"files": files, "closure_sha256": closure, "container_identity": proof["container_identity"],
-            "network_id": proof["network_id"]}
+            "network_id": proof["network_id"], **({"profile": profile} if profile == MIME_ONLY_PROFILE else {})}
 
 
-def describe(row, network_id, archives):
+def describe(row, network_id, archives, *, profile=DEFAULT_PROFILE):
     """Construct a static proof from reviewed private original archive files."""
-    gate._require(isinstance(archives, dict) and set(archives) == set(ARCHIVE_PATHS), "fixed gateway archives required")
-    records = {path: archive_identity(archives[path], path) for path in ARCHIVE_PATHS}
-    parsed = {path: _local(records[path], path)[0] for path in ARCHIVE_PATHS}
-    _files, closure = _closure(parsed)
+    paths = archive_paths(profile)
+    gate._require(isinstance(archives, dict) and set(archives) == set(paths), "fixed gateway archives required")
+    records = {path: archive_identity(archives[path], path) for path in paths}
+    parsed = {path: _local(records[path], path)[0] for path in paths}
+    _files, closure = _closure(parsed, profile=profile)
     proof = {"schema": 1, "kind": KIND, "source_sha256": source_sha256(), "container_identity": identity(row),
              "network_id": network_id, "archives": records, "closure_sha256": closure}
+    if profile == MIME_ONLY_PROFILE:
+        proof["profile"] = profile
     validate(proof)
     _row(proof, row)
     return proof
@@ -335,11 +374,12 @@ def verify(proof, row, *, inspect, archive):
     identifier = proof["container_identity"]["id"]
     _row(proof, inspect(identifier))
     actual = {}
-    for path in ARCHIVE_PATHS:
+    profile = _proof_profile(proof)
+    for path in archive_paths(profile):
         actual[path] = archive(identifier, path, lambda read, fixed=path: parse_archive(read, fixed))
         gate._require(actual[path]["sha256"] == proof["archives"][path]["sha256"],
                       "actual retained gateway archive bytes changed")
-    files, closure = _closure(actual)
+    files, closure = _closure(actual, profile=profile)
     _row(proof, inspect(identifier))
     gate._require(closure == proof["closure_sha256"] and files == result["files"],
                   "actual retained gateway include closure changed")

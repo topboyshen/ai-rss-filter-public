@@ -255,7 +255,7 @@ def test_postcheck_failure_keeps_original_transition_marker_and_never_success(ca
     assert not (case.registry / final.MARKER).exists()
 
 
-@pytest.mark.parametrize("change", ["route", "capability"])
+@pytest.mark.parametrize("change", ["route", "capability", "profile"])
 def test_change_after_last_actual_check_blocks_before_intent_or_registry_cas(case, monkeypatch, change):
     legacy, gateway, _calls, _receipt = bind(case, monkeypatch)
     retain, before = final._retain, (case.registry / "current.state").read_bytes()
@@ -264,6 +264,8 @@ def test_change_after_last_actual_check_blocks_before_intent_or_registry_cas(cas
         result = retain(*args, **kwargs)
         if change == "route":
             gateway.test_state["route"]["synthetic_concurrent_change"] = True
+        elif change == "profile":
+            gateway.test_state["route"]["old_config"]["profile"] = "mime-only-two-file-v1"
         else:
             gateway.session = object()
         return result

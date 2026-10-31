@@ -287,7 +287,8 @@ def load_plan(path):
     archive_route = _archive_route(route)
     gate._require(set(route) == (route_keys | {"gateway_plan_sha256"} if archive_route else route_keys)
                   and route["container_id"] == plan["containers"]["gateway"]["id"]
-                  and route["config_target"] == "/etc/nginx/conf.d/default.conf"
+                  and (route["config_target"] in {"/etc/nginx/nginx.conf", "/etc/nginx/conf.d/default.conf"}
+                       if archive_route else route["config_target"] == "/etc/nginx/conf.d/default.conf")
                   and re.fullmatch(r"[a-z][a-z0-9_-]{0,62}", route["candidate_service"])
                   and re.fullmatch(r"sha256:[0-9a-f]{64}", route["candidate_image_id"])
                   and gate.HEX64.fullmatch(route["private_contract_sha256"]), "exact future route plan required")
@@ -298,7 +299,8 @@ def load_plan(path):
         from scripts import retained_gateway_configuration as configuration
         verified = configuration.validate(route["original"])
         gate._require(gate.HEX64.fullmatch(str(route["gateway_plan_sha256"]))
-                      and verified["container_identity"]["id"] == route["container_id"],
+                      and verified["container_identity"]["id"] == route["container_id"]
+                      and route["config_target"] == configuration.legacy_config_target(route["original"]),
                       "archive route must bind exact old gateway and frozen gateway plan")
     else:
         _bound(route["original"])

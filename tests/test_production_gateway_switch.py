@@ -655,7 +655,7 @@ def test_native_archive_keeps_original_deadline_and_fixed_reader(case, monkeypat
     assert captured[0][2] == p.transport.deadline
 
 
-def _zero_mount_case(p, tmp_path, monkeypatch):
+def _zero_mount_case(p, tmp_path, monkeypatch, *, profile=switch.retained_config.DEFAULT_PROFILE):
     main = b"events {}\nhttp { include /etc/nginx/mime.types; include /etc/nginx/conf.d/*.conf; }\n"
     mime = b"types { text/plain txt; }\n"
     original = b"server { listen 5000; location / { proxy_pass http://old-api:5000; } }\n"
@@ -675,6 +675,9 @@ def _zero_mount_case(p, tmp_path, monkeypatch):
     raw = {paths[0]: tar([("nginx.conf", main)]), paths[1]: tar([("mime.types", mime)]),
            paths[2]: tar([("default.conf", original)]),
            switch.retained_config.DIRECTORY_PATH: tar([("conf.d", None), ("conf.d/default.conf", original)])}
+    if profile == switch.retained_config.MIME_ONLY_PROFILE:
+        main = b"events {}\nhttp { include /etc/nginx/mime.types; " + original + b"}\n"
+        raw = {paths[0]: tar([("nginx.conf", main)]), paths[1]: tar([("mime.types", mime)])}
     files = {}
     for index, (path, value) in enumerate(raw.items()):
         output = tmp_path / f"retained-original-{index}.tar"
@@ -683,7 +686,7 @@ def _zero_mount_case(p, tmp_path, monkeypatch):
         files[path] = output
     p.old.update(Mounts=[], Image=switch.retained_config.IMAGE_ID)
     p.plan["old_gateway_identity"] = switch.gateway_identity(p.old)
-    p.plan["old_config"] = switch.retained_config.describe(p.old, p.plan["network_id"], files)
+    p.plan["old_config"] = switch.retained_config.describe(p.old, p.plan["network_id"], files, profile=profile)
     previous_run = switch.NativeTransport.run
 
     def run(self, args, **kwargs):
@@ -693,7 +696,7 @@ def _zero_mount_case(p, tmp_path, monkeypatch):
         return result
 
     def archive(_self, identifier, path, consume):
-        assert identifier == p.old["Id"] and path in switch.retained_config.ARCHIVE_PATHS
+        assert identifier == p.old["Id"] and path in switch.retained_config.archive_paths(profile)
         p.state.archive_calls.append((path, p.old["State"]["Running"]))
         return consume(io.BytesIO(raw[path]).read)
 
@@ -771,3 +774,37 @@ def test_unreviewed_image_is_rejected_before_any_lookup(monkeypatch):
     monkeypatch.setattr(switch.NativeTransport, "run", lambda *_a: pytest.fail("must not inspect unreviewed image"))
     with pytest.raises(gate.AdmissionError, match="image identity required"):
         switch.NativeTransport().image("sha256:" + "f" * 64)
+
+
+def test_mime_only_gateway_switch_retains_profile_and_exact_two_live_archives(case, tmp_path, monkeypatch):
+    p = case
+    p.old["State"].update(Running=True, Status="running")
+    _zero_mount_case(p, tmp_path, monkeypatch, profile=switch.retained_config.MIME_ONLY_PROFILE)
+    subject = adapter(p)
+    result = subject.switch()
+    assert result["status"] == "gateway_switched" and result["old_config"]["profile"] == switch.retained_config.MIME_ONLY_PROFILE
+    assert set(result["old_config"]["archives"]) == set(switch.retained_config.MIME_ONLY_PATHS)
+    with subject.retained_verification(p.session) as verified:
+        assert verified["old_config"] == p.plan["old_config"]
+    assert {path for path, _running in p.state.archive_calls} == set(switch.retained_config.MIME_ONLY_PATHS)
+    assert {running for _path, running in p.state.archive_calls} == {True, False}
+
+
+@pytest.mark.parametrize("fault", ["remove", "unknown", "source", "hash"])
+def test_mime_gateway_static_profile_confusion_stops_before_mutation(case, tmp_path, monkeypatch, fault):
+    p = case
+    p.old["State"].update(Running=True, Status="running")
+    _zero_mount_case(p, tmp_path, monkeypatch, profile=switch.retained_config.MIME_ONLY_PROFILE)
+    proof = p.plan["old_config"]
+    if fault == "remove":
+        proof.pop("profile")
+    elif fault == "unknown":
+        proof["profile"] = switch.retained_config.DEFAULT_PROFILE
+    elif fault == "source":
+        proof["source_sha256"] = "f" * 64
+    else:
+        proof["closure_sha256"] = "f" * 64
+    before = list(p.state.calls)
+    with pytest.raises(gate.AdmissionError):
+        adapter(p).switch()
+    assert p.state.calls == before and p.old["State"]["Running"] is True

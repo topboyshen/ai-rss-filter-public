@@ -1,5 +1,6 @@
 """Local wiring/negative tests, never a native custody or .125 execution proof."""
 from copy import deepcopy
+import base64
 from contextlib import contextmanager
 import io
 import json
@@ -303,14 +304,17 @@ def test_activation_forwards_same_live_legacy_and_actual_gateway_instead_of_rece
     assert p["sender_transport"].posts.count("/production-resume") == 1
 
 
-@pytest.mark.parametrize("fault", [None, "json_capability", "wrong_new_app", "extra_old_app", "missing_custody", "wrong_gateway", "not_durable"])
+@pytest.mark.parametrize("fault", [None, "json_capability", "wrong_new_app", "extra_old_app", "missing_custody", "wrong_gateway", "not_durable", "missing_default", "wrong_default", "wrong_profile"])
 def test_completed_proof_requires_live_type_and_exact_persisted_runtime_association(tmp_path, fault):
     p = {"directory": tmp_path, "paths": {"lifecycle": tmp_path / "lifecycle"},
         "previous_containers": {str(n) * 64: {} for n in (1, 2, 3)},
         "custody_new_containers": {"web": "4" * 64, "worker": "5" * 64},
-        "gateway_plan": {"old_gateway_id": "3" * 64, "old_config": {"closure_sha256": "f" * 64}},
+        "gateway_plan": {"old_gateway_id": "3" * 64, "old_config": {"closure_sha256": "f" * 64,
+            "profile": configuration.MIME_ONLY_PROFILE}},
         "custody_roles": {"gateway": {"HostConfig": {"PortBindings": {"5000/tcp":
             [{"HostIp": host, "HostPort": "5000"} for host in native.HOSTS]}}}}}
+    p["custody_default_profile"] = {"status": "passed", "profile": configuration.DEFAULT_PROFILE,
+        "archive_count": 4, "normal_exit_code": 0, "ports": [], "mounts": []}
     p["paths"]["lifecycle"].mkdir(mode=0o700)
     verified = {"status": "actual_runtime_verified", "durable": True, "containers": deepcopy(p["custody_new_containers"]),
         "retained_previous_ids": ["1" * 64, "2" * 64], "retained_gateway_custody": {"old_gateway_id": "3" * 64}}
@@ -328,6 +332,12 @@ def test_completed_proof_requires_live_type_and_exact_persisted_runtime_associat
         verified["retained_gateway_custody"]["old_gateway_id"] = "6" * 64
     elif fault == "not_durable":
         verified["durable"] = False
+    elif fault == "missing_default":
+        p.pop("custody_default_profile")
+    elif fault == "wrong_default":
+        p["custody_default_profile"]["archive_count"] = 2
+    elif fault == "wrong_profile":
+        p["gateway_plan"]["old_config"].pop("profile")
     gate._write(p["paths"]["lifecycle"] / "active-verified.json", verified)
     if fault is not None:
         with pytest.raises((gate.AdmissionError, KeyError)):
@@ -382,7 +392,7 @@ def test_preserve_uses_one_term_and_requires_normal_exit_without_delete(tmp_path
 
 
 @pytest.mark.parametrize("conflict", [False, True])
-def test_prepare_retains_real_four_archive_bytes_seals_complete_plan_once_and_never_retries_conflict(tmp_path, monkeypatch, conflict):
+def test_prepare_retains_mime_only_originals_seals_complete_plan_once_and_never_retries_conflict(tmp_path, monkeypatch, conflict):
     """Transport is fake here; real archive/closure/private-custody validation is not."""
     from core import config
     from scripts import private_release_contract as private
@@ -400,6 +410,12 @@ def test_prepare_retains_real_four_archive_bytes_seals_complete_plan_once_and_ne
     network = {"Name": "owned-network", "Id": "e" * 64}
     rows, commands, sealed = [], [], []
     monkeypatch.setattr(native, "require_private_host", lambda _harness: None)
+    def default_profile(_harness, actual, image_id, network_id):
+        assert actual is p and image_id == configuration.IMAGE_CONFIG_ID and network_id == network["Id"]
+        actual["custody_default_profile"] = {"status": "passed", "profile": configuration.DEFAULT_PROFILE,
+            "archive_count": 4, "normal_exit_code": 0, "ports": [], "mounts": []}
+        return actual["custody_default_profile"]
+    monkeypatch.setattr(native, "verify_four_archive_profile", default_profile)
     monkeypatch.setattr(host_native, "require_harness_network", lambda _harness, _network: None)
     monkeypatch.setattr(native.native_deadline, "clamp", lambda seconds: seconds)
     monkeypatch.setattr("scripts.verify_miniflux_pause_native.image_checks", lambda *_a: None)
@@ -434,8 +450,8 @@ def test_prepare_retains_real_four_archive_bytes_seals_complete_plan_once_and_ne
                 "NetworkSettings": {"Ports": deepcopy(portmap), "Networks": {harness.network: {"NetworkID": network["Id"]}}}})
     monkeypatch.setattr(private, "run", fake_compose)
     monkeypatch.setattr(private, "inspect_project", lambda _contract: deepcopy(rows))
-    from tests.test_retained_gateway_configuration import archive_map
-    data = archive_map(main=native.NGINX_CONFIG, default=native.DEFAULT_CONFIG)
+    from tests.test_retained_gateway_configuration import mime_archive_map
+    data = mime_archive_map(main=native.NGINX_CONFIG)
     class Transport:
         def __init__(self):
             self.deadline = time.monotonic() + 120
@@ -467,7 +483,9 @@ def test_prepare_retains_real_four_archive_bytes_seals_complete_plan_once_and_ne
             assert len(sealed) == 1 and len(p["previous_containers"]) == 3
             review, info = sealed[0]
             assert info["plan"] == p["gateway_plan"] and info["plan"]["window"] == p["custody_window"]
-            assert len(info["configuration"]["files"]) == 3
+            assert len(info["configuration"]["files"]) == 2
+            assert info["proof"]["profile"] == configuration.MIME_ONLY_PROFILE
+            assert set(info["proof"]["archives"]) == set(configuration.MIME_ONLY_PATHS)
             assert p["custody_image_id"] == configuration.IMAGE_CONFIG_ID != configuration.IMAGE_ID
             assert info["proof"]["container_identity"]["image_id"] == configuration.IMAGE_CONFIG_ID
             assert info["plan"]["old_gateway_identity"]["image_id"] == configuration.IMAGE_CONFIG_ID
@@ -606,3 +624,95 @@ def test_finalizers_keep_original_total_deadline_without_a_new_window(monkeypatc
         assert native.native_deadline.STATE.get() == before
     assert states == [(now + 1.5, now + 1.5)] * 2
     assert len(waits) == 1 and 0 < waits[0] <= 1.5
+
+
+def four_profile_harness(tmp_path, monkeypatch, *, fault=None):
+    """Real parser/private-file proof, local transport only, not native evidence."""
+    from test_retained_gateway_configuration import archive_map, row
+    from scripts.verify_miniflux_pause_native import LABEL
+    root = tmp_path / "native-root"
+    root.mkdir(mode=0o700)
+    p = {"gateway_native_root": root}
+    data = archive_map(main=native.FOUR_NGINX_CONFIG, default=native.DEFAULT_CONFIG)
+    actual, calls = row(), []
+    actual["Config"].update(User="0:0", Labels={LABEL: "d" * 32})
+    actual["HostConfig"].update(Memory=128 * 1024**2, MemorySwap=128 * 1024**2, PidsLimit=64,
+        NanoCpus=1_000_000_000, Privileged=False, NetworkMode="retained-net", PortBindings={},
+        SecurityOpt=["no-new-privileges"], CapDrop=["ALL"])
+    actual["State"].update(Running=False, Status="exited", ExitCode=0,
+        FinishedAt="2026-10-31T02:00:00.123456789Z", OOMKilled=False)
+    actual["NetworkSettings"]["Ports"] = {"80/tcp": None}
+    original = deepcopy(actual)
+    h = SimpleNamespace(owner="d" * 32, network="retained-net")
+    def launch(role, image, extra, command, *, memory, pids):
+        calls.append(("launch", role))
+        assert image == configuration.IMAGE_ID and memory == 128 * 1024**2 and pids == 64
+        assert extra == ["--entrypoint", "/bin/sh", "--user", "0:0", "--cap-drop=ALL", "--restart", "no"]
+        assert command[0] == "-ec" and command[1].endswith("exec nginx -t")
+        assert not any(argument in extra for argument in ("-p", "--publish", "--mount", "-v"))
+        actual["Config"].update(Entrypoint=["/bin/sh"], Cmd=command)
+        original.update(deepcopy(actual))
+        return deepcopy(actual)
+    def command(argv, **kwargs):
+        assert argv == ["inspect", actual["Id"]] and kwargs["timeout"] == 3
+        calls.append(("inspect",))
+        if fault == "exit":
+            actual["State"]["ExitCode"] = 143
+        elif fault == "oom":
+            actual["State"]["OOMKilled"] = True
+        elif fault == "port":
+            actual["NetworkSettings"]["Ports"]["5000/tcp"] = [{"HostIp": "127.0.0.1", "HostPort": "5000"}]
+        elif fault == "identity":
+            actual["Config"]["changed"] = True
+        elif fault == "resource":
+            actual["HostConfig"]["Memory"] += 1
+        elif fault == "post_exit" and sum(call[0] == "archive" for call in calls) == 8:
+            actual["State"]["ExitCode"] = 137
+        return json.dumps([actual])
+    h.launch, h.command = launch, command
+    h.wait = lambda function, **kwargs: function()
+    class Transport:
+        def __init__(self):
+            self.deadline = time.monotonic() + 120
+        def archive(self, identifier, path, consumer):
+            calls.append(("archive", path))
+            assert identifier == actual["Id"] and path in configuration.ARCHIVE_PATHS
+            return consumer(io.BytesIO(data[path]).read)
+    monkeypatch.setattr(native.gateway, "NativeTransport", Transport)
+    monkeypatch.setattr(native.native_deadline, "STATE", SimpleNamespace(get=lambda: "existing-absolute-budget"))
+    monkeypatch.setattr(native.native_deadline, "clamp", lambda value: value)
+    return h, p, actual, calls, data
+
+
+def test_native_default_four_profile_is_real_archive_flow_no_port_and_confirmed_zero_exit(tmp_path, monkeypatch):
+    h, p, actual, calls, data = four_profile_harness(tmp_path, monkeypatch)
+    result = native.verify_four_archive_profile(h, p, actual["Image"], "b" * 64)
+    assert result["status"] == "passed" and result["profile"] == configuration.DEFAULT_PROFILE
+    assert result["memory"] == actual["HostConfig"]["Memory"] == 128 * 1024**2
+    assert result["pids"] == actual["HostConfig"]["PidsLimit"] == 64
+    assert result["ports"] == result["mounts"] == [] and result["normal_exit_code"] == 0
+    assert all(result["resource_checks"].values())
+    assert [x[1] for x in calls if x[0] == "archive"] == list(configuration.ARCHIVE_PATHS) * 2
+    proof = gate._read(p["gateway_native_root"] / "default-four-profile" / "CONFIGURATION.json")
+    assert set(proof) == configuration.PROOF_FIELDS
+    assert all(Path(record["path"]).read_bytes() == data[target] for target, record in proof["archives"].items())
+    assert len([x for x in calls if x[0] == "launch"]) == 1
+
+
+@pytest.mark.parametrize("fault", ["exit", "oom", "port", "identity", "resource", "post_exit"])
+def test_default_four_profile_cannot_publish_success_without_protected_normal_exit(tmp_path, monkeypatch, fault):
+    h, p, actual, _calls, _data = four_profile_harness(tmp_path, monkeypatch, fault=fault)
+    with pytest.raises((gate.AdmissionError, ValueError)):
+        native.verify_four_archive_profile(h, p, actual["Image"], "b" * 64)
+    assert "custody_default_profile" not in p
+    assert not (p["gateway_native_root"] / "default-four-profile" / "RESULT.json").exists()
+
+
+def test_both_native_include_profiles_are_fixed_and_mime_only_is_initial_manifest(tmp_path, monkeypatch):
+    assert configuration._includes(native.NGINX_CONFIG) == [configuration.FILE_PATHS[1]]
+    assert configuration._includes(native.FOUR_NGINX_CONFIG) == [configuration.FILE_PATHS[1], configuration.DIRECTORY_PATH + "/*.conf"]
+    monkeypatch.setattr(fixture, "previous_manifest", lambda *_args: ({"services": {}}, {}))
+    plan, _names = native.old_manifest({"custody_owner": "a" * 32, "custody_old_name": "owned"}, "python", configuration.IMAGE_ID)
+    initializer = plan["services"][native.OLD_SERVICE]["command"][0]
+    assert "> /etc/nginx/conf.d/default.conf" not in initializer
+    assert base64.b64encode(native.NGINX_CONFIG).decode() in initializer

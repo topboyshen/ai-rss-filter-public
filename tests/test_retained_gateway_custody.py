@@ -176,3 +176,58 @@ def test_exit_alone_is_not_normal_stop_proof(custody_case, state, value):
 
 def test_no_declaration_does_not_read_or_expand_old_contract():
     assert custody.load({}, {}, [], read_private=lambda _p: pytest.fail("unexpected read")) is None
+
+
+def rebind_mime_profile(f):
+    from test_retained_gateway_configuration import mime_archive_map
+    directory = f["config"].parent
+    archives = {target: save(directory / f"mime-gateway-{number}.tar", raw)
+                for number, (target, raw) in enumerate(mime_archive_map().items())}
+    proof = configuration.describe(f["rows"][-1], "b" * 64, archives, profile=configuration.MIME_ONLY_PROFILE)
+    f["proof"] = proof
+    f["plan"]["old_config"] = proof
+    save(f["proof_path"], proof)
+    save(f["plan_path"], f["plan"])
+    declaration = f["review_data"][custody.KEY]
+    declaration["old_configuration_proof_sha256"] = private.sha(f["proof_path"].read_bytes())
+    declaration["gateway_plan_sha256"] = private.sha(f["plan_path"].read_bytes())
+    reseal_inputs(f)
+    return f
+
+
+def test_private_custody_seal_preserves_explicit_mime_profile_and_originals(custody_case):
+    f = rebind_mime_profile(custody_case)
+    held = load(f)
+    assert held["proof"]["profile"] == held["configuration"]["profile"] == configuration.MIME_ONLY_PROFILE
+    assert len(held["configuration"]["files"]) == 2 and held["plan"]["old_config"] == held["proof"]
+    contract_path = private.seal(**{key: f[key] for key in ("root", "config", "manifest", "environment", "review", "output")})
+    contract, _manifest, _digest = private.load(contract_path, f["root"])
+    assert (f["output"] / "custody-configuration-proof.json").read_bytes() == f["proof_path"].read_bytes()
+    assert contract["review"][custody.KEY]["old_configuration_proof_sha256"] == private.sha(f["proof_path"].read_bytes())
+
+
+@pytest.mark.parametrize("fault", ["plan_profile", "proof_profile", "proof_source", "old_review_hash", "old_plan_hash"])
+def test_custody_mime_profile_cannot_cross_sealed_plan_source_or_review(custody_case, fault):
+    original = deepcopy(custody_case["review_data"][custody.KEY])
+    f = rebind_mime_profile(custody_case)
+    declaration = f["review_data"][custody.KEY]
+    if fault == "plan_profile":
+        f["plan"]["old_config"] = deepcopy(f["proof"])
+        f["plan"]["old_config"].pop("profile")
+        save(f["plan_path"], f["plan"])
+        declaration["gateway_plan_sha256"] = private.sha(f["plan_path"].read_bytes())
+    elif fault in {"proof_profile", "proof_source"}:
+        if fault == "proof_profile":
+            f["proof"].pop("profile")
+        else:
+            f["proof"]["source_sha256"] = "f" * 64
+        save(f["proof_path"], f["proof"])
+        declaration["old_configuration_proof_sha256"] = private.sha(f["proof_path"].read_bytes())
+    elif fault == "old_review_hash":
+        declaration["old_configuration_proof_sha256"] = original["old_configuration_proof_sha256"]
+    else:
+        declaration["gateway_plan_sha256"] = original["gateway_plan_sha256"]
+    reseal_inputs(f)
+    from services import admission_fence as gate
+    with pytest.raises((ValueError, gate.AdmissionError)):
+        load(f)

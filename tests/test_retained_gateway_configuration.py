@@ -598,3 +598,141 @@ def test_chain_member_cannot_replace_an_already_sealed_retained_gateway(proof_ca
     actual["Image"] = subject.IMAGE_CONFIG_ID
     with pytest.raises(gate.AdmissionError, match="identity changed"):
         subject._row(proof, actual)
+
+
+MIME_MAIN = b"events {}\nhttp { include /etc/nginx/mime.types; server { listen 5000; } }\n"
+
+
+def mime_archive_map(main=MIME_MAIN, mime=MIME):
+    """The reviewed second complete closure, never a generic archive subset."""
+    return {subject.FILE_PATHS[0]: tar([("nginx.conf", main, tarfile.REGTYPE)]),
+            subject.FILE_PATHS[1]: tar([("mime.types", mime, tarfile.REGTYPE)])}
+
+
+@pytest.fixture
+def mime_proof_case(tmp_path):
+    data, files = mime_archive_map(), {}
+    for number, (target, raw) in enumerate(data.items()):
+        path = tmp_path / f"mime-profile-{number}.tar"
+        path.write_bytes(raw)
+        path.chmod(0o600)
+        files[target] = path
+    actual = row()
+    return subject.describe(actual, "b" * 64, files, profile=subject.MIME_ONLY_PROFILE), actual, data
+
+
+def test_named_mime_profile_exact_two_live_archives_and_identity_rechecks(mime_proof_case):
+    proof, actual, data = mime_proof_case
+    calls = []
+    def inspect(identifier):
+        calls.append(("inspect", identifier))
+        return deepcopy(actual)
+    def archive(identifier, path, consume):
+        calls.append(("archive", path))
+        return consume(io.BytesIO(data[path]).read)
+    result = subject.verify(proof, actual, inspect=inspect, archive=archive)
+    assert set(proof) == subject.PROOF_FIELDS | {"profile"}
+    assert proof["profile"] == result["profile"] == subject.MIME_ONLY_PROFILE
+    assert result["files"] == dict(zip(subject.MIME_ONLY_PATHS, (MIME_MAIN, MIME), strict=True))
+    assert calls == [("inspect", actual["Id"]), *[("archive", path) for path in subject.MIME_ONLY_PATHS],
+                     ("inspect", actual["Id"])]
+    assert subject.legacy_config_target(proof) == subject.FILE_PATHS[0]
+    actual["State"].update(Running=False, Status="exited", ExitCode=143)
+    assert subject.verify(proof, actual, inspect=inspect, archive=archive) == result
+
+
+def test_default_profile_retains_original_fields_and_hash_algorithm(proof_case):
+    proof, _actual, data = proof_case
+    parsed = {path: subject.parse_archive(io.BytesIO(raw).read, path) for path, raw in data.items()}
+    original_closure = {"files": {path: subject.hashlib.sha256(raw).hexdigest()
+        for path, raw in zip(subject.FILE_PATHS, (MAIN, MIME, DEFAULT), strict=True)},
+        "archives": {path: {key: value[key] for key in ("sha256", "bytes", "members")}
+                     for path, value in parsed.items()}}
+    assert set(proof) == subject.PROOF_FIELDS and "profile" not in proof
+    assert proof["closure_sha256"] == gate._hash(original_closure)
+    assert subject.legacy_config_target(proof) == subject.FILE_PATHS[2]
+
+
+def test_mime_closure_hash_binds_explicit_profile(mime_proof_case):
+    proof, _actual, data = mime_proof_case
+    parsed = {path: subject.parse_archive(io.BytesIO(raw).read, path) for path, raw in data.items()}
+    closure_without_profile = {"files": {path: subject.hashlib.sha256(raw).hexdigest()
+        for path, raw in zip(subject.MIME_ONLY_PATHS, (MIME_MAIN, MIME), strict=True)},
+        "archives": {path: {key: value[key] for key in ("sha256", "bytes", "members")}
+                     for path, value in parsed.items()}}
+    assert proof["closure_sha256"] == gate._hash({**closure_without_profile, "profile": subject.MIME_ONLY_PROFILE})
+    assert proof["closure_sha256"] != gate._hash(closure_without_profile)
+
+
+@pytest.mark.parametrize("fault", ["no_profile", "unknown_profile", "explicit_default", "schema", "extra_field",
+    "extra_archive", "missing_archive", "copied_closure", "source", "duplicate_private"])
+def test_mime_profile_cannot_be_implicitly_adopted_or_crossed(mime_proof_case, proof_case, fault):
+    proof, actual, _data = mime_proof_case
+    if fault == "no_profile":
+        proof.pop("profile")
+    elif fault == "unknown_profile":
+        proof["profile"] = "arbitrary-subset"
+    elif fault == "explicit_default":
+        proof["profile"] = subject.DEFAULT_PROFILE
+    elif fault == "schema":
+        proof["schema"] = True
+    elif fault == "extra_field":
+        proof["verified"] = True
+    elif fault == "extra_archive":
+        proof["archives"][subject.FILE_PATHS[2]] = proof_case[0]["archives"][subject.FILE_PATHS[2]]
+    elif fault == "missing_archive":
+        proof["archives"].pop(subject.FILE_PATHS[1])
+    elif fault == "copied_closure":
+        proof["closure_sha256"] = proof_case[0]["closure_sha256"]
+    elif fault == "source":
+        proof["source_sha256"] = "f" * 64
+    else:
+        proof["archives"][subject.FILE_PATHS[1]] = deepcopy(proof["archives"][subject.FILE_PATHS[0]])
+    with pytest.raises(gate.AdmissionError):
+        subject.verify(proof, actual, inspect=lambda _i: pytest.fail("static failure must precede live access"),
+                       archive=lambda *_a: pytest.fail("no archive access"))
+
+
+def test_four_archive_proof_cannot_be_relabelled_as_mime_only(proof_case):
+    proof, _actual, _data = proof_case
+    proof["profile"] = subject.MIME_ONLY_PROFILE
+    with pytest.raises(gate.AdmissionError):
+        subject.validate(proof)
+
+
+@pytest.mark.parametrize("main,mime", [
+    (MAIN, MIME), (b"events {} http { server { listen 5000; } }", MIME),
+    (MIME_MAIN + b"include /outside;", MIME),
+    (MIME_MAIN.replace(b"/etc/nginx/mime.types", b"mime.types"), MIME),
+    (MIME_MAIN + b"include /etc/nginx/mime.types;", MIME),
+    (MIME_MAIN.replace(b"/etc/nginx/mime.types", b"/etc/nginx/conf.d/*.conf"), MIME),
+    (MIME_MAIN, MIME + b"include /etc/nginx/conf.d/default.conf;"),
+])
+def test_mime_profile_rejects_unknown_missing_duplicate_or_recursive_includes(main, mime):
+    parsed = {path: subject.parse_archive(io.BytesIO(raw).read, path)
+              for path, raw in mime_archive_map(main, mime).items()}
+    with pytest.raises(gate.AdmissionError):
+        subject._closure(parsed, profile=subject.MIME_ONLY_PROFILE)
+
+
+@pytest.mark.parametrize("fault", ["bytes", "identity_before", "identity_after", "file_metadata"])
+def test_mime_profile_keeps_live_and_private_identity_guards(mime_proof_case, fault):
+    proof, actual, data = mime_proof_case
+    calls = []
+    if fault == "bytes":
+        data[subject.FILE_PATHS[0]] = mime_archive_map(main=MIME_MAIN + b"# changed\n")[subject.FILE_PATHS[0]]
+    elif fault == "file_metadata":
+        Path(proof["archives"][subject.FILE_PATHS[0]]["path"]).chmod(0o644)
+    def inspect(_identifier):
+        calls.append("inspect")
+        result = deepcopy(actual)
+        if fault == "identity_before" or (fault == "identity_after" and calls.count("inspect") == 2):
+            result["RestartCount"] = 1
+        return result
+    def archive(_identifier, path, consume):
+        calls.append(path)
+        return consume(io.BytesIO(data[path]).read)
+    with pytest.raises(gate.AdmissionError):
+        subject.verify(proof, actual, inspect=inspect, archive=archive)
+    if fault == "file_metadata":
+        assert calls == []
