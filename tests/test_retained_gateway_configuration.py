@@ -542,3 +542,59 @@ def test_inherited_listener_fd_does_not_authorize_different_process_netns(monkey
     monkeypatch.setattr(subject.os, "lstat", lambda _path: pytest.fail("FD scan must not begin for other netns"))
     with pytest.raises(gate.AdmissionError, match="another network namespace"):
         authority._anchor(pid)
+
+
+def fixed_image(identifier=None):
+    return {"Id": identifier or subject.IMAGE_ID, "Architecture": "amd64", "Os": "linux",
+            "RepoDigests": ["nginx@" + subject.IMAGE_ID],
+            "RootFS": {"Type": "layers", "Layers": list(subject.IMAGE_DIFF_IDS)}}
+
+
+@pytest.mark.parametrize("identifier", ["index", "manifest", "config"])
+def test_fixed_content_chain_accepts_backend_representation_but_preserves_exact_id(identifier):
+    identifier = {"index": subject.IMAGE_ID, "manifest": subject.IMAGE_MANIFEST_ID,
+                  "config": subject.IMAGE_CONFIG_ID}[identifier]
+    assert subject.validate_image(fixed_image(identifier), expected_id=identifier) == identifier
+    assert len(subject.IMAGE_IDS) == 3 and subject.IMAGE_ID != subject.IMAGE_CONFIG_ID
+
+
+@pytest.mark.parametrize("fault", ["unreviewed_id", "sealed_identity", "platform", "os", "missing_rootfs",
+                                   "wrong_layer", "layer_order", "extra_layer", "missing_digest", "other_repo",
+                                   "other_digest", "missing_id"])
+def test_fixed_image_content_or_sealed_predecessor_drift_is_blocked(fault):
+    image = fixed_image(subject.IMAGE_CONFIG_ID)
+    expected = subject.IMAGE_CONFIG_ID
+    if fault == "unreviewed_id":
+        image["Id"] = "sha256:" + "f" * 64
+    elif fault == "sealed_identity":
+        expected = subject.IMAGE_ID
+    elif fault == "platform":
+        image["Architecture"] = "arm64"
+    elif fault == "os":
+        image["Os"] = "windows"
+    elif fault == "missing_rootfs":
+        image.pop("RootFS")
+    elif fault == "wrong_layer":
+        image["RootFS"]["Layers"][0] = "sha256:" + "f" * 64
+    elif fault == "layer_order":
+        image["RootFS"]["Layers"].reverse()
+    elif fault == "extra_layer":
+        image["RootFS"]["Layers"].append("sha256:" + "f" * 64)
+    elif fault == "missing_digest":
+        image["RepoDigests"] = []
+    elif fault == "other_repo":
+        image["RepoDigests"] = ["unreviewed/nginx@" + subject.IMAGE_ID]
+    elif fault == "other_digest":
+        image["RepoDigests"] = ["nginx@" + subject.IMAGE_CONFIG_ID]
+    else:
+        image.pop("Id")
+    with pytest.raises(gate.AdmissionError, match="image content or exact identity"):
+        subject.validate_image(image, expected_id=expected)
+
+
+def test_chain_member_cannot_replace_an_already_sealed_retained_gateway(proof_case):
+    proof, actual, _data = proof_case
+    assert actual["Image"] == subject.IMAGE_ID
+    actual["Image"] = subject.IMAGE_CONFIG_ID
+    with pytest.raises(gate.AdmissionError, match="identity changed"):
+        subject._row(proof, actual)

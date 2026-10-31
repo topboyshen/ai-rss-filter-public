@@ -155,7 +155,10 @@ def _mock_transport(monkeypatch, state, network, old_id, image, new_config):
 
     monkeypatch.setattr(switch.NativeTransport, "inspect", inspect)
     monkeypatch.setattr(switch.NativeTransport, "network_members", members)
-    monkeypatch.setattr(switch.NativeTransport, "image", lambda _self: {"Id": image})
+    def exact_image(_self, expected_id):
+        assert expected_id == image
+        return {"Id": image}
+    monkeypatch.setattr(switch.NativeTransport, "image", exact_image)
     monkeypatch.setattr(switch.NativeTransport, "find", find)
     monkeypatch.setattr(switch.NativeTransport, "run", run)
     monkeypatch.setattr(switch.NativeTransport, "health", health)
@@ -695,7 +698,10 @@ def _zero_mount_case(p, tmp_path, monkeypatch):
         return consume(io.BytesIO(raw[path]).read)
 
     p.state.archive_calls = []
-    monkeypatch.setattr(switch.NativeTransport, "image", lambda _self: {"Id": switch.retained_config.IMAGE_ID})
+    def exact_image(_self, expected_id):
+        assert expected_id == switch.retained_config.IMAGE_ID
+        return {"Id": switch.retained_config.IMAGE_ID}
+    monkeypatch.setattr(switch.NativeTransport, "image", exact_image)
     monkeypatch.setattr(switch.NativeTransport, "archive", archive)
     monkeypatch.setattr(switch.NativeTransport, "run", run)
     return raw, run
@@ -737,3 +743,31 @@ def test_zero_mount_config_change_after_term_blocks_gateway_create(case, tmp_pat
     assert len([args for args in p.state.calls if args[0] == "create"]) == 1
     assert (p.evidence / "old-configuration-proof.json").exists()
     assert not (p.evidence / "result.json").exists()
+
+
+@pytest.mark.parametrize("identifier", ["index", "config"])
+def test_native_image_lookup_reuses_exact_sealed_id_not_registry_reference(monkeypatch, identifier):
+    from tests.test_retained_gateway_configuration import fixed_image
+    expected = switch.retained_config.IMAGE_ID if identifier == "index" else switch.retained_config.IMAGE_CONFIG_ID
+    calls = []
+    def run(_self, argv):
+        calls.append(argv)
+        return json.dumps([fixed_image(expected)])
+    monkeypatch.setattr(switch.NativeTransport, "run", run)
+    assert switch.NativeTransport().image(expected)["Id"] == expected
+    assert calls == [["image", "inspect", expected]]
+    assert expected != switch.NGINX_REF
+
+
+def test_native_image_lookup_cannot_substitute_another_fixed_chain_member(monkeypatch):
+    from tests.test_retained_gateway_configuration import fixed_image
+    monkeypatch.setattr(switch.NativeTransport, "run", lambda _self, _argv: json.dumps([
+        fixed_image(switch.retained_config.IMAGE_CONFIG_ID)]))
+    with pytest.raises(gate.AdmissionError, match="image content or exact identity"):
+        switch.NativeTransport().image(switch.retained_config.IMAGE_ID)
+
+
+def test_unreviewed_image_is_rejected_before_any_lookup(monkeypatch):
+    monkeypatch.setattr(switch.NativeTransport, "run", lambda *_a: pytest.fail("must not inspect unreviewed image"))
+    with pytest.raises(gate.AdmissionError, match="image identity required"):
+        switch.NativeTransport().image("sha256:" + "f" * 64)

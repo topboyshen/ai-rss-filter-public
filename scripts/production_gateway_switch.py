@@ -237,11 +237,13 @@ class NativeTransport:
         with _hard_deadline(deadline - time.monotonic()):
             return retained_config.read_native_archive(identifier, container_path, consumer, deadline=deadline)
 
-    def image(self):
-        rows = json.loads(self.run(["image", "inspect", NGINX_REF]))
-        gate._require(
-            len(rows) == 1 and re.fullmatch(r"sha256:[0-9a-f]{64}", rows[0]["Id"]), "fixed nginx image missing"
-        )
+    def image(self, expected_id):
+        # Retain the sealed predecessor image; a registry manifest digest is
+        # not interchangeable with a daemon-local config/image identifier.
+        gate._require(expected_id in retained_config.IMAGE_IDS, "fixed nginx image identity required")
+        rows = json.loads(self.run(["image", "inspect", expected_id]))
+        gate._require(isinstance(rows, list) and len(rows) == 1, "fixed nginx image missing")
+        retained_config.validate_image(rows[0], expected_id=expected_id)
         return rows[0]
 
     def network_members(self, identifier):
@@ -871,7 +873,8 @@ class GatewaySwitch:
             "gateway attempted or receiver already open; query original only",
         )
         self.session.check_receiver_resume(active=True)
-        old, image, api = self._old(), self.transport.image(), self._api()
+        old = self._old()
+        image, api = self.transport.image(self.plan["old_gateway_identity"]["image_id"]), self._api()
         gate._require(
             old["Image"] == image["Id"]
             and self.project != old["Config"]["Labels"].get("com.docker.compose.project")
@@ -972,7 +975,7 @@ class GatewaySwitch:
             and self.intent["schema"] == 1
             and self.intent["plan"] == self.plan
             and type(self.intent["old_was_running"]) is bool
-            and self.intent["image_id"] == old["Image"] == self.transport.image()["Id"]
+            and self.intent["image_id"] == old["Image"] == self.transport.image(self.plan["old_gateway_identity"]["image_id"])["Id"]
             and self.intent["execution"] == _execution(old)
             and self.intent["ports"] == _ports(old),
             "query original gateway intent only",

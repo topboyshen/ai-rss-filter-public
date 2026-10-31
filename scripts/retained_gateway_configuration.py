@@ -30,13 +30,48 @@ DIRECTORY_PATH = "/etc/nginx/conf.d"
 ARCHIVE_PATHS = (*FILE_PATHS, DIRECTORY_PATH)
 MAX_FILE = 64 * 1024
 MAX_ARCHIVE = 128 * 1024
+# Preserve the exact image ID already observed for the retained production gateway.
 IMAGE_ID = "sha256:0d3b80406a13a767339fbe2f41406d6c7da727ab89cf8fae399e81f780f814d1"
+# Fixed public registry bytes independently hashed on 2026-10-31. These are
+# distinct content-addresses of one reviewed linux/amd64 image, not synonyms.
+IMAGE_MANIFEST_ID = "sha256:61f816887864af764259e28edb5331584ae2e42de57b3cb1e4f134d757559951"
+IMAGE_CONFIG_ID = "sha256:d0701bd41f8279135aa6c81e23fbcdae7bcc3df591c47741405412a8dcdb2eab"
+IMAGE_IDS = frozenset((IMAGE_ID, IMAGE_MANIFEST_ID, IMAGE_CONFIG_ID))
+IMAGE_DIFF_IDS = (
+    "sha256:31ad4a471c6852bfec14d757cc75a566c82a9769f12c3918cf6bf52cc0eeb3d0",
+    "sha256:513bb45c86b3ab007a1f05b558211f5b69ae412d6834f4f890988a2f765fc399",
+    "sha256:e0292b802b8d62769f1e2f7ea969575894d0f7d8fb6244c824c95997591ebb5e",
+    "sha256:ccc7cae931833ad18af797b54e21afa361279bc2161e86ffe7eb89041cd6b962",
+    "sha256:c66f3fc2d00b6f8f7c46c9d94a23d9b51e66883151fc5edaccdf781e90df929f",
+    "sha256:0a7d4fc0fa12bb5b447649d680fc84a35167dde454e242fc843dbc670b208864",
+    "sha256:9c436f5312f14af26c4dd62076f77841be450178171276e676ed18744ab020bc",
+    "sha256:61d47f9d34fb476a81f30e840d869f301c2bde5b2b6878dd6577cbaf0b69842e",
+)
+REPO_DIGESTS = frozenset(name + "@" + IMAGE_ID for name in
+                         ("nginx", "library/nginx", "docker.io/library/nginx", "index.docker.io/library/nginx"))
 RECORD_FIELDS = {"path", "device", "inode", "uid", "mode", "size", "mtime_ns", "ctime_ns", "sha256"}
 IDENTITY_FIELDS = {"id", "image_id", "name", "started_at", "restart_count", "config_sha256",
                    "host_sha256", "mounts_sha256", "networks"}
 PROOF_FIELDS = {"schema", "kind", "source_sha256", "container_identity", "network_id", "archives", "closure_sha256"}
 SOCKET_PATH = "/run/docker.sock"
 PIDFILE = "/run/docker.pid"
+
+
+def validate_image(row, *, expected_id=None):
+    """One reviewed public content chain, exact daemon-local predecessor ID.
+
+    Classic Docker can expose the config digest while the containerd store can
+    expose the manifest/index digest. Neither representation permits choosing
+    a different image from the sealed predecessor identity.
+    """
+    gate._require(isinstance(row, dict) and isinstance(row.get("Id"), str) and row["Id"] in IMAGE_IDS
+                  and (expected_id is None or row["Id"] == expected_id)
+                  and row.get("Architecture") == "amd64" and row.get("Os") == "linux"
+                  and row.get("RootFS") == {"Type": "layers", "Layers": list(IMAGE_DIFF_IDS)}
+                  and isinstance(row.get("RepoDigests"), list)
+                  and any(value in REPO_DIGESTS for value in row["RepoDigests"] if isinstance(value, str)),
+                  "fixed retained gateway image content or exact identity differs")
+    return row["Id"]
 
 
 def source_sha256():
@@ -244,7 +279,7 @@ def archive_identity(path, container_path):
 
 def _validate_identity(value):
     gate._require(isinstance(value, dict) and set(value) == IDENTITY_FIELDS
-                  and gate.HEX64.fullmatch(str(value["id"])) and value["image_id"] == IMAGE_ID
+                  and gate.HEX64.fullmatch(str(value["id"])) and value["image_id"] in IMAGE_IDS
                   and isinstance(value["name"], str) and bool(re.fullmatch(r"/[A-Za-z0-9_.-]{1,128}", value["name"]))
                   and isinstance(value["started_at"], str) and bool(value["started_at"])
                   and type(value["restart_count"]) is int and value["restart_count"] == 0
@@ -287,7 +322,7 @@ def describe(row, network_id, archives):
 
 def _row(proof, row):
     gate._require(identity(row) == proof["container_identity"] and row["Mounts"] == []
-                  and row["Image"] == IMAGE_ID and len(row["NetworkSettings"]["Networks"]) == 1
+                  and row["Image"] in IMAGE_IDS and len(row["NetworkSettings"]["Networks"]) == 1
                   and next(iter(row["NetworkSettings"]["Networks"].values()))["NetworkID"] == proof["network_id"]
                   and not any(row["State"].get(key) for key in ("Paused", "Restarting", "Dead", "OOMKilled")),
                   "actual retained gateway archive identity changed")

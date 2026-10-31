@@ -122,7 +122,8 @@ def test_old_manifest_is_exact_same_project_three_roles_zero_gateway_mounts_and_
 
 def old_rows():
     p = {"project": "same-project", "paths": {"project": Path("/synthetic/project")}, "custody_owner": "a" * 32,
-         "custody_old_services": ("old-api", "old-worker", native.OLD_SERVICE), "custody_old_name": "owned-gateway"}
+         "custody_old_services": ("old-api", "old-worker", native.OLD_SERVICE), "custody_old_name": "owned-gateway",
+         "custody_image_id": configuration.IMAGE_ID}
     rows = []
     for number, name in enumerate(p["custody_old_services"], start=1):
         row = {"Id": str(number) * 64, "Name": "/owned-gateway" if name == native.OLD_SERVICE else "/" + name,
@@ -407,7 +408,8 @@ def test_prepare_retains_real_four_archive_bytes_seals_complete_plan_once_and_ne
         if argv[:2] == ["network", "inspect"]:
             return json.dumps([network])
         if argv[:2] == ["image", "inspect"]:
-            return json.dumps([{"Id": configuration.IMAGE_ID}])
+            from tests.test_retained_gateway_configuration import fixed_image
+            return json.dumps([fixed_image(configuration.IMAGE_CONFIG_ID)])
         if argv[0] == "exec":
             return "1"
         if argv[0] == "inspect":
@@ -466,6 +468,9 @@ def test_prepare_retains_real_four_archive_bytes_seals_complete_plan_once_and_ne
             review, info = sealed[0]
             assert info["plan"] == p["gateway_plan"] and info["plan"]["window"] == p["custody_window"]
             assert len(info["configuration"]["files"]) == 3
+            assert p["custody_image_id"] == configuration.IMAGE_CONFIG_ID != configuration.IMAGE_ID
+            assert info["proof"]["container_identity"]["image_id"] == configuration.IMAGE_CONFIG_ID
+            assert info["plan"]["old_gateway_identity"]["image_id"] == configuration.IMAGE_CONFIG_ID
             assert info["declaration"]["ports"] == private.runtime_topology(rows)[native.OLD_SERVICE][0]["ports"]
             assert all(path.read_bytes() == data[container_path] for container_path, path in
                 ((container_path, Path(record["path"])) for container_path, record in info["proof"]["archives"].items()))

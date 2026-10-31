@@ -135,7 +135,7 @@ def _running_old(p, rows):
     old = by_service[OLD_SERVICE]
     expected = {"5000/tcp": [{"HostIp": host, "HostPort": "5000"} for host in HOSTS]}
     actual = {key: value for key, value in old["NetworkSettings"]["Ports"].items() if value is not None}
-    gate._require(old["Image"] == configuration.IMAGE_ID and old["Name"] == "/" + p["custody_old_name"] and old["Mounts"] == []
+    gate._require(p["custody_image_id"] in configuration.IMAGE_IDS and old["Image"] == p["custody_image_id"] and old["Name"] == "/" + p["custody_old_name"] and old["Mounts"] == []
                   and old["HostConfig"]["PortBindings"] == expected and actual == expected,
                   "retained gateway must have zero mounts and both exact fixed original ports")
     return by_service
@@ -151,7 +151,8 @@ def prepare_and_seal(harness, p):
     image = json.loads(harness.command(["image", "inspect", gateway.NGINX_REF], timeout=3))[0]
     from scripts.verify_miniflux_pause_native import image_checks
     image_checks(image, gateway.NGINX_REF)
-    gate._require(image["Id"] == configuration.IMAGE_ID, "fixed retained gateway image differs")
+    configuration.validate_image(image)
+    p["custody_image_id"] = image["Id"]
     root = p["directory"] / "gateway-native"
     root.mkdir(mode=0o700)
     p["gateway_native_root"] = root
