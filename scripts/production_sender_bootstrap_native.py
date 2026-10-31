@@ -36,7 +36,7 @@ from scripts.verify_miniflux_pause_native import (  # noqa: E402
 from scripts import sender_host_loopback_pg as local_pg  # noqa: E402
 
 SAFE_FILES = ("SOURCE.json", "SEED131.json", "SEED132.json", "DIRECT131_RESTART.json", "DIRECT131_OLD_LIMIT.json",
-              "HOST_LOOPBACK.json",
+              "HOST_LOOPBACK.json", "LOOPBACK_PG_CHECKS.json",
               "LEGACY_STOP.json", "CREATED.json", "STARTED.json",
               "CLOSED.json", "QUERY.json", "PROOF.json", "RESULT.json", "FAILURE.json", "CANDIDATE_FINAL.json",
               "RECEIVER_OLD_STORAGE.json", "RECEIVER_BOOTSTRAP_PROOF.json", "RECEIVER_SQLITE_PRESERVED.json")
@@ -76,7 +76,8 @@ class HostLoopbackHarness(Harness):
             "--cpus=1", "--security-opt=no-new-privileges", *extra, image_id, *command])
         row = json.loads(self.command(["inspect", actual]))[0]
         if name == "pg":
-            checks = loopback_pg_resources(row, image_id, self.owner, self.network, memory, pids)
+            checks = loopback_pg_resources(row, image_id, self.owner, self.network, memory, pids,
+                                           diagnostic_root=self.output)
         else:
             checks = resource_checks(row, image_id, self.owner, "host", memory, pids)
             gate._require(row["NetworkSettings"]["Networks"].keys() == {"host"}, "old sender is not exact host network")
@@ -90,7 +91,7 @@ class HostLoopbackHarness(Harness):
         return ready
 
 
-def loopback_pg_resources(row, image_id, owner, network, memory, pids):
+def loopback_pg_resources(row, image_id, owner, network, memory, pids, *, diagnostic_root=None):
     """An exact alternative topology guard, never normalize an inspect to pass."""
     host = row["HostConfig"]
     ports = {"5432/tcp": [{"HostIp": "127.0.0.1", "HostPort": "5432"}]}
@@ -105,6 +106,12 @@ def loopback_pg_resources(row, image_id, owner, network, memory, pids):
         "not_oom": row["State"]["OOMKilled"] is False,
         "real_healthcheck": row["Config"].get("Healthcheck") == {"Test": ["CMD-SHELL", "pg_isready -U synthetic -d synthetic_pause"],
             "Interval": 1_000_000_000, "Timeout": 1_000_000_000, "Retries": 5}}
+    if diagnostic_root is not None:
+        # Preserve only fixed boolean predicates before the original refusal.
+        # A rejected actual inspect must never be copied to a public diagnostic.
+        _save(Path(diagnostic_root) / "LOOPBACK_PG_CHECKS.json", {
+            "schema": 1, "scope": "loopback_pg_resource_predicates_only", "checks": checks,
+            "passed": all(checks.values()), "execution_proof": False})
     gate._require(all(checks.values()), "exact loopback PG resource/topology binding differs")
     return checks
 
