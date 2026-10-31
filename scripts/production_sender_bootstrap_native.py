@@ -535,7 +535,7 @@ def _old131_log_diagnostic(harness, logs):
     redacted = harness.redacted(bounded)
     safe, private, unknown = [], [], []
     for line in redacted.splitlines():
-        migration = re.fullmatch(r'(?:time=[0-9T:Z+.-]{20,40} level=INFO )?(?:msg=)?"?Running database migrations"? '
+        migration = re.fullmatch(r'(?:(?:time=[0-9T:Z+.-]{20,40} )?level=INFO )?(?:msg=)?"?Running database migrations"? '
                                 r'current_version=(\d{1,6}) latest_version=(\d{1,6})', line)
         stale = re.search(r"the database schema is not up to date: current=v(\d{1,6}) expected=v(\d{1,6})(?:\W|$)", line)
         if migration:

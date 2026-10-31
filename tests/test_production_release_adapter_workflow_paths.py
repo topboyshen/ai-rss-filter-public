@@ -26,6 +26,7 @@ def selected(path, patterns):
     "services/production_release_lock.py", "services/production_admission_lifecycle.py",
     "services/admission_fence.py", "services/production_activation_control.py",
     "scripts/private_release_diagnostics.py", "tests/test_private_release_diagnostics.py",
+    "scripts/verify_cutover_completion_native.py", "tests/test_cutover_completion_native.py",
     "scripts/private_control_subpaths.py", "scripts/controlled_production_release.py",
     "scripts/controlled_release_finalize.py", "scripts/private_release_contract.py",
     "scripts/sender_namespace_http.py", "scripts/production_gateway_switch.py",
@@ -76,6 +77,8 @@ def test_each_real_adapter_path_triggers_native(event, path):
 @pytest.mark.parametrize("event", ["push", "pull_request"])
 @pytest.mark.parametrize("path", [
     "docs/production-release.md", "README.md", "core/scorer.py",
+    "scripts/verify_cutover_completion_native.py.bak", "scripts/nested/verify_cutover_completion_native.py",
+    "tests/test_cutover_completion_native.py.bak", "tests/nested/test_cutover_completion_native.py",
     "scripts/production_gateway_custody_native.py.bak", "scripts/nested/production_gateway_custody_native.py",
     "tests/test_production_gateway_custody_native.py.bak", "tests/nested/test_production_gateway_custody_native.py",
     "scripts/retained_gateway_configuration.py.bak",
@@ -399,6 +402,88 @@ def _named_step(steps, name):
     matches = [step for step in steps if step.get("name") == name]
     assert len(matches) == 1
     return matches[0]
+
+
+UNSTARTED_CONTEXT_NAME = "Record explicitly skipped native stages"
+UNSTARTED_CONTEXT_CODE = '''import importlib.util, json, os
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('completion_archive_context', 'scripts/verify_cutover_completion_native.py')
+module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+result = module.prepare_unstarted_evidence_roots(Path(os.environ['RUNNER_TEMP']), {
+    'storage': os.environ['STORAGE_OUTCOME'],
+    'startup': os.environ['STARTUP_OUTCOME'],
+    'activation': os.environ['ACTIVATION_OUTCOME'],
+})
+print(json.dumps(result, sort_keys=True))
+'''
+
+
+def _assert_unstarted_stage_contract(workflow):
+    steps = workflow["jobs"]["native-amd64"]["steps"]
+    stage_names = (
+        ("Real synthetic storage and frozen lifecycle at 768 MiB / 256 PID", "frozen_storage"),
+        ("Actual application image migration and closed multiworker startup", "application_startup"),
+        ("Build fixed sender and verify actual T0 activation", "full_activation"),
+    )
+    record = _named_step(steps, UNSTARTED_CONTEXT_NAME)
+    assert set(record) == {"name", "if", "env", "run"} and record["if"] == "always()"
+    assert record["env"] == {
+        "STORAGE_OUTCOME": "${{ steps.frozen_storage.outcome }}",
+        "STARTUP_OUTCOME": "${{ steps.application_startup.outcome }}",
+        "ACTIVATION_OUTCOME": "${{ steps.full_activation.outcome }}",
+    }
+    for name, stage_id in stage_names:
+        step = _named_step(steps, name)
+        assert step["id"] == stage_id and steps.index(step) < steps.index(record)
+        assert sum(value.get("id") == stage_id for value in steps) == 1
+    assert steps.index(record) + 1 == steps.index(_named_step(steps, "Prepare evidence without following fixture links"))
+    run = record["run"]
+    assert run.startswith("python -I -B - <<'PY'\n") and run.endswith("\nPY\n")
+    actual = ast.parse(run[len("python -I -B - <<'PY'\n"):-len("\nPY\n")])
+    assert ast.dump(actual) == ast.dump(ast.parse(UNSTARTED_CONTEXT_CODE))
+
+
+def test_skipped_stage_context_binds_real_outcomes_after_producers_before_unchanged_collector():
+    workflow = yaml.load((ROOT / PATH).read_text(), Loader=yaml.BaseLoader)
+    _assert_unstarted_stage_contract(workflow)
+    _assert_priority_upload_contract(workflow)
+
+
+@pytest.mark.parametrize("mutation", [
+    "missing-id", "wrong-id", "duplicate-id", "skip-failure", "ignore-error", "outcome-success",
+    "wrong-step", "missing-outcome", "invent-passed", "before-producer", "after-collector", "duplicate",
+])
+def test_skipped_context_cannot_invent_success_ignore_failures_or_guess_step_state(mutation):
+    workflow = yaml.load((ROOT / PATH).read_text(), Loader=yaml.BaseLoader)
+    steps = workflow["jobs"]["native-amd64"]["steps"]
+    record = _named_step(steps, UNSTARTED_CONTEXT_NAME)
+    source = _named_step(steps, "Actual application image migration and closed multiworker startup")
+    if mutation == "missing-id":
+        del source["id"]
+    elif mutation == "wrong-id":
+        source["id"] = "other"
+    elif mutation == "duplicate-id":
+        steps.append({"id": source["id"], "run": "false"})
+    elif mutation == "skip-failure":
+        record["if"] = "success()"
+    elif mutation == "ignore-error":
+        record["continue-on-error"] = "true"
+    elif mutation == "outcome-success":
+        record["env"]["STARTUP_OUTCOME"] = "skipped"
+    elif mutation == "wrong-step":
+        record["env"]["STARTUP_OUTCOME"] = "${{ steps.full_activation.outcome }}"
+    elif mutation == "missing-outcome":
+        del record["env"]["STARTUP_OUTCOME"]
+    elif mutation == "invent-passed":
+        record["run"] = record["run"].replace("print(json.dumps(result, sort_keys=True))", "result['status']='passed'")
+    elif mutation == "duplicate":
+        steps.append(deepcopy(record))
+    else:
+        steps.remove(record)
+        position = steps.index(source) if mutation == "before-producer" else len(steps)
+        steps.insert(position, record)
+    with pytest.raises((AssertionError, KeyError)):
+        _assert_unstarted_stage_contract(workflow)
 
 
 def _assert_priority_upload_contract(workflow):

@@ -502,10 +502,12 @@ jobs:
         run: |
           python -m pip install --only-binary=:all: -r requirements.txt -r requirements-ops.txt
       - name: Real synthetic storage and frozen lifecycle at 768 MiB / 256 PID
+        id: frozen_storage
         run: |
           python -I -B scripts/verify_cutover_completion_native.py \
             --repo . --output "${RUNNER_TEMP}/cutover-completion"
       - name: Actual application image migration and closed multiworker startup
+        id: application_startup
         env:
           # Hosted runners can be refused by the production Tsinghua mirror.
           STARTUP_PIP_INDEX_URL: https://pypi.org/simple
@@ -529,6 +531,7 @@ jobs:
             --postgres-dsn-file "${RUNNER_TEMP}/startup-synthetic-dsn.json" \
             --miniflux-source "${RUNNER_TEMP}/startup-miniflux"
       - name: Build fixed sender and verify actual T0 activation
+        id: full_activation
         run: |
           set -euo pipefail
           umask 077
@@ -623,6 +626,25 @@ jobs:
           preserve PG_MEMORY_EVENTS.txt docker --host unix:///var/run/docker.sock exec "$PG_ID" cat /sys/fs/cgroup/memory.events
           preserve SYNTHETIC_DATABASE.sql docker --host unix:///var/run/docker.sock exec "$PG_ID" pg_dump -U postgres -d synthetic_outbox
           exit "$failed"
+      - name: Record explicitly skipped native stages
+        if: always()
+        env:
+          STORAGE_OUTCOME: ${{ steps.frozen_storage.outcome }}
+          STARTUP_OUTCOME: ${{ steps.application_startup.outcome }}
+          ACTIVATION_OUTCOME: ${{ steps.full_activation.outcome }}
+        run: |
+          python -I -B - <<'PY'
+          import importlib.util, json, os
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location('completion_archive_context', 'scripts/verify_cutover_completion_native.py')
+          module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+          result = module.prepare_unstarted_evidence_roots(Path(os.environ['RUNNER_TEMP']), {
+              'storage': os.environ['STORAGE_OUTCOME'],
+              'startup': os.environ['STARTUP_OUTCOME'],
+              'activation': os.environ['ACTIVATION_OUTCOME'],
+          })
+          print(json.dumps(result, sort_keys=True))
+          PY
       - name: Prepare evidence without following fixture links
         if: always()
         run: |

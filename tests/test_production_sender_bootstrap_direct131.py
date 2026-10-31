@@ -451,6 +451,23 @@ def test_old_probe_safe_catalogue_and_private_redaction_never_export_arbitrary_t
     assert "DIRECT131_OLD_LOG_REDACTED.log" not in native.SAFE_FILES
 
 
+@pytest.mark.parametrize("prefix", ["", "level=INFO ", "time=2026-10-31T16:59:02.000Z level=INFO "])
+def test_old_actual_info_with_optional_reviewed_time_retains_exact_migration_fields(restart_case, prefix):
+    restart_case.old_logs = prefix + 'msg="Running database migrations" current_version=135 latest_version=131\n'
+    _run(restart_case)
+    proof = json.loads((restart_case.harness.output / "DIRECT131_OLD_LIMIT.json").read_bytes())
+    assert proof["status"] == "no_op_not_schema_refusal" and proof["old_image_direct_rollback_safe"] is False
+
+
+@pytest.mark.parametrize("prefix", ["level=ERROR ", "level=DEBUG ", "level=WARN ",
+    "time=2026-10-31T16:59:02.000Z ", "level=info "])
+def test_old_migration_unknown_level_or_unreviewed_time_prefix_still_blocks(restart_case, prefix):
+    restart_case.old_logs = prefix + 'msg="Running database migrations" current_version=135 latest_version=131\n'
+    with pytest.raises(gate.AdmissionError, match="no-op"):
+        _run(restart_case)
+    assert not (restart_case.harness.output / "DIRECT131_OLD_LIMIT.json").exists()
+
+
 def test_noop_still_requires_post_probe_original_and_closed_snapshot_unchanged(restart_case):
     original_command = restart_case.harness.command
 

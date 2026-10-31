@@ -49,6 +49,78 @@ def write_fixture_record(path, value):
     return hashlib.sha256(raw).hexdigest()
 
 
+def prepare_unstarted_evidence_roots(temporary_root, outcomes):
+    """Record only explicit skipped CI stages after their producers did not run.
+
+    This is archive context, never execution proof. Existing originals are not
+    touched, and a missing root after any non-skipped outcome still blocks.
+    """
+    required = {"storage", "startup", "activation"}
+    if (type(outcomes) is not dict or set(outcomes) != required
+            or any(type(value) is not str or value not in {"success", "failure", "cancelled", "skipped"}
+                   for value in outcomes.values())):
+        raise ValueError("exact known workflow stage outcomes required")
+    root = Path(temporary_root)
+    if not root.is_absolute() or root.resolve() != root:
+        raise ValueError("exact workflow evidence parent required")
+    parent = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        original = os.fstat(parent)
+        if original.st_uid != os.geteuid() or stat.S_IMODE(original.st_mode) & 0o022:
+            raise ValueError("private workflow evidence parent required")
+        fields = ("st_dev", "st_ino", "st_uid", "st_mode")
+        parent_identity = tuple(getattr(original, field) for field in fields)
+        mapping = {"cutover-completion": ("storage",), "production-startup": ("startup",),
+                   "production-startup-source": ("startup", "activation")}
+        observed, missing = {}, []
+        for name, stages in mapping.items():
+            try:
+                info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                if any(outcomes[stage] != "skipped" for stage in stages):
+                    raise ValueError("required evidence source missing after non-skipped stage") from None
+                missing.append((name, stages))
+                continue
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+                raise ValueError("existing workflow evidence source is unsafe")
+            observed[name] = "existing_originals_unmodified"
+        for name, stages in missing:
+            if (tuple(getattr(os.fstat(parent), field) for field in fields) != parent_identity
+                    or tuple(getattr(root.lstat(), field) for field in fields) != parent_identity):
+                raise ValueError("workflow evidence parent changed")
+            os.mkdir(name, mode=0o700, dir_fd=parent)
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            try:
+                info = os.fstat(child)
+                if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
+                        or stat.S_IMODE(info.st_mode) != 0o700):
+                    raise ValueError("new skipped workflow evidence source is unsafe")
+                value = {"schema": 1, "status": "not_started", "execution_proof": False, "stage_passed": False,
+                         "source": name, "step_outcomes": {stage: outcomes[stage] for stage in stages}}
+                raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+                fd = os.open("NOT_STARTED.json", os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o600, dir_fd=child)
+                try:
+                    if os.write(fd, raw) != len(raw):
+                        raise OSError("skipped workflow marker short write")
+                    os.fsync(fd)
+                    if os.pread(fd, len(raw) + 1, 0) != raw:
+                        raise ValueError("skipped workflow marker readback differs")
+                finally:
+                    os.close(fd)
+                os.fsync(child)
+            finally:
+                os.close(child)
+            os.fsync(parent)
+            observed[name] = "not_started_recorded"
+        if tuple(getattr(root.lstat(), field) for field in fields) != parent_identity:
+            raise ValueError("workflow evidence parent changed")
+        return {"status": "skipped_stage_context_only", "execution_proof": False, "stage_passed": False,
+                "sources": observed, "step_outcomes": dict(outcomes)}
+    finally:
+        os.close(parent)
+
+
 def create_fixture_storage(mount):
     """Create one new short root in an already-owned per-group evidence mount."""
     mount = Path(mount)
@@ -497,7 +569,11 @@ TESTS = ("tests/test_independent_drain_inventory.py", "tests/test_frozen_cutover
          "tests/test_production_sender_bootstrap_export.py",
          "tests/test_production_sender_bootstrap_pg_diagnostics.py",
          "tests/test_production_sender_bootstrap_host_native.py")
-TEST_GROUPS = (("foundation", TESTS[:22]), ("activation", TESTS[22:34]), ("adapters", TESTS[34:]))
+# Keep the original three bounded groups. The direct-131 bootstrap checks belong
+# to activation; keeping them in adapters overflowed the unchanged 2,000-case
+# temporary-path limit after parametrized regression coverage grew.
+TEST_GROUPS = (("foundation", TESTS[:22]), ("activation", TESTS[22:34] + TESTS[59:60]),
+               ("adapters", TESTS[34:59] + TESTS[60:]))
 MOUNTS = ("scripts", "tests", "services", "routes", "core", "db", "utils", "workers", "modules",
           "templates", "app.py", "worker_main.py", "sse_engine.py", "logging_bootstrap.py",
           "scoring_provenance.py", "scoring_explanation.py", "config.yaml", "docker-compose.yml",
