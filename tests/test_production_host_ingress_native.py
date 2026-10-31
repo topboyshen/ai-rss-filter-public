@@ -119,8 +119,10 @@ def test_container_remains_nonprivileged_and_below_parent_limits(tmp_path, plan)
 
 
 def fixture_container(plan):
-    return {"Id": "d" * 64, "Image": plan["image"]["Id"], "Config": {"Labels": {native.LABEL: plan["owner"]}},
-            "RestartCount": 0, "State": {"Running": True, "Pid": 123, "Status": "running"},
+    return {"Id": "d" * 64, "Name": "/isolated-host-gateway", "Created": "2026-10-31T00:00:00Z", "Mounts": [],
+            "Image": plan["image"]["Id"], "Config": {"Labels": {native.LABEL: plan["owner"]}},
+            "RestartCount": 0, "State": {"Running": True, "Pid": 123, "Status": "running", "OOMKilled": False,
+                "Paused": False, "Dead": False, "Restarting": False, "StartedAt": "2026-10-31T00:00:01Z"},
             "HostConfig": {"Memory": 128 * 1024**2, "MemorySwap": 128 * 1024**2, "PidsLimit": 64,
                            "NanoCpus": 1_000_000_000, "CgroupParent": plan["cgroup"] + "/containers",
                            "Privileged": False, "CapAdd": [], "RestartPolicy": {"Name": "no"},
@@ -680,7 +682,7 @@ def stopping(tmp_path, plan, monkeypatch):
             if args[0] == "kill":
                 if state.fault == "ack":
                     raise TimeoutError("TERM result unknown")
-                row["State"].update(Running=False, Status="exited", ExitCode=0)
+                row["State"].update(Running=False, Status="exited", ExitCode=0, FinishedAt="2026-10-31T00:00:02Z")
             if args[0] == "ps":
                 return row["Id"] if state.fault == "live" else ""
             return ""
@@ -700,6 +702,8 @@ def stopping(tmp_path, plan, monkeypatch):
             return 0
 
     monkeypatch.setattr(native, "check_peer", lambda *_: None)
+    monkeypatch.setattr(native, "retainer_confirmed", lambda *_: True)
+    monkeypatch.setattr(native, "RETAINERS", {300: (SimpleNamespace(poll=lambda: 0, returncode=0), {})})
     monkeypatch.setattr(native, "resource_snapshot", lambda *_: {"memory.peak": "42"})
     logs = SimpleNamespace(finish=lambda *_: None)
     return SimpleNamespace(commands=Commands(), daemon=Daemon(), state=state, logs=logs, root=tmp_path, plan=plan)
@@ -712,6 +716,108 @@ def test_cleanup_requires_all_stopped_before_daemon_term(stopping):
     assert [x for x in s.state.calls if x[0] == "kill"] == [["kill", "--signal", "TERM", s.state.row["Id"]]]
     assert not any(x[0] in {"rm", "stop", "restart", "prune"} for x in s.state.calls)
     assert json.loads((s.root / "CLEANUP.json").read_bytes())["forced_kill"] is False
+
+
+@pytest.mark.parametrize("fault", ["created", "abnormal_exit", "oom", "paused", "dead", "restarting", "missing_finished",
+                                  "invalid_finished", "before_started", "bool_exit", "unrequested_143"])
+def test_already_stopped_requires_real_normal_exit(stopping, fault):
+    s = stopping
+    s.state.row["State"].update(Running=False, Status="exited", ExitCode=0, FinishedAt="2026-10-31T00:00:02Z")
+    state = s.state.row["State"]
+    if fault == "created":
+        state["Status"] = "created"
+    elif fault == "abnormal_exit":
+        state["ExitCode"] = 2
+    elif fault in {"oom", "paused", "dead", "restarting"}:
+        state[{"oom": "OOMKilled", "paused": "Paused", "dead": "Dead", "restarting": "Restarting"}[fault]] = True
+    elif fault == "missing_finished":
+        state.pop("FinishedAt")
+    elif fault == "invalid_finished":
+        state["FinishedAt"] = "0001-01-01T00:00:00Z"
+    elif fault == "before_started":
+        state["FinishedAt"] = "2026-10-31T00:00:00Z"
+    elif fault == "bool_exit":
+        state["ExitCode"] = False
+    else:
+        state["ExitCode"] = 143
+    with pytest.raises(native.ProofError):
+        native.stop_owned(s.commands, s.root, s.plan, s.daemon, {}, s.logs)
+    assert s.state.daemon_term == 0 and not (s.root / "CLEANUP.json").exists()
+    assert not any(args[0] == "kill" for args in s.state.calls)
+
+
+def test_already_normally_exited_never_sends_another_term(stopping):
+    s = stopping
+    s.state.row["State"].update(Running=False, Status="exited", ExitCode=0, FinishedAt="2026-10-31T00:00:02Z")
+    assert native.stop_owned(s.commands, s.root, s.plan, s.daemon, {}, s.logs)
+    assert not any(args[0] == "kill" for args in s.state.calls)
+    assert json.loads((s.root / "CLEANUP.json").read_bytes())["retainer_returncode"] == 0
+
+
+def test_requested_term_143_with_same_identity_is_normal_exit(stopping):
+    s = stopping
+    original = s.commands.docker
+
+    def term_143(args):
+        result = original(args)
+        if args[0] == "kill":
+            s.state.row["State"]["ExitCode"] = 143
+        return result
+
+    s.commands.docker = term_143
+    assert native.stop_owned(s.commands, s.root, s.plan, s.daemon, {}, s.logs)
+    assert len([args for args in s.state.calls if args[0] == "kill"]) == 1
+    assert json.loads((s.root / "STOPPED_INSPECT.json").read_bytes())["State"]["ExitCode"] == 143
+
+
+@pytest.mark.parametrize("field", ["OOMKilled", "Paused", "Dead", "Restarting"])
+@pytest.mark.parametrize("fault", ["missing", "false_integer", "false_string"])
+def test_unknown_running_state_never_sends_term(stopping, field, fault):
+    s = stopping
+    if fault == "missing":
+        s.state.row["State"].pop(field)
+    else:
+        s.state.row["State"][field] = 0 if fault == "false_integer" else ""
+    with pytest.raises(native.ProofError, match="unknown container state prevents TERM"):
+        native.stop_owned(s.commands, s.root, s.plan, s.daemon, {}, s.logs)
+    assert not any(args[0] == "kill" for args in s.state.calls)
+    assert s.state.daemon_term == 0 and not (s.root / "CLEANUP.json").exists()
+
+
+@pytest.mark.parametrize("key", ["Id", "Name", "Image", "Config", "HostConfig", "Mounts", "RestartCount", "StartedAt"])
+def test_identity_change_after_term_cannot_confirm_cleanup(stopping, key):
+    s = stopping
+    original = s.commands.inspect
+    count = []
+    def drift(identifier):
+        row = original(identifier)
+        count.append(1)
+        if len(count) > 1:
+            if key == "StartedAt":
+                row["State"][key] = "2026-10-31T00:00:01.1Z"
+            else:
+                row[key] = {"changed": True} if isinstance(row[key], dict) else ["changed"]
+        return row
+    s.commands.inspect = drift
+    with pytest.raises(native.ProofError):
+        native.stop_owned(s.commands, s.root, s.plan, s.daemon, {}, s.logs)
+    assert s.state.daemon_term == 0 and not (s.root / "CLEANUP.json").exists()
+
+
+@pytest.mark.parametrize("fault", ["missing", "unconfirmed", "nonzero"])
+def test_retainer_exit_is_mandatory_before_cleanup_success(stopping, monkeypatch, fault):
+    s = stopping
+    if fault == "missing":
+        monkeypatch.setattr(native, "RETAINERS", {})
+    elif fault == "unconfirmed":
+        monkeypatch.setattr(native, "retainer_confirmed", lambda *_: False)
+    else:
+        monkeypatch.setattr(native, "RETAINERS", {300: (SimpleNamespace(poll=lambda: 1, returncode=1), {})})
+    with pytest.raises(native.ProofError):
+        native.stop_owned(s.commands, s.root, s.plan, s.daemon, {}, s.logs)
+    assert not (s.root / "CLEANUP.json").exists()
+    if fault in {"missing", "unconfirmed"}:
+        assert s.state.daemon_term == 0
 
 
 @pytest.mark.parametrize("fault", ["ack", "live", "foreign", "evidence"])
@@ -744,6 +850,21 @@ def test_private_evidence_is_exclusive_and_preserved(tmp_path):
     with pytest.raises(FileExistsError):
         native.durable(path, {"two": 2})
     assert path.read_bytes() == original and path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("value", [b"fixed original bytes\n", {"fixed": "original"}])
+def test_durable_writes_original_and_syncs_file_and_directory(tmp_path, monkeypatch, value):
+    path, synced = tmp_path / "original", []
+    original_fsync = native.os.fsync
+
+    def observed_fsync(fd):
+        synced.append(native.os.fstat(fd).st_mode)
+        return original_fsync(fd)
+
+    monkeypatch.setattr(native.os, "fsync", observed_fsync)
+    native.durable(path, value)
+    assert path.read_bytes() == (value if isinstance(value, bytes) else native.encoded(value))
+    assert len(synced) == 2 and native.stat.S_ISREG(synced[0]) and native.stat.S_ISDIR(synced[1])
 
 
 def test_main_failure_safe_packet_has_no_message_env_or_path(tmp_path, monkeypatch, capsys):
@@ -865,7 +986,8 @@ def test_safe_packet_includes_actual_ports_and_hashes_but_not_env_or_paths(tmp_p
     row["Config"]["Env"] = ["TOKEN=private-secret"]
     row["Args"] = ["/secret/private/path"]
     native.durable(root / "HTTP_AFTER.json", row)
-    native.durable(root / "CLEANUP.json", {"all_containers_stopped": True, "daemon_returncode": 0, "removed": False, "forced_kill": False})
+    native.durable(root / "CLEANUP.json", {"all_containers_stopped": True, "daemon_returncode": 0,
+        "retainer_returncode": 0, "removed": False, "forced_kill": False})
     native.durable(root / "RESOURCES_FINAL.json", {"memory.max": str(native.MEMORY), "memory.events": "oom 0\noom_kill 0"})
     for name in ("NAMESPACE_BEFORE.json", "NAMESPACE_AFTER.json"):
         native.durable(root / name, {"netns": 123, "links": [{"ifname": "lo", "ifindex": 1}],

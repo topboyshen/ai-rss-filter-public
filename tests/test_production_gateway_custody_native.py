@@ -514,3 +514,90 @@ def test_preserve_already_exited_rechecks_identity_and_normal_completion(tmp_pat
         assert not list((tmp_path / "custody-final").glob("*.stopped.json"))
     assert sum(args[0] == "inspect" for args in calls) == 1
     assert not any(args[0] in {"kill", "rm", "stop", "prune"} for args in calls)
+
+
+def test_scenario_precompose_failure_is_not_replaced_by_empty_project_cleanup(tmp_path, monkeypatch):
+    """The first native failure remains observable; empty project never passes."""
+    calls = []
+    primary = gate.AdmissionError("original fixture preparation failed")
+    p = {"directory": tmp_path, "strategy": "synthetic-strategy", "project": "synthetic-project",
+         "paths": {"project": tmp_path}, "anchor": SimpleNamespace(close=lambda: calls.append("anchor"))}
+    harness = SimpleNamespace(repo=tmp_path, network="synthetic-network", python_id="synthetic-python",
+                              stage=lambda name: calls.append(name), launch_sender=lambda: calls.append("sender"))
+    monkeypatch.setattr(native, "require_private_host", lambda _harness: None)
+    monkeypatch.setattr(native.private, "source_identity", lambda _repo: {})
+    monkeypatch.setattr(native.fixture, "prepare_disk", lambda *_a: p)
+    monkeypatch.setattr(activation, "closed_initialization", lambda *_a: object())
+    def fail_prepare(*_a):
+        raise primary
+    def missing_project(_contract):
+        calls.append("inspect_missing_project")
+        raise native.private.ContractError("existing Compose project is missing")
+    monkeypatch.setattr(native, "prepare_and_seal", fail_prepare)
+    monkeypatch.setattr(native.private, "inspect_project", missing_project)
+    with pytest.raises(gate.AdmissionError) as caught:
+        native.scenario(harness, tmp_path)
+    assert caught.value is primary
+    assert calls[-2:] == ["inspect_missing_project", "anchor"]
+    assert len(primary.__notes__) == 1 and "ContractError" in primary.__notes__[0]
+    assert "existing Compose project is missing" not in primary.__notes__[0]
+    assert list((tmp_path / "custody-final").iterdir()) == []
+
+
+@pytest.mark.parametrize("first_failure", ["gateway", "project", "anchor", "daemon", None])
+@pytest.mark.parametrize("has_primary", [False, True])
+def test_each_finalizer_runs_once_and_cannot_mask_first_failure(tmp_path, monkeypatch, first_failure, has_primary):
+    calls = []
+    failures = {label: RuntimeError("secret-token raw-argv /private/raw-root " + label)
+                for label in ("gateway", "project", "anchor", "daemon")}
+    def invoke(label):
+        calls.append(label)
+        if label == first_failure:
+            raise failures[label]
+    p = {"gateway_native_root": tmp_path, "anchor": SimpleNamespace(close=lambda: invoke("anchor"))}
+    monkeypatch.setattr(native.ordinary_gateway, "preserve", lambda *_a: invoke("gateway"))
+    monkeypatch.setattr(native, "preserve", lambda *_a: invoke("project"))
+    daemon = SimpleNamespace(terminate=lambda: invoke("daemon"), wait=lambda **_k: calls.append("wait"))
+    primary = ValueError("original operation") if has_primary else None
+    if not has_primary and first_failure is not None:
+        with pytest.raises(RuntimeError) as caught:
+            native._preserve_scenario(object(), p, daemon, primary)
+        assert caught.value is failures[first_failure]
+    else:
+        native._preserve_scenario(object(), p, daemon, primary)
+    assert calls[:4] == ["gateway", "project", "anchor", "daemon"]
+    assert calls.count("wait") == (0 if first_failure == "daemon" else 1)
+    if has_primary and first_failure:
+        notes = primary.__notes__
+        assert len(notes) == 1 and first_failure in notes[0]
+        assert native.hashlib.sha256(str(failures[first_failure]).encode()).hexdigest() in notes[0]
+        assert all(value not in notes[0] for value in ("secret-token", "raw-argv", "/private/raw-root"))
+
+
+def test_multiple_cleanup_failures_still_block_and_preserve_all_first_failure_notes(tmp_path, monkeypatch):
+    errors = [gate.AdmissionError("gateway unknown"), native.private.ContractError("project unknown")]
+    calls = []
+    def reject(index):
+        calls.append(index)
+        raise errors[index]
+    monkeypatch.setattr(native.ordinary_gateway, "preserve", lambda *_a: reject(0))
+    monkeypatch.setattr(native, "preserve", lambda *_a: reject(1))
+    p = {"gateway_native_root": tmp_path, "anchor": SimpleNamespace(close=lambda: calls.append("anchor"))}
+    with pytest.raises(gate.AdmissionError) as caught:
+        native._preserve_scenario(object(), p, None, None)
+    assert caught.value is errors[0] and calls == [0, 1, "anchor"]
+    assert len(errors[0].__notes__) == 1 and "ContractError" in errors[0].__notes__[0]
+
+
+def test_finalizers_keep_original_total_deadline_without_a_new_window(monkeypatch):
+    states, waits = [], []
+    monkeypatch.setattr(native, "preserve", lambda *_a: states.append(native.native_deadline.STATE.get()))
+    p = {"anchor": SimpleNamespace(close=lambda: states.append(native.native_deadline.STATE.get()))}
+    daemon = SimpleNamespace(terminate=lambda: None, wait=lambda **kwargs: waits.append(kwargs["timeout"]))
+    now = time.monotonic()
+    with native.native_deadline.scope(now + 0.2, now + 1.5):
+        before = native.native_deadline.STATE.get()
+        native._preserve_scenario(object(), p, daemon, None)
+        assert native.native_deadline.STATE.get() == before
+    assert states == [(now + 1.5, now + 1.5)] * 2
+    assert len(waits) == 1 and 0 < waits[0] <= 1.5

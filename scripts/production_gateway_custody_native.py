@@ -383,6 +383,38 @@ def completed_proof(p, capability):
     return result
 
 
+def _preserve_scenario(harness, p, daemon, primary):
+    """Keep the first failure while still attempting every existing finalizer.
+
+    An empty/partly-created predecessor project is still an error, never a
+    successful drain. Its cleanup error must not replace the earlier operation
+    error that explains why the project was never created.
+    """
+    def gateway_originals():
+        if "gateway_native_root" in p:
+            ordinary_gateway.preserve(harness, p)
+
+    def daemon_exit():
+        if daemon is not None:
+            daemon.terminate()
+            daemon.wait(timeout=native_deadline.clamp(3))
+
+    failure = primary
+    with native_deadline.final_phase():
+        for label, finalize in (("gateway", gateway_originals), ("project", lambda: preserve(harness, p)),
+                                ("anchor", p["anchor"].close), ("daemon", daemon_exit)):
+            try:
+                finalize()
+            except BaseException as secondary:
+                if failure is None:
+                    failure = secondary
+                else:
+                    failure.add_note("custody finalizer " + label + " failed: " + type(secondary).__name__
+                                     + " sha256=" + hashlib.sha256(str(secondary).encode()).hexdigest())
+    if primary is None and failure is not None:
+        raise failure
+
+
 def scenario(harness, output):
     from scripts import verify_production_activation_native as activation
     from scripts.production_sender_native_bridge import NativeControlBridge
@@ -391,7 +423,7 @@ def scenario(harness, output):
     harness.stage("custody_never_opened_synthetic_storage_not_actual125")
     p = fixture.prepare_disk(output / "receiver", private.source_identity(harness.repo), harness.network, harness.python_id)
     p["activation_operation"] = activation.operation("receiver-activation-custody")
-    daemon = None
+    daemon, primary = None, None
     try:
         harness.sender_contract = p["strategy"]
         harness.stage("custody_actual_sender_first_closed")
@@ -429,16 +461,8 @@ def scenario(harness, output):
                 except BaseException:
                     activation.abort_native_guardian(p)
                     raise
+    except BaseException as error:
+        primary = error
+        raise
     finally:
-        with native_deadline.final_phase():
-            try:
-                try:
-                    if "gateway_native_root" in p:
-                        ordinary_gateway.preserve(harness, p)
-                finally:
-                    preserve(harness, p)
-            finally:
-                p["anchor"].close()
-                if daemon is not None:
-                    daemon.terminate()
-                    daemon.wait(timeout=native_deadline.clamp(3))
+        _preserve_scenario(harness, p, daemon, primary)

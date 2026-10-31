@@ -221,7 +221,7 @@ def test_stop_fallback_reports_first_inner_error_before_scenario(tmp_path, monke
     monkeypatch.setattr(native, "evidence_packet", lambda *_: {"complete": False})
     result = {}
     native.failure_evidence(tmp_path, native.time.monotonic() + 2, result)
-    assert result == {"first_inner_failure": first, "safe_evidence": {"complete": False}}
+    assert result == {"first_inner_failure": first, "safe_evidence": {"complete": False}, "cleanup_confirmed": False}
 
 
 @pytest.mark.parametrize("fault", ["schema_bool", "extra_field", "unknown_stage", "secret_literal", "literal_hash",
@@ -280,3 +280,134 @@ def test_disabled_diagnostics_leave_shared_full_activation_commands_unobserved(m
     native.diagnostic_stage("not-a-stage")
     native.diagnostic_command(["/private/path"], 1)
     assert native.DIAGNOSTICS is None
+
+
+def test_fixed_daemon_start_diagnostics_export_redacted_text_and_info_receipt(tmp_path, monkeypatch):
+    root = tmp_path / "inner"
+    root.mkdir()
+    first = sample_failure()
+    first.update(stage="daemon_start")
+    first["last_command"].update(operation="docker_info", sequence=14)
+    raw = b'time="now" level=error msg="failed plugin load"\ntoken=private-token /private/daemon/path\n'
+    native.durable(root / "daemon.stderr", raw)
+    native.durable(root / "command-0014.json", {"argv": [*native.DOCKER, "info", "--format", "{{json .}}"],
+        "elapsed": 3.001197, "returncode": None, "client_term_sent": True})
+    native.durable(root / "command-0014.stderr", b"password=private-password docker info deadline\n")
+    native.durable(root / "STOP.json", {"status": "unconfirmed", "cleanup_confirmed": True, "diagnostics": first})
+    originals = {p.name: p.read_bytes() for p in root.iterdir()}
+    monkeypatch.setattr(native, "evidence_packet", lambda *_: {"complete": False})
+    native.durable(root / "FIRST_FAILURE.json", first)
+    result = {"cleanup_confirmed": False}
+    native.failure_evidence(tmp_path, time.monotonic() + 2, result)
+    rows = result["daemon_start_evidence"]
+    assert rows["daemon.stderr"]["profile"]["sha256"] == hashlib.sha256(raw).hexdigest()
+    assert "failed plugin load" in rows["daemon.stderr"]["profile"]["text"]
+    assert rows["command-0014.json"]["profile"] == {
+        "operation": "docker_info", "returncode": None, "elapsed_seconds": 3.001197,
+        "client_term_sent": True, "outcome": "unknown", "execution_proof": False}
+    assert rows["STOP.json"]["profile"]["cleanup_claimed"] is True
+    assert rows["STOP.json"]["profile"]["cleanup_confirmed"] is False
+    assert result["cleanup_confirmed"] is False
+    output = json.dumps(result)
+    assert "private-token" not in output and "private-password" not in output and "/private/daemon" not in output
+    assert all((root / name).read_bytes() == value for name, value in originals.items())
+
+
+def test_daemon_and_info_text_profiles_reach_actual_safe_packet(tmp_path):
+    root = tmp_path / "inner"
+    root.mkdir()
+    native.durable(root / "daemon.stderr", b"failed to start storage driver\n")
+    native.durable(root / "command-0014.json", {"argv": [*native.DOCKER, "info", "--format", "{{json .}}"],
+        "elapsed": 3.0, "returncode": None})
+    native.durable(root / "command-0014.stderr", b"docker info incomplete\n")
+    native.durable(root / "STOP.json", {"status": "unconfirmed", "diagnostics": sample_failure()})
+    packet = native.evidence_packet(tmp_path)
+    assert packet["complete"] is False
+    assert packet["profiles"]["inner/daemon.stderr"]["text"] == "failed to start storage driver\n"
+    assert packet["profiles"]["inner/command-0014.stderr"]["text"] == "docker info incomplete\n"
+    assert packet["profiles"]["inner/command-0014.json"]["outcome"] == "unknown"
+    assert packet["profiles"]["inner/STOP.json"]["diagnostics"] == sample_failure()
+
+
+def test_text_export_is_bounded_tail_and_never_changes_original(tmp_path):
+    path = tmp_path / "daemon.stderr"
+    raw = b"old line\n" * 10000 + b"final observed plugin error\n"
+    native.durable(path, raw)
+    value = native.diagnostic_text_original(path)
+    assert len(value["text"].encode()) <= native.DIAGNOSTIC_TEXT_BYTES
+    assert value["truncated"] is True and value["source_window"] == "tail"
+    assert value["text"].endswith("final observed plugin error\n")
+    assert value["bytes"] == len(raw) and value["sha256"] == hashlib.sha256(raw).hexdigest()
+    assert path.read_bytes() == raw and value["execution_proof"] is False
+
+
+@pytest.mark.parametrize("line", [
+    "--password SYNTHETIC_SECRET_XYZ", "PRIVATE_KEY=SYNTHETIC_SECRET_XYZ", "Bearer SYNTHETIC_SECRET_XYZ",
+    "password=\"SYNTHETIC_SECRET_XYZ with spaces\"", "API_KEY SYNTHETIC_SECRET_XYZ",
+    "Authorization: Basic SYNTHETIC_SECRET_XYZ", "--client-secret SYNTHETIC_SECRET_XYZ",
+    "cookie SYNTHETIC_SECRET_XYZ", "TOKEN: SYNTHETIC_SECRET_XYZ",
+])
+def test_unstructured_sensitive_line_is_omitted_instead_of_partial_redaction(tmp_path, line):
+    path = tmp_path / "daemon.stderr"
+    raw = (line + "\nfailed to start storage driver\n").encode()
+    native.durable(path, raw)
+    value = native.diagnostic_text_original(path)
+    assert value["text"] == "<sensitive-line-redacted>\nfailed to start storage driver\n"
+    assert "SYNTHETIC_SECRET_XYZ" not in value["text"]
+    assert path.read_bytes() == raw and value["sha256"] == hashlib.sha256(raw).hexdigest()
+
+
+@pytest.mark.parametrize("newline", [False, True])
+def test_tail_start_inside_a_credential_is_never_exported(tmp_path, newline):
+    path = tmp_path / "daemon.stderr"
+    raw = b"TOKEN=" + b"privatecredential" * 2048
+    if newline:
+        raw += b"\nobserved storage driver error\n"
+    native.durable(path, raw)
+    value = native.diagnostic_text_original(path)
+    assert "privatecredential" not in value["text"]
+    assert value["text"] == ("observed storage driver error\n" if newline else "")
+    assert value["truncated"] is True and path.read_bytes() == raw
+
+
+@pytest.mark.parametrize("fault", ["symlink", "hardlink", "changing"])
+def test_diagnostic_text_refuses_unsafe_or_mutating_original(tmp_path, monkeypatch, fault):
+    target = tmp_path / "private-target"
+    target.write_bytes(b"token=private-original")
+    path = tmp_path / "daemon.stderr"
+    if fault == "symlink":
+        path.symlink_to(target)
+    elif fault == "hardlink":
+        native.os.link(target, path)
+    else:
+        native.durable(path, b"first")
+        original = native.file_proof
+        calls = []
+        def changing(*args, **kwargs):
+            calls.append(1)
+            value = original(*args, **kwargs)
+            return value if len(calls) == 1 else {**value, "sha256": "0" * 64}
+        monkeypatch.setattr(native, "file_proof", changing)
+    with pytest.raises((OSError, native.ProofError)):
+        native.diagnostic_text_original(path)
+    assert target.read_bytes() == b"token=private-original"
+
+
+def test_unknown_command_stderr_is_never_exported_as_docker_info(tmp_path):
+    native.durable(tmp_path / "command-0014.json", {"argv": [*native.DOCKER, "exec", "private"],
+        "elapsed": 1, "returncode": 0})
+    native.durable(tmp_path / "command-0014.stderr", b"unclassified private message")
+    assert native.profile_for(tmp_path / "command-0014.json") is None
+    assert native.profile_for(tmp_path / "command-0014.stderr") is None
+
+
+@pytest.mark.parametrize("retainer,confirmed", [(0, True), (None, False), (1, False), (True, False)])
+def test_cleanup_claim_requires_independent_normal_daemon_and_retainer(tmp_path, monkeypatch, retainer, confirmed):
+    (tmp_path / "inner").mkdir()
+    profile = {"all_containers_stopped": True, "daemon_returncode": 0,
+        "retainer_returncode": retainer, "removed": False, "forced_kill": False}
+    monkeypatch.setattr(native, "evidence_packet", lambda *_: {"complete": False,
+        "profiles": {"inner/CLEANUP.json": profile}})
+    result = {"cleanup_confirmed": False}
+    native.failure_evidence(tmp_path, time.monotonic() + 2, result)
+    assert result["cleanup_confirmed"] is confirmed

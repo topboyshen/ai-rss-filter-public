@@ -806,6 +806,25 @@ def safe_harness_failure(value):
         return None
 
 
+def safe_failure_locations(value):
+    """Reviewed source basenames and line numbers only; never locals or text."""
+    if type(value) is not list or len(value) > 32:
+        return None
+    result = []
+    for item in value:
+        if type(item) is not dict or set(item) != {"file", "function", "line"}:
+            return None
+        name, line = item["file"], item["line"]
+        if (type(name) is not str or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,95}\.py", name)
+                or type(line) is not int or not 1 <= line <= 20000
+                or not any((ROOT / folder / name).is_file() for folder in ("scripts", "services"))):
+            return None
+        # The function name is deliberately omitted: unlike a reviewed source
+        # basename, caller-provided text must not enter the public diagnostic.
+        result.append({"file": name, "line": line})
+    return result
+
+
 def safe_activation(value):
     """Project report is still untrusted input to the public summary."""
     result = {"schema": "production-activation-native-v1", "status": value.get("status") if isinstance(value.get("status"), str) and value.get("status") in {
@@ -820,6 +839,7 @@ def safe_activation(value):
         result[key] = item if type(item) in {int, float} and math.isfinite(item) and item >= 0 else None
     failure = value.get("failure")
     if isinstance(failure, dict):
+        result["failure_locations"] = safe_failure_locations(failure.get("locations"))
         result["failure_message_sha256"] = (failure.get("message_sha256") if
             re.fullmatch(r"[0-9a-f]{64}", str(failure.get("message_sha256"))) else None)
         result["failure_type_sha256"] = hashlib.sha256(host.encoded(failure.get("type"))).hexdigest()

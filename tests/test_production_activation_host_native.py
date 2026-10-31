@@ -786,6 +786,32 @@ def test_safe_activation_reports_only_boolean_custody_mode(value, expected):
     assert native.safe_activation({"gateway_custody": value})["gateway_custody"] is expected
 
 
+def test_public_failure_locations_retain_source_line_without_runtime_text():
+    failure = {"type": "RuntimeError", "locations": [{
+        "file": "production_gateway_custody_native.py", "function": "TOKEN=never-export", "line": 159}]}
+    result = native.safe_activation({"failure": failure})
+    assert result["failure_locations"] == [{"file": "production_gateway_custody_native.py", "line": 159}]
+    assert "never-export" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("change", [
+    {"file": "../secrets.py"}, {"file": "/private/secrets.py"}, {"file": "TOKEN_never_export.py"},
+    {"line": True}, {"line": 0}, {"line": 20001}, {"unexpected": "secret"},
+])
+def test_public_failure_locations_reject_unreviewed_or_malformed_fields(change):
+    row = {"file": "production_gateway_custody_native.py", "function": "prepare_and_seal", "line": 159}
+    row.update(change)
+    assert native.safe_failure_locations([row]) is None
+
+
+def test_public_failure_locations_are_bounded_and_not_execution_proof():
+    row = {"file": "production_gateway_custody_native.py", "function": "prepare_and_seal", "line": 159}
+    assert native.safe_failure_locations([row] * 32) == [{"file": row["file"], "line": 159}] * 32
+    assert native.safe_failure_locations([row] * 33) is None
+    assert native.safe_failure_locations(None) is None
+    assert native.safe_failure_locations([]) == []
+
+
 def test_failed_terminal_summary_reports_safe_child_phase_without_waiting_for_holder(tmp_path, monkeypatch, capsys):
     root = tmp_path / "private-originals"
     monkeypatch.setattr(native, "_arguments", lambda argv: SimpleNamespace(output=root, inside=False))
