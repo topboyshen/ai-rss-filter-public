@@ -407,7 +407,7 @@ jobs:
           sudo -n install -m 0400 "$RUNNER_TEMP/host-loopback131/build/IMAGE.json" "$native_stage/build/rawimage.json"
           sudo -n install -m 0500 "$RUNNER_TEMP/host-loopback131/build/miniflux" "$native_stage/miniflux-binary"
           printf 'AI_FILTER_NATIVE_LOOPBACK_IMAGE=%s\n' "$image_id" >> "$GITHUB_ENV"
-      - name: Real host-loopback131 CLOSED migration restart and old-image refusal
+      - name: Real host-loopback131 CLOSED migration restart and old-image rollback boundary
         run: |
           set -euo pipefail
           umask 077

@@ -524,7 +524,7 @@ def test_priority_upload_preserves_real_four_source_collector_without_bypass(mut
 HOST131_JOB = "native-host-loopback131"
 HOST131_PROOF = "Prove real root daemon host namespace before fixture access"
 HOST131_BUILD = "Build locked sender from actual checkout for host131"
-HOST131_CASE = "Real host-loopback131 CLOSED migration restart and old-image refusal"
+HOST131_CASE = "Real host-loopback131 CLOSED migration restart and old-image rollback boundary"
 
 
 def _host131_tree(run, output_name):

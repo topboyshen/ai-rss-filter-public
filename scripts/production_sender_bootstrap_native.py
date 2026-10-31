@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import base64
 from contextlib import nullcontext
+from datetime import datetime
 import hashlib
 import json
 import math
@@ -37,6 +38,7 @@ from scripts.verify_miniflux_pause_native import (  # noqa: E402
 from scripts import sender_host_loopback_pg as local_pg  # noqa: E402
 
 SAFE_FILES = ("SOURCE.json", "SEED131.json", "SEED132.json", "DIRECT131_RESTART.json", "DIRECT131_OLD_LIMIT.json",
+              "DIRECT131_OLD_PROBE.json",
               "HOST_LOOPBACK.json", "LOOPBACK_PG_CHECKS.json",
               "LEGACY_STOP.json", "CREATED.json", "STARTED.json",
               "CLOSED.json", "QUERY.json", "PROOF.json", "RESULT.json", "FAILURE.json", "CANDIDATE_FINAL.json",
@@ -498,6 +500,8 @@ def closed_http(harness, actual):
 
 
 DIRECT131_BODY = b'{"synthetic":"post-migration-retained-original","entry":{"id":1}}'
+OLD131_LOG_BYTES = 16 * 1024
+OLD131_SOURCE_REVISION = "51f2e0d8199ea8fa305081f6e175bba64b0ef94b"
 DIRECT131_ORIGINAL_SQL = """SELECT json_build_object(
  'schema',(SELECT version FROM schema_version),
  'gate',(SELECT json_build_object('manifest',manifest,'generation',generation,'phase',phase,
@@ -518,6 +522,103 @@ def direct131_snapshot(harness, operation):
                       "phase": "closed", "current_operation": operation}
                   and value["retained"] == retained, "direct131 retained original or closed state differs")
     return value
+
+
+def _old131_log_diagnostic(harness, logs):
+    """Export only fixed source literals; retain bounded redacted text privately.
+
+    The literal catalogue describes the reviewed source, not a guarantee that a
+    particular image emitted it. Unknown text is never copied into the packet.
+    """
+    raw = logs.encode()
+    bounded = raw[:OLD131_LOG_BYTES].decode(errors="replace")
+    redacted = harness.redacted(bounded)
+    safe, private, unknown = [], [], []
+    for line in redacted.splitlines():
+        migration = re.fullmatch(r'(?:time=[0-9T:Z+.-]{20,40} level=INFO )?(?:msg=)?"?Running database migrations"? '
+                                r'current_version=(\d{1,6}) latest_version=(\d{1,6})', line)
+        stale = re.search(r"the database schema is not up to date: current=v(\d{1,6}) expected=v(\d{1,6})(?:\W|$)", line)
+        if migration:
+            safe.append({"literal": "Running database migrations", "current_version": int(migration[1]),
+                         "latest_version": int(migration[2])})
+        elif stale:
+            safe.append({"literal": "the database schema is not up to date", "current_version": int(stale[1]),
+                         "expected_version": int(stale[2])})
+        else:
+            unknown.append(hashlib.sha256(line.encode()).hexdigest())
+        if re.search(r"(?i)password|passwd|\bpwd\b|token|secret|dsn|credential|authorization|bearer|private.?key|database_url|\bPG[A-Z_]+", line):
+            line = "<sensitive line retained only by SHA256 " + hashlib.sha256(line.encode()).hexdigest() + ">"
+        private.append(re.sub(r"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s]+", "<redacted-uri>", line))
+    private_raw = ("\n".join(private) + "\n").encode()[:OLD131_LOG_BYTES]
+    _save(harness.output / "DIRECT131_OLD_LOG_REDACTED.log", private_raw)
+    return {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
+        "capture_scope": "docker_logs_tail_64", "bounded_complete": len(raw) <= OLD131_LOG_BYTES and len(logs.splitlines()) < 64,
+        "reviewed_source_revision": OLD131_SOURCE_REVISION, "source_literals": safe[:8],
+        "literal_entries_truncated": len(safe) > 8, "unknown_line_count": len(unknown),
+        "unknown_line_sha256": unknown[:8], "private_redacted_file": "DIRECT131_OLD_LOG_REDACTED.log",
+        "private_redacted_bytes": len(private_raw), "private_redacted_sha256": hashlib.sha256(private_raw).hexdigest(),
+        "raw_log_exported": False}
+
+
+def _old131_probe(harness, seed):
+    """Save actual wait, image lifecycle and safe log observations before refusal."""
+    dsn = f"postgres://synthetic:{harness.password}@pg:5432/synthetic_pause?sslmode=disable"
+    launched = harness.launch("old131-after135", seed["upstream_image"],
+        ["--read-only", "--cap-drop=ALL", "-e", "DATABASE_URL=" + dsn], ["/usr/bin/miniflux", "-migrate"])
+    container_id = launched["Id"]
+    code = harness.command(["wait", container_id], timeout=15).strip()
+    logs = harness.command(["logs", "--tail=64", container_id], timeout=3)
+    actual = json.loads(harness.command(["inspect", container_id], timeout=3))[0]
+    state = actual.get("State", {})
+    started, finished = _old131_timestamp(state.get("StartedAt")), _old131_timestamp(state.get("FinishedAt"))
+    checks = {"same_id": actual.get("Id") == container_id, "same_image": actual.get("Image") == seed["upstream_image"],
+        "complete_id": bool(re.fullmatch(r"[0-9a-f]{64}", container_id)),
+        "complete_image_id": bool(re.fullmatch(r"sha256:[0-9a-f]{64}", seed["upstream_image"])),
+        "same_created": actual.get("Created") == launched.get("Created") and _old131_timestamp(actual.get("Created")) is not None,
+        "same_started": state.get("StartedAt") == launched.get("State", {}).get("StartedAt"),
+        "same_execution": all(actual.get(key) == launched.get(key) for key in ("Config", "HostConfig", "Mounts")),
+        "same_owner": actual.get("Config", {}).get("Labels", {}).get(LABEL) == harness.owner,
+        "same_name": actual.get("Name") == "/" + harness.names["old131-after135"],
+        "fixed_executable": actual.get("Config", {}).get("Entrypoint") is None
+            and actual.get("Config", {}).get("Cmd") == ["/usr/bin/miniflux", "-migrate"],
+        "read_only": actual.get("HostConfig", {}).get("ReadonlyRootfs") is True,
+        "all_capabilities_dropped": actual.get("HostConfig", {}).get("CapDrop") == ["ALL"],
+        "zero_mounts": actual.get("Mounts") == [],
+        "status_exited": state.get("Status") == "exited", "not_running": state.get("Running") is False,
+        "not_paused": state.get("Paused") is False, "not_restarting": state.get("Restarting") is False,
+        "not_dead": state.get("Dead") is False, "not_oom": state.get("OOMKilled") is False,
+        "no_restart": actual.get("RestartCount") == 0,
+        "wait_matches_inspect": code in {"0", "1"} and type(state.get("ExitCode")) is int and str(state["ExitCode"]) == code,
+        "finished_at_recorded": started is not None and finished is not None and finished >= started}
+    log = _old131_log_diagnostic(harness, logs)
+    _save(harness.output / "DIRECT131_OLD_PROBE.json", {"status": "observed_not_accepted", "synthetic_only": True,
+        "container_id": container_id, "old_image_id": seed["upstream_image"], "checks": checks,
+        "wait_code": code if code in {"0", "1", "137", "143"} else None,
+        "wait_code_sha256": hashlib.sha256(code.encode()).hexdigest(),
+        "inspect_exit_code": state.get("ExitCode") if type(state.get("ExitCode")) is int else None,
+        "inspect_state": {key: state.get(key) if type(state.get(key)) is bool else None
+            for key in ("Running", "Paused", "Restarting", "Dead", "OOMKilled")},
+        "inspect_status": state.get("Status") if state.get("Status") in {"created", "running", "paused",
+            "restarting", "removing", "exited", "dead"} else None,
+        "logs": log,
+        "old_image_direct_rollback_safe": False, "production_compatibility_proven": False})
+    gate._require(all(checks.values()) and log["bounded_complete"], "old fixed image lifecycle or bounded diagnostic unconfirmed")
+    resource_checks(actual, seed["upstream_image"], harness.owner, harness.network)
+    expected = {"literal": "Running database migrations", "current_version": 135, "latest_version": 131}
+    gate._require(code == "0" and log["source_literals"] == [expected] and log["unknown_line_count"] == 0
+                  and not log["literal_entries_truncated"], "old fixed image migration no-op not confirmed")
+    return log
+
+
+def _old131_timestamp(value):
+    if type(value) is not str or not re.fullmatch(
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z", value):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00").timestamp()
+    except ValueError:
+        return None
+    return parsed if parsed > 0 else None
 
 
 def direct131_restart_and_old_limit(harness, plan, created, cap, evidence):
@@ -554,23 +655,17 @@ def direct131_restart_and_old_limit(harness, plan, created, cap, evidence):
         "stale_release_binding_rejected": True, "historical_raw_coverage": "unknown_before_T0_no_replay",
         "retained_fixture_created_after_migration": True, "power_loss_durability_proven": False})
     seed = json.loads((harness.output / "SEED131.json").read_bytes())
-    dsn = f"postgres://synthetic:{harness.password}@pg:5432/synthetic_pause?sslmode=disable"
-    harness.launch("old131-after135", seed["upstream_image"],
-        ["--read-only", "--cap-drop=ALL", "-e", "DATABASE_URL=" + dsn], ["/usr/bin/miniflux", "-migrate"])
-    code = harness.command(["wait", harness.names["old131-after135"]], timeout=15).strip()
-    logs = harness.command(["logs", harness.names["old131-after135"]], timeout=3)
-    gate._require(code == "1" and "database schema version" in logs.lower() and "newer" in logs.lower(),
-                  "old fixed image schema refusal not confirmed")
+    log = _old131_probe(harness, seed)
     gate._require(direct131_snapshot(harness, plan["operation_id"]) == original,
                   "old fixed image changed migrated data")
-    _save(harness.output / "DIRECT131_OLD_LIMIT.json", {"status": "expected_schema_refusal_confirmed",
+    _save(harness.output / "DIRECT131_OLD_LIMIT.json", {"status": "no_op_not_schema_refusal",
         "synthetic_only": True, "old_image_id": seed["upstream_image"], "schema": 135,
-        "exit_code": 1, "schema_refusal_log_sha256": hashlib.sha256(logs.encode()).hexdigest(),
+        "exit_code": 0, "migration_log_sha256": log["sha256"], "schema_refusal_observed": False,
         "originals_unchanged": True, "old_image_direct_rollback_safe": False,
         "requires_separate_reviewed_database_restore_or_forward_recovery": True,
         "historical_raw_coverage": "unknown_before_T0_no_replay"})
     return {"candidate_restart_closed": True, "retained_original_unchanged": True,
-            "old_image_schema_refusal": True, "old_image_direct_rollback_safe": False,
+            "old_image_migration_no_op": True, "old_image_schema_refusal": False, "old_image_direct_rollback_safe": False,
             "production_compatibility_proven": False}
 
 

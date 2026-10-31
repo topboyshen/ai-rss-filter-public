@@ -51,7 +51,9 @@ The four explicit phases are:
 Accepted source schemas are deliberately restricted to canonical
 131/132/133/134/135. The separate native host-loopback131 CI job must prove
 the fixed upstream image's actual 131 migration directly to 135, CLOSED
-initialization, retained-original restart and old-image refusal before release.
+initialization, retained-original restart and the old CLI's actual migration
+behavior before release. A successful old `-migrate` no-op is not schema refusal
+or evidence that the old sender can safely resume.
 The fixture never manufactures a 131 marker. The original 132/bridge and full
 activation proofs remain required. Earlier, future, malformed or unknown schema
 markers stop before create. PG metadata uses a read-only transaction, bounded LIMIT queries,
@@ -88,9 +90,13 @@ or denied duplication is UNKNOWN and blocks; no capability, sysctl, listener
 fallback or timeout extension is authorized. A shared host namespace alone is
 never listener ownership proof.
 
-These checks do not make a schema downgrade safe. After migration to 135 the
-fixed upstream 131 image must refuse startup; rollback cannot consist of merely
-switching a sender image. Preserve all original PG/control/outbox/held records,
+These checks do not make a schema downgrade safe. The fixed upstream 131
+implementation only migrates when the database version is lower than its own;
+its CLI can return success without changing a newer schema. The native check
+must observe the exact image, normal exit, the actual 135/131 migration log and
+unchanged retained original/CLOSED state. This proves only that CLI no-op,
+not old-service compatibility, startup refusal or safe rollback. Rollback cannot
+consist of merely switching a sender image. Preserve all original PG/control/outbox/held records,
 keep producers and consumers closed, and separately review recovery before any
 rollback. Historical messages whose old sender never saved raw bytes remain an
 explicit gap and must not be replayed or invented.

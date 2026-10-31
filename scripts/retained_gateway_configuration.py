@@ -433,12 +433,46 @@ def _process(pid, *, systemd=False):
             "namespace_identity": (namespace.st_dev, namespace.st_ino)}
 
 
+LINK_MUTATION_MESSAGES = {
+    "dev": "gateway archive authority link changed: dev",
+    "ino": "gateway archive authority link changed: ino",
+    "mode": "gateway archive authority link changed: mode",
+    "uid": "gateway archive authority link changed: uid",
+    "gid": "gateway archive authority link changed: gid",
+    "nlink": "gateway archive authority link changed: nlink",
+    "size": "gateway archive authority link changed: size",
+    "mtime_ns": "gateway archive authority link changed: mtime_ns",
+    "ctime_ns": "gateway archive authority link changed: ctime_ns",
+}
+LINK_UNKNOWN_MESSAGES = {
+    "lstat_before": "gateway archive authority link unknown: lstat_before",
+    "readlink": "gateway archive authority link unknown: readlink",
+    "lstat_after": "gateway archive authority link unknown: lstat_after",
+}
+
+
 def _link_identity(path):
-    info = os.lstat(path)
-    gate._require(stat.S_ISLNK(info.st_mode), "gateway archive authority link required")
-    value = os.readlink(path)
-    gate._require(len(value) <= 4096 and os.lstat(path) == info, "gateway archive authority link changed")
-    return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid, info.st_ctime_ns, value)
+    operation = "lstat_before"
+    try:
+        info = os.lstat(path)
+        gate._require(stat.S_ISLNK(info.st_mode), "gateway archive authority link required")
+        operation = "readlink"
+        value = os.readlink(path)
+        operation = "lstat_after"
+        after = os.lstat(path)
+    except OSError:
+        error = gate.AdmissionUncertain(LINK_UNKNOWN_MESSAGES[operation])
+        error.gateway_link_diagnostic = {"operation": operation, "changed_fields": [], "unknown": True}
+        raise error from None
+    changed = [key for key in LINK_MUTATION_MESSAGES if getattr(info, "st_" + key) != getattr(after, "st_" + key)]
+    if changed:
+        error = gate.AdmissionUncertain(LINK_MUTATION_MESSAGES[changed[0]])
+        error.gateway_link_diagnostic = {"operation": "readlink_identity", "changed_fields": changed, "unknown": False}
+        raise error
+    gate._require(len(value) <= 4096, "gateway archive authority link value capacity")
+    # readlink may change only access time. Every mutation field and the value
+    # remain part of the held identity, rechecked by _process/confirm afterward.
+    return (*_stat_identity(info), value)
 
 
 def _stat_identity(info):

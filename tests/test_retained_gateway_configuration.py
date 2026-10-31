@@ -4,6 +4,7 @@ import base64
 import io
 import json
 from pathlib import Path
+import os
 import socket
 import stat
 import struct
@@ -736,3 +737,108 @@ def test_mime_profile_keeps_live_and_private_identity_guards(mime_proof_case, fa
         subject.verify(proof, actual, inspect=inspect, archive=archive)
     if fault == "file_metadata":
         assert calls == []
+
+
+def link_stat(*, atime=1, **changes):
+    values = {"st_mode": stat.S_IFLNK | 0o777, "st_ino": 2, "st_dev": 3, "st_nlink": 1,
+              "st_uid": 0, "st_gid": 0, "st_size": 12, "st_atime": atime, "st_mtime": 4, "st_ctime": 5}
+    values.update(changes)
+    ns = {key: int(values[key[:-3]] * 10**9) for key in ("st_atime_ns", "st_mtime_ns", "st_ctime_ns")}
+    ns.update({key: value for key, value in changes.items() if key.endswith("_ns")})
+    return os.stat_result(tuple(values[key] for key in
+        ("st_mode", "st_ino", "st_dev", "st_nlink", "st_uid", "st_gid", "st_size", "st_atime", "st_mtime", "st_ctime")), ns)
+
+
+def test_readlink_access_time_is_not_link_mutation_or_a_retry(monkeypatch):
+    first, later = link_stat(), link_stat(atime=9)
+    assert first != later  # Real stat_result comparison includes access time.
+    calls, rows = [], iter((first, later))
+    def lstat(path):
+        calls.append(("lstat", path))
+        return next(rows)
+    def readlink(path):
+        calls.append(("readlink", path))
+        return "socket:[123]"
+    monkeypatch.setattr(subject.os, "lstat", lstat)
+    monkeypatch.setattr(subject.os, "readlink", readlink)
+    assert subject._link_identity("/fixed-private-fd") == (*subject._stat_identity(first), "socket:[123]")
+    assert calls == [("lstat", "/fixed-private-fd"), ("readlink", "/fixed-private-fd"),
+                     ("lstat", "/fixed-private-fd")]
+
+
+@pytest.mark.parametrize("field,new", [("dev", 9), ("ino", 9), ("mode", stat.S_IFREG | 0o777),
+    ("uid", 9), ("gid", 9), ("nlink", 2), ("size", 99), ("mtime_ns", 999), ("ctime_ns", 999)])
+def test_every_readlink_mutation_field_blocks_without_exposing_path_or_target(monkeypatch, field, new):
+    rows = iter((link_stat(), link_stat(**{"st_" + field: new})))
+    monkeypatch.setattr(subject.os, "lstat", lambda _p: next(rows))
+    monkeypatch.setattr(subject.os, "readlink", lambda _p: "SECRET-TARGET")
+    with pytest.raises(gate.AdmissionUncertain, match="authority link changed") as caught:
+        subject._link_identity("/SECRET-PATH")
+    message = str(caught.value)
+    diagnostic = caught.value.gateway_link_diagnostic
+    assert diagnostic == {"operation": "readlink_identity", "changed_fields": [field], "unknown": False}
+    assert message == subject.LINK_MUTATION_MESSAGES[field] and "SECRET" not in message
+
+
+@pytest.mark.parametrize("operation", ["lstat_before", "readlink", "lstat_after"])
+def test_missing_or_denied_link_observation_remains_unknown_and_never_retried(monkeypatch, operation):
+    calls = []
+    def lstat(_path):
+        stage = "lstat_after" if calls else "lstat_before"
+        calls.append(stage)
+        if stage == operation:
+            raise OSError("SECRET-PATH AND ENV")
+        return link_stat()
+    def readlink(_path):
+        calls.append("readlink")
+        if operation == "readlink":
+            raise OSError("SECRET-TARGET")
+        return "socket:[123]"
+    monkeypatch.setattr(subject.os, "lstat", lstat)
+    monkeypatch.setattr(subject.os, "readlink", readlink)
+    with pytest.raises(gate.AdmissionUncertain, match="authority link unknown") as caught:
+        subject._link_identity("/SECRET-PATH")
+    diagnostic = caught.value.gateway_link_diagnostic
+    assert diagnostic == {"operation": operation, "changed_fields": [], "unknown": True}
+    assert str(caught.value) == subject.LINK_UNKNOWN_MESSAGES[operation]
+    assert calls == ["lstat_before", "readlink", "lstat_after"][:len(calls)]
+    assert calls[-1] == operation and "SECRET" not in str(caught.value)
+
+
+def test_retained_listener_link_value_change_is_still_rejected_by_live_confirm(monkeypatch):
+    info = link_stat()
+    monkeypatch.setattr(subject.os, "lstat", lambda _p: info)
+    target = ["socket:[123]"]
+    monkeypatch.setattr(subject.os, "readlink", lambda _p: target[0])
+    held = subject._link_identity("/fixed-private-fd")
+    authority = subject._ArchiveAuthority(time.monotonic() + 3)
+    authority.socket, authority.pid_raw, authority.pid_metadata = info, b"123", ()
+    authority.namespace_fd, authority.namespace = 19, (3, 2)
+    authority.listener_row = {"inode": 123}
+    authority.pidfds, authority.processes = {123: 99}, {123: {"fixed": True}}
+    authority.held = {123: {"/fixed-private-fd": held}}
+    monkeypatch.setattr(subject, "_small", lambda *_a: (b"123", ()))
+    monkeypatch.setattr(subject.os, "stat", lambda _p: info)
+    monkeypatch.setattr(subject.os, "fstat", lambda _fd: info)
+    monkeypatch.setattr(subject, "_current_listener", lambda: authority.listener_row)
+    monkeypatch.setattr(subject, "_alive", lambda _fd: None)
+    monkeypatch.setattr(subject, "_process", lambda *_a, **_k: authority.processes[123])
+    target[0] = "socket:[999]"
+    with pytest.raises(gate.AdmissionError, match="listener FD changed"):
+        authority.confirm()
+
+
+@pytest.mark.parametrize("message", [*subject.LINK_MUTATION_MESSAGES.values(), *subject.LINK_UNKNOWN_MESSAGES.values()])
+def test_actual_source_literal_guard_exports_only_the_fixed_link_diagnostic(message):
+    from scripts.verify_production_activation_native import source_literal
+    assert source_literal(message, Path(__file__).resolve().parents[1]) == message
+
+
+@pytest.mark.parametrize("message", [
+    "gateway archive authority link changed: dev SECRET-PATH",
+    'gateway archive authority link changed {"changed_fields": ["dev"]}',
+    "SECRET-COMMAND SECRET-ENV SECRET-TARGET",
+])
+def test_link_diagnostics_do_not_widen_actual_source_literal_export(message):
+    from scripts.verify_production_activation_native import source_literal
+    assert source_literal(message, Path(__file__).resolve().parents[1]) is None

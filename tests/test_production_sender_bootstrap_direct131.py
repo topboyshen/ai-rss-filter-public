@@ -115,6 +115,29 @@ def test_direct131_metadata_refuses_wrong_ambiguous_marker_and_rolls_back(
     assert calls[-1] == "ROLLBACK"
 
 
+def _old131_rows():
+    created = {
+        "Id": "1" * 64,
+        "Image": "sha256:" + "f" * 64,
+        "Name": "/owned-old131-after135",
+        "Created": "2026-11-01T00:00:00.000000001Z",
+        "Config": {"Labels": {native.LABEL: "owner"}, "Entrypoint": None,
+                   "Cmd": ["/usr/bin/miniflux", "-migrate"]},
+        "HostConfig": {"NetworkMode": "owned-private", "Memory": 768 * 1024**2,
+            "MemorySwap": 768 * 1024**2, "PidsLimit": 256, "NanoCpus": 1_000_000_000,
+            "Privileged": False, "SecurityOpt": ["no-new-privileges"],
+            "ReadonlyRootfs": True, "CapDrop": ["ALL"]},
+        "Mounts": [], "RestartCount": 0,
+        "State": {"Running": True, "OOMKilled": False, "StartedAt": "2026-11-01T00:00:00.000000001Z"},
+    }
+    actual = deepcopy(created)
+    actual["State"] = {"Status": "exited", "Running": False, "ExitCode": 0,
+        "OOMKilled": False, "Paused": False, "Dead": False, "Restarting": False,
+        "StartedAt": "2026-11-01T00:00:00.000000001Z",
+        "FinishedAt": "2026-11-01T00:00:01.000000001Z"}
+    return created, actual
+
+
 @pytest.fixture
 def restart_case(tmp_path, monkeypatch):
     digest = hashlib.sha256(native.DIRECT131_BODY).hexdigest()
@@ -147,8 +170,8 @@ def restart_case(tmp_path, monkeypatch):
         commands=[],
         launches=[],
         stopped=False,
-        old_code="1",
-        old_logs="database schema version is newer",
+        old_code="0",
+        old_logs='time=2026-11-01T00:00:00.000Z level=INFO msg="Running database migrations" current_version=135 latest_version=131',
         mutate=None,
         query_rejected=True,
     )
@@ -168,6 +191,8 @@ def restart_case(tmp_path, monkeypatch):
         "State": {"Running": True, "StartedAt": "after"},
     }
     case.before, case.exited, case.after = before, exited, after
+    old_created, case.old_actual = _old131_rows()
+    case.old_created = old_created
     rows = iter((before, exited, after))
     monkeypatch.setattr(native.bootstrap, "_inspect", lambda _id: next(rows))
     monkeypatch.setattr(native, "_ready", lambda *_args: {"schema_version": 135})
@@ -198,6 +223,9 @@ def restart_case(tmp_path, monkeypatch):
             return case.old_code
         if args[0] == "logs":
             return case.old_logs
+        if args[0] == "inspect":
+            assert args[1] == old_created["Id"]
+            return json.dumps([case.old_actual])
         return ""
 
     names = {}
@@ -205,11 +233,15 @@ def restart_case(tmp_path, monkeypatch):
     def launch(*args):
         case.launches.append(args)
         names[args[0]] = "owned-" + args[0]
+        return deepcopy(old_created)
 
     harness = SimpleNamespace(
         output=tmp_path,
         image_id=image,
+        owner="owner",
+        network="owned-private",
         password="synthetic-only",
+        redacted=lambda text: text.replace("synthetic-only", "<synthetic-secret>"),
         names=names,
         sql=sql,
         command=command,
@@ -251,7 +283,14 @@ def test_direct131_restart_keeps_closed_original_and_old_image_is_not_direct_rol
         and proof["power_loss_durability_proven"] is False
     )
     old = json.loads((case.harness.output / "DIRECT131_OLD_LIMIT.json").read_bytes())
-    assert old["exit_code"] == 1 and old["old_image_direct_rollback_safe"] is False
+    assert old["exit_code"] == 0 and old["old_image_direct_rollback_safe"] is False
+    assert old["status"] == "no_op_not_schema_refusal"
+    assert result["old_image_schema_refusal"] is False and result["old_image_migration_no_op"] is True
+    probe = json.loads((case.harness.output / "DIRECT131_OLD_PROBE.json").read_bytes())
+    assert probe["wait_code"] == "0" and probe["inspect_exit_code"] == 0
+    assert all(probe["checks"].values())
+    assert probe["logs"]["source_literals"] == [{"literal": "Running database migrations",
+        "current_version": 135, "latest_version": 131}]
     assert case.launches[0][1] == "sha256:" + "f" * 64
     assert case.launches[0][-1] == ["/usr/bin/miniflux", "-migrate"]
     assert all(
@@ -318,14 +357,113 @@ def test_stale_release_identity_may_not_silently_rebind(restart_case):
         ("137", "schema version"),
         ("1", "unrelated network failure"),
         ("1", "database schema version check: network error"),
+        ("1", "database schema version is newer"),
+        ("0", 'msg="Running database migrations" current_version=134 latest_version=131'),
+        ("0", 'msg="Running database migrations" current_version=135 latest_version=132'),
     ],
 )
 def test_old_image_unknown_failure_is_not_schema_refusal_proof(
     restart_case, code, logs
 ):
     restart_case.old_code, restart_case.old_logs = code, logs
-    with pytest.raises(gate.AdmissionError, match="schema refusal"):
+    with pytest.raises(gate.AdmissionError, match="old fixed image"):
         _run(restart_case)
+    assert not (restart_case.harness.output / "DIRECT131_OLD_LIMIT.json").exists()
+    observed = json.loads((restart_case.harness.output / "DIRECT131_OLD_PROBE.json").read_bytes())
+    assert observed["status"] == "observed_not_accepted"
+    assert observed["logs"]["sha256"] == hashlib.sha256(logs.encode()).hexdigest()
+
+
+@pytest.mark.parametrize("kind", ["oom", "running", "paused", "dead", "restarting", "exit_mismatch",
+    "created_status", "missing_finished", "zero_finished", "invalid_finished", "before_started", "started",
+    "image", "id", "owner", "name", "created", "missing_created", "missing_started", "command", "mount",
+    "memory", "pids", "read_only", "cap_drop", "restart"])
+def test_old_probe_real_lifecycle_identity_or_resource_drift_is_not_noop(restart_case, kind):
+    case = restart_case
+    row, state = case.old_actual, case.old_actual["State"]
+    if kind in {"oom", "running", "paused", "dead", "restarting"}:
+        state[{"oom": "OOMKilled", "running": "Running", "paused": "Paused",
+            "dead": "Dead", "restarting": "Restarting"}[kind]] = True
+    elif kind == "exit_mismatch":
+        state["ExitCode"] = 1
+    elif kind == "created_status":
+        state["Status"] = "created"
+    elif kind == "missing_finished":
+        state["FinishedAt"] = ""
+    elif kind == "zero_finished":
+        state["FinishedAt"] = "0001-01-01T00:00:00Z"
+    elif kind == "invalid_finished":
+        state["FinishedAt"] = "2026-99-99T00:00:00Z"
+    elif kind == "before_started":
+        state["FinishedAt"] = "2026-10-31T23:59:59Z"
+    elif kind == "started":
+        state["StartedAt"] = "2026-10-31T23:59:59Z"
+    elif kind == "missing_started":
+        state.pop("StartedAt")
+        case.old_created["State"].pop("StartedAt")
+    elif kind == "missing_created":
+        row.pop("Created")
+        case.old_created.pop("Created")
+    elif kind in {"image", "id", "name", "created"}:
+        row[{"image": "Image", "id": "Id", "name": "Name", "created": "Created"}[kind]] = "different"
+    elif kind == "owner":
+        row["Config"]["Labels"][native.LABEL] = "other"
+    elif kind == "command":
+        row["Config"]["Cmd"] = ["/usr/bin/miniflux"]
+    elif kind == "mount":
+        row["Mounts"] = [{"Destination": "/unexpected"}]
+    elif kind in {"memory", "pids", "read_only", "cap_drop"}:
+        row["HostConfig"][{"memory": "Memory", "pids": "PidsLimit", "read_only": "ReadonlyRootfs",
+            "cap_drop": "CapDrop"}[kind]] = {"memory": 1024**3, "pids": 512,
+            "read_only": False, "cap_drop": []}[kind]
+    elif kind == "restart":
+        row["RestartCount"] = 1
+    with pytest.raises((gate.AdmissionError, ValueError), match="old fixed image|actual resource"):
+        _run(case)
+    assert (case.harness.output / "DIRECT131_OLD_PROBE.json").exists()
+    assert not (case.harness.output / "DIRECT131_OLD_LIMIT.json").exists()
+
+
+@pytest.mark.parametrize("logs", ["", "database schema version is newer",
+    'msg="Running database migrations" current_version=135 latest_version=131\nunknown error',
+    'msg="Running database migrations" current_version=135 latest_version=131 network_error',
+    'msg="Running database migrations" current_version=135 latest_version=131\n' * 64,
+    "x" * (native.OLD131_LOG_BYTES + 1)])
+def test_old_noop_unknown_or_truncated_log_blocks_but_preserves_diagnostic(restart_case, logs):
+    restart_case.old_logs = logs
+    with pytest.raises(gate.AdmissionError, match="old fixed image"):
+        _run(restart_case)
+    assert (restart_case.harness.output / "DIRECT131_OLD_PROBE.json").exists()
+    assert not (restart_case.harness.output / "DIRECT131_OLD_LIMIT.json").exists()
+
+
+def test_old_probe_safe_catalogue_and_private_redaction_never_export_arbitrary_text(restart_case):
+    case = restart_case
+    case.old_logs += "\npassword=synthetic-only\npostgres://account:OTHER_SECRET@pg/db\nPRIVATE_KEY=OTHER_SECRET\nopaque-unknown"
+    with pytest.raises(gate.AdmissionError, match="no-op"):
+        _run(case)
+    safe = (case.harness.output / "DIRECT131_OLD_PROBE.json").read_bytes()
+    private = (case.harness.output / "DIRECT131_OLD_LOG_REDACTED.log").read_bytes()
+    assert all(secret not in safe for secret in (b"synthetic-only", b"OTHER_SECRET", b"opaque-unknown", b"postgres://"))
+    assert all(secret not in private for secret in (b"synthetic-only", b"OTHER_SECRET", b"postgres://"))
+    assert b"opaque-unknown" in private
+    assert (case.harness.output / "DIRECT131_OLD_LOG_REDACTED.log").stat().st_mode & 0o777 == 0o600
+    assert "DIRECT131_OLD_LOG_REDACTED.log" not in native.SAFE_FILES
+
+
+def test_noop_still_requires_post_probe_original_and_closed_snapshot_unchanged(restart_case):
+    original_command = restart_case.harness.command
+
+    def command(args, **options):
+        value = original_command(args, **options)
+        if args[0] == "inspect":
+            restart_case.snapshot["retained"]["state"] = "acked"
+        return value
+
+    restart_case.harness.command = command
+    with pytest.raises(gate.AdmissionError, match="original or closed"):
+        _run(restart_case)
+    assert (restart_case.harness.output / "DIRECT131_OLD_PROBE.json").exists()
     assert not (restart_case.harness.output / "DIRECT131_OLD_LIMIT.json").exists()
 
 
@@ -335,6 +473,7 @@ def test_new_safe_export_records_are_allowlisted_without_removing_old132():
         "SEED132.json",
         "DIRECT131_RESTART.json",
         "DIRECT131_OLD_LIMIT.json",
+        "DIRECT131_OLD_PROBE.json",
     } <= set(native.SAFE_FILES)
 
 
