@@ -660,6 +660,8 @@ def test_existing_unsafe_root_is_not_replaced_or_followed(tmp_path, unsafe):
         path.write_bytes(b"original")
     else:
         path.mkdir(mode=0o755)
+        path.chmod(0o755)
+        assert stat.S_IMODE(path.stat().st_mode) == 0o755
     before = path.lstat()
     with pytest.raises(ValueError, match="existing workflow evidence source is unsafe"):
         runner.prepare_unstarted_evidence_roots(root, dict.fromkeys(("storage", "startup", "activation"), "skipped"))

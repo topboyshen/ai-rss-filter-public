@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 from copy import deepcopy
+from collections import Counter
 import hashlib
 import json
 import os
@@ -461,6 +462,35 @@ def completed_proof(p, capability):
     return result
 
 
+def _observed_mount_order_only(p, capability, error):
+    """Classify an existing rejection using exact snapshots, never authorize it."""
+    if type(error) is not gate.AdmissionError or str(error) != "old container identity changed: mounts_sha256":
+        return False
+    observation = getattr(error, "legacy_identity_observation", None)
+    if (type(observation) is not dict or set(observation) != {"role", "identity", "mounts"}
+            or observation["role"] not in legacy.ROLES):
+        return False
+    try:
+        role = observation["role"]
+        original = p["custody_roles"][role]
+        expected = capability.plan["containers"][role]
+        observed, mounts = observation["identity"], observation["mounts"]
+        if (legacy.container_identity(original) != expected or type(observed) is not dict
+                or set(observed) != set(expected) or set(expected) != set(legacy._CONTAINER_IDENTITY_ERRORS)
+                or {key for key in expected if observed[key] != expected[key]} != {"mounts_sha256"}
+                or type(mounts) is not list or type(original["Mounts"]) is not list
+                or gate._hash(mounts) != observed["mounts_sha256"]):
+            return False
+        def records(rows):
+            if any(type(row) is not dict for row in rows):
+                raise TypeError("mount records must remain complete dictionaries")
+            return [json.dumps(row, sort_keys=True, separators=(",", ":"), allow_nan=False) for row in rows]
+        before, after = records(original["Mounts"]), records(mounts)
+        return before != after and Counter(before) == Counter(after)
+    except (KeyError, TypeError, AttributeError, ValueError):
+        return False
+
+
 def _preserve_scenario(harness, p, daemon, primary):
     """Keep the first failure while still attempting every existing finalizer.
 
@@ -524,7 +554,12 @@ def scenario(harness, output):
         evidence = p["directory"] / "legacy-stop"
         evidence.mkdir(mode=0o700)
         with legacy.locked_takeover(path, evidence) as capability:
-            stopped = capability.stop()
+            try:
+                stopped = capability.stop()
+            except gate.AdmissionError as error:
+                if _observed_mount_order_only(p, capability, error):
+                    raise gate.AdmissionError("old container identity changed: mounts_order_only") from error
+                raise
             gate._require(stopped["status"] == "registered_legacy_runtime_stopped", "actual four-role legacy stop unconfirmed")
             fixture.save(p["directory"] / "ACTUAL_LEGACY_STOP.json", stopped)
             migration_root = p["directory"] / "migration"

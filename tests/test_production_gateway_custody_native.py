@@ -1,5 +1,6 @@
 """Local wiring/negative tests, never a native custody or .125 execution proof."""
 from copy import deepcopy
+import ast
 import base64
 from contextlib import contextmanager
 import io
@@ -716,3 +717,72 @@ def test_both_native_include_profiles_are_fixed_and_mime_only_is_initial_manifes
     initializer = plan["services"][native.OLD_SERVICE]["command"][0]
     assert "> /etc/nginx/conf.d/default.conf" not in initializer
     assert base64.b64encode(native.NGINX_CONFIG).decode() in initializer
+
+
+def mount_order_failure():
+    from tests.test_production_legacy_takeover import container
+    row = container(1, "sender")
+    row["Mounts"] += [{"Source": "/synthetic/private", "Destination": "/config", "RW": False, "Extra": {"all": 1}}]
+    expected = native.legacy.container_identity(row)
+    mounts = deepcopy(row["Mounts"])[::-1]
+    observed = {**expected, "mounts_sha256": gate._hash(mounts)}
+    error = gate.AdmissionError("old container identity changed: mounts_sha256")
+    error.legacy_identity_observation = {"role": "sender", "identity": observed, "mounts": mounts}
+    return {"custody_roles": {"sender": row}}, SimpleNamespace(plan={"containers": {"sender": expected}}), error
+
+
+def test_native_mount_order_classifier_uses_complete_originals_but_never_allows_identity_change():
+    p, capability, error = mount_order_failure()
+    before = deepcopy(p), deepcopy(capability.plan), deepcopy(error.legacy_identity_observation)
+    assert native._observed_mount_order_only(p, capability, error) is True
+    assert (p, capability.plan, error.legacy_identity_observation) == before
+    assert native.legacy.container_identity(p["custody_roles"]["sender"]) != error.legacy_identity_observation["identity"]
+    assert activation.source_literal("old container identity changed: mounts_order_only", Path(native.__file__).resolve().parents[1])
+    # The wiring rethrows this as AdmissionError from the original rejection,
+    # before the stopped receipt or any later activation can be accepted.
+    tree = ast.parse(Path(native.__file__).read_bytes())
+    raises = [node for node in ast.walk(tree) if isinstance(node, ast.Raise)
+              and node.cause is not None and isinstance(node.cause, ast.Name) and node.cause.id == "error"]
+    assert any("mounts_order_only" in ast.unparse(node) for node in raises)
+
+
+@pytest.mark.parametrize("fault", [
+    "missing-original", "original-changed", "missing-observation", "unknown-role", "extra-identity-field",
+    "other-identity-change", "mount-content", "mount-key-missing", "duplicate-dropped", "hash-disagrees",
+    "same-order", "wrong-error", "non-list", "non-dict",
+])
+def test_native_mount_order_classification_never_hides_real_or_unknown_changes(fault):
+    p, capability, error = mount_order_failure()
+    obs = error.legacy_identity_observation
+    if fault == "missing-original":
+        p["custody_roles"].clear()
+    elif fault == "original-changed":
+        p["custody_roles"]["sender"]["RestartCount"] += 1
+    elif fault == "missing-observation":
+        del error.legacy_identity_observation
+    elif fault == "unknown-role":
+        obs["role"] = "private-unknown-role"
+    elif fault == "extra-identity-field":
+        obs["identity"]["private-extra"] = "secret"
+    elif fault == "other-identity-change":
+        obs["identity"]["image_id"] = "sha256:" + "f" * 64
+    elif fault == "mount-content":
+        obs["mounts"][0]["RW"] = True
+    elif fault == "mount-key-missing":
+        del obs["mounts"][0]["Extra"]
+    elif fault == "duplicate-dropped":
+        p["custody_roles"]["sender"]["Mounts"].append(deepcopy(p["custody_roles"]["sender"]["Mounts"][0]))
+        capability.plan["containers"]["sender"] = native.legacy.container_identity(p["custody_roles"]["sender"])
+    elif fault == "hash-disagrees":
+        obs["identity"]["mounts_sha256"] = "f" * 64
+    elif fault == "same-order":
+        obs["mounts"] = deepcopy(p["custody_roles"]["sender"]["Mounts"])
+    elif fault == "wrong-error":
+        error = gate.AdmissionError("old container identity changed: user")
+    elif fault == "non-list":
+        obs["mounts"] = "private-invalid-value"
+    else:
+        obs["mounts"][0] = "private-invalid-value"
+    if fault in {"mount-content", "mount-key-missing", "non-dict"}:
+        obs["identity"]["mounts_sha256"] = gate._hash(obs["mounts"])
+    assert native._observed_mount_order_only(p, capability, error) is False

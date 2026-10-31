@@ -30,6 +30,31 @@ MAX_CRON = 256 * 1024
 MAX_QUERIES = 32
 MAX_PROCESSES = 4096
 ARCHIVE_KIND = "retained_container_config_archive"
+_CONTAINER_IDENTITY_ERRORS = {
+    "id": "old container identity changed: id",
+    "image_id": "old container identity changed: image_id",
+    "revision": "old container identity changed: revision",
+    "service": "old container identity changed: service",
+    "started_at": "old container identity changed: started_at",
+    "restart_count": "old container identity changed: restart_count",
+    "user": "old container identity changed: user",
+    "command_sha256": "old container identity changed: command_sha256",
+    "environment_sha256": "old container identity changed: environment_sha256",
+    "mounts_sha256": "old container identity changed: mounts_sha256",
+    "network_sha256": "old container identity changed: network_sha256",
+    "resources_sha256": "old container identity changed: resources_sha256",
+}
+
+
+def _container_identity_error(observed, expected):
+    """Classify only fixed field names; runtime identity values never enter logs."""
+    if (type(observed) is not dict or type(expected) is not dict
+            or set(observed) != set(_CONTAINER_IDENTITY_ERRORS) or set(expected) != set(_CONTAINER_IDENTITY_ERRORS)):
+        return "old container identity changed: unknown"
+    for field, literal in _CONTAINER_IDENTITY_ERRORS.items():
+        if observed[field] != expected[field]:
+            return literal
+    return "old container identity changed: unknown"
 
 
 def _archive_route(route):
@@ -335,8 +360,19 @@ class LegacyTakeover:
     def _containers(self):
         rows = {}
         for role, expected in self.plan["containers"].items():
+            gate._require(type(expected) is dict and set(expected) == set(_CONTAINER_IDENTITY_ERRORS),
+                          "old container identity changed: unknown")
             row = self.transport.inspect(self.plan["docker"]["path"], expected["id"])
-            gate._require(container_identity(row) == expected, "old container identity changed")
+            try:
+                observed = container_identity(row)
+            except (KeyError, TypeError, AttributeError):
+                raise gate.AdmissionError("old container identity changed: unknown") from None
+            if observed != expected:
+                error = gate.AdmissionError(_container_identity_error(observed, expected))
+                # Private same-observation context for the synthetic native
+                # classifier only; none of these values enter exception text.
+                error.legacy_identity_observation = {"role": role, "identity": observed, "mounts": row["Mounts"]}
+                raise error
             state = row["State"]
             gate._require(not state.get("Paused") and not state.get("Restarting") and not state.get("Dead")
                           and not state.get("OOMKilled"), "old container state uncertain")

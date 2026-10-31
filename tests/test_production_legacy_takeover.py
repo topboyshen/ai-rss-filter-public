@@ -144,6 +144,107 @@ def test_stop_keeps_lock_exact_originals_and_term_only_without_drain_claim(case)
         os.close(fd)
 
 
+def test_mount_order_change_still_blocks_and_reports_only_fixed_field(case):
+    p = case
+    row = p.state.rows["sender"]
+    row["Mounts"].append({"Source": "/synthetic/secret-mount", "Destination": "/app/config", "RW": False})
+    p.plan["containers"]["sender"] = legacy.container_identity(row)
+    save(p.path, p.plan)
+    row["Mounts"].reverse()
+    plan_before, row_before = deepcopy(p.plan), deepcopy(row)
+    with legacy.locked_takeover(p.path, p.evidence) as session:
+        with pytest.raises(gate.AdmissionError) as error:
+            session.stop()
+    assert str(error.value) == "old container identity changed: mounts_sha256"
+    assert "/synthetic/secret-mount" not in str(error.value)
+    assert p.plan == plan_before and row == row_before and p.state.calls == []
+    assert not list(p.evidence.iterdir())
+
+
+@pytest.mark.parametrize("field", tuple(legacy._CONTAINER_IDENTITY_ERRORS))
+def test_each_protected_identity_value_change_keeps_original_comparison_blocking(case, monkeypatch, field):
+    p = case
+    row = deepcopy(p.state.rows["sender"])
+    expected = legacy.container_identity(row)
+    expected[field] = "do-not-export-secret-value"
+    p.plan["containers"]["sender"] = expected
+    before = deepcopy(p.plan)
+    monkeypatch.setattr(legacy.NativeTransport, "inspect", lambda *_args: deepcopy(row))
+    session = legacy.LegacyTakeover(p.plan, p.before, p.after, p.evidence, legacy.NativeTransport())
+    with pytest.raises(gate.AdmissionError) as error:
+        session._containers()
+    assert str(error.value) == legacy._CONTAINER_IDENTITY_ERRORS[field]
+    assert "do-not-export-secret-value" not in str(error.value)
+    assert p.plan == before and p.state.calls == []
+
+
+@pytest.mark.parametrize("field", tuple(legacy._CONTAINER_IDENTITY_ERRORS))
+def test_each_missing_expected_identity_field_is_unknown_and_blocks_before_inspect(case, monkeypatch, field):
+    p = case
+    del p.plan["containers"]["sender"][field]
+    def forbidden(*_args):
+        raise AssertionError("missing identity must not reach inspection")
+    monkeypatch.setattr(legacy.NativeTransport, "inspect", forbidden)
+    session = legacy.LegacyTakeover(p.plan, p.before, p.after, p.evidence, legacy.NativeTransport())
+    with pytest.raises(gate.AdmissionError, match="^old container identity changed: unknown$"):
+        session._containers()
+    assert p.state.calls == []
+
+
+@pytest.mark.parametrize("shape", ["extra-expected", "missing-observed", "extra-observed", "raw-key", "raw-type", "raw-attribute"])
+def test_unknown_identity_shapes_remain_blocked_without_runtime_values(case, monkeypatch, shape):
+    p = case
+    row = deepcopy(p.state.rows["sender"])
+    identity = legacy.container_identity(row)
+    if shape == "extra-expected":
+        p.plan["containers"]["sender"]["secret-field-name"] = "secret-value"
+    elif shape == "missing-observed":
+        del identity["command_sha256"]
+        monkeypatch.setattr(legacy, "container_identity", lambda _row: identity)
+    elif shape == "extra-observed":
+        identity["secret-field-name"] = "secret-value"
+        monkeypatch.setattr(legacy, "container_identity", lambda _row: identity)
+    elif shape == "raw-key":
+        del row["Config"]
+    elif shape == "raw-type":
+        row["HostConfig"] = None
+    else:
+        row["Config"]["Labels"] = None
+    monkeypatch.setattr(legacy.NativeTransport, "inspect", lambda *_args: deepcopy(row))
+    session = legacy.LegacyTakeover(p.plan, p.before, p.after, p.evidence, legacy.NativeTransport())
+    with pytest.raises(gate.AdmissionError) as error:
+        session._containers()
+    assert str(error.value) == "old container identity changed: unknown"
+    assert "secret" not in str(error.value) and p.state.calls == []
+
+
+def test_first_fixed_identity_difference_only_and_existing_literal_exporter_remains_strict():
+    from scripts import verify_production_activation_native as native
+    original = legacy.container_identity(container(1, "sender"))
+    changed = deepcopy(original)
+    changed["user"] = "private-account-value"
+    changed["mounts_sha256"] = "/private/secret-path"
+    assert legacy._container_identity_error(changed, original) == "old container identity changed: user"
+    assert tuple(original) == tuple(legacy._CONTAINER_IDENTITY_ERRORS)
+    repo = Path(__file__).resolve().parents[1]
+    for literal in (*legacy._CONTAINER_IDENTITY_ERRORS.values(), "old container identity changed: unknown"):
+        assert native.source_literal(literal, repo) == literal
+    assert native.source_literal("old container identity changed: private-account-value", repo) is None
+    assert native.source_literal("old container identity changed: /private/secret-path", repo) is None
+
+
+def test_existing_failure_export_does_not_serialize_private_same_observation_values(tmp_path, capsys):
+    from scripts import verify_production_activation_native as native
+    error = gate.AdmissionError("old container identity changed: mounts_sha256")
+    error.legacy_identity_observation = {"role": "sender", "identity": {"user": "private-account-sentinel"},
+                                         "mounts": [{"Source": "/private/source-sentinel"}]}
+    native.record_failure(error, Path(legacy.__file__).resolve().parents[1], tmp_path, "fixed_synthetic_stage")
+    output = capsys.readouterr().out + (tmp_path / "FAILURE.json").read_text()
+    assert "old container identity changed: mounts_sha256" in output
+    assert "private-account-sentinel" not in output and "/private/source-sentinel" not in output
+    assert "legacy_identity_observation" not in output
+
+
 @pytest.mark.parametrize("change", ["boot", "writer_bytes", "inventory", "before", "docker", "lock_inode", "container", "restart", "cron_concurrent"])
 def test_bad_bound_evidence_prevents_mutation(case, monkeypatch, change):
     p = case
