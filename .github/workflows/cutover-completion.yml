@@ -28,6 +28,28 @@ on:
       - 'scripts/production_startup_pg_fixture.py'
       - 'scripts/production_startup_fixture.py'
       - 'scripts/private_release_contract.py'
+      - 'scripts/private_release_diagnostics.py'
+      - 'scripts/private_control_subpaths.py'
+      - 'scripts/controlled_production_release.py'
+      - 'scripts/controlled_release_finalize.py'
+      - 'scripts/sender_namespace_http.py'
+      - 'scripts/production_admission_supervisor.py'
+      - 'scripts/production_admission_watchdog.py'
+      - 'scripts/production_legacy_takeover.py'
+      - 'scripts/production_gateway_switch.py'
+      - 'scripts/production_gateway_native.py'
+      - 'scripts/production_host_ingress_native.py'
+      - 'scripts/production_activation_host_native.py'
+      - 'scripts/production_offline_registry.py'
+      - 'scripts/production_native_deadline.py'
+      - 'scripts/production_namespace_native.py'
+      - 'scripts/production_sender_bootstrap.py'
+      - 'scripts/production_sender_bootstrap_native.py'
+      - 'scripts/production_receiver_bootstrap.py'
+      - 'scripts/production_receiver_bootstrap_native.py'
+      - 'scripts/production_sender_native_bridge.py'
+      - 'tests/test_sender_external_postgres_identity.py'
+      - 'tests/production_admission_environment_support.py'
       - 'scripts/check_release_container_lifecycle.py'
       - 'scripts/release.sh'
       - 'tests/test_release_container_lifecycle.py'
@@ -45,9 +67,21 @@ on:
       - 'tests/test_sender_receiver_joint_native.py'
       - 'scripts/verify_production_startup_native.py'
       - 'scripts/verify_production_activation_native.py'
+      - 'scripts/verify_miniflux_pause_native.py'
+      - 'tests/test_outer_build_diagnostics.py'
       - 'scripts/production_activation_fixture.py'
       - 'scripts/takeover_readonly_preflight.py'
       - 'tests/test_production_*.py'
+      - 'tests/test_private_release_control_subpaths.py'
+      - 'tests/test_private_release_diagnostics.py'
+      - 'tests/test_miniflux_command_observation.py'
+      - 'tests/test_controlled_production_release.py'
+      - 'tests/test_controlled_release_finalize.py'
+      - 'tests/test_controlled_finalize_cli.py'
+      - 'tests/test_controlled_release_shell.py'
+      - 'tests/test_sender_namespace_http.py'
+      - 'tests/test_production_namespace_native.py'
+      - 'tests/test_production_release_adapter_workflow_paths.py'
       - 'tests/test_receiver_drain*.py'
       - 'tests/test_sender_drain*.py'
       - 'tests/test_sender_pg_deadlines.py'
@@ -93,6 +127,28 @@ on:
       - 'scripts/production_startup_pg_fixture.py'
       - 'scripts/production_startup_fixture.py'
       - 'scripts/private_release_contract.py'
+      - 'scripts/private_release_diagnostics.py'
+      - 'scripts/private_control_subpaths.py'
+      - 'scripts/controlled_production_release.py'
+      - 'scripts/controlled_release_finalize.py'
+      - 'scripts/sender_namespace_http.py'
+      - 'scripts/production_admission_supervisor.py'
+      - 'scripts/production_admission_watchdog.py'
+      - 'scripts/production_legacy_takeover.py'
+      - 'scripts/production_gateway_switch.py'
+      - 'scripts/production_gateway_native.py'
+      - 'scripts/production_host_ingress_native.py'
+      - 'scripts/production_activation_host_native.py'
+      - 'scripts/production_offline_registry.py'
+      - 'scripts/production_native_deadline.py'
+      - 'scripts/production_namespace_native.py'
+      - 'scripts/production_sender_bootstrap.py'
+      - 'scripts/production_sender_bootstrap_native.py'
+      - 'scripts/production_receiver_bootstrap.py'
+      - 'scripts/production_receiver_bootstrap_native.py'
+      - 'scripts/production_sender_native_bridge.py'
+      - 'tests/test_sender_external_postgres_identity.py'
+      - 'tests/production_admission_environment_support.py'
       - 'scripts/check_release_container_lifecycle.py'
       - 'scripts/release.sh'
       - 'tests/test_release_container_lifecycle.py'
@@ -110,9 +166,21 @@ on:
       - 'tests/test_sender_receiver_joint_native.py'
       - 'scripts/verify_production_startup_native.py'
       - 'scripts/verify_production_activation_native.py'
+      - 'scripts/verify_miniflux_pause_native.py'
+      - 'tests/test_outer_build_diagnostics.py'
       - 'scripts/production_activation_fixture.py'
       - 'scripts/takeover_readonly_preflight.py'
       - 'tests/test_production_*.py'
+      - 'tests/test_private_release_control_subpaths.py'
+      - 'tests/test_private_release_diagnostics.py'
+      - 'tests/test_miniflux_command_observation.py'
+      - 'tests/test_controlled_production_release.py'
+      - 'tests/test_controlled_release_finalize.py'
+      - 'tests/test_controlled_finalize_cli.py'
+      - 'tests/test_controlled_release_shell.py'
+      - 'tests/test_sender_namespace_http.py'
+      - 'tests/test_production_namespace_native.py'
+      - 'tests/test_production_release_adapter_workflow_paths.py'
       - 'tests/test_receiver_drain*.py'
       - 'tests/test_sender_drain*.py'
       - 'tests/test_sender_pg_deadlines.py'
@@ -141,9 +209,80 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  isolated-host-ingress:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Fixed host-entry diagnostic dependencies
+        run: |
+          python -m pip install --only-binary=:all: -r requirements.txt -r requirements-ops.txt
+      - name: Independent isolated host loopback proof
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -m 700 "$RUNNER_TEMP/isolated-host-ingress"
+          python -I -B - <<'PY'
+          import importlib.util, os, pathlib
+          spec = importlib.util.spec_from_file_location('host_entry_archive', 'scripts/verify_production_startup_native.py')
+          archive = importlib.util.module_from_spec(spec); spec.loader.exec_module(archive)
+          output = pathlib.Path(os.environ['RUNNER_TEMP']) / 'isolated-host-ingress' / 'FIXED_IMAGE_PULL'
+          archive.archive_command(['/usr/bin/docker', '--host', 'unix:///var/run/docker.sock', 'pull',
+              '--platform=linux/amd64',
+              'nginx:stable-alpine@sha256:0d3b80406a13a767339fbe2f41406d6c7da727ab89cf8fae399e81f780f814d1'],
+              output, seconds=60, limit=128 * 1024, child_umask=0o077)
+          PY
+          source_sha="$(git rev-parse HEAD)"
+          native_stage="$(sudo -n mktemp -d /tmp/ai-filter-host-ingress.XXXXXX)"
+          sudo -n install -d -m 0700 "$native_stage/source"
+          sudo -n git -c "safe.directory=$GITHUB_WORKSPACE" clone --no-local --no-hardlinks \
+            "$GITHUB_WORKSPACE" "$native_stage/source"
+          sudo -n test "$(sudo -n git -C "$native_stage/source" rev-parse HEAD)" = "$source_sha"
+          export AI_FILTER_HOST_INGRESS_STAGE="$native_stage"
+          python -I -B - <<'PY'
+          import importlib.util, json, os, pathlib, sys, time
+          spec = importlib.util.spec_from_file_location('host_entry_archive', 'scripts/verify_production_startup_native.py')
+          archive = importlib.util.module_from_spec(spec); spec.loader.exec_module(archive)
+          root = pathlib.Path(os.environ['AI_FILTER_HOST_INGRESS_STAGE'])
+          output = pathlib.Path(os.environ['RUNNER_TEMP']) / 'isolated-host-ingress' / 'HOST_INGRESS_PROCESS'
+          deadline = time.monotonic() + 180
+          args = ['/usr/bin/sudo', '-n', '--', sys.executable, '-I', '-B',
+                  str(root / 'source/scripts/production_host_ingress_native.py'),
+                  '--repo', str(root / 'source'), '--output', str(root / 'originals'),
+                  '--deadline-monotonic', str(deadline)]
+          archive.archive_command(args, output, seconds=200, limit=512 * 1024, child_umask=0o077)
+          result = json.loads(pathlib.Path(str(output) + '.stdout').read_bytes())
+          assert result['status'] == 'passed' and result['safe_evidence']['complete'] is True
+          assert result['scope'] == 'independent_synthetic_host_namespace_only'
+          assert result['full_activation_verified'] is False and result['runner_global_loopback_verified'] is False
+          print('isolated_host_ingress_summary=' + json.dumps(result, sort_keys=True), flush=True)
+          PY
+      - name: Prepare independent safe host-entry evidence
+        if: always()
+        run: |
+          python -I -B scripts/prepare_synthetic_evidence.py \
+            --source "isolated-host-ingress=${RUNNER_TEMP}/isolated-host-ingress" \
+            --output "${RUNNER_TEMP}/isolated-host-ingress-upload"
+      - name: Preserve independent host-entry evidence including failure
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: isolated-host-ingress-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/isolated-host-ingress-upload/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
   native-amd64:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # Steps 1-8 take ~6.5 min; step 9 alone is bounded by 240 s bootstrap +
+    # 600 s activation plus Go/image build, so 15 min cancelled a healthy run.
+    timeout-minutes: 25
     services:
       postgres:
         image: postgres@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
@@ -175,6 +314,9 @@ jobs:
           python -I -B scripts/verify_cutover_completion_native.py \
             --repo . --output "${RUNNER_TEMP}/cutover-completion"
       - name: Actual application image migration and closed multiworker startup
+        env:
+          # Hosted runners can be refused by the production Tsinghua mirror.
+          STARTUP_PIP_INDEX_URL: https://pypi.org/simple
         run: |
           set -euo pipefail
           umask 077
@@ -199,15 +341,16 @@ jobs:
           set -euo pipefail
           umask 077
           mkdir -m 700 "$RUNNER_TEMP/production-startup-source/production-activation-build"
+          source_sha="$(git rev-parse HEAD)"
           cd "$RUNNER_TEMP/startup-miniflux"
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -p 1 -trimpath \
-            -ldflags "-X miniflux.app/v2/internal/version.Version=2.3.2 -X miniflux.app/v2/internal/version.Commit=${GITHUB_SHA}" \
-            -o "$RUNNER_TEMP/production-startup-source/production-activation-build/miniflux" . \
+          { go version; set -x; CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -p 1 -trimpath \
+            -ldflags "-X miniflux.app/v2/internal/version.Version=2.3.2 -X miniflux.app/v2/internal/version.Commit=${source_sha}" \
+            -o "$RUNNER_TEMP/production-startup-source/production-activation-build/miniflux" .; } \
             2>&1 | tee "$RUNNER_TEMP/production-startup-source/production-activation-build/BUILD.log"
           chmod 0755 "$RUNNER_TEMP/production-startup-source/production-activation-build/miniflux"
           cd "$GITHUB_WORKSPACE"
           docker --host unix:///var/run/docker.sock build --platform=linux/amd64 --pull=false \
-            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.revision=${source_sha}" \
             -f ops/miniflux/Dockerfile -t "miniflux-activation-isolation:${GITHUB_SHA}" \
             "$RUNNER_TEMP/production-startup-source/production-activation-build" \
             2>&1 | tee "$RUNNER_TEMP/production-startup-source/production-activation-build/IMAGE_BUILD.log"
@@ -215,11 +358,54 @@ jobs:
             > "$RUNNER_TEMP/production-startup-source/production-activation-build/IMAGE.json"
           docker --host unix:///var/run/docker.sock pull --platform=linux/amd64 \
             redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+          docker --host unix:///var/run/docker.sock pull --platform=linux/amd64 \
+            nginx:stable-alpine@sha256:0d3b80406a13a767339fbe2f41406d6c7da727ab89cf8fae399e81f780f814d1
           image_id="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))[0]["Id"])' "$RUNNER_TEMP/production-startup-source/production-activation-build/IMAGE.json")"
-          python -I -B scripts/verify_production_activation_native.py \
-            --repo . --source "$RUNNER_TEMP/startup-miniflux" \
-            --binary "$RUNNER_TEMP/production-startup-source/production-activation-build/miniflux" --image-id "$image_id" \
-            --output "$RUNNER_TEMP/production-startup-source/production-activation"
+          native_stage="$(sudo -n mktemp -d /tmp/ai-filter-bootstrap-native.XXXXXX)"
+          # These are new private synthetic copies. Do not change checkout
+          # ownership, trust a broad safe.directory, or alter the system cron.
+          sudo -n git -c "safe.directory=$GITHUB_WORKSPACE" clone --no-local --no-hardlinks \
+            "$GITHUB_WORKSPACE" "$native_stage/source"
+          sudo -n test "$(sudo -n git -C "$native_stage/source" rev-parse HEAD)" = "$source_sha"
+          sudo -n cp -a --no-preserve=ownership -- "$RUNNER_TEMP/startup-miniflux" "$native_stage/miniflux"
+          sudo -n install -d -m 0700 "$native_stage/build"
+          sudo -n install -m 0400 "$RUNNER_TEMP/production-startup-source/production-activation-build/BUILD.log" "$native_stage/build/BUILD.log"
+          sudo -n install -m 0400 "$RUNNER_TEMP/production-startup-source/production-activation-build/IMAGE_BUILD.log" "$native_stage/build/IMAGE_BUILD.log"
+          sudo -n install -m 0400 "$RUNNER_TEMP/production-startup-source/production-activation-build/IMAGE.json" "$native_stage/build/rawimage.json"
+          sudo -n install -m 0500 "$RUNNER_TEMP/production-startup-source/production-activation-build/miniflux" "$native_stage/miniflux-binary"
+          export AI_FILTER_NATIVE_BOOTSTRAP_STAGE="$native_stage" AI_FILTER_NATIVE_BOOTSTRAP_IMAGE="$image_id"
+          python -I -B - <<'PY'
+          import importlib.util, json, os, pathlib, sys
+          spec = importlib.util.spec_from_file_location('startup_archive', 'scripts/verify_production_startup_native.py')
+          module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+          root = pathlib.Path(os.environ['AI_FILTER_NATIVE_BOOTSTRAP_STAGE'])
+          output = pathlib.Path(os.environ['RUNNER_TEMP']) / 'production-startup-source' / 'BOOTSTRAP_PROCESS'
+          args = ['/usr/bin/sudo', '-n', '--', sys.executable, '-I', '-B',
+                  str(root / 'source/scripts/production_sender_bootstrap_native.py'),
+                  '--repo', str(root / 'source'), '--source', str(root / 'miniflux'),
+                  '--binary', str(root / 'miniflux-binary'), '--image-id', os.environ['AI_FILTER_NATIVE_BOOTSTRAP_IMAGE'],
+                  '--build-evidence', str(root / 'build'), '--output', str(root / 'originals')]
+          module.archive_command(args, output, seconds=240, limit=512 * 1024, child_umask=0o077)
+          result = json.loads(pathlib.Path(str(output) + '.stdout').read_bytes())
+          assert result['status'] == 'passed' and result['safe_evidence']['complete'] is True
+          PY
+          python -I -B - <<'PY'
+          import importlib.util, json, os, pathlib, sys
+          spec = importlib.util.spec_from_file_location('activation_archive', 'scripts/verify_production_startup_native.py')
+          archive = importlib.util.module_from_spec(spec); spec.loader.exec_module(archive)
+          root = pathlib.Path(os.environ['AI_FILTER_NATIVE_BOOTSTRAP_STAGE'])
+          output = pathlib.Path(os.environ['RUNNER_TEMP']) / 'production-startup-source' / 'ACTIVATION_HOST_PROCESS'
+          # Pass only this fixed CI index across sudo; do not preserve ambient env.
+          args = ['/usr/bin/sudo', '-n', '--', '/usr/bin/env', 'STARTUP_PIP_INDEX_URL=https://pypi.org/simple', sys.executable, '-I', '-B',
+                  str(root / 'source/scripts/production_activation_host_native.py'),
+                  '--repo', str(root / 'source'), '--source', str(root / 'miniflux'),
+                  '--binary', str(root / 'miniflux-binary'), '--image-id', os.environ['AI_FILTER_NATIVE_BOOTSTRAP_IMAGE'],
+                  '--output', str(root / 'activation-originals')]
+          archive.archive_command(args, output, seconds=600, limit=512 * 1024, child_umask=0o077)
+          result = json.loads(pathlib.Path(str(output) + '.stdout').read_bytes())
+          assert result['status'] == 'passed' and result['safe_evidence']['complete'] is True
+          assert result['full_activation_verified'] is True
+          PY
       - name: Preserve actual synthetic PostgreSQL state on success or failure
         if: always()
         env:
@@ -252,6 +438,21 @@ jobs:
             --source "production-startup-postgres=${RUNNER_TEMP}/production-startup-postgres" \
             --source "production-startup-source=${RUNNER_TEMP}/production-startup-source" \
             --output "${RUNNER_TEMP}/cutover-safe-upload"
+
+      - name: Preserve bounded prepared priority diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cutover-priority-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/cutover-safe-upload/PRIORITY_DIAGNOSTICS.json
+            ${{ runner.temp }}/cutover-safe-upload/files/production-startup-source/BOOTSTRAP_PROCESS.stdout
+            ${{ runner.temp }}/cutover-safe-upload/files/production-startup-source/BOOTSTRAP_PROCESS.stderr
+            ${{ runner.temp }}/cutover-safe-upload/files/production-startup-source/ACTIVATION_HOST_PROCESS.stdout
+            ${{ runner.temp }}/cutover-safe-upload/files/production-startup-source/ACTIVATION_HOST_PROCESS.stderr
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Preserve original evidence including failures
         if: always()

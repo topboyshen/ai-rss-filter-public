@@ -38,6 +38,18 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# These paths acquire the real release lock through the activation capability.
+# Dispatch before this shell opens another lock description or touches registry.
+case "${1:-}" in
+  controlled-finalize|controlled-finalize-query)
+    [[ "$#" -eq 3 ]] || { echo "Usage: $0 $1 <immutable-image-ref> <private-request.json>" >&2; exit 2; }
+    action=finalize
+    [[ "$1" == "controlled-finalize-query" ]] && action=query
+    exec python3 -I "${ROOT}/scripts/controlled_release_finalize.py" \
+      --action "$action" --image-ref "$2" --request "$3"
+    ;;
+esac
+
 REGISTRY_DIR="${RELEASE_REGISTRY_DIR:-${ROOT}/data/releases}"
 MANIFEST_DIR="${REGISTRY_DIR}/manifests"
 BUILD_CONTRACT_DIR="${REGISTRY_DIR}/build-contracts"
@@ -315,6 +327,14 @@ acquire_release_lock
 cmd="${1:-}"
 image_ref="${2:-${IMAGE_REF:-}}"
 
+if [[ ( -e "${REGISTRY_DIR}/controlled-finalize.pending.json" ||
+        -L "${REGISTRY_DIR}/controlled-finalize.pending.json" ||
+        -e "${REGISTRY_DIR}/controlled-finalize.pending.json.pending" ||
+        -L "${REGISTRY_DIR}/controlled-finalize.pending.json.pending" ) && "$cmd" != "controlled-check" ]]; then
+  echo "Controlled finalize is pending; query its original operation before another release command" >&2
+  exit 8
+fi
+
 if [[ -n "$PRIVATE_CONTRACT" ]]; then
   if [[ "$ALLOW_DIRTY_TREE" != "0" || "$REQUIRE_BUILD_CONTRACT" != "1" ||
         "$AUTO_ROLLBACK" != "0" || "$CAPTURE_HEALTH_DIAGNOSTICS" != "0" ||
@@ -337,7 +357,7 @@ if [[ -n "$PRIVATE_CONTRACT" ]]; then
 fi
 
 usage() {
-  echo "Usage: $0 {build|deploy|rollback|verify|seal-current} <immutable-image-ref>" >&2
+  echo "Usage: $0 {build|deploy|rollback|verify|seal-current|controlled-finalize|controlled-finalize-query} <immutable-image-ref> [private-request.json]" >&2
   exit 1
 }
 
@@ -1323,6 +1343,7 @@ validate_recorded_image_contract_if_present() {
 
 validate_build_contract_for_deploy() {
   local ref="$1" digest="$2" manifest="$3" config_hash source_id
+  local freshness="${4:-fresh}"
   local reason actor audit_file
   if [[ "$REQUIRE_BUILD_CONTRACT" != "1" ]]; then
     reason="${RELEASE_BUILD_CONTRACT_OVERRIDE_REASON:-}"
@@ -1339,7 +1360,13 @@ validate_build_contract_for_deploy() {
     return 0
   fi
   if [[ -n "$PRIVATE_CONTRACT" ]]; then
-    private_contract check --fresh || return $?
+    if [[ "$freshness" == "fresh" ]]; then
+      private_contract check --fresh || return $?
+    elif [[ "$freshness" == "recovery" ]]; then
+      private_contract check || return $?
+    else
+      return 3
+    fi
   fi
   config_hash="$(release_config_hash)"
   source_id="$RELEASE_SOURCE_ID"
@@ -2078,6 +2105,37 @@ recorded_target_for_rollback() {
 [[ -n "$cmd" && -n "$image_ref" ]] || usage
 
 case "$cmd" in
+  controlled-check)
+    # Read/verify only. The caller holds a real activation/release capability;
+    # this command can never register, start, recreate, resume or roll back.
+    [[ "$#" -eq 8 && -n "$PRIVATE_CONTRACT" && -n "${RELEASE_LOCK_FD:-}" ]] || exit 8
+    manifest="$3"
+    freshness="$4"
+    [[ "$freshness" == "fresh" || "$freshness" == "recovery" ]] || exit 8
+    [[ "$8" == "health" || "$8" == "preflight" ]] || exit 8
+    require_clean_release_tree "controlled-check" "$image_ref"
+    validate_image_ref "$image_ref"
+    verify_requested_digest "$image_ref"
+    digest="$(resolved_image_id "$image_ref")"
+    assert_ref_consistency "$image_ref" "$digest"
+    manifest_path "$manifest" >/dev/null
+    validate_image_ref "$5"
+    [[ "$(resolved_image_id "$5")" == "$6" ]] || exit 8
+    manifest_path "$7" >/dev/null
+    [[ "$(sha256sum "$COMPOSE_FILE" | awk '{print $1}')" == "$manifest" ]] || exit 8
+    if [[ "$freshness" == "fresh" ]]; then
+      require_valid_release_test_attestation "$RELEASE_SOURCE_ID"
+    fi
+    validate_build_contract_for_deploy "$image_ref" "$digest" "$manifest" "$freshness"
+    validate_event_mapping_release_target "deploy" "$image_ref" "$digest" "$manifest" "$5" "$6" "$7"
+    IMAGE_REF="$digest" release_compose -f "$(manifest_path "$manifest")" config --quiet
+    validate_runtime_secrets_for_manifest "$manifest"
+    validate_manifest_health_services "$digest" "$manifest" "$HEALTH_SERVICES"
+    if [[ "$8" == "health" ]]; then
+      wait_healthy "$digest" "$manifest" "$HEALTH_SERVICES" "controlled-finalize"
+    fi
+    echo "controlled-check:ok"
+    ;;
   build)
     validate_image_ref "$image_ref"
     if [[ "$image_ref" == *@sha256:* || "$image_ref" == sha256:* ]]; then

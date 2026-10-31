@@ -417,9 +417,15 @@ class Fence:
                 if kind == "intake":
                     accepted = [r for r in leases.values() if r["kind"] == "intake"]
                     clock = state["opening_clock"]
+                    # Only retained production activation grants can continue
+                    # time. Original cumulative quotas and generation remain.
+                    from services.production_admission_lifecycle import runtime_window
+                    continuation = runtime_window(self, manifest, state)
+                    window = continuation or policy
+                    clock = continuation["clock"] if continuation else clock
                     elapsed = _elapsed() - clock["elapsed"]
-                    if (not policy["not_before"] <= now < policy["expires_at"]
-                            or not 0 <= elapsed < policy["expires_at"] - clock["wall"]
+                    if (not window["not_before"] <= now < window["expires_at"]
+                            or not 0 <= elapsed < window["expires_at"] - clock["wall"]
                             or any(now < r["created_at"] for r in accepted)):
                         raise AdmissionClosed("intake time window invalid/expired")
                     if len(accepted) >= policy["max_admissions"] or sum(r["charge_bytes"] for r in accepted) + charge_bytes > policy["max_bytes"]:

@@ -126,16 +126,17 @@ index 28687c6..d52ca6d 100644
 +		httpServers = append(httpServers, server.StartWebServer(store, pool)...)
 diff --git a/internal/cli/handoff_control.go b/internal/cli/handoff_control.go
 new file mode 100644
-index 0000000..16197dd
+index 0000000..03ea94c
 --- /dev/null
 +++ b/internal/cli/handoff_control.go
-@@ -0,0 +1,136 @@
+@@ -0,0 +1,170 @@
 +// SPDX-License-Identifier: Apache-2.0
 +package cli
 +
 +import (
 +	"context"
 +	"crypto/subtle"
++	"database/sql"
 +	"encoding/json"
 +	"errors"
 +	"io"
@@ -147,7 +148,38 @@ index 0000000..16197dd
 +	"miniflux.app/v2/internal/config"
 +	"miniflux.app/v2/internal/handoff"
 +	"miniflux.app/v2/internal/storage"
++
++	"github.com/lib/pq"
 +)
++
++// handoffCategoryHeader carries only a fixed diagnostic enum on refusals. The
++// JSON body, status code and acceptance rules are unchanged.
++const handoffCategoryHeader = "X-Handoff-Error-Category"
++
++func handoffErrorCategory(err error) string {
++	var pgErr *pq.Error
++	switch {
++	case err == nil:
++		return "unconfirmed"
++	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
++		return "deadline"
++	case errors.Is(err, handoff.ErrUncertain):
++		return "uncertain"
++	case errors.Is(err, handoff.ErrConflict):
++		return "conflict"
++	case errors.Is(err, handoff.ErrClosed):
++		return "closed"
++	case errors.Is(err, sql.ErrNoRows):
++		return "no_rows"
++	case errors.As(err, &pgErr) && pgErr.Code == "55P03":
++		return "lock"
++	case errors.As(err, &pgErr) && pgErr.Code == "57014":
++		return "deadline"
++	case errors.As(err, &pgErr):
++		return "db"
++	}
++	return "other"
++}
 +
 +func handoffFields(r *http.Request) (map[string]string, error) {
 +	defer r.Body.Close()
@@ -199,7 +231,8 @@ index 0000000..16197dd
 +		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 +		defer cancel()
 +		if r.Method == "GET" && r.URL.Path == "/activation-registration" {
-+			if store.ActivationHandoffAvailable(ctx) != nil {
++			if err := store.ActivationHandoffAvailable(ctx); err != nil {
++				w.Header().Set(handoffCategoryHeader, handoffErrorCategory(err))
 +				http.Error(w, "activation capability unavailable", http.StatusConflict)
 +				return
 +			}
@@ -247,6 +280,7 @@ index 0000000..16197dd
 +		receipt, ok := result.(handoff.Receipt)
 +		confirmed := err == nil && ok && receipt.Durable && receipt.Confirmed
 +		if !confirmed {
++			w.Header().Set(handoffCategoryHeader, handoffErrorCategory(err))
 +			w.WriteHeader(http.StatusConflict)
 +		}
 +		json.NewEncoder(w).Encode(map[string]any{"result": result, "confirmed": confirmed})
@@ -268,17 +302,24 @@ index 0000000..16197dd
 +}
 diff --git a/internal/cli/handoff_control_test.go b/internal/cli/handoff_control_test.go
 new file mode 100644
-index 0000000..8e43a12
+index 0000000..095969e
 --- /dev/null
 +++ b/internal/cli/handoff_control_test.go
-@@ -0,0 +1,20 @@
+@@ -0,0 +1,49 @@
 +// SPDX-License-Identifier: Apache-2.0
 +package cli
 +
 +import (
++	"context"
++	"database/sql"
++	"errors"
++	"fmt"
 +	"net/http/httptest"
 +	"strings"
 +	"testing"
++
++	"github.com/lib/pq"
++	"miniflux.app/v2/internal/handoff"
 +)
 +
 +func TestHandoffControlStrictCommandBody(t *testing.T) {
@@ -290,6 +331,28 @@ index 0000000..8e43a12
 +	fields, err := handoffFields(httptest.NewRequest("POST", "/pause", strings.NewReader(`{"operation_id":"exact"}`)))
 +	if err != nil || fields["operation_id"] != "exact" {
 +		t.Fatal("valid command rejected")
++	}
++}
++
++func TestHandoffErrorCategoryIsFixedEnum(t *testing.T) {
++	cases := map[string]error{
++		"unconfirmed": nil,
++		"deadline":    fmt.Errorf("wrapped: %w", context.DeadlineExceeded),
++		"uncertain":   handoff.ErrUncertain,
++		"conflict":    handoff.ErrConflict,
++		"closed":      handoff.ErrClosed,
++		"no_rows":     sql.ErrNoRows,
++		"lock":        &pq.Error{Code: "55P03", Message: "secret detail"},
++		"db":          &pq.Error{Code: "08006"},
++		"other":       errors.New("token=secret"),
++	}
++	for want, err := range cases {
++		if got := handoffErrorCategory(err); got != want {
++			t.Fatalf("%s: got %s", want, got)
++		}
++	}
++	if handoffErrorCategory(&pq.Error{Code: "57014"}) != "deadline" {
++		t.Fatal("statement cancel must be deadline")
 +	}
 +}
 diff --git a/internal/cli/scheduler.go b/internal/cli/scheduler.go
@@ -968,7 +1031,7 @@ index 9450ed0..c0aba63 100644
 +	}
 diff --git a/internal/handoff/activation.go b/internal/handoff/activation.go
 new file mode 100644
-index 0000000..487dd4f
+index 0000000..ea6385d
 --- /dev/null
 +++ b/internal/handoff/activation.go
 @@ -0,0 +1,169 @@
@@ -1115,7 +1178,7 @@ index 0000000..487dd4f
 +}
 +
 +func confirmInitialClosed(ctx context.Context, conn *sql.Conn, manifest, op string) (Receipt, error) {
-+	got, err := activity(ctx, conn, false)
++	got, err := exclusiveActivityBounded(ctx, conn)
 +	if err != nil {
 +		return Receipt{}, err
 +	}
@@ -1336,6 +1399,136 @@ index 0000000..f703ada
 +	var n int
 +	if err = f.db.QueryRow(`SELECT count(*) FROM handoff_operations`).Scan(&n); err != nil || n != MaxRetainedRecords-1 {
 +		t.Fatal(n, err)
++	}
++}
+diff --git a/internal/handoff/activity_wait_integration_test.go b/internal/handoff/activity_wait_integration_test.go
+new file mode 100644
+index 0000000..ebcd2fe
+--- /dev/null
++++ b/internal/handoff/activity_wait_integration_test.go
+@@ -0,0 +1,124 @@
++// SPDX-License-Identifier: Apache-2.0
++package handoff
++
++import (
++	"context"
++	"errors"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++func closedGateWithShared(t *testing.T) (fixture, func(time.Duration)) {
++	t.Helper()
++	f := activationGate(t)
++	ctx := context.Background()
++	if _, err := InitializeClosed(ctx, f.db, testManifest, initializeOp); err != nil {
++		t.Fatal(err)
++	}
++	hold := func(d time.Duration) {
++		conn, err := f.pool.Conn(ctx)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if _, err = conn.ExecContext(ctx, `SELECT pg_advisory_lock_shared($1, 'handoff_state'::regclass::oid::integer)`, activityNamespace); err != nil {
++			t.Fatal(err)
++		}
++		go func() { time.Sleep(d); discard(conn) }()
++	}
++	return f, hold
++}
++
++func TestPGConfirmWaitsForBriefSharedActivity(t *testing.T) {
++	f, hold := closedGateWithShared(t)
++	hold(150 * time.Millisecond)
++	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
++	defer cancel()
++	r, err := Query(ctx, f.db, testManifest, initializeOp)
++	if err != nil || !r.Durable || !r.Confirmed || r.State != "closed" {
++		t.Fatal(r, err)
++	}
++}
++
++func TestPGConfirmFailsClosedBeyondActivityBound(t *testing.T) {
++	f, hold := closedGateWithShared(t)
++	hold(confirmActivityWait + 700*time.Millisecond)
++	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
++	defer cancel()
++	started := time.Now()
++	r, err := Query(ctx, f.db, testManifest, initializeOp)
++	if !errors.Is(err, ErrUncertain) || r != (Receipt{}) {
++		t.Fatal("must fail closed with empty receipt", r, err)
++	}
++	if elapsed := time.Since(started); elapsed > confirmActivityWait+500*time.Millisecond {
++		t.Fatal("wait exceeded bound", elapsed)
++	}
++}
++
++// stressConfirmations is a fixed count, not a time window: slow runners finish
++// fewer iterations per second, which made a time-bounded loop collect too few
++// samples (7 in CI) for a stable ratio.
++const stressConfirmations = 12
++
++// singleExclusiveTry is the pre-fix behaviour: one exclusive activity try-lock
++// with no bounded retry. It is the in-test control under identical stress.
++func singleExclusiveTry(ctx context.Context, t *testing.T, f fixture) bool {
++	conn, err := f.db.Conn(ctx)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer conn.Close()
++	got, err := activity(ctx, conn, false)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got {
++		if _, err = conn.ExecContext(ctx, `SELECT pg_advisory_unlock($1, 'handoff_state'::regclass::oid::integer)`, activityNamespace); err != nil {
++			t.Fatal(err)
++		}
++	}
++	return got
++}
++
++func TestPGConfirmSurvivesClosedSchedulerBeginStress(t *testing.T) {
++	f, _ := closedGateWithShared(t)
++	ctx := context.Background()
++	var stop atomic.Bool
++	var wg sync.WaitGroup
++	var begins atomic.Int64
++	for range 4 {
++		wg.Go(func() {
++			for !stop.Load() {
++				if _, err := Begin(ctx, f.pool, testManifest, "scheduler"); !errors.Is(err, ErrClosed) {
++					t.Error("closed Begin must stay ErrClosed", err)
++					return
++				}
++				begins.Add(1)
++			}
++		})
++	}
++	confirmed, control := 0, 0
++	for range stressConfirmations {
++		qctx, cancel := context.WithTimeout(ctx, 3*time.Second)
++		if _, err := Query(qctx, f.db, testManifest, initializeOp); err == nil {
++			confirmed++
++		}
++		cancel()
++		if singleExclusiveTry(ctx, t, f) {
++			control++
++		}
++	}
++	stop.Store(true)
++	wg.Wait()
++	t.Logf("closed Begin stress: bounded %d/%d confirmed, single-try control %d/%d, %d closed Begin attempts",
++		confirmed, stressConfirmations, control, stressConfirmations, begins.Load())
++	// Interleaved pairs see the same stress, so host speed affects both. The
++	// bounded wait must win clearly over one try and confirm a majority; CI
++	// starvation of single retries (5/7 seen) cannot fail this, a missing or
++	// broken retry (control-level success) still does.
++	if confirmed*2 < stressConfirmations || confirmed <= control {
++		t.Fatalf("bounded confirmation %d/%d vs single-try control %d/%d under closed Begin stress",
++			confirmed, stressConfirmations, control, stressConfirmations)
 +	}
 +}
 diff --git a/internal/handoff/drain.go b/internal/handoff/drain.go
@@ -1642,10 +1835,10 @@ index 0000000..1d786c0
 +}
 diff --git a/internal/handoff/handoff.go b/internal/handoff/handoff.go
 new file mode 100644
-index 0000000..336642e
+index 0000000..bda12c4
 --- /dev/null
 +++ b/internal/handoff/handoff.go
-@@ -0,0 +1,791 @@
+@@ -0,0 +1,817 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Package handoff implements a durable admission gate, not a delivery ACK.
 +// A retained active/uncertain lease blocks closing even after its backend dies.
@@ -1812,6 +2005,32 @@ index 0000000..336642e
 +	var got bool
 +	err := conn.QueryRowContext(ctx, query, activityNamespace).Scan(&got)
 +	return got, err
++}
++
++// confirmActivityWait bounds how long a confirmation retries the exclusive
++// activity try-lock. Closed-state Begin* attempts hold the shared key only for
++// milliseconds; retrying (instead of queueing a blocking waiter) never delays
++// or refuses their shared try-lock. Timeout still fails closed (ErrUncertain).
++const (
++	confirmActivityWait  = time.Second
++	confirmActivityRetry = 5 * time.Millisecond
++)
++
++func exclusiveActivityBounded(ctx context.Context, conn *sql.Conn) (bool, error) {
++	deadline := time.Now().Add(confirmActivityWait)
++	for {
++		got, err := activity(ctx, conn, false)
++		if err != nil || got || !time.Now().Add(confirmActivityRetry).Before(deadline) {
++			return got, err
++		}
++		timer := time.NewTimer(confirmActivityRetry)
++		select {
++		case <-ctx.Done():
++			timer.Stop()
++			return false, ctx.Err()
++		case <-timer.C:
++		}
++	}
 +}
 +
 +// Lease owns a dedicated physical session until Finish or Abort. The supplied
@@ -2239,7 +2458,7 @@ index 0000000..336642e
 +}
 +
 +func confirmPause(ctx context.Context, conn *sql.Conn, manifest, op string) (Receipt, error) {
-+	got, err := activity(ctx, conn, false)
++	got, err := exclusiveActivityBounded(ctx, conn)
 +	if err != nil {
 +		return Receipt{}, err
 +	}

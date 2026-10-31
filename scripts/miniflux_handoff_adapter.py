@@ -46,7 +46,8 @@ def checked_binding(value, *, scope="isolation"):
     require(value["source_sha256"] == source_sha256() and type(value["generation"]) is int
             and 0 <= value["generation"] < 2**63 - 2, "source or generation differs")
     require(value["entrances"] == list(ENTRANCES), "Miniflux bridge only covers its three named producer groups")
-    _component(value["component_name"], value["component"])
+    require("external_postgres" not in value["component"] or value["control_id"] == "miniflux", "external PostgreSQL requires miniflux control")
+    _component(value["component_name"], value["component"], allow_external_postgres=scope == "instrumented_sender_only")
     return value
 
 
@@ -108,7 +109,8 @@ class MinifluxPauseControl:
     def _identity(self):
         checked_binding(self.binding, scope=self._scope)
         require(sha(self.binding) == self.binding_sha256, "frozen binding mutated")
-        inspect_binding(self.inspect_current(), {self.binding["component_name"]: self.binding["component"]})
+        inspect_binding(self.inspect_current(), {self.binding["component_name"]: self.binding["component"]},
+                        allow_external_postgres=self._scope == "instrumented_sender_only")
 
     def _exchange(self, method, path, payload=None):
         self._identity()
@@ -481,6 +483,16 @@ class MinifluxActivationControl(MinifluxPauseControl):
             self._save_exchange("initialize_closed-response", status, raw)
             receipt = self._confirmed(status, raw, operation, 0, "initialize_closed", "closed")
             return self._persist_result("initialize_closed", receipt)
+
+    def recorded_initialize_closed(self, operation):
+        """Already-confirmed closed initialization from disk only; never contacts Go."""
+        with locked(self.root / "control.lock", True):
+            require(not present(self.root / "initialize_closed.intent.json.pending")
+                    and read_private(self.root / "initialize_closed.intent.json") == self._closed_intent(operation),
+                    "original closed initialization intent missing/conflicting")
+            path = self.root / "initialize_closed.confirmed.json"
+            require(present(path), "confirmed closed initialization receipt missing")
+            return _pg_receipt(read_private(path), self.binding["manifest"], operation, 0, "initialize_closed", "closed")
 
     def query_initialize_closed(self, operation):
         with locked(self.root / "control.lock", True):

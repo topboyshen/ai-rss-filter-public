@@ -9,10 +9,13 @@ on:
     branches: [master, 'codex/**']
     paths:
       - 'scripts/private_release_contract.py'
+      - 'scripts/private_release_diagnostics.py'
+      - 'scripts/production_native_deadline.py'
       - 'scripts/verify_private_release_native.py'
       - 'scripts/release.sh'
       - 'scripts/run-release-gate.sh'
       - 'tests/test_private_release_*.py'
+      - 'tests/test_production_native_deadline.py'
       - 'tests/test_release_script.py'
       - 'Dockerfile'
       - 'core/config.py'
@@ -21,7 +24,9 @@ on:
     branches: [master]
     paths:
       - 'scripts/*release*'
+      - 'scripts/production_native_deadline.py'
       - 'tests/test_private_release_*.py'
+      - 'tests/test_production_native_deadline.py'
       - 'Dockerfile'
       - 'core/config.py'
       - '.github/workflows/private-release-config.yml'

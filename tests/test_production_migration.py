@@ -70,7 +70,9 @@ def prepared(tmp_path, monkeypatch):
     # The sealed release loader has separate filesystem regression coverage;
     # native integration uses the actual clean-source seal and actual PG lock.
     monkeypatch.setattr(migration, "_release_contract", lambda permit, **kwargs: None)
-    directory = tmp_path.resolve() / "production-migration-synthetic"
+    # Keep every original in the retained fixture root without repeating a long
+    # directory label in thousands of bounded inventory records.
+    directory = tmp_path.resolve() / "m"
     directory.mkdir(mode=0o700)
     db = directory / "fixture.db"
     monkeypatch.setattr(database, "DB_PATH", str(db))

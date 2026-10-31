@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import threading
 from xml.sax.saxutils import escape
 
@@ -144,14 +145,50 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(400, {"error": "invalid_or_failed_fixture_request"})
 
 
+def serve_until_term(server):
+    """Stop accepting on TERM; exit only after accepted request threads finish."""
+    stopping, finished = False, threading.Event()
+    # ThreadingMixIn.server_close waits for these threads. In particular, a
+    # held request must not disappear merely because the fixture received TERM.
+    server.daemon_threads = False
+    server.block_on_close = True
+
+    def request_stop(_number, _frame):
+        # Signal handlers can reenter: no locks or Event.set calls here.
+        nonlocal stopping
+        stopping = True
+
+    def stop():
+        while not stopping and not finished.wait(0.05):
+            pass
+        if not finished.is_set():
+            # shutdown must run outside the serve_forever thread.
+            server.shutdown()
+
+    previous = signal.signal(signal.SIGTERM, request_stop)
+    # A failure before serve_forever initializes must propagate even when TERM
+    # races with it. A blocked shutdown helper cannot hold that failure hostage.
+    thread = threading.Thread(target=stop, name="synthetic-http-stop", daemon=True)
+    try:
+        thread.start()
+        server.serve_forever(poll_interval=0.05)
+        if not stopping:
+            raise RuntimeError("synthetic HTTP server stopped without TERM")
+    finally:
+        finished.set()
+        try:
+            server.server_close()
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+
+
 def main():
     token = os.environ["MINIFLUX_PAUSE_FIXTURE_TOKEN"]
     if not re.fullmatch(r"[0-9a-f]{64}", token):
         raise ValueError("synthetic private control token required")
     server = ThreadingHTTPServer(("0.0.0.0", 8080), Handler)
-    server.daemon_threads = True
     server.fixture = Fixture("/evidence", token)
-    server.serve_forever(poll_interval=0.05)
+    serve_until_term(server)
 
 
 if __name__ == "__main__":

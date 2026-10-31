@@ -231,7 +231,8 @@ def _initial_candidates(permit, contract, manifest, rows):
     directory = Path(permit["config"]["private_contract_path"]).parent
     values = private.environment_values(private.private_file(directory / "environment", sealed=True)[0])
     for row in rows:
-        service = manifest["services"][row["Config"]["Labels"]["com.docker.compose.service"]]
+        service_name = row["Config"]["Labels"]["com.docker.compose.service"]
+        service = manifest["services"][service_name]
         env = private.role_environment(service, image["Config"], values)
         gate._require(row["Image"] == image_id and row["RestartCount"] == 0
                       and env.get("AI_FILTER_PRODUCTION_STARTUP_OPERATION") == permit["parent_operation_id"]
@@ -239,11 +240,10 @@ def _initial_candidates(permit, contract, manifest, rows):
                       and env.get("AI_FILTER_PRODUCTION_STARTUP_ROOT")
                       and gate._parsed(env.get("AI_FILTER_ADMISSION_BINDING", "null")) == permit["freeze"]["binding"],
                       "candidate is not bound to the reviewed closed startup")
-        roots = [mount for mount in row["Mounts"] if mount["Destination"] == env.get("AI_FILTER_ADMISSION_ROOT")]
-        gate._require(len(roots) == 1 and roots[0]["Type"] == "bind" and roots[0]["RW"] is True
-                      and roots[0]["Source"] == permit["freeze"]["root"], "initial candidate fence mount differs")
+        from services.production_startup_control import _control_mount, _topology
+        mapping = contract["review"].get("control_subpaths", {}).get(service_name)
+        _control_mount(row, mapping, "freeze", permit["freeze"]["root"], env.get("AI_FILTER_ADMISSION_ROOT"))
         private.verify_execution(service, row, image, values, expected_running=row["State"]["Running"])
-        from services.production_startup_control import _topology
         _topology(contract, manifest, service, row)
 
 
@@ -521,7 +521,7 @@ class LockedMigration:
 
 
 @contextmanager
-def locked_session(root, permit):
+def locked_session(root, permit, *, release_lock=None):
     session = LockedMigration(root, permit)
     try:
         seen = set()
@@ -531,7 +531,11 @@ def locked_session(root, permit):
             key = (expected["device"], expected["inode"])
             gate._require(key not in seen, "duplicate migration lock identity")
             seen.add(key)
-            fd = gate._lock(Path(expected["path"]), True, 0.1)
+            if name == "release":
+                from services.production_release_lock import acquire_for_phase
+                fd = acquire_for_phase(expected, release_lock)
+            else:
+                fd = gate._lock(Path(expected["path"]), True, 0.1)
             session.fds.append((name, fd))
         fence_root = Path(permit["freeze"]["root"])
         gate._require(all(Path(permit["locks"][name]["path"]) == fence_root / "locks" / (name + ".lock")

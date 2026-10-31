@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import http.client
+import math
 from pathlib import Path
 import time
 from urllib.parse import urlsplit
@@ -18,6 +19,7 @@ from handoff_runtime_adapter import inspect_binding
 from miniflux_handoff_adapter import MinifluxDrainControl, MinifluxActivationControl, HEX64, checked_binding, source_sha256 as bridge_source
 from production_receiver_driver import _capture
 from sender_drain_inventory import PostgresReader
+import sender_namespace_http
 from services import sender_drain_contract as contract
 
 MAX_SAMPLES = 32
@@ -26,7 +28,7 @@ MAX_SAMPLES = 32
 def sources():
     names = ("production_sender_driver.py", "sender_drain_inventory.py", "miniflux_handoff_adapter.py",
              "handoff_runtime_adapter.py", "handoff_host_cron.py", "durable_handoff_cutover.py", "observe_handoff_capacity.py",
-             "production_receiver_driver.py")
+             "production_receiver_driver.py", "sender_namespace_http.py")
     return {**{name: hashlib.sha256((Path(__file__).parent/name).read_bytes()).hexdigest() for name in names},
             "sender_drain_contract": contract.source_sha256()}
 
@@ -49,12 +51,23 @@ def validate_plan(plan):
 
 class NativeSenderTransport:
     """Only fixed Docker inspect and authenticated loopback private gate calls."""
-    def __init__(self, url, token_file):
+    DEFAULT_TIMEOUT_SECONDS = 2
+    MAX_TIMEOUT_SECONDS = 30
+
+    def __init__(self, url, token_file, *, container_id=None, timeout_seconds=None):
         value = urlsplit(url)
         require(value.scheme == "http" and value.hostname == "127.0.0.1" and value.port and value.path in ("", "/")
                 and not value.query and not value.fragment and not value.username and not value.password,
                 "sender private loopback endpoint required")
         self.port, self.token_file = value.port, Path(token_file)
+        require(container_id is None or (isinstance(container_id, str) and HEX64.fullmatch(container_id)),
+                "exact sender namespace container ID required")
+        self.container_id = container_id
+        if timeout_seconds is None:
+            timeout_seconds = self.DEFAULT_TIMEOUT_SECONDS
+        require(type(timeout_seconds) in (int, float) and math.isfinite(timeout_seconds)
+                and 0 < timeout_seconds <= self.MAX_TIMEOUT_SECONDS, "bounded sender control timeout required")
+        self.timeout_seconds = timeout_seconds
         require(self.token_file.is_absolute(), "absolute private sender token required")
         self.token_sha256 = contract.digest(self._token())
 
@@ -66,6 +79,7 @@ class NativeSenderTransport:
 
     def inspect(self, component_id):
         require(isinstance(component_id, str) and HEX64.fullmatch(component_id), "exact sender container ID required")
+        require(self.container_id is None or component_id == self.container_id, "sender namespace binding differs")
         return parsed(_capture(["/usr/bin/docker", "--host", "unix:///var/run/docker.sock", "inspect", component_id]))
 
     def _allowed(self, method, path):
@@ -78,21 +92,23 @@ class NativeSenderTransport:
         require(contract.digest(token) == self.token_sha256, "sender credential changed")
         body = None if payload is None else encoded(payload)
         require(body is None or len(body) <= 8192, "sender request byte budget")
-        started = time.monotonic()
-        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=2)
+        if self.container_id is not None:
+            return sender_namespace_http.request(self.container_id, self.port, method, path, token["token"], payload)
+        started, limit = time.monotonic(), self.timeout_seconds
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=limit)
         try:
             connection.request(method, path, body=body, headers={"Authorization":"Bearer " + token["token"], "Content-Type":"application/json"})
             response = connection.getresponse()
             raw = bytearray()
             while len(raw) <= 65536:
-                require(time.monotonic()-started < 2, "sender control deadline; outcome unknown")
+                require(time.monotonic()-started < limit, "sender control deadline; outcome unknown")
                 if connection.sock:
-                    connection.sock.settimeout(max(0.001, 2-(time.monotonic()-started)))
+                    connection.sock.settimeout(max(0.001, limit-(time.monotonic()-started)))
                 chunk = response.read1(min(4096, 65537-len(raw)))
                 if not chunk:
                     break
                 raw.extend(chunk)
-            require(len(raw) <= 65536 and response.status in (200,409) and time.monotonic()-started < 2,
+            require(len(raw) <= 65536 and response.status in (200,409) and time.monotonic()-started < limit,
                     "sender response unconfirmed; exact query only")
             return response.status, parsed(bytes(raw))
         finally:
@@ -126,7 +142,7 @@ class SenderDriver:
         require(contract.digest(self.plan) == self.plan_sha256, "sender plan mutated")
         binding = self.plan["binding"]
         rows = self._inspect()
-        inspect_binding(rows, {binding["component_name"]:binding["component"]})
+        inspect_binding(rows, {binding["component_name"]:binding["component"]}, allow_external_postgres=True)
         for row in rows:
             env = dict(item.split("=",1) for item in row["Config"]["Env"])
             require(env.get("HANDOFF_ENABLED") == "1" and env.get("HANDOFF_MANIFEST") == binding["manifest"],
@@ -242,7 +258,7 @@ class SenderActivationDriver(SenderDriver):
         require(contract.digest(self.plan) == self.plan_sha256, "activation plan mutated")
         binding = self.plan["binding"]
         rows = self._inspect()
-        inspect_binding(rows, {binding["component_name"]:binding["component"]})
+        inspect_binding(rows, {binding["component_name"]:binding["component"]}, allow_external_postgres=True)
         for row in rows:
             env = dict(item.split("=",1) for item in row["Config"]["Env"])
             require(env.get("HANDOFF_ENABLED") == "1" and env.get("HANDOFF_MANIFEST") == binding["manifest"],
@@ -268,6 +284,17 @@ class SenderActivationDriver(SenderDriver):
                                   "phase":"closed", "current_operation":receipt["operation_id"]}
                 and sample["retained_leases"]["active"] == sample["retained_leases"]["uncertain"] == 0,
                 "actual sender closed state differs")
+
+    def recorded_initialize_closed(self, operation, frozen_sample):
+        """Closed proof while the receiver session holds the sender PG locks.
+
+        Go metadata queries would block on those locks, so the evidence is the
+        snapshot taken under them plus the original confirmed receipt on disk."""
+        self.bind()
+        receipt = self.control.recorded_initialize_closed(operation)
+        require(frozen_sample["database_identity"] == self.plan["postgres_identity"], "frozen sender PG identity differs")
+        self._check_closed(frozen_sample, receipt)
+        return receipt
 
     def query_initialize_closed(self, operation):
         self.bind()
