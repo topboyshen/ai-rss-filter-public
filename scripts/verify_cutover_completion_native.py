@@ -495,9 +495,10 @@ MOUNTS = ("scripts", "tests", "services", "routes", "core", "db", "utils", "work
           "ops/isolation", "ops/miniflux", ".github/workflows", "gunicorn.conf.py",
           "Dockerfile", "requirements-prod.txt", "start.sh")
 CONTAINER_TEST = r'''
-import json, os, pathlib, platform, sys, pytest
+import json, os, pathlib, platform, sys, pytest, psycopg
 from scripts.verify_cutover_completion_native import NativeDiagnostics, NativeShortPaths, native_short_path_plugin, create_fixture_storage, retain_fixture_storage, confirm_fixture_storage, verify_git_fixture
 assert platform.system() == 'Linux' and platform.machine() == 'x86_64'
+assert psycopg.__version__ == '3.3.6' and psycopg.pq.__impl__ == 'binary'
 fixture_mount = pathlib.Path('/tmp/cutover-fixtures')
 assert fixture_mount.samefile('/evidence/disk-fixtures')
 assert fixture_mount.stat().st_uid == os.getuid() and fixture_mount.stat().st_mode & 0o777 == 0o700

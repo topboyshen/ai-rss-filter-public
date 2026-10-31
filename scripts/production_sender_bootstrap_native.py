@@ -632,7 +632,13 @@ def _command_error_class(stderr, rc):
 
 def _command_summary(fd, sequence, budget):
     name = f"command-{sequence:04d}.json"
-    original, raw = export._export_file(fd, name, budget)
+    try:
+        original, raw = export._export_file(fd, name, budget)
+    except Exception as error:
+        # No second open/read, chmod, or relaxed original-reader limit. This is
+        # only a nofollow path observation after failure, not the rejected FD.
+        error._bootstrap_command_metadata = _failed_command_metadata(fd, sequence)
+        raise
     def unique(pairs):
         value = {}
         for key, item in pairs:
@@ -655,6 +661,38 @@ def _command_summary(fd, sequence, budget):
     return {"command_sequence": sequence, "operation": operation, "rc": rc, "elapsed_seconds": elapsed,
             "original_record_sha256": original["sha256"], "retained_stderr_sha256": hashlib.sha256(stderr.encode()).hexdigest(),
             "stderr_bytes": len(stderr.encode()), "error_class": _command_error_class(stderr, rc), "execution_proof": False}
+
+
+def _failed_command_metadata(fd, sequence):
+    gate._require(type(sequence) is int and 1 <= sequence <= 9999, "bounded command sequence required")
+    name = f"command-{sequence:04d}.json"
+    result = {"schema": 1, "command_sequence": sequence, "file_name": name,
+              "observation": "nofollow_path_after_export_failure_not_original_fd",
+              "content_read_for_diagnostic": False, "original_failure_condition_confirmed": False}
+    try:
+        info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+    except OSError:
+        return {**result, "metadata_state": "unavailable"}
+    checks = {"regular_file": stat.S_ISREG(info.st_mode), "single_link": info.st_nlink == 1,
+              "current_uid": info.st_uid == os.geteuid(), "private_mode_0600": stat.S_IMODE(info.st_mode) == 0o600,
+              "original_file_byte_limit": info.st_size <= export.EXPORT_FILE_BYTES}
+    return {**result, "metadata_state": "observed", "size": info.st_size, "mode": stat.S_IMODE(info.st_mode),
+            "uid": info.st_uid, "nlink": info.st_nlink, "failed_observed_conditions": [k for k, ok in checks.items() if not ok]}
+
+
+def _partial_export(packet):
+    # Failure output is proof-only, even for small already-validated originals:
+    # file identity does not validate the privacy of arbitrary JSON fields.
+    # No raw_root, argv, message or credential content crosses this boundary.
+    files = {}
+    for name in ("RESULT.json", "FAILURE.json"):
+        if name in packet["files"]:
+            record = packet["files"][name]
+            files[name] = {key: record[key] for key in ("sha256", "metadata")}
+    value = {"complete": False, "originals_modified": False, "execution_proof": False,
+             "scope": "already_validated_result_failure_proofs_only", "files": files}
+    gate._require(len(gate._encoded(value)) <= 256 * 1024, "bounded partial failure export required")
+    return value
 
 
 def _command_summaries(fd, files, budget):
@@ -751,37 +789,55 @@ def safe_export(root):
         gate._require(len(gate._encoded(packet)) <= 256 * 1024,
                       "bounded complete result export required")
         return packet
+    except Exception as error:
+        try:
+            error._bootstrap_partial_export = _partial_export(packet)
+        except Exception:
+            # A diagnostic cannot replace the original refusal or claim any
+            # content was exported when its bounded encoding failed.
+            error._bootstrap_partial_export = {"complete": False, "originals_modified": False,
+                "execution_proof": False, "scope": "partial_export_unavailable", "files": {}}
+        raise
     finally:
         os.close(fd)
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("repo", "source", "binary", "output", "build-evidence"):
-        parser.add_argument("--" + name, required=True, type=Path)
-    parser.add_argument("--image-id", required=True)
-    parser.add_argument("--predecessor-schema", type=int, choices=(131, 132), default=132,
-                        help="explicit real fixed upstream131 or existing exact132 seed (default remains132)")
-    parser.add_argument("--host-loopback", action="store_true",
-                        help="real daemon host namespace only; exact loopback PG and explicit predecessor131")
-    args = parser.parse_args()
+    previous_umask = os.umask(0o077)
     try:
-        result = execute(args.repo.resolve(), args.source.resolve(), args.image_id, args.binary.resolve(),
-                         args.output.resolve(), args.build_evidence.resolve(), predecessor_schema=args.predecessor_schema, host_loopback=args.host_loopback)
-        packet = {"status": result["status"], "safe_evidence": safe_export(args.output.resolve())}
-        print(gate._encoded(packet).decode(), flush=True)
-        return 0 if packet["status"] == "passed" else 3
-    except BaseException as error:
-        locations = []
+        parser = argparse.ArgumentParser(description=__doc__)
+        for name in ("repo", "source", "binary", "output", "build-evidence"):
+            parser.add_argument("--" + name, required=True, type=Path)
+        parser.add_argument("--image-id", required=True)
+        parser.add_argument("--predecessor-schema", type=int, choices=(131, 132), default=132,
+                            help="explicit real fixed upstream131 or existing exact132 seed (default remains132)")
+        parser.add_argument("--host-loopback", action="store_true",
+                            help="real daemon host namespace only; exact loopback PG and explicit predecessor131")
+        args = parser.parse_args()
         try:
-            from scripts.verify_production_startup_native import public_exception_locations
-            locations = public_exception_locations(error, root=ROOT)
-        except Exception:
-            pass  # Keep the original fallback even if diagnostics are unavailable.
-        print(json.dumps({"status": "unconfirmed", "error_type": type(error).__name__,
-                          "error_sha256": hashlib.sha256(str(error).encode()).hexdigest(),
-                          "safe_export_complete": False, "locations": locations}), flush=True)
-        return 3
+            result = execute(args.repo.resolve(), args.source.resolve(), args.image_id, args.binary.resolve(),
+                             args.output.resolve(), args.build_evidence.resolve(), predecessor_schema=args.predecessor_schema, host_loopback=args.host_loopback)
+            packet = {"status": result["status"], "safe_evidence": safe_export(args.output.resolve())}
+            print(gate._encoded(packet).decode(), flush=True)
+            return 0 if packet["status"] == "passed" else 3
+        except BaseException as error:
+            locations = []
+            try:
+                from scripts.verify_production_startup_native import public_exception_locations
+                locations = public_exception_locations(error, root=ROOT)
+            except Exception:
+                pass  # Keep the original fallback even if diagnostics are unavailable.
+            failure = {"status": "unconfirmed", "error_type": type(error).__name__,
+                       "error_sha256": hashlib.sha256(str(error).encode()).hexdigest(),
+                       "safe_export_complete": False, "locations": locations}
+            if hasattr(error, "_bootstrap_partial_export"):
+                failure["safe_evidence"] = error._bootstrap_partial_export
+            if hasattr(error, "_bootstrap_command_metadata"):
+                failure["command_export_diagnostic"] = error._bootstrap_command_metadata
+            print(json.dumps(failure), flush=True)
+            return 3
+    finally:
+        os.umask(previous_umask)
 
 
 if __name__ == "__main__":

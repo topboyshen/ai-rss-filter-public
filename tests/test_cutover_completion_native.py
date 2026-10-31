@@ -463,6 +463,37 @@ def check_dependency_image_git(source):
     assert "--no-install-recommends" in source
 
 
+def check_dependency_image_postgres(source, probe):
+    assert "COPY requirements-prod.txt requirements.txt requirements-ops.txt /dependencies/" in source
+    assert "-r /dependencies/requirements.txt -r /dependencies/requirements-ops.txt" in source
+    tree = ast.parse(probe)
+    imports = {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
+    assert "psycopg" in imports
+    assert "psycopg.__version__ == '3.3.6' and psycopg.pq.__impl__ == 'binary'" in probe
+    assert probe.index("psycopg.__version__") < probe.index("pytest.main(")
+
+
+@pytest.mark.parametrize("drift", [None, "copy", "install", "import", "version", "implementation"])
+def test_disposable_native_image_installs_and_checks_actual_pinned_postgres_driver(drift):
+    source = (ROOT / "ops/isolation/Dockerfile.cutover-completion").read_text()
+    probe = runner.CONTAINER_TEST
+    if drift == "copy":
+        source = source.replace("requirements.txt requirements-ops.txt /dependencies/", "requirements.txt /dependencies/")
+    elif drift == "install":
+        source = source.replace(" -r /dependencies/requirements-ops.txt", "")
+    elif drift == "import":
+        probe = probe.replace(", pytest, psycopg", ", pytest")
+    elif drift == "version":
+        probe = probe.replace("psycopg.__version__ == '3.3.6'", "True")
+    elif drift == "implementation":
+        probe = probe.replace("psycopg.pq.__impl__ == 'binary'", "True")
+    if drift is None:
+        check_dependency_image_postgres(source, probe)
+    else:
+        with pytest.raises(AssertionError):
+            check_dependency_image_postgres(source, probe)
+
+
 @pytest.mark.parametrize("drift", [None, "git", "git-man", "version_check"])
 def test_dependency_image_requires_exact_git_pins_and_native_smoke_before_pytest(drift):
     source = (ROOT / "ops/isolation/Dockerfile.cutover-completion").read_text()
