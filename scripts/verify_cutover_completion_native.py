@@ -480,7 +480,14 @@ TESTS = ("tests/test_independent_drain_inventory.py", "tests/test_frozen_cutover
          "tests/test_production_receiver_bootstrap.py",
          "tests/test_production_receiver_bootstrap_native.py",
          "tests/test_production_sender_native_bridge.py",
-         "tests/test_sender_external_postgres_identity.py")
+         "tests/test_sender_external_postgres_identity.py",
+         "tests/test_sender_host_loopback_pg.py",
+         "tests/test_sender_host_loopback_postgres_identity.py",
+         "tests/test_production_sender_host_loopback_plan.py",
+         "tests/test_production_sender_bootstrap_direct131.py",
+         "tests/test_sender_host_loopback_pg_inventory.py",
+         "tests/test_production_sender_bootstrap_host_pg.py",
+         "tests/test_sender_namespace_host_listener.py")
 TEST_GROUPS = (("foundation", TESTS[:22]), ("activation", TESTS[22:34]), ("adapters", TESTS[34:]))
 MOUNTS = ("scripts", "tests", "services", "routes", "core", "db", "utils", "workers", "modules",
           "templates", "app.py", "worker_main.py", "sse_engine.py", "logging_bootstrap.py",
@@ -554,7 +561,14 @@ frozen_test_files = ('tests/test_independent_drain_inventory.py',
  'tests/test_production_receiver_bootstrap.py',
  'tests/test_production_receiver_bootstrap_native.py',
  'tests/test_production_sender_native_bridge.py',
- 'tests/test_sender_external_postgres_identity.py')
+ 'tests/test_sender_external_postgres_identity.py',
+ 'tests/test_sender_host_loopback_pg.py',
+ 'tests/test_sender_host_loopback_postgres_identity.py',
+ 'tests/test_production_sender_host_loopback_plan.py',
+ 'tests/test_production_sender_bootstrap_direct131.py',
+ 'tests/test_sender_host_loopback_pg_inventory.py',
+ 'tests/test_production_sender_bootstrap_host_pg.py',
+ 'tests/test_sender_namespace_host_listener.py')
 summary = NativeDiagnostics(frozen_test_files)
 short_paths = NativeShortPaths(fixtures, summary)
 try:

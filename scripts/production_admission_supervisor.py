@@ -172,7 +172,7 @@ def plan_keys_valid(plan, keys):
 def sender_from_plan(plan):
     return SenderActivationDriver(plan["sender_plan"], NativeSenderActivationTransport(plan["sender_url"], plan["token_file"], container_id=plan["sender_namespace_container_id"],
                                   timeout_seconds=plan.get(TIMEOUT_KEY)),
-                                  PostgresReader(plan["dsn_file"], plan["sender_plan"]["postgres_identity"]),
+                                  PostgresReader.from_plan(plan["dsn_file"], plan["sender_plan"]),
                                   Path(plan["sender_evidence_root"]))
 
 

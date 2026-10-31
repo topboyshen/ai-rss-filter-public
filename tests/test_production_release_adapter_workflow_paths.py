@@ -29,6 +29,11 @@ def selected(path, patterns):
     "scripts/private_control_subpaths.py", "scripts/controlled_production_release.py",
     "scripts/controlled_release_finalize.py", "scripts/private_release_contract.py",
     "scripts/sender_namespace_http.py", "scripts/production_gateway_switch.py",
+    "tests/test_sender_namespace_host_listener.py",
+    "scripts/sender_host_loopback_pg.py", "tests/test_sender_host_loopback_pg.py",
+    "tests/test_sender_host_loopback_pg_inventory.py", "tests/test_production_sender_bootstrap_host_pg.py",
+    "tests/test_sender_host_loopback_postgres_identity.py", "tests/test_production_sender_host_loopback_plan.py",
+    "tests/test_production_sender_bootstrap_direct131.py",
     "scripts/production_legacy_takeover.py", "scripts/production_admission_watchdog.py",
     "scripts/production_admission_supervisor.py", "tests/test_sender_namespace_http.py",
     "scripts/production_gateway_native.py", "scripts/production_namespace_native.py",
@@ -68,6 +73,14 @@ def test_each_real_adapter_path_triggers_native(event, path):
     "scripts/production_activation_host_native.py.bak", "scripts/nested/production_activation_host_native.py",
     "scripts/production_offline_registry.py.bak", "scripts/nested/production_offline_registry.py",
     "scripts/production_native_deadline.py.bak", "scripts/nested/production_native_deadline.py",
+    "scripts/sender_host_loopback_pg.py.bak", "scripts/nested/sender_host_loopback_pg.py",
+    "tests/test_sender_host_loopback_pg.py.bak", "tests/nested/test_sender_host_loopback_pg.py",
+    "tests/test_sender_host_loopback_pg_inventory.py.bak", "tests/nested/test_sender_host_loopback_pg_inventory.py",
+    "tests/test_production_sender_bootstrap_host_pg.py.bak", "tests/nested/test_production_sender_bootstrap_host_pg.py",
+    "tests/test_sender_host_loopback_postgres_identity.py.bak", "tests/nested/test_sender_host_loopback_postgres_identity.py",
+    "tests/test_production_sender_host_loopback_plan.py.bak", "tests/nested/test_production_sender_host_loopback_plan.py",
+    "tests/test_production_sender_bootstrap_direct131.py.bak", "tests/nested/test_production_sender_bootstrap_direct131.py",
+    "tests/test_sender_namespace_host_listener.py.bak", "tests/nested/test_sender_namespace_host_listener.py",
     "scripts/verify_miniflux_pause_native.py.bak", "scripts/nested/verify_miniflux_pause_native.py",
     "tests/test_outer_build_diagnostics.py.bak", "tests/nested/test_outer_build_diagnostics.py",
     "tests/nested/test_controlled_release_finalize.py", "tests/test_unrelated.py",
@@ -455,3 +468,204 @@ def test_priority_upload_preserves_real_four_source_collector_without_bypass(mut
         prepare["if"] = "success()"
     with pytest.raises(AssertionError):
         _assert_priority_upload_contract(workflow)
+
+
+HOST131_JOB = "native-host-loopback131"
+HOST131_PROOF = "Prove real root daemon host namespace before fixture access"
+HOST131_BUILD = "Build locked sender from actual checkout for host131"
+HOST131_CASE = "Real host-loopback131 CLOSED migration restart and old-image refusal"
+
+
+def _host131_tree(run, output_name):
+    blocks = re.findall(r"python -I -B - <<'PY'\n(.*?)^PY$", run, re.MULTILINE | re.DOTALL)
+    trees = [ast.parse(block) for block in blocks]
+    matches = [tree for tree in trees if any(
+        isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "output" for target in node.targets)
+        and any(isinstance(value, ast.Constant) and value.value == output_name for value in ast.walk(node.value))
+        for node in tree.body)]
+    assert len(matches) == 1
+    return matches[0]
+
+
+def _assert_host131_process(run):
+    tree = _host131_tree(run, "HOST131_PROCESS")
+    for name, expression in (
+        ("root", "pathlib.Path(os.environ['AI_FILTER_NATIVE_LOOPBACK_STAGE'])"),
+        ("output", "pathlib.Path(os.environ['RUNNER_TEMP']) / 'host-loopback131' / 'HOST131_PROCESS'"),
+        ("result", "json.loads(pathlib.Path(str(output) + '.stdout').read_bytes())"),
+        ("files", "result['safe_evidence']['files']"), ("proof", "files['RESULT.json']['content']"),
+    ):
+        _same_expression(_single_assignment(tree, name).value, expression)
+    args = _single_assignment(tree, "args")
+    _same_expression(args.value,
+        "['/usr/bin/sudo', '-n', '--', sys.executable, '-I', '-B', "
+        "str(root / 'source/scripts/production_sender_bootstrap_native.py'), "
+        "'--repo', str(root / 'source'), '--source', str(root / 'miniflux'), "
+        "'--binary', str(root / 'miniflux-binary'), '--image-id', os.environ['AI_FILTER_NATIVE_LOOPBACK_IMAGE'], "
+        "'--build-evidence', str(root / 'build'), '--output', str(root / 'originals'), "
+        "'--host-loopback', '--predecessor-schema', '131']")
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+             and isinstance(node.func.value, ast.Name) and node.func.value.id == "archive"
+             and node.func.attr == "archive_command"]
+    assert len(calls) == 1 and any(isinstance(node, ast.Expr) and node.value is calls[0] for node in tree.body)
+    call = calls[0]
+    assert len(call.args) == 2 and {key.arg for key in call.keywords} == {"seconds", "limit", "child_umask"}
+    for actual, expected in zip(call.args, ("args", "output"), strict=True):
+        _same_expression(actual, expected)
+    for keyword in call.keywords:
+        _same_expression(keyword.value, {"seconds": "240", "limit": "512 * 1024", "child_umask": "0o077"}[keyword.arg])
+    assertions = [node for node in tree.body if isinstance(node, ast.Assert)]
+    assert len(assertions) == 4
+    for node, expected in zip(assertions, (
+        "result['status'] == 'passed' and result['safe_evidence']['complete'] is True",
+        "proof['host_loopback'] is True and proof['predecessor_schema'] == 131",
+        "proof['limits'] == {'application_memory': 768 * 1024**2, 'application_pids': 256, "
+        "'postgres_memory': 384 * 1024**2, 'postgres_pids': 64, 'operation_seconds': 180}",
+        "{'HOST_LOOPBACK.json', 'SEED131.json', 'DIRECT131_RESTART.json', 'DIRECT131_OLD_LIMIT.json'} <= files.keys()",
+    ), strict=True):
+        _same_expression(node.test, expected)
+    assert args.lineno < call.lineno < _single_assignment(tree, "result").lineno < assertions[0].lineno
+
+
+def _assert_host131_job(workflow):
+    job = workflow["jobs"][HOST131_JOB]
+    assert set(job) == {"runs-on", "timeout-minutes", "steps"}
+    assert job["runs-on"] == "ubuntu-24.04" and job["timeout-minutes"] == "12"
+    steps = job["steps"]
+    assert steps[0] == {"uses": "actions/checkout@v7", "with": {
+        "ref": "${{ github.event.pull_request.head.sha || github.sha }}", "persist-credentials": "false"}}
+    assert steps[1] == {"uses": "actions/setup-python@v7", "with": {"python-version": "3.11"}}
+    assert steps[2] == {"uses": "actions/setup-go@v6", "with": {"go-version": "1.26.4", "cache": "false"}}
+    proof, build, case = [_named_step(steps, name) for name in (HOST131_PROOF, HOST131_BUILD, HOST131_CASE)]
+    assert steps.index(proof) < steps.index(build) < steps.index(case)
+    for step in steps[:-2]:
+        assert "if" not in step and "continue-on-error" not in step
+    _assert_private_clone_contract(proof["run"])
+    tree = _host131_tree(proof["run"], "HOST_NAMESPACE_PROCESS")
+    code = _single_assignment(tree, "code")
+    assert isinstance(code.value, ast.Constant)
+    assert code.value.value == "import json,sys;sys.path.insert(0,sys.argv[1]);from scripts.sender_host_loopback_pg import _host;print(json.dumps({'status':'passed','host':_host()},sort_keys=True),flush=True)"
+    args = _single_assignment(tree, "args")
+    _same_expression(args.value, "['/usr/bin/sudo', '-n', '--', sys.executable, '-I', '-B', '-c', code, str(root / 'source')]")
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+             and isinstance(node.func.value, ast.Name) and node.func.value.id == "archive"
+             and node.func.attr == "archive_command"]
+    assert len(calls) == 1 and any(isinstance(node, ast.Expr) and node.value is calls[0] for node in tree.body)
+    call = calls[0]
+    assert len(call.args) == 2 and {key.arg for key in call.keywords} == {"seconds", "limit", "child_umask"}
+    for actual, expected in zip(call.args, ("args", "output"), strict=True):
+        _same_expression(actual, expected)
+    for keyword in call.keywords:
+        _same_expression(keyword.value, {"seconds": "15", "limit": "16 * 1024", "child_umask": "0o077"}[keyword.arg])
+    _same_expression(_single_assignment(tree, "result").value, "json.loads(pathlib.Path(str(output) + '.stdout').read_bytes())")
+    assertions = [node for node in tree.body if isinstance(node, ast.Assert)]
+    assert len(assertions) == 1
+    _same_expression(assertions[0].test,
+        "result['status'] == 'passed' and set(result['host']) == {'boot_id', 'network_device', 'network_inode'}")
+    assert code.lineno < args.lineno < call.lineno < _single_assignment(tree, "result").lineno < assertions[0].lineno
+    assert "docker " not in proof["run"]
+    run = build["run"]
+    for required in ('git clone --depth 1 --branch 2.3.2 https://github.com/miniflux/v2.git',
+                     'scripts/apply_miniflux_pause.py --source', '--apply', 'source_sha="$(git rev-parse HEAD)"',
+                     'CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -p 1 -trimpath',
+                     'Commit=${source_sha}', 'revision=${source_sha}', '--platform=linux/amd64 --pull=false',
+                     'cp -a --no-preserve=ownership', 'install -d -m 0700 "$native_stage/build"',
+                     'install -m 0500', 'seconds=60, limit=128 * 1024, child_umask=0o077'):
+        assert required in run
+    for name in ("BUILD.log", "IMAGE_BUILD.log", "rawimage.json"):
+        assert f'native_stage/build/{name}' in run
+    assert 'python:3.11.17-slim-trixie@sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e5767af9ea65f6ce' in run
+    assert 'postgres@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea' in run
+    _assert_host131_process(case["run"])
+    combined = "\n".join(step.get("run", "") for step in steps)
+    for forbidden in ("|| true", "docker kill", "docker rm", "docker stop", "systemctl", "kill -", ":5433",
+                      "safe.directory=*", "git config --global", "--privileged", "--skip", "--allow-unsafe",
+                      "chmod -R", "chown -R", "--network=host", "crontab"):
+        assert forbidden not in combined
+    prepare, upload = steps[-2:]
+    assert prepare == {"name": "Prepare host131 evidence without following links", "if": "always()",
+        "run": 'python -I -B scripts/prepare_synthetic_evidence.py \\\n  --source "host-loopback131=${RUNNER_TEMP}/host-loopback131" \\\n  --output "${RUNNER_TEMP}/host-loopback131-upload"\n'}
+    assert upload["if"] == "always()" and upload["uses"] == "actions/upload-artifact@v7"
+    assert upload["with"] == {"name": "host-loopback131-${{ github.run_id }}-${{ github.run_attempt }}",
+        "path": "${{ runner.temp }}/host-loopback131-upload/", "include-hidden-files": "true",
+        "if-no-files-found": "error", "retention-days": "14"}
+
+
+def test_independent_host131_job_has_no_service_port_conflict_and_keeps_original_132_activation():
+    workflow = yaml.load((ROOT / PATH).read_text(), Loader=yaml.BaseLoader)
+    _assert_host131_job(workflow)
+    original = workflow["jobs"]["native-amd64"]
+    assert original["services"]["postgres"]["ports"] == ["5432:5432"]
+    run = _full_activation_step(workflow)["run"]
+    assert "--host-loopback" not in run and "--predecessor-schema" not in run
+    _assert_full_activation_contract(run)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("services", {"postgres": {"ports": ["5432:5432"]}}), ("needs", "native-amd64"),
+    ("if", "${{ false }}"), ("continue-on-error", "true"), ("runs-on", "ubuntu-24.04-arm"),
+    ("timeout-minutes", "13"),
+])
+def test_host131_rejects_service_conflict_skip_dependency_emulation_or_time_drift(field, value):
+    workflow = yaml.load((ROOT / PATH).read_text(), Loader=yaml.BaseLoader)
+    workflow["jobs"][HOST131_JOB][field] = value
+    with pytest.raises(AssertionError):
+        _assert_host131_job(workflow)
+
+
+@pytest.mark.parametrize("before,after", [
+    ("'--host-loopback', '--predecessor-schema', '131'", "'--predecessor-schema', '132'"),
+    ("'--predecessor-schema', '131'", "'--predecessor-schema', '132'"),
+    ("'/usr/bin/sudo'", "'/bin/true'"), ("seconds=240", "seconds=241"),
+    ("limit=512 * 1024", "limit=513 * 1024"), ("child_umask=0o077", "child_umask=0o022"),
+    ("proof['host_loopback'] is True", "proof['host_loopback'] is False"),
+    ("'operation_seconds': 180", "'operation_seconds': 181"),
+    ("'postgres_memory': 384 * 1024**2", "'postgres_memory': 768 * 1024**2"),
+    ("'application_pids': 256", "'application_pids': 512"),
+    ("result['safe_evidence']['complete'] is True", "result['safe_evidence']['complete'] is False"),
+    ("'DIRECT131_OLD_LIMIT.json'", "'SEED132.json'"),
+])
+def test_host131_ast_rejects_changed_runtime_or_limits_even_with_comment_decoy(before, after):
+    workflow = yaml.load((ROOT / PATH).read_text(), Loader=yaml.BaseLoader)
+    step = _named_step(workflow["jobs"][HOST131_JOB]["steps"], HOST131_CASE)
+    assert before in step["run"]
+    step["run"] = step["run"].replace(before, after, 1) + "\n# expected-decoy " + before
+    with pytest.raises(AssertionError):
+        _assert_host131_job(workflow)
+
+
+@pytest.mark.parametrize("mutation", ["fake-proof", "missing-proof", "skip-proof", "ignore-case", "raw-upload", "lenient-upload", "relax-collector"])
+def test_host131_rejects_assumed_host_proof_or_missing_failure_evidence(mutation):
+    workflow = yaml.load((ROOT / PATH).read_text(), Loader=yaml.BaseLoader)
+    steps = workflow["jobs"][HOST131_JOB]["steps"]
+    if mutation == "fake-proof":
+        step = _named_step(steps, HOST131_PROOF)
+        step["run"] = step["run"].replace("'host':_host()", "'host':{}")
+    elif mutation == "missing-proof":
+        steps.remove(_named_step(steps, HOST131_PROOF))
+    elif mutation == "skip-proof":
+        _named_step(steps, HOST131_PROOF)["if"] = "${{ false }}"
+    elif mutation == "ignore-case":
+        _named_step(steps, HOST131_CASE)["continue-on-error"] = "true"
+    elif mutation == "raw-upload":
+        steps[-1]["with"]["path"] = "${{ runner.temp }}/host-loopback131/"
+    elif mutation == "lenient-upload":
+        steps[-1]["with"]["if-no-files-found"] = "warn"
+    else:
+        steps[-2]["run"] += " || true"
+    with pytest.raises(AssertionError):
+        _assert_host131_job(workflow)
+
+
+@pytest.mark.parametrize("step_name,seconds,limit", [(HOST131_PROOF, 15, "16 * 1024"), (HOST131_CASE, 240, "512 * 1024")])
+@pytest.mark.parametrize("mutation", ["missing", "duplicate", "conditional", "args-modified"])
+def test_host131_proof_and_case_require_one_actual_unconditional_bounded_process(step_name, seconds, limit, mutation):
+    workflow = yaml.load((ROOT / PATH).read_text(), Loader=yaml.BaseLoader)
+    step = _named_step(workflow["jobs"][HOST131_JOB]["steps"], step_name)
+    call = f"archive.archive_command(args, output, seconds={seconds}, limit={limit}, child_umask=0o077)"
+    assert call in step["run"]
+    replacement = {"missing": "# " + call, "duplicate": call + "\n" + call,
+        "conditional": "if False:\n    " + call, "args-modified": "args += ['--skip-guard']\n" + call}[mutation]
+    step["run"] = step["run"].replace(call, replacement, 1)
+    with pytest.raises(AssertionError):
+        _assert_host131_job(workflow)

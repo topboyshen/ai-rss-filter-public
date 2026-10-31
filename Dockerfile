@@ -65,6 +65,7 @@ COPY scripts/run_controlled_startup.py ./scripts/run_controlled_startup.py
 # is added to the application container.
 COPY scripts/production_sender_driver.py ./scripts/production_sender_driver.py
 COPY scripts/sender_drain_inventory.py ./scripts/sender_drain_inventory.py
+COPY scripts/sender_host_loopback_pg.py ./scripts/sender_host_loopback_pg.py
 COPY scripts/observe_handoff_capacity.py ./scripts/observe_handoff_capacity.py
 COPY scripts/production_admission_supervisor.py ./scripts/production_admission_supervisor.py
 COPY scripts/production_admission_watchdog.py ./scripts/production_admission_watchdog.py

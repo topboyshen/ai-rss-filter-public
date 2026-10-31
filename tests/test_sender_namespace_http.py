@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -208,12 +209,14 @@ def test_inspect_requires_live_exact_container_state(monkeypatch, field, value):
 @pytest.fixture
 def http_case(monkeypatch):
     owner = {"pid": 321, "start_ticks": 45, "network_device": 4, "network_inode": 12}
-    p = SimpleNamespace(owner=owner, calls=[], response=b'{"confirmed":true}', status=200, closed=False)
+    p = SimpleNamespace(owner=owner, calls=[], response=b'{"confirmed":true}', status=200, closed=False,
+                        listener_live=False, listener_released=False, listener_confirmed=False)
     class Connection:
         sock = None
         def __init__(self, *args, **kwargs):
             p.calls.append((args, kwargs))
         def request(self, method, path, **kwargs):
+            assert p.listener_live
             p.calls.append((method, path, kwargs))
         def getresponse(self):
             return SimpleNamespace(status=p.status, read1=self.read)
@@ -221,9 +224,24 @@ def http_case(monkeypatch):
             part, p.response = p.response[:size], p.response[size:]
             return part
         def close(self):
+            assert p.listener_live
             p.closed = True
     monkeypatch.setattr(namespace, "Path", lambda path: SimpleNamespace(stat=lambda: SimpleNamespace(st_dev=4, st_ino=12)))
     monkeypatch.setattr(namespace, "_process_identity", lambda pid: deepcopy(owner))
+    @contextmanager
+    def owned_listener(_owner, _port, _deadline):
+        # This fixture isolates HTTP framing. Real FD/port ownership has its own
+        # strict positive and negative tests; it is never inferred from this fake.
+        assert _owner == owner and _port == 8910 and _deadline <= time.monotonic() + 2
+        p.listener_live = True
+        def confirm():
+            assert p.listener_live
+            p.listener_confirmed = True
+        try:
+            yield SimpleNamespace(confirm=confirm)
+        finally:
+            p.listener_live, p.listener_released = False, True
+    monkeypatch.setattr(namespace, "_listener_owner", owned_listener)
     monkeypatch.setattr(namespace.http.client, "HTTPConnection", Connection)
     p.value = {"port": 8910, "method": "POST", "path": "/initialize-closed", "token": TOKEN,
                "payload": {"operation_id": "c" * 64}, "owner": owner}
@@ -233,10 +251,12 @@ def http_case(monkeypatch):
 def test_child_only_requests_loopback_after_own_namespace_check(http_case):
     p = http_case
     assert namespace._http(p.value) == {"status": 200, "body": {"confirmed": True}}
-    assert p.calls[0] == (("127.0.0.1", 8910), {"timeout": 2})
+    assert p.calls[0][0] == ("127.0.0.1", 8910)
+    assert 0 < p.calls[0][1]["timeout"] <= 2
     assert p.calls[1][0:2] == ("POST", "/initialize-closed")
     assert p.calls[1][2]["headers"]["Authorization"] == "Bearer " + TOKEN
     assert json.loads(p.calls[1][2]["body"]) == p.value["payload"] and p.closed
+    assert p.listener_confirmed and p.listener_released and not p.listener_live
 
 
 def test_child_wrong_namespace_never_opens_http(http_case):
@@ -254,4 +274,4 @@ def test_child_response_budget_status_and_duplicates_fail_closed(http_case, raw,
     p.response, p.status = raw, status
     with pytest.raises(namespace.NamespaceUncertain):
         namespace._http(p.value)
-    assert p.closed
+    assert p.closed and p.listener_released and not p.listener_live and not p.listener_confirmed

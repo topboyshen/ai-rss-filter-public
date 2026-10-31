@@ -26,6 +26,7 @@ def source_sha256():
     names = ("services/production_admission_lifecycle.py", "services/admission_fence.py",
              "services/production_activation.py", "services/production_activation_control.py",
              "scripts/production_sender_driver.py", "scripts/sender_drain_inventory.py",
+             "scripts/sender_host_loopback_pg.py",
              "scripts/observe_handoff_capacity.py", "scripts/production_admission_supervisor.py", "scripts/production_admission_watchdog.py", "scripts/sender_namespace_http.py")
     return gate._hash({name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in names})
 

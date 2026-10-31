@@ -502,7 +502,7 @@ def _cli_call(request, action):
         transport = sender.NativeSenderActivationTransport(s["url"], s["token_file"],
             container_id=container_id)
         driver = sender.SenderActivationDriver(sender_plan, transport,
-            sender.PostgresReader(s["dsn_file"], sender_plan["postgres_identity"]), s["evidence_root"])
+            sender.PostgresReader.from_plan(s["dsn_file"], sender_plan), s["evidence_root"])
         with activation.locked_activation(r["migration_root"], r["runtime_root"], r["state"],
                                           operation_id=r["operation_id"]) as session:
             return (finalize if action == "finalize" else query)(session, driver, request["plan"], request["evidence_root"])

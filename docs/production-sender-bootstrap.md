@@ -48,20 +48,52 @@ The four explicit phases are:
    first initialization. A lost initialize ACK is recovered by GET of the same
    operation, including after the write window expires; never repeat POST.
 
-Actual source-schema coverage here is deliberately restricted to canonical
-132/133/134/135. Earlier, future, malformed or unknown schema markers stop before
-create. This limit must not be loosened without an actual old-image migration
-experiment. PG metadata uses a read-only transaction, bounded LIMIT queries,
+Accepted source schemas are deliberately restricted to canonical
+131/132/133/134/135. The separate native host-loopback131 CI job must prove
+the fixed upstream image's actual 131 migration directly to 135, CLOSED
+initialization, retained-original restart and old-image refusal before release.
+The fixture never manufactures a 131 marker. The original 132/bridge and full
+activation proofs remain required. Earlier, future, malformed or unknown schema
+markers stop before create. PG metadata uses a read-only transaction, bounded LIMIT queries,
 3-second statement timeout and a 10-second observation deadline; no body,
 credential or whole-table inventory is returned. A failed or not-yet-complete
 migration leaves initialization blocked.
 
-Zero mounts are legitimate only for an explicitly bound Miniflux using external
-PostgreSQL and a read-only root filesystem. The component records
+For a Miniflux using external PostgreSQL, the component records
 `external_postgres={dsn_sha256,host,read_only_rootfs:true}` from actual Docker Env
 and HostConfig. Missing Mounts, extra mounts, changed DSN, libpq host overrides,
 loopback DB, writable rootfs, application roles and old isolation scope still
 fail. No dummy mount is added to satisfy an old fixture assumption.
+
+A separate `host_loopback_postgres` capability supports the exact existing
+host-network topology: read-only sender, zero mounts, zero published ports,
+`network_mode: host`, and literal `127.0.0.1` with port 5432. Omitting the default
+port preserves the original DSN bytes/hash; an empty port or any PG-prefixed
+environment override is rejected. This does not permit loopback under the
+external-host policy or aliases on Docker's host network.
+
+The sealed transport binds host boot/net namespace plus the exact healthy PG
+container image, start/restart/PID, config, mounts, independent bridge and sole
+`127.0.0.1:5432` publication. The collector must run in the real root daemon-host
+namespace. Every PG operation rechecks this binding and verifies server address,
+port and instance/session identity on its actual connection. It cannot replace
+this check with a second connection. Migration permits and all reader factories
+retain the same transport capability.
+
+Control HTTP also requires the unique IPv4 loopback LISTEN socket to belong to
+the exact sender PID's FD. `pidfd_getfd` holds that listening FD through the
+request and cleanup, with process/start/netns/FD checks before and after. This
+requires Linux support and existing ptrace/LSM/seccomp permission. Unsupported
+or denied duplication is UNKNOWN and blocks; no capability, sysctl, listener
+fallback or timeout extension is authorized. A shared host namespace alone is
+never listener ownership proof.
+
+These checks do not make a schema downgrade safe. After migration to 135 the
+fixed upstream 131 image must refuse startup; rollback cannot consist of merely
+switching a sender image. Preserve all original PG/control/outbox/held records,
+keep producers and consumers closed, and separately review recovery before any
+rollback. Historical messages whose old sender never saved raw bytes remain an
+explicit gap and must not be replayed or invented.
 
 The resulting `driver-plan.json` contains real table OIDs, container ID and start
 identity. Receiver migration/activation permits must be sealed using those actual

@@ -87,6 +87,8 @@ def load_inputs(path, *, active=True):
     gate._require(permit["sender"]["closed_operation_id"] == final["sender_closed_operation_id"]
                   and permit["sender"]["expected_identity"] == sender_plan["postgres_identity"],
                   "sender migration and resume endpoints differ")
+    gate._require(permit["sender"].get("postgres_transport") == sender_plan.get("postgres_transport"),
+                  "migration and sender transport capabilities differ")
     gate._require(permit["locks"]["release"]["path"] == str(Path(final["registry_root"]) / "release.lock"),
                   "formal registry release lock differs")
     return plan, permit, final, policy, sender_plan
@@ -104,7 +106,7 @@ def _sender(plan, permit, sender_plan):
     config = plan["sender"]
     transport = NativeSenderActivationTransport(config["endpoint"], config["token"],
                                                 container_id=sender_plan["binding"]["component"]["id"])
-    reader = PostgresReader(Path(permit["sender"]["dsn_file"]), sender_plan["postgres_identity"])
+    reader = PostgresReader.from_plan(Path(permit["sender"]["dsn_file"]), sender_plan)
     return SenderActivationDriver(sender_plan, transport, reader, Path(config["evidence_root"]))
 
 
