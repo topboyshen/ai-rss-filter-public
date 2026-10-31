@@ -37,7 +37,9 @@ PG_KEYS = {
     "network_id",
     "address",
 }
-SQL = """SELECT inet_server_addr()::text,inet_server_port(),current_database(),
+# inet -> text retains a /32 suffix even for a host address. Docker's exact
+# IPAddress has no netmask; host() selects only that address, never a subnet.
+SQL = """SELECT host(inet_server_addr()),inet_server_port(),current_database(),
  current_schema(),(SELECT system_identifier::text FROM pg_control_system()),
  pg_postmaster_start_time()::text,current_user,session_user"""
 _NATIVE_HOST = ContextVar("synthetic_exact_private_daemon_host", default=None)

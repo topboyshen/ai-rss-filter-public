@@ -169,6 +169,37 @@ def test_actual_connection_checks_same_cursor_without_connecting_again(case):
     assert calls == [local.SQL]
 
 
+def test_postgres_host_projection_avoids_explicit_inet_text_netmask(case):
+    """PG17 casts inet to text with /32; host(inet) emits the bare address.
+
+    This is the documented SQL projection, not a live PostgreSQL claim. The
+    old fixture returned a bare IP for either expression and hid the mismatch.
+    """
+    calls = []
+    def execute(sql):
+        calls.append(sql)
+    def fetchone():
+        if "host(inet_server_addr())" in calls[-1]:
+            address = "172.19.0.2"
+        else:
+            assert "inet_server_addr()::text" in calls[-1]
+            address = "172.19.0.2/32"
+        return (address, 5432, *IDENTITY.values())
+    cursor = SimpleNamespace(execute=execute, fetchone=fetchone)
+    local.HostLoopbackPostgres(case.binding).check_connection(cursor, IDENTITY)
+    assert calls == [local.SQL]
+    assert local.SQL.startswith("SELECT host(inet_server_addr()),inet_server_port(),")
+
+
+@pytest.mark.parametrize("address", ["172.19.0.2/32", "172.19.0.0/24", "172.19.0.2/24",
+                                      "172.19.0.20", "127.0.0.1", "172.19.0.2 "])
+def test_actual_connection_never_adopts_network_or_prefix_as_exact_host(case, address):
+    cursor = SimpleNamespace(execute=lambda sql: None,
+                             fetchone=lambda: (address, 5432, *IDENTITY.values()))
+    with pytest.raises(CutoverError, match="sealed container instance"):
+        local.HostLoopbackPostgres(case.binding).check_connection(cursor, IDENTITY)
+
+
 @pytest.mark.parametrize("field", range(8))
 def test_actual_connection_wrong_server_or_identity_stops(case, field):
     result = ["172.19.0.2", 5432, *IDENTITY.values()]
