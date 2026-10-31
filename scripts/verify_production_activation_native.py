@@ -897,6 +897,7 @@ def scenario(harness, output):
 
 DIAGNOSTIC_HEX_RE = re.compile(r"[0-9a-fA-F]{32,}")
 DIAGNOSTIC_TEXT_CHARS = 200
+GUARDIAN_TEXT_CHARS = 1600  # fixed-vocabulary fields only; must match host relay bound
 NAMESPACE_NOTE = "namespace helper: "
 GUARDIAN_NOTE = "guardian handoff: "
 GUARDIAN_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,80}")
@@ -914,6 +915,16 @@ def _guardian_word(value, allowed=None):
     if not isinstance(value, str) or not GUARDIAN_WORD.fullmatch(value):
         return "other"
     return value if allowed is None or value in allowed else "other"
+
+
+def _guardian_error_fields(fields, label, error):
+    """Append label=Type and label_sha12=<12 hex of message_sha256>; never raw message text."""
+    if not isinstance(error, dict):
+        return
+    fields.append("%s=%s" % (label, _guardian_word(error.get("type"))))
+    digest = str(error.get("message_sha256", ""))
+    if re.fullmatch(r"[0-9a-f]{64}", digest):
+        fields.append("%s_sha12=%s" % (label, digest[:12]))
 
 
 def guardian_handoff_summary(active, child=None):
@@ -935,8 +946,7 @@ def guardian_handoff_summary(active, child=None):
         fields.append("wd_result_status=" + _guardian_word(result.get("status")))
         errors = result.get("errors") if isinstance(result.get("errors"), dict) else {}
         for key in ("marker", "sender", "receiver"):
-            if isinstance(errors.get(key), dict):
-                fields.append("wd_result_error_%s=%s" % (key, _guardian_word(errors[key].get("type"))))
+            _guardian_error_fields(fields, "wd_result_error_" + key, errors.get(key))
     fields.append("wd_handoff=%d" % int((watchdog_root / "handoff.json").exists()))
     failed = _guardian_json(watchdog_root / "handoff.failed.json")
     fields.append("wd_handoff_failed=%d" % int(failed is not None or (watchdog_root / "handoff.failed.json").exists()))
@@ -975,6 +985,11 @@ def guardian_handoff_summary(active, child=None):
             digest = str(trigger.get("message_sha256", ""))
             if re.fullmatch(r"[0-9a-f]{64}", digest):
                 fields.append("sup_tick_trigger_sha12=" + digest[:12])
+        tick_errors = tick_value["result"].get("errors")
+        tick_errors = tick_errors if isinstance(tick_errors, dict) else {}
+        for key in ("marker", "sender", "receiver"):
+            _guardian_error_fields(fields, "sup_tick_error_" + key, tick_errors.get(key))
+        _guardian_error_fields(fields, "sup_tick_sender_construction", tick_value["result"].get("sender_construction_error"))
         clock = tick_value.get("clock") if isinstance(tick_value.get("clock"), dict) else {}
         if type(clock.get("wall")) in (int, float):
             fields.append("sup_tick_age_s=%.1f" % (now - clock["wall"]))
@@ -1027,7 +1042,7 @@ def record_failure(error, repo, output, stage, *, private_commands=None):
         failure["namespace_helper"] = summary["namespace_helper"] = helper[0][:DIAGNOSTIC_TEXT_CHARS * 4]
     guardian = [note[len(GUARDIAN_NOTE):] for note in getattr(error, "__notes__", ()) if str(note).startswith(GUARDIAN_NOTE)]
     if guardian:
-        failure["guardian_handoff"] = summary["guardian_handoff"] = guardian[0][:DIAGNOSTIC_TEXT_CHARS * 4]
+        failure["guardian_handoff"] = summary["guardian_handoff"] = guardian[0][:GUARDIAN_TEXT_CHARS]
     commands = command_diagnostics.safe_summary(private_commands)
     if commands is not None:
         failure["private_commands"] = summary["private_commands"] = commands

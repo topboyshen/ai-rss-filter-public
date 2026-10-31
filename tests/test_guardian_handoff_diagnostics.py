@@ -155,3 +155,30 @@ def test_non_exiting_guardian_still_fails_with_timeout(tmp_path, monkeypatch):
     with pytest.raises(native.subprocess.TimeoutExpired) as caught:
         native.complete_native_supervision(SimpleNamespace(stage=lambda name: None), p, active, None, None)
     assert any("exit=none" in note and "child_alive=1" in note for note in caught.value.__notes__)
+
+
+def test_summary_names_supervisor_tick_restrictive_errors_by_type_and_hash(tmp_path):
+    active, wd, sup = _roots(tmp_path)
+    _write(wd / "result.json", {"status": "stop_unconfirmed",
+                                "errors": {"receiver": {"type": "AdmissionError", "message_sha256": "d" * 64}}})
+    _write(sup / "supervisor.tick.json", {"clock": {"wall": time.time()}, "result": {
+        "status": "stop_unconfirmed", "trigger": {"type": "AdmissionBusy", "message_sha256": "a" * 64},
+        "errors": {"sender": {"type": "CutoverError", "message_sha256": "1" * 64},
+                   "receiver": {"type": "AdmissionError", "message_sha256": "2" * 64, "extra": SECRET}},
+        "sender_construction_error": {"type": "OSError", "message_sha256": "3" * 64}}})
+    fields = dict(item.split("=", 1) for item in native.guardian_handoff_summary(active).split(","))
+    assert fields["wd_result_error_receiver_sha12"] == "d" * 12
+    assert fields["sup_tick_error_sender"] == "CutoverError" and fields["sup_tick_error_sender_sha12"] == "1" * 12
+    assert fields["sup_tick_error_receiver"] == "AdmissionError" and fields["sup_tick_error_receiver_sha12"] == "2" * 12
+    assert fields["sup_tick_sender_construction"] == "OSError"
+    assert "sup_tick_error_marker" not in fields
+    assert "supersecret" not in ",".join(fields.values())
+
+
+def test_full_guardian_summary_survives_host_relay_bound():
+    # The CI run 41027597583 summary was 636 chars; the added fields must not push it past the relay cap,
+    # where the host would silently drop the whole field.
+    text = "phase=exit_wait,exit_code=1," + ",".join("field_%02d=AdmissionError" % i for i in range(40))
+    assert 800 < len(text) <= native.GUARDIAN_TEXT_CHARS
+    relayed = {"failure": {"type": "AdmissionError", "message_sha256": "0" * 64, "guardian_handoff": text}}
+    assert host_native.safe_activation(relayed)["failure_guardian_handoff"] == text
