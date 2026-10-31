@@ -53,6 +53,7 @@ def selected(path, patterns):
     "scripts/production_native_deadline.py", "tests/test_production_native_deadline.py",
     "scripts/production_sender_bootstrap.py", "tests/test_production_namespace_native.py",
     "scripts/production_sender_bootstrap_native.py",
+    "scripts/production_sender_bootstrap_host_native.py", "tests/test_production_sender_bootstrap_host_native.py",
     "scripts/production_receiver_bootstrap.py", "scripts/production_receiver_bootstrap_native.py",
     "tests/test_production_receiver_bootstrap.py",
     "tests/test_production_receiver_bootstrap_native.py",
@@ -103,6 +104,8 @@ def test_each_real_adapter_path_triggers_native(event, path):
     "scripts/production_activation_host_native.py.bak", "scripts/nested/production_activation_host_native.py",
     "scripts/production_offline_registry.py.bak", "scripts/nested/production_offline_registry.py",
     "scripts/production_native_deadline.py.bak", "scripts/nested/production_native_deadline.py",
+    "scripts/production_sender_bootstrap_host_native.py.bak", "scripts/nested/production_sender_bootstrap_host_native.py",
+    "tests/test_production_sender_bootstrap_host_native.py.bak", "tests/nested/test_production_sender_bootstrap_host_native.py",
     "scripts/sender_host_loopback_pg.py.bak", "scripts/nested/sender_host_loopback_pg.py",
     "tests/test_sender_host_loopback_pg.py.bak", "tests/nested/test_sender_host_loopback_pg.py",
     "tests/test_sender_host_loopback_pg_inventory.py.bak", "tests/nested/test_sender_host_loopback_pg_inventory.py",
@@ -542,16 +545,16 @@ def _assert_host131_process(run):
         ("output", "pathlib.Path(os.environ['RUNNER_TEMP']) / 'host-loopback131' / 'HOST131_PROCESS'"),
         ("result", "json.loads(pathlib.Path(str(output) + '.stdout').read_bytes())"),
         ("files", "result['safe_evidence']['files']"), ("proof", "files['RESULT.json']['content']"),
+        ("private_host", "result['private_host']"), ("inner", "private_host['result']"),
     ):
         _same_expression(_single_assignment(tree, name).value, expression)
     args = _single_assignment(tree, "args")
     _same_expression(args.value,
         "['/usr/bin/sudo', '-n', '--', sys.executable, '-I', '-B', "
-        "str(root / 'source/scripts/production_sender_bootstrap_native.py'), "
+        "str(root / 'source/scripts/production_sender_bootstrap_host_native.py'), "
         "'--repo', str(root / 'source'), '--source', str(root / 'miniflux'), "
         "'--binary', str(root / 'miniflux-binary'), '--image-id', os.environ['AI_FILTER_NATIVE_LOOPBACK_IMAGE'], "
-        "'--build-evidence', str(root / 'build'), '--output', str(root / 'originals'), "
-        "'--host-loopback', '--predecessor-schema', '131']")
+        "'--build-evidence', str(root / 'build'), '--output', str(root / 'originals')]")
     calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
              and isinstance(node.func.value, ast.Name) and node.func.value.id == "archive"
              and node.func.attr == "archive_command"]
@@ -563,11 +566,17 @@ def _assert_host131_process(run):
     for keyword in call.keywords:
         _same_expression(keyword.value, {"seconds": "240", "limit": "512 * 1024", "child_umask": "0o077"}[keyword.arg])
     assertions = [node for node in tree.body if isinstance(node, ast.Assert)]
-    assert len(assertions) == 10
+    assert len(assertions) == 15
     _same_expression(_single_assignment(tree, "pg_checks").value, "files['LOOPBACK_PG_CHECKS.json']['content']")
     _same_expression(_single_assignment(tree, "port_diagnostics").value, "pg_checks['port_diagnostics']")
     for node, expected in zip(assertions, (
         "result['status'] == 'passed' and result['safe_evidence']['complete'] is True",
+        "private_host['mode'] == 'private-host-loopback131-v1' and private_host['operation_seconds'] == 180",
+        "private_host['failure'] is None and inner['status'] == 'passed'",
+        "inner['operation_seconds'] == 180 and 0 <= inner['elapsed_seconds'] <= 180",
+        "inner['bootstrap_result'] == proof and inner['error_type'] is None and inner['error_sha256'] is None",
+        "inner['daemon_stop'] == {'status': 'stopped', 'all_containers_stopped': True, "
+        "'daemon_returncode': 0, 'forced_kill': False, 'removed': False}",
         "proof['host_loopback'] is True and proof['predecessor_schema'] == 131",
         "proof['limits'] == {'application_memory': 768 * 1024**2, 'application_pids': 256, "
         "'postgres_memory': 384 * 1024**2, 'postgres_pids': 64, 'operation_seconds': 180}",
@@ -676,8 +685,8 @@ def test_host131_rejects_service_conflict_skip_dependency_emulation_or_time_drif
 
 
 @pytest.mark.parametrize("before,after", [
-    ("'--host-loopback', '--predecessor-schema', '131'", "'--predecessor-schema', '132'"),
-    ("'--predecessor-schema', '131'", "'--predecessor-schema', '132'"),
+    ("source/scripts/production_sender_bootstrap_host_native.py", "source/scripts/production_sender_bootstrap_native.py"),
+    ("'--output', str(root / 'originals')]", "'--output', str(root / 'originals'), '--host-loopback']"),
     ("'/usr/bin/sudo'", "'/bin/true'"), ("seconds=240", "seconds=241"),
     ("limit=512 * 1024", "limit=513 * 1024"), ("child_umask=0o077", "child_umask=0o022"),
     ("proof['host_loopback'] is True", "proof['host_loopback'] is False"),
@@ -685,6 +694,17 @@ def test_host131_rejects_service_conflict_skip_dependency_emulation_or_time_drif
     ("'postgres_memory': 384 * 1024**2", "'postgres_memory': 768 * 1024**2"),
     ("'application_pids': 256", "'application_pids': 512"),
     ("result['safe_evidence']['complete'] is True", "result['safe_evidence']['complete'] is False"),
+    ("private_host['mode'] == 'private-host-loopback131-v1'", "private_host['mode'] == 'ordinary-runner-bridge'"),
+    ("private_host['failure'] is None", "private_host['failure'] is not None"),
+    ("inner['status'] == 'passed'", "inner['status'] == 'unconfirmed'"),
+    ("inner['operation_seconds'] == 180", "inner['operation_seconds'] == 181"),
+    ("inner['elapsed_seconds'] <= 180", "inner['elapsed_seconds'] <= 181"),
+    ("inner['bootstrap_result'] == proof", "inner['bootstrap_result'] == {}"),
+    ("inner['error_type'] is None", "inner['error_type'] is not None"),
+    ("'all_containers_stopped': True", "'all_containers_stopped': False"),
+    ("'daemon_returncode': 0", "'daemon_returncode': 1"),
+    ("'forced_kill': False", "'forced_kill': True"),
+    ("'removed': False", "'removed': True"),
     ("'DIRECT131_OLD_LIMIT.json'", "'SEED132.json'"),
     ("pg_checks['passed'] is True", "pg_checks['passed'] is False"),
     ("pg_checks['execution_proof'] is False", "pg_checks['execution_proof'] is True"),

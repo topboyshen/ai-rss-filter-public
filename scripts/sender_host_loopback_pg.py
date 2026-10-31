@@ -7,6 +7,8 @@ the fixed PostgreSQL container, and verifies the server on that connection.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 import hashlib
 import os
 from pathlib import Path
@@ -38,6 +40,28 @@ PG_KEYS = {
 SQL = """SELECT inet_server_addr()::text,inet_server_port(),current_database(),
  current_schema(),(SELECT system_identifier::text FROM pg_control_system()),
  pg_postmaster_start_time()::text,current_user,session_user"""
+_NATIVE_HOST = ContextVar("synthetic_exact_private_daemon_host", default=None)
+
+
+@contextmanager
+def native_private_host(context):
+    """Only a live, source-bound isolated native daemon; no receipt or flag.
+
+    The ordinary production host checks below remain the default. The native
+    wrapper validates its actual namespaces, peer, plan, routes and lifetime
+    on entry, on every host observation, and again before leaving this scope.
+    """
+    from scripts.production_sender_bootstrap_host_native import native_host_identity
+    require(_NATIVE_HOST.get() is None, "nested native host authority refused")
+    native_host_identity(context)
+    token = _NATIVE_HOST.set(context)
+    try:
+        yield
+        from scripts import production_native_deadline as native_budget
+        with native_budget.final_phase():
+            native_host_identity(context)
+    finally:
+        _NATIVE_HOST.reset(token)
 
 
 def source_sha256():
@@ -167,6 +191,10 @@ def _process(pid):
 
 
 def _host():
+    context = _NATIVE_HOST.get()
+    if context is not None:
+        from scripts.production_sender_bootstrap_host_native import native_host_identity
+        return native_host_identity(context)
     require(
         os.geteuid() == 0 and os.uname().sysname == "Linux",
         "native root host proof required",

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import nullcontext
 import hashlib
 import json
 import math
@@ -58,6 +59,37 @@ class HostLoopbackHarness(Harness):
     """
     host_loopback = True
 
+    def __init__(self, *args, private_host_context=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.private_host_context = private_host_context
+        if private_host_context is not None:
+            from scripts.production_sender_bootstrap_host_native import native_host_identity
+            native_host_identity(private_host_context)
+            self.started = private_host_context.plan["started"]
+
+    def command(self, *args, **kwargs):
+        context = getattr(self, "private_host_context", None)
+        if context is None:
+            return super().command(*args, **kwargs)
+        context.check(final=kwargs.get("final", False))
+        end = context.plan["deadline"] if kwargs.get("final", False) else context.plan["active_deadline"]
+        from scripts.production_activation_host_native import remaining
+        kwargs["timeout"] = min(kwargs.get("timeout", 30), remaining(end))
+        try:
+            value = super().command(*args, **kwargs)
+            context.check(final=kwargs.get("final", False))
+            return value
+        except BaseException:
+            context.commands.uncertain_mutation = True
+            raise
+
+    def prepare_network(self):
+        context = self.private_host_context
+        if context is None:
+            return super().prepare_network()
+        row = context.prepare_network(self)
+        _save(self.output / "NETWORK.json", row)
+
     def launch(self, name, image_id, extra=(), command=(), *, memory=768 * 1024**2, pids=256):
         if name not in {"pg", "old-sender"}:
             return super().launch(name, image_id, extra, command, memory=memory, pids=pids)
@@ -78,6 +110,8 @@ class HostLoopbackHarness(Harness):
         if name == "pg":
             checks = loopback_pg_resources(row, image_id, self.owner, self.network, memory, pids,
                                            diagnostic_root=self.output)
+            if getattr(self, "private_host_context", None) is not None:
+                self.pg_launch_identity = self._pg_readiness_identity(row)
         else:
             checks = resource_checks(row, image_id, self.owner, "host", memory, pids)
             gate._require(row["NetworkSettings"]["Networks"].keys() == {"host"}, "old sender is not exact host network")
@@ -85,10 +119,36 @@ class HostLoopbackHarness(Harness):
         return row
 
     def postgres_ready(self):
+        if getattr(self, "private_host_context", None) is not None:
+            from scripts.verify_production_activation_native import ActivationHarness
+            if not ActivationHarness.postgres_ready(self):
+                return False
+            row = json.loads(self.command(["inspect", self.names["pg"]]))[0]
+            health = row["State"].get("Health", {}).get("Status")
+            gate._require(health in {"starting", "healthy"}, "real PG health failed or unrecognized")
+            return health == "healthy"
         ready = super().postgres_ready()
         row = json.loads(self.command(["inspect", self.names["pg"]]))[0]
         gate._require(row["State"].get("Health", {}).get("Status") == "healthy", "real PG health not ready")
         return ready
+
+    def _pg_readiness_identity(self, row):
+        loopback_pg_resources(row, self.images["pg"], self.owner, self.network, 384 * 1024**2, 64)
+        state = row["State"]
+        gate._require(re.fullmatch(r"[0-9a-f]{64}", row["Id"]) and row["Name"] == "/" + self.names["pg"]
+                      and state["Running"] is True and state["Dead"] is False and state["Restarting"] is False
+                      and type(state["Pid"]) is int and state["Pid"] > 0
+                      and type(row["RestartCount"]) is int and row["RestartCount"] >= 0
+                      and type(state["StartedAt"]) is str and 0 < len(state["StartedAt"]) <= 64
+                      and not state["StartedAt"].startswith("0001-")
+                      and type(row["Created"]) is str and 0 < len(row["Created"]) <= 64,
+                      "owned running loopback PostgreSQL identity required")
+        return {key: row[key] for key in ("Id", "Name", "Image", "Created", "RestartCount")} | {
+            "Pid": state["Pid"], "StartedAt": state["StartedAt"]}
+
+    def _preserve_command_failure(self, observation):
+        from scripts.verify_production_activation_native import ActivationHarness
+        return ActivationHarness._preserve_command_failure(self, observation)
 
 
 def loopback_pg_resources(row, image_id, owner, network, memory, pids, *, diagnostic_root=None):
@@ -746,11 +806,14 @@ def _command_summaries(fd, files, budget):
     return summaries
 
 
-def execute(repo, source, image_id, binary, output, build_evidence, *, predecessor_schema=132, host_loopback=False):
+def execute(repo, source, image_id, binary, output, build_evidence, *, predecessor_schema=132, host_loopback=False,
+            private_host_context=None):
     gate._require(sys.platform == "linux" and os.geteuid() == 0, "native bootstrap requires Linux root")
     gate._require(type(predecessor_schema) is int and predecessor_schema in (131, 132), "explicit synthetic predecessor required")
     gate._require(type(host_loopback) is bool and (not host_loopback or predecessor_schema == 131),
                   "host-loopback native proof requires explicit actual131 predecessor")
+    gate._require(private_host_context is None or (host_loopback and local_pg._NATIVE_HOST.get() is private_host_context),
+                  "private daemon host requires the exact active live native scope")
     if host_loopback:
         local_pg._host()  # Hard fail before Docker unless this is the real daemon host namespace.
     gate._require(repo == ROOT and output.is_absolute() and not output.exists(), "fixed source and fresh synthetic output required")
@@ -759,8 +822,10 @@ def execute(repo, source, image_id, binary, output, build_evidence, *, predecess
                   "new native originals must stay inside a private root-owned parent")
     binding = source_binding(repo, source, binary)
     records = build_records(build_evidence, image_id, binding["revision"])
-    harness = (HostLoopbackHarness if host_loopback else Harness)(repo, source, image_id, binary, output)
-    harness.phase_deadline = harness.started + MAX_SECONDS
+    options = {"private_host_context": private_host_context} if private_host_context is not None else {}
+    harness = (HostLoopbackHarness if host_loopback else Harness)(repo, source, image_id, binary, output, **options)
+    harness.phase_deadline = (private_host_context.plan["active_deadline"] if private_host_context is not None
+                              else harness.started + MAX_SECONDS)
     harness.predecessor_schema = predecessor_schema
     _save(output / "SOURCE.json", binding)
     daemon, failure, errors = None, None, []
@@ -778,25 +843,27 @@ def execute(repo, source, image_id, binary, output, build_evidence, *, predecess
                           for row in traceback.extract_tb(error.__traceback__) if Path(row.filename).resolve().is_relative_to(repo)]}
         _save(output / "FAILURE.json", failure)
     finally:
-        errors.extend(preserve_candidate(harness))
-        if "pg" in harness.names:
-            try:
-                harness.command(["exec", harness.names["pg"], "pg_dump", "-U", "synthetic", "-d", "synthetic_pause"],
-                                timeout=15, final=True)
-            except BaseException as error:
-                errors.append({"stage": "postgres_dump", "type": type(error).__name__, **_command_reference(harness, error)})
-        # Preserve owned synthetic containers; no KILL fallback or deletion.
-        for role in reversed(harness.created):
-            try:
-                errors.extend(preserve_owned(harness, role))
-            except BaseException as error:
-                errors.append({"stage": role, "type": type(error).__name__, **_command_reference(harness, error)})
-        if daemon is not None:
-            daemon.terminate()
-            try:
-                daemon.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                errors.append({"stage": "owned_daemon", "type": "TERM_unconfirmed"})
+        from scripts import production_native_deadline as native_budget
+        with native_budget.final_phase() if private_host_context is not None else nullcontext():
+            errors.extend(preserve_candidate(harness))
+            if "pg" in harness.names:
+                try:
+                    harness.command(["exec", harness.names["pg"], "pg_dump", "-U", "synthetic", "-d", "synthetic_pause"],
+                                    timeout=15, final=True)
+                except BaseException as error:
+                    errors.append({"stage": "postgres_dump", "type": type(error).__name__, **_command_reference(harness, error)})
+            # Preserve owned synthetic containers; no KILL fallback or deletion.
+            for role in reversed(harness.created):
+                try:
+                    errors.extend(preserve_owned(harness, role))
+                except BaseException as error:
+                    errors.append({"stage": role, "type": type(error).__name__, **_command_reference(harness, error)})
+            if daemon is not None:
+                daemon.terminate()
+                try:
+                    daemon.wait(timeout=native_budget.clamp(3) if private_host_context is not None else 3)
+                except subprocess.TimeoutExpired:
+                    errors.append({"stage": "owned_daemon", "type": "TERM_unconfirmed"})
     result = {"status": "passed" if failure is None and not errors else "unconfirmed", "source_sha": binding["revision"],
         "failure": failure, "errors": errors, "elapsed_seconds": time.monotonic() - harness.started,
         "production_access": False, "real_models": 0, "system_cron_access": False, "raw_root": str(output), "predecessor_schema": predecessor_schema, "host_loopback": host_loopback,
