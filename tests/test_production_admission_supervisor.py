@@ -150,3 +150,60 @@ def test_actual_isolated_cli_ignores_malicious_pythonpath(prepared, monkeypatch,
     assert not marker.exists()
     launch = gate._read(p.root / "continuation/supervisor.launch.json")
     assert launch["status"] == "started_not_yet_proven"
+
+
+def _busy_then_lock(p, monkeypatch, *, operator_first):
+    """First attempt: an operator holds the controller lock (optionally mid-STOP)."""
+    from contextlib import contextmanager
+    state = {"held": False, "attempts": 0, "unlocked_stops": 0}
+    @contextmanager
+    def locked(*args, **kwargs):
+        state["attempts"] += 1
+        if state["attempts"] == 1:
+            state["held"] = True
+            if operator_first:
+                life.stop_new(p.session, p.sender, reason_code="operator")
+            raise gate.AdmissionBusy("active work/lock did not drain within bound")
+        state["held"] = False
+        yield p.session
+    original = supervisor.restrictive_stop
+    def stop(*args, **kwargs):
+        state["unlocked_stops"] += 1
+        assert not state["held"], "unlocked stop raced the operator-held controller lock"
+        return original(*args, **kwargs)
+    monkeypatch.setattr(supervisor, "locked_activation", locked)
+    monkeypatch.setattr(supervisor, "restrictive_stop", stop)
+    monkeypatch.setattr(supervisor, "sender_from_plan", lambda plan: p.sender)
+    monkeypatch.setattr(supervisor, "process_identity", lambda: {"pid": 123, "synthetic": True})
+    return state
+
+
+def test_operator_stop_holding_lock_is_not_raced_by_unlocked_supervisor_stop(prepared, monkeypatch):
+    p = prepared
+    state = _busy_then_lock(p, monkeypatch, operator_first=True)
+    value = supervisor.tick(p.plan_path)
+    assert state["attempts"] == 2 and state["unlocked_stops"] == 0
+    assert value["result"]["status"] == "producers_stopped_drain_pending"
+    assert value["result"]["drained"] is False
+    assert p.transport.state == p.fence.snapshot()["phase"] == "draining"
+
+
+def test_busy_without_exact_operator_stop_still_fails_closed_to_restrictive_stop(prepared, monkeypatch):
+    p = prepared
+    real_stop = supervisor.restrictive_stop
+    state = _busy_then_lock(p, monkeypatch, operator_first=False)
+    calls = []
+    monkeypatch.setattr(supervisor, "restrictive_stop", lambda *a, **k: calls.append(1) or real_stop(*a, **k))
+    value = supervisor.tick(p.plan_path)
+    assert state["attempts"] == 1 and calls == [1]
+    assert value["result"]["trigger"]["type"] == "AdmissionBusy"
+    assert value["result"]["status"] == "producers_stopped_drain_pending"
+
+
+def test_non_operator_stop_marker_does_not_authorize_retry(prepared, monkeypatch):
+    p = prepared
+    plan, root, authority = supervisor.load(p.plan_path)
+    life.stop_new(p.session, p.sender, reason_code="supervisor_failure")
+    assert not supervisor.operator_stop_marked(root, authority)
+    gate._write(root / "STOP.json", {**gate._read(root / "STOP.json"), "authority_sha256": "0" * 64})
+    assert not supervisor.operator_stop_marked(root, authority)

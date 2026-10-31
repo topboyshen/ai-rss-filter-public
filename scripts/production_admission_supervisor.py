@@ -191,14 +191,43 @@ def restrictive_stop(plan_path, *, sender=None):
     return result
 
 
+def operator_stop_marked(root, authority):
+    """Exact durable operator STOP for this authority; anything else is unconfirmed."""
+    marker = root / "STOP.json"
+    if not (gate._present(marker) or gate._present(marker.with_suffix(".json.pending"))):
+        return False
+    try:
+        from services.controlled_startup import _read_complete
+        old = _read_complete(marker)
+    except Exception:
+        return False
+    digest = gate._hash(authority)
+    expected = {"schema": life.SCHEMA, "authority_sha256": digest, "reason_code": "operator",
+                "sender_stop_operation": gate._hash({"authority": digest, "action": "sender_stop_new"}),
+                "receiver_stop_operation": gate._hash({"authority": digest, "action": "receiver_stop_new"})}
+    return isinstance(old, dict) and old == expected
+
+
+def _locked_step(plan, sender):
+    with locked_activation(plan["migration_root"], plan["runtime_root"], plan["state"],
+                           operation_id=plan["activation_operation"]) as session:
+        return life.supervise_step(session, sender)
+
+
 def tick(plan_path):
-    plan, root, _authority = load(plan_path)
+    plan, root, authority = load(plan_path)
     sender = None
     try:
         sender = sender_from_plan(plan)
-        with locked_activation(plan["migration_root"], plan["runtime_root"], plan["state"],
-                               operation_id=plan["activation_operation"]) as session:
-            result = life.supervise_step(session, sender)
+        try:
+            result = _locked_step(plan, sender)
+        except gate.AdmissionBusy:
+            # An exact operator STOP holds the controller lock: never race it with
+            # an unlocked competing stop. Wait once more under the same existing
+            # lock bound, then re-check and stop through the normal locked path.
+            if not operator_stop_marked(root, authority):
+                raise
+            result = _locked_step(plan, sender)
     except Exception as exc:
         # Context unwinding releases the controller lock before independent stop.
         result = restrictive_stop(plan_path, sender=sender)
