@@ -344,3 +344,258 @@ def test_unknown_command_outcome_prevents_daemon_cleanup(monkeypatch):
     with pytest.raises(TimeoutError, match="unknown transport"):
         harness.command(["start", "exact"])
     assert context.commands.uncertain_mutation is True
+
+
+# Local export tests: no Docker, subprocess, network or production calls.
+@pytest.fixture
+def failure_export(tmp_path, monkeypatch):
+    import hashlib
+    import json
+
+    isolated = native.isolated
+    monkeypatch.setattr(isolated.time, "monotonic", lambda: 100)
+    for module, field in ((isolated.subprocess, "run"), (isolated.subprocess, "Popen")):
+        monkeypatch.setattr(module, field, lambda *a, **kw: pytest.fail("diagnostic executed a command"))
+    root = tmp_path / "originals"
+    command = root / "inner/activation/command-0109.json"
+    command.parent.mkdir(parents=True)
+    observation = {"schema": 1, "sequence": 109, "operation": "docker_create", "timeout_seconds": 3,
+        "harness_remaining_seconds": 338.2, "elapsed_seconds": 3.005, "returncode": None, "outcome": "timeout"}
+    value = {"argv": ["docker", "--host", "unix:///var/run/docker.sock", "create", "DO-NOT-EXPORT-ARGV"], "rc": None,
+        "stdin_sha256": hashlib.sha256(b"").hexdigest(), "elapsed_seconds": 3.006,
+        "utc": "2026-11-01T03:00:00Z", "stdout": "DO-NOT-EXPORT-STDOUT", "stderr": "create pending\n"}
+    resource = {**isolated.SUPERVISOR, "scope": isolated.RESOURCE_SCOPE, "memory.peak": "12345",
+        "memory.events": {"low": "0", "high": "0", "max": "3", "oom": "0", "oom_kill": "0"}}
+    files = {"inner/activation/HARNESS_COMMAND_FAILURE.json": observation,
+        "inner/activation/command-0109.json": value, "inner/RESOURCES_FINAL.json": resource}
+    for relative, content in files.items():
+        (root / relative).write_text(json.dumps(content))
+    (root / "inner/daemon.stderr").write_text("daemon waiting\n")
+
+    def records():
+        return [{"path_sha256": hashlib.sha256(str(path.relative_to(root)).encode()).hexdigest(),
+                 "bytes": path.stat().st_size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+                for path in root.rglob("*") if path.is_file()]
+
+    def run(rows=None, profile=None):
+        return isolated.failure_originals(root, records() if rows is None else rows,
+            {"inner/activation/HARNESS_COMMAND_FAILURE.json": observation if profile is None else profile}, 600)
+
+    return SimpleNamespace(root=root, command=command, value=value, resources=resource, observation=observation,
+                           records=records, run=run, isolated=isolated)
+
+
+def test_failure_export_exact_command_hash_empty_stderr_and_supervisor_scope(failure_export):
+    import hashlib
+    import json
+
+    case = failure_export
+    case.value["stderr"] = ""
+    case.command.write_text(json.dumps(case.value))
+    result = case.run()
+    assert result["observation"]["sequence"] == 109 and result["observation"]["returncode"] is None
+    assert result["command"]["original"]["sha256"] == hashlib.sha256(case.command.read_bytes()).hexdigest()
+    assert result["command"]["text"] == "" and result["command"]["stderr_bytes"] == 0
+    assert result["resources"]["profile"]["memory.peak"] == 12345
+    assert result["resources"]["profile"]["memory.events"]["max"] == 3
+    assert result["resources"]["profile"]["scope"] == case.isolated.RESOURCE_SCOPE
+    assert "DO-NOT-EXPORT" not in json.dumps(result)
+    assert "sender" not in result["resources"]["profile"]["scope"]
+
+
+@pytest.mark.parametrize("which", ["command", "daemon", "resources", "observation"])
+@pytest.mark.parametrize("fault", ["missing", "wrong_hash", "wrong_size", "duplicate", "symlink"])
+def test_failure_export_requires_unique_original_commitment(failure_export, which, fault):
+    case = failure_export
+    names = {"command": "inner/activation/command-0109.json", "daemon": "inner/daemon.stderr",
+        "resources": "inner/RESOURCES_FINAL.json", "observation": "inner/activation/HARNESS_COMMAND_FAILURE.json"}
+    import hashlib
+
+    path = case.root / names[which]
+    rows = case.records()
+    row = next(value for value in rows if value["path_sha256"] == hashlib.sha256(names[which].encode()).hexdigest())
+    if fault == "missing":
+        rows.remove(row)
+    elif fault == "wrong_hash":
+        row["sha256"] = "f" * 64
+    elif fault == "wrong_size":
+        row["bytes"] += 1
+    elif fault == "duplicate":
+        rows.append(dict(row))
+    else:
+        target = path.with_name(path.name + ".original")
+        path.rename(target)
+        path.symlink_to(target)
+    result = case.run(rows)
+    assert (result if which == "observation" else result[which])["status"] == "evidence_insufficient"
+
+
+def test_failure_export_wrong_sequence_does_not_find_an_alternate(failure_export):
+    case = failure_export
+    profile = {**case.observation, "sequence": 110}
+    assert case.run(profile=profile)["status"] == "evidence_insufficient"
+
+
+@pytest.mark.parametrize("field,value", [("argv", ["docker", "create"]), ("rc", 0),
+    ("elapsed_seconds", float("nan")), ("stderr", None), ("stdin_sha256", "invalid")])
+def test_failure_export_malformed_or_different_command_is_missing(failure_export, field, value):
+    import json
+    case = failure_export
+    case.value[field] = value
+    case.command.write_text(json.dumps(case.value))
+    assert case.run()["command"]["status"] == "evidence_insufficient"
+
+
+@pytest.mark.parametrize("secret", ["password=top-secret", "Bearer top-secret", "--api-token top-secret",
+    "-----BEGIN PRIVATE KEY----- top-secret", "https://user:top-secret@example.invalid/x",
+    "A" * 64, "cookie: top-secret", "PRIVATE KEY top-secret"])
+def test_failure_export_hashes_sensitive_whole_lines(failure_export, secret):
+    import json
+    case = failure_export
+    ending = "-----END PRIVATE KEY-----\n" if "BEGIN PRIVATE KEY" in secret else ""
+    case.value["stderr"] = secret + "\n" + ending + "ordinary diagnostic\n"
+    case.command.write_text(json.dumps(case.value))
+    (case.root / "inner/daemon.stderr").write_text(secret + "\n" + ending + "ordinary daemon\n")
+    result = case.run()
+    assert "top-secret" not in json.dumps(result) and "A" * 64 not in json.dumps(result)
+    assert "<sensitive-line-sha256:" in result["command"]["text"]
+    assert "ordinary diagnostic" in result["command"]["text"]
+    assert "ordinary daemon" in result["daemon"]["text"]
+
+
+@pytest.mark.parametrize("kind", ["command", "daemon"])
+def test_failure_export_mutation_during_read_is_missing_without_retry(failure_export, monkeypatch, kind):
+    case = failure_export
+    actual = case.isolated.host.file_proof
+    target = case.command if kind == "command" else case.root / "inner/daemon.stderr"
+    count = 0
+
+    def changed(path, *args, **kwargs):
+        nonlocal count
+        value = actual(path, *args, **kwargs)
+        if path == target:
+            count += 1
+            if count == 1:
+                path.write_bytes(path.read_bytes() + b"changed")
+        return value
+
+    monkeypatch.setattr(case.isolated.host, "file_proof", changed)
+    assert case.run()[kind]["status"] == "evidence_insufficient"
+    assert count == (1 if kind == "command" else 2)  # Initial/final proofs, never a retry.
+
+
+@pytest.mark.parametrize("fault", ["scope", "peak", "event", "extra_event", "extra_field"])
+def test_failure_export_invalid_resource_scope_or_counters_not_success(failure_export, fault):
+    import json
+    case = failure_export
+    if fault == "scope":
+        del case.resources["scope"]
+    elif fault == "peak":
+        case.resources["memory.peak"] = "-1"
+    elif fault == "event":
+        case.resources["memory.events"]["oom"] = True
+    elif fault == "extra_event":
+        case.resources["memory.events"]["secret"] = "1"
+    else:
+        case.resources["secret"] = "x"
+    (case.root / "inner/RESOURCES_FINAL.json").write_text(json.dumps(case.resources))
+    assert case.run()["resources"]["status"] == "evidence_insufficient"
+
+
+def test_failure_export_bounded_tails_and_oversized_command(failure_export):
+    import json
+    case = failure_export
+    case.value["stderr"] = "discarded-partial-secret" + "x" * 4096 + "\nlast diagnostic\n"
+    case.command.write_text(json.dumps(case.value))
+    (case.root / "inner/daemon.stderr").write_text("discarded-partial-secret" + "x" * 8192 + "\nlast daemon\n")
+    result = case.run()
+    assert result["command"]["truncated"] and result["daemon"]["truncated"]
+    assert len(result["command"]["text"].encode()) <= 4096 and len(result["daemon"]["text"].encode()) <= 8192
+    assert "discarded-partial-secret" not in json.dumps(result)
+    case.value["stdout"] = "x" * case.isolated.FAILURE_COMMAND_BYTES
+    case.command.write_text(json.dumps(case.value))
+    assert case.run()["command"]["status"] == "evidence_insufficient"
+
+
+def test_failure_export_not_observed_never_reads_other_files(failure_export, monkeypatch):
+    case = failure_export
+    monkeypatch.setattr(case.isolated, "_failure_original", lambda *a, **kw: pytest.fail("unexpected file read"))
+    assert case.isolated.failure_originals(case.root, [], {}, 600) == {"status": "not_observed"}
+
+
+def test_safe_inventory_exports_diagnostics_without_altering_completion(failure_export, monkeypatch):
+    import json
+    case = failure_export
+    # Existing sealed INNER_RESULT capability is outside this local export unit.
+    monkeypatch.setattr(case.isolated, "original", lambda path: (json.loads(path.read_text()), {}))
+    for relative in ("inner/INNER_RESULT.json", "inner/activation/RESULT.json", "inner/DAEMON_STOP.json"):
+        (case.root / relative).write_text("{}")
+    packet = case.isolated.safe_inventory(case.root, 600)
+    assert packet["complete"] is True and packet["full_raw_archive_verified"] is False
+    assert packet["failure_originals"]["command"]["status"] == "available"
+    assert len(case.isolated.host.encoded(packet)) <= 384 * 1024
+
+
+@pytest.mark.parametrize("kind", ["command", "daemon", "resources", "observation"])
+def test_failure_export_missing_actual_original_is_missing(failure_export, kind):
+    case = failure_export
+    names = {"command": "inner/activation/command-0109.json", "daemon": "inner/daemon.stderr",
+        "resources": "inner/RESOURCES_FINAL.json", "observation": "inner/activation/HARNESS_COMMAND_FAILURE.json"}
+    rows = case.records()
+    (case.root / names[kind]).unlink()
+    result = case.run(rows)
+    assert (result if kind == "observation" else result[kind])["status"] == "evidence_insufficient"
+
+
+@pytest.mark.parametrize("allow_fallback", [True, False])
+def test_optional_failure_diagnostics_never_displace_original_packet(failure_export, monkeypatch, allow_fallback):
+    import json
+    case = failure_export
+    for relative in ("inner/INNER_RESULT.json", "inner/activation/RESULT.json", "inner/DAEMON_STOP.json"):
+        (case.root / relative).write_text("{}")
+    monkeypatch.setattr(case.isolated, "original", lambda path: (json.loads(path.read_text()), {}))
+    actual = case.isolated.host.encoded
+
+    def bounded(value):
+        if isinstance(value, dict) and "failure_originals" in value:
+            fallback = value["failure_originals"].get("status") == "export_budget_exhausted"
+            if not fallback or not allow_fallback:
+                return b"x" * (384 * 1024 + 1)
+        return actual(value)
+
+    monkeypatch.setattr(case.isolated.host, "encoded", bounded)
+    packet = case.isolated.safe_inventory(case.root, 600)
+    assert packet["complete"] is True and packet["full_raw_archive_verified"] is False
+    if allow_fallback:
+        assert packet["failure_originals"] == {"status": "export_budget_exhausted"}
+    else:
+        assert "failure_originals" not in packet
+
+
+@pytest.mark.parametrize("profile", [None, {}, {"schema": 1, "sequence": True}, {"status": "success"}])
+def test_unknown_failure_observation_never_becomes_not_observed_or_success(failure_export, monkeypatch, profile):
+    case = failure_export
+    monkeypatch.setattr(case.isolated, "_failure_original", lambda *a, **kw: pytest.fail("invalid observation read files"))
+    assert case.isolated.failure_originals(case.root, [],
+        {"inner/activation/HARNESS_COMMAND_FAILURE.json": profile}, 600) == {"status": "evidence_insufficient"}
+
+
+def test_private_key_short_body_lines_remain_hashes(failure_export):
+    raw = b"-----BEGIN PRIVATE KEY-----\nsh0rtB0dy\n-----END PRIVATE KEY-----\nnormal daemon\n"
+    result = failure_export.isolated._failure_text(raw, 8192)
+    assert "sh0rtB0dy" not in result["text"] and "normal daemon" in result["text"]
+    assert result["text"].count("<sensitive-line-sha256:") == 3
+
+
+@pytest.mark.parametrize("path", ["/私有目录/配置.json", "/tmp/客户数据/配置.json", "/tmp/private/config.json"])
+def test_failure_export_masks_unicode_and_ascii_absolute_paths(failure_export, path):
+    text = failure_export.isolated._failure_text(("open " + path + ": permission denied").encode(), 8192)["text"]
+    assert path not in text and "<path>" in text and "permission denied" in text
+
+
+@pytest.mark.parametrize("ending", [b"-----END PRIVATE KEY-----\n", b""])
+def test_truncated_private_key_without_header_does_not_export_short_body(failure_export, ending):
+    raw = b"discarded header\n" + b"x" * 8192 + b"\nQUJDREVGR0hJSg==\n" + ending + b"normal daemon\n"
+    text = failure_export.isolated._failure_text(raw, 8192)["text"]
+    assert "QUJDREVGR0hJSg==" not in text and "<sensitive-line-sha256:" in text
+    assert "normal daemon" in text

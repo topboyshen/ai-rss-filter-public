@@ -1007,6 +1007,133 @@ def custody_completion_profile(root, records, deadline):
             "sha256": before["sha256"], "actual_125_compatibility_proven": False}
 
 
+FAILURE_COMMAND_BYTES, FAILURE_STDERR_BYTES, FAILURE_DAEMON_BYTES = 128 * 1024, 4096, 8192
+FAILURE_TEXT_BYTES = 16 * 1024
+RESOURCE_SCOPE = "supervisor_and_private_daemon_only_not_all_application_containers"
+RESOURCE_EVENTS = {"low", "high", "max", "oom", "oom_kill", "oom_group_kill"}
+
+
+def _failure_original(root, relative, records, deadline, *, limit, tail=None):
+    """Read one exact hashed original, never a replacement or a link target."""
+    remaining(deadline)
+    path = root / relative
+    path_hash = hashlib.sha256(relative.encode()).hexdigest()
+    matches = [row for row in records if row.get("path_sha256") == path_hash]
+    gate._require(len(matches) == 1 and set(matches[0]) == {"path_sha256", "sha256", "bytes"},
+                  "failure diagnostic original commitment missing")
+    expected = matches[0]
+    gate._require(type(expected["bytes"]) is int and 0 <= expected["bytes"] <= limit
+                  and type(expected["sha256"]) is str and re.fullmatch(r"[0-9a-f]{64}", expected["sha256"])
+                  and path == path.resolve(), "failure diagnostic original commitment invalid")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        proof = host.file_proof(path, limit=limit, fd=fd)
+        gate._require(proof["size"] == expected["bytes"] and proof["sha256"] == expected["sha256"],
+                      "failure diagnostic original hash changed")
+        offset = max(0, proof["size"] - tail) if tail is not None else 0
+        os.lseek(fd, offset, os.SEEK_SET)
+        data = os.read(fd, min(proof["size"], tail) if tail is not None else limit + 1)
+        gate._require(len(data) == proof["size"] - offset
+                      and host.file_proof(path, limit=limit, fd=fd) == proof and path == path.resolve(),
+                      "failure diagnostic original changed during read")
+    finally:
+        os.close(fd)
+    remaining(deadline)
+    return data, dict(expected), bool(offset)
+
+
+def _failure_text(raw, limit, *, partial=False):
+    """Unstructured sensitive lines remain hashes, never public text."""
+    from scripts.capture_release_diagnostics import SENSITIVE_KEY_RE, URL_USERINFO_RE, redact_text
+    original_bytes = len(raw)
+    partial = partial or original_bytes > limit
+    raw = raw[-limit:]
+    if partial:
+        boundary = raw.find(b"\n")
+        raw = raw[boundary + 1:] if boundary >= 0 else b""
+    source_lines = raw.decode("utf-8", errors="replace").split("\n")
+    private_key = partial and any(re.search(r"(?i)-----END .*PRIVATE KEY-----", line) for line in source_lines)
+    lines = []
+    for line in source_lines:
+        private_key = private_key or bool(re.search(r"(?i)-----BEGIN .*PRIVATE KEY-----", line))
+        if (private_key or SENSITIVE_KEY_RE.search(line) or URL_USERINFO_RE.search(line)
+                or partial and re.fullmatch(r"[A-Za-z0-9+/_-]+={0,2}", line.strip())
+                or re.search(r"(?i)private[ _-]*key|-----[A-Z ]*KEY-----|[A-Za-z0-9+/=_-]{32,}", line)):
+            lines.append("<sensitive-line-sha256:" + hashlib.sha256(line.encode()).hexdigest() + ">")
+            if re.search(r"(?i)-----END .*PRIVATE KEY-----", line):
+                private_key = False
+        else:
+            text = re.sub(r"[0-9a-fA-F]{32,}", "<hex>", redact_text(line))
+            lines.append(re.sub(r"(?<![A-Za-z0-9])/[^\s\"\'<>]+", "<path>", text))
+    rendered = "\n".join(lines).encode()
+    return {"text": rendered[:limit].decode("utf-8", errors="ignore"),
+            "truncated": partial or len(rendered) > limit, "redacted": True}
+
+
+def _failure_resources(value):
+    gate._require(type(value) is dict and set(value) == set(SUPERVISOR) | {"memory.peak", "memory.events", "scope"}
+                  and all(value.get(key) == expected for key, expected in SUPERVISOR.items())
+                  and value.get("scope") == RESOURCE_SCOPE, "failure diagnostic resource scope invalid")
+    peak, events = value["memory.peak"], value["memory.events"]
+    gate._require(type(peak) is str and re.fullmatch(r"0|[1-9][0-9]{0,19}", peak)
+                  and type(events) is dict and {"oom", "oom_kill"} <= set(events) <= RESOURCE_EVENTS
+                  and all(type(count) is str and re.fullmatch(r"0|[1-9][0-9]{0,19}", count)
+                          for count in events.values()), "failure diagnostic resource counters invalid")
+    return {**SUPERVISOR, "memory.peak": int(peak), "memory.events": {key: int(count) for key, count in events.items()},
+            "scope": RESOURCE_SCOPE}
+
+
+def failure_originals(root, records, profiles, deadline):
+    """Only same-failure local originals; missing evidence never proves success."""
+    name = "inner/activation/HARNESS_COMMAND_FAILURE.json"
+    if name not in profiles:
+        return {"status": "not_observed"}
+    observation = safe_harness_failure(profiles[name])
+    if observation is None:
+        return {"status": "evidence_insufficient"}
+    try:
+        data, proof, _ = _failure_original(root, "inner/activation/HARNESS_COMMAND_FAILURE.json", records, deadline,
+                                           limit=FAILURE_COMMAND_BYTES)
+        gate._require(safe_harness_failure(json.loads(data)) == observation, "failure diagnostic observation changed")
+    except (OSError, ValueError, TypeError, KeyError, gate.AdmissionError, host.ProofError) as error:
+        return {"status": "evidence_insufficient", "error_type": error_type(error)}
+    result = {"status": "diagnostic_only_not_execution_proof", "observation": observation, "observation_original": proof}
+    for kind, relative, limit, tail in (
+            ("command", "inner/activation/command-%04d.json" % observation["sequence"], FAILURE_COMMAND_BYTES, None),
+            ("daemon", "inner/daemon.stderr", 8 * 1024**2, FAILURE_DAEMON_BYTES),
+            ("resources", "inner/RESOURCES_FINAL.json", FAILURE_COMMAND_BYTES, None)):
+        try:
+            data, proof, partial = _failure_original(root, relative, records, deadline, limit=limit, tail=tail)
+            item = {"status": "available", "original": proof}
+            if kind == "command":
+                value = json.loads(data)
+                gate._require(type(value) is dict and set(value) == {
+                    "argv", "rc", "stdin_sha256", "elapsed_seconds", "utc", "stdout", "stderr"}
+                    and type(value["argv"]) is list and len(value["argv"]) >= 4
+                    and value["argv"][:3] == ["docker", "--host", "unix:///var/run/docker.sock"]
+                    and value["argv"][3] in {"create", "start", "exec", "inspect", "logs"}
+                    and "docker_" + value["argv"][3] == observation["operation"]
+                    and type(value["rc"]) is type(observation["returncode"]) and value["rc"] == observation["returncode"]
+                    and type(value["elapsed_seconds"]) in {int, float} and math.isfinite(value["elapsed_seconds"])
+                    and 0 <= value["elapsed_seconds"] <= MAX_SECONDS
+                    and type(value["stdin_sha256"]) is str and re.fullmatch(r"[0-9a-f]{64}", value["stdin_sha256"])
+                    and type(value["stdout"]) is str and type(value["utc"]) is str and len(value["utc"]) <= 64
+                    and type(value["stderr"]) is str, "failure diagnostic command differs from observation")
+                raw = value["stderr"].encode()
+                item.update(stderr_bytes=len(raw), stderr_sha256=hashlib.sha256(raw).hexdigest(),
+                            **_failure_text(raw, FAILURE_STDERR_BYTES))
+            elif kind == "daemon":
+                item.update(source_window="tail", **_failure_text(data, FAILURE_DAEMON_BYTES, partial=partial))
+            else:
+                item["profile"] = _failure_resources(json.loads(data))
+            result[kind] = item
+        except (OSError, ValueError, TypeError, KeyError, gate.AdmissionError, host.ProofError) as error:
+            result[kind] = {"status": "evidence_insufficient", "error_type": error_type(error)}
+    if len(host.encoded(result)) > FAILURE_TEXT_BYTES:
+        return {"status": "export_budget_exhausted"}
+    return result
+
+
 def safe_inventory(root, deadline, *, gateway_custody=False):
     """Hash bounded originals; explicitly exclude storage trees and raw payloads."""
     gate._require(type(gateway_custody) is bool, "exact inventory custody mode required")
@@ -1090,6 +1217,11 @@ def safe_inventory(root, deadline, *, gateway_custody=False):
               "profiles": profiles, "full_raw_archive_verified": False, "raw_originals_preserved_privately": True,
               "gateway_command_stderr": gateway_command_exports(gateway_texts, deadline),
               "outer_build_command_stderr": outer_build_command_exports(outer_build_texts, deadline)}
+    packet["failure_originals"] = failure_originals(root, records, profiles, deadline)
+    if len(host.encoded(packet)) > 384 * 1024:
+        packet["failure_originals"] = {"status": "export_budget_exhausted"}
+        if len(host.encoded(packet)) > 384 * 1024:
+            del packet["failure_originals"]  # Optional diagnostics never displace the existing packet.
     gate._require(len(host.encoded(packet)) <= 384 * 1024, "selected full-host evidence encoding bound")
     remaining(deadline)
     return packet
