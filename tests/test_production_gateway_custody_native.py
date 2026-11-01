@@ -447,7 +447,10 @@ def test_prepare_retains_mime_only_originals_seals_complete_plan_once_and_never_
                 "State": {"StartedAt": "2026-10-31T01:00:00Z", "Running": True, "Status": "running"},
                 "Config": {"User": "0:0", "Labels": {**service["labels"], "com.docker.compose.service": name,
                     "com.docker.compose.project": p["project"], "com.docker.compose.project.working_dir": str(p["paths"]["project"])}},
-                "HostConfig": {"PortBindings": deepcopy(portmap)}, "Mounts": [],
+                "HostConfig": {"PortBindings": deepcopy(portmap), "CapDrop": service.get("cap_drop"),
+                    "Memory": 128 * 1024**2, "MemorySwap": 128 * 1024**2, "PidsLimit": 64,
+                    "NanoCpus": 10**9, "ReadonlyRootfs": False,
+                    "SecurityOpt": service.get("security_opt"), "IpcMode": "private"}, "Mounts": [],
                 "NetworkSettings": {"Ports": deepcopy(portmap), "Networks": {harness.network: {"NetworkID": network["Id"]}}}})
     monkeypatch.setattr(private, "run", fake_compose)
     monkeypatch.setattr(private, "inspect_project", lambda _contract: deepcopy(rows))
@@ -484,6 +487,9 @@ def test_prepare_retains_mime_only_originals_seals_complete_plan_once_and_never_
             assert len(sealed) == 1 and len(p["previous_containers"]) == 3
             review, info = sealed[0]
             assert info["plan"] == p["gateway_plan"] and info["plan"]["window"] == p["custody_window"]
+            assert info["plan"]["worker_policy"] == native.gateway.ROOT_WORKER_POLICY
+            assert native.gateway.validate_worker_policy(info["plan"], old=rows[-1]) == native.gateway.ROOT_WORKER_POLICY
+            assert Path(info["plan"]["new_config"]["path"]).read_bytes().startswith(b"user root;\n")
             assert len(info["configuration"]["files"]) == 2
             assert info["proof"]["profile"] == configuration.MIME_ONLY_PROFILE
             assert set(info["proof"]["archives"]) == set(configuration.MIME_ONLY_PATHS)

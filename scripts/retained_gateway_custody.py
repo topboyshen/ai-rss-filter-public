@@ -109,8 +109,9 @@ def load(review, manifest, apps, *, read_private):
         files[name], inputs[name] = raw, metadata
     require(value["gateway_plan_path"] != value["old_configuration_proof_path"])
     plan, proof = (parsed(files[name]) for name in FILES)
-    from scripts.production_gateway_switch import PLAN_KEYS, file_identity, render_config, source_sha256
-    require(isinstance(plan, dict) and set(plan) == PLAN_KEYS and type(plan["schema"]) is int and plan["schema"] == 1
+    from scripts.production_gateway_switch import PLAN_KEYS, file_identity, render_config, source_sha256, validate_worker_policy
+    require(isinstance(plan, dict) and set(plan) in (PLAN_KEYS, PLAN_KEYS | {"worker_policy"})
+            and type(plan["schema"]) is int and plan["schema"] == 1
             and plan["source_sha256"] == source_sha256()
             and re.fullmatch(r"[0-9a-f]{64}", plan["operation_id"])
             and type(plan["wait_seconds"]) is int and 1 <= plan["wait_seconds"] <= 30
@@ -122,7 +123,9 @@ def load(review, manifest, apps, *, read_private):
             and plan["api_alias"] == next(name for name in apps
                 if manifest["services"][name]["environment"]["AI_FILTER_ROLE"] == "web"))
     new_config, new_bytes = file_identity(plan["new_config"]["path"])
-    require(new_config == plan["new_config"] and new_bytes == render_config(plan["operation_id"], plan["api_alias"]))
+    worker_policy = validate_worker_policy(plan)
+    require(new_config == plan["new_config"] and new_bytes == render_config(
+        plan["operation_id"], plan["api_alias"], worker_policy=worker_policy))
     helper = configuration_helper()
     configuration = helper.validate(proof)
     require(proof["kind"] == helper.KIND and configuration["container_identity"] == value["old_gateway_identity"]
@@ -140,7 +143,7 @@ def load(review, manifest, apps, *, read_private):
 
 def verify_records(info, review, records):
     """Keep the whole old set; only this exact identity may change resource domain."""
-    from scripts.production_gateway_switch import gateway_identity
+    from scripts.production_gateway_switch import gateway_identity, validate_worker_policy
     value = info["declaration"]
     require(all(row["Config"]["Labels"].get("com.docker.compose.oneoff", "False").lower() != "true"
                 for row in records))
@@ -156,6 +159,7 @@ def verify_records(info, review, records):
     networks = row["NetworkSettings"]["Networks"]
     require(len(networks) == 1
             and next(iter(networks.values()))["NetworkID"] == info["configuration"]["network_id"])
+    validate_worker_policy(info["plan"], old=row)
     return row
 
 

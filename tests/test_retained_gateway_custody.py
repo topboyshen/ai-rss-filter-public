@@ -9,7 +9,7 @@ from scripts import private_release_contract as private, retained_gateway_custod
 from scripts import retained_gateway_configuration as configuration, production_gateway_switch as gateway
 from scripts.production_legacy_takeover import LegacyTakeover, container_identity
 from test_private_release_contract import fixture as private_fixture, reseal_inputs, save  # noqa: F401
-from test_retained_gateway_configuration import archive_map
+from test_retained_gateway_configuration import archive_map, MAIN
 
 
 def record(identifier, service, project, directory):
@@ -176,6 +176,64 @@ def test_exit_alone_is_not_normal_stop_proof(custody_case, state, value):
 
 def test_no_declaration_does_not_read_or_expand_old_contract():
     assert custody.load({}, {}, [], read_private=lambda _p: pytest.fail("unexpected read")) is None
+
+
+def bind_root_policy(f, *, user="0:0", cap_drop=None):
+    old = f["rows"][-1]
+    old["Config"]["User"] = user
+    old["HostConfig"].update(Memory=128 * 1024**2, MemorySwap=128 * 1024**2, PidsLimit=64,
+        NanoCpus=0, ReadonlyRootfs=False, SecurityOpt=["no-new-privileges:true"], IpcMode="private",
+        CapDrop=["ALL"] if cap_drop is None else cap_drop)
+    directory = f["config"].parent
+    archives = {target: save(directory / f"root-gateway-{number}.tar", raw)
+                for number, (target, raw) in enumerate(archive_map(main=b"user root;\n" + MAIN).items())}
+    proof = configuration.describe(old, "b" * 64, archives)
+    f["proof"] = proof
+    f["plan"].update(old_config=proof, old_gateway_identity=gateway.gateway_identity(old), worker_policy=gateway.ROOT_WORKER_POLICY)
+    save(f["proof_path"], proof)
+    config_path = f["plan"]["new_config"]["path"]
+    save(directory / "new-nginx.conf", gateway.render_config("9" * 64, "candidate-api", worker_policy=gateway.ROOT_WORKER_POLICY))
+    f["plan"]["new_config"] = gateway.file_identity(config_path)[0]
+    save(f["plan_path"], f["plan"])
+    review, declaration = f["review_data"], f["review_data"][custody.KEY]
+    review["existing_topology"] = private.runtime_topology(f["rows"])
+    declaration.update(old_gateway_identity=gateway.gateway_identity(old),
+        old_topology_sha256=custody.digest(review["existing_topology"][declaration["service"]][0]),
+        old_configuration_proof_sha256=private.sha(f["proof_path"].read_bytes()),
+        gateway_plan_sha256=private.sha(f["plan_path"].read_bytes()))
+    reseal_inputs(f)
+    return f
+
+
+def test_root_worker_variant_seals_exact_template_and_rederives_actual_execution(custody_case):
+    f = bind_root_policy(custody_case)
+    held = load(f)
+    assert held["plan"]["worker_policy"] == gateway.ROOT_WORKER_POLICY
+    assert custody.verify_records(held, f["review_data"], f["rows"]) == f["rows"][-1]
+    contract_path = private.seal(**{key: f[key] for key in ("root", "config", "manifest", "environment", "review", "output")})
+    contract, _manifest, _digest = private.load(contract_path, f["root"])
+    assert contract["review"][custody.KEY]["gateway_plan_sha256"] == private.sha(f["plan_path"].read_bytes())
+    assert (f["output"] / "custody-gateway-plan.json").read_bytes() == f["plan_path"].read_bytes()
+
+
+@pytest.mark.parametrize("user,cap_drop", [("", ["ALL"]), ("101:101", ["ALL"]), ("root", ["ALL"]), ("0:0", []), ("0:0", ["CHOWN"])])
+def test_root_custody_field_and_rebound_static_proof_are_not_actual_execution_authority(custody_case, user, cap_drop):
+    f = bind_root_policy(custody_case, user=user, cap_drop=cap_drop)
+    held = load(f)  # Static sealed files cannot prove the runtime's worker policy.
+    from services import admission_fence as gate
+    with pytest.raises(gate.AdmissionError, match="actual retained worker policy differs"):
+        custody.verify_records(held, f["review_data"], f["rows"])
+
+
+def test_custody_root_plan_cannot_substitute_default_new_template(custody_case):
+    f = bind_root_policy(custody_case)
+    save(f["config"].parent / "new-nginx.conf", gateway.render_config("9" * 64, "candidate-api"))
+    f["plan"]["new_config"] = gateway.file_identity(f["plan"]["new_config"]["path"])[0]
+    save(f["plan_path"], f["plan"])
+    f["review_data"][custody.KEY]["gateway_plan_sha256"] = private.sha(f["plan_path"].read_bytes())
+    reseal_inputs(f)
+    with pytest.raises(ValueError, match="retained gateway custody differs"):
+        load(f)
 
 
 def rebind_mime_profile(f):

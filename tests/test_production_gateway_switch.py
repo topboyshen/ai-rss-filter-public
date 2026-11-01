@@ -111,6 +111,10 @@ def _mock_transport(monkeypatch, state, network, old_id, image, new_config):
                 Entrypoint=["nginx"],
                 Cmd=["-t", "-c", switch.CONFIG_TARGET] if purpose == "config-test" else ["-g", "daemon off;"],
             )
+            if "--user" in args:
+                row["Config"]["User"] = args[args.index("--user") + 1]
+            if "--cap-drop" in args:
+                row["HostConfig"]["CapDrop"] = [args[args.index("--cap-drop") + 1]]
             row["State"].update(Status="created", StartedAt="", FinishedAt="")
             row["HostConfig"]["RestartPolicy"] = {"Name": "no"}
             if purpose == "config-test":
@@ -655,7 +659,7 @@ def test_native_archive_keeps_original_deadline_and_fixed_reader(case, monkeypat
     assert captured[0][2] == p.transport.deadline
 
 
-def _zero_mount_case(p, tmp_path, monkeypatch, *, profile=switch.retained_config.DEFAULT_PROFILE):
+def _zero_mount_case(p, tmp_path, monkeypatch, *, profile=switch.retained_config.DEFAULT_PROFILE, main_prefix=b""):
     main = b"events {}\nhttp { include /etc/nginx/mime.types; include /etc/nginx/conf.d/*.conf; }\n"
     mime = b"types { text/plain txt; }\n"
     original = b"server { listen 5000; location / { proxy_pass http://old-api:5000; } }\n"
@@ -672,12 +676,12 @@ def _zero_mount_case(p, tmp_path, monkeypatch, *, profile=switch.retained_config
         return output.getvalue()
 
     paths = switch.retained_config.FILE_PATHS
-    raw = {paths[0]: tar([("nginx.conf", main)]), paths[1]: tar([("mime.types", mime)]),
+    raw = {paths[0]: tar([("nginx.conf", main_prefix + main)]), paths[1]: tar([("mime.types", mime)]),
            paths[2]: tar([("default.conf", original)]),
            switch.retained_config.DIRECTORY_PATH: tar([("conf.d", None), ("conf.d/default.conf", original)])}
     if profile == switch.retained_config.MIME_ONLY_PROFILE:
         main = b"events {}\nhttp { include /etc/nginx/mime.types; " + original + b"}\n"
-        raw = {paths[0]: tar([("nginx.conf", main)]), paths[1]: tar([("mime.types", mime)])}
+        raw = {paths[0]: tar([("nginx.conf", main_prefix + main)]), paths[1]: tar([("mime.types", mime)])}
     files = {}
     for index, (path, value) in enumerate(raw.items()):
         output = tmp_path / f"retained-original-{index}.tar"
@@ -726,6 +730,133 @@ def test_zero_mount_archive_branch_rechecks_before_after_stop_and_retains_origin
     assert len(creates) == 2 and all("dst=/etc/nginx/nginx.conf,readonly" in args[args.index("--mount") + 1]
                                     for args in creates)
     assert all("retained-original" not in " ".join(args) for args in creates)
+
+
+def _root_policy_case(p, tmp_path, monkeypatch, *, user="0:0", cap_drop=None,
+                      profile=switch.retained_config.DEFAULT_PROFILE):
+    p.old["Config"]["User"] = user
+    p.old["HostConfig"]["CapDrop"] = ["ALL"] if cap_drop is None else cap_drop
+    _zero_mount_case(p, tmp_path, monkeypatch, profile=profile, main_prefix=b"user root;\n")
+    p.plan["worker_policy"] = switch.ROOT_WORKER_POLICY
+    p.plan["new_config"] = save(Path(p.plan["new_config"]["path"]), switch.render_config(
+        p.plan["operation_id"], p.plan["api_alias"], worker_policy=switch.ROOT_WORKER_POLICY))
+    return p
+
+
+def test_default_rendering_is_unchanged_and_root_is_the_only_named_template_addition():
+    default = switch.render_config("a" * 64, "candidate-api")
+    assert switch.render_config("a" * 64, "candidate-api", worker_policy=switch.DEFAULT_WORKER_POLICY) == default
+    assert switch.render_config("a" * 64, "candidate-api", worker_policy=switch.ROOT_WORKER_POLICY) == b"user root;\n" + default
+    assert not default.startswith(b"user ")
+    for unknown in (None, "root", "user root;", "future-policy", {}):
+        with pytest.raises(gate.AdmissionError, match="fixed gateway worker policy"):
+            switch.render_config("a" * 64, "candidate-api", worker_policy=unknown)
+
+
+@pytest.mark.parametrize("profile", [switch.retained_config.DEFAULT_PROFILE, switch.retained_config.MIME_ONLY_PROFILE])
+def test_root_worker_switch_derives_from_actual_protected_predecessor_without_changing_execution(case, tmp_path, monkeypatch, profile):
+    p = _root_policy_case(case, tmp_path, monkeypatch, profile=profile)
+    original = deepcopy(p.old)
+    assert switch.derive_worker_policy(p.old, p.plan["old_config"]) == switch.ROOT_WORKER_POLICY
+    result = adapter(p).switch()
+    assert result["status"] == "gateway_switched"
+    creates = [args for args in p.state.calls if args[0] == "create"]
+    assert len(creates) == 2
+    assert all(args[args.index("--user") + 1] == "0:0" and args[args.index("--cap-drop") + 1] == "ALL" for args in creates)
+    assert all("--cap-add" not in args and args[args.index("--security-opt") + 1] == "no-new-privileges:true" for args in creates)
+    assert p.old == original and p.plan["old_gateway_identity"] == switch.gateway_identity(original)
+    assert (p.evidence / "new-nginx.conf").read_bytes().startswith(b"user root;\n")
+    assert len(p.state.http) == 2
+
+
+@pytest.mark.parametrize("user", ["", "101", "101:101", "root", "root:root", "0"])
+def test_root_policy_field_cannot_authorize_nonroot_or_unknown_predecessor(case, tmp_path, monkeypatch, user):
+    p = _root_policy_case(case, tmp_path, monkeypatch, user=user)
+    with pytest.raises(gate.AdmissionError, match="actual retained worker policy differs"):
+        adapter(p).switch()
+    assert not p.state.calls and not (p.evidence / "intent.json").exists()
+
+
+@pytest.mark.parametrize("cap_drop", [[], ["CHOWN"], ["ALL", "CHOWN"]])
+def test_named_root_policy_never_replaces_exact_cap_drop_all(case, tmp_path, monkeypatch, cap_drop):
+    p = _root_policy_case(case, tmp_path, monkeypatch, cap_drop=cap_drop)
+    with pytest.raises(gate.AdmissionError, match="actual retained worker policy differs"):
+        adapter(p).switch()
+    assert not p.state.calls
+
+
+@pytest.mark.parametrize("main", [
+    b"events {}", b"user nginx;", b"user root; user root;", b"http { user root; }",
+    b'"user" root;', b"user 'root';", b"user r\\oot;", b"u\\ser root;", b'user root "";',
+    b"# user root;\nevents {}", b"user root # misleading\n nginx;", b"user root; http { user root; }",
+    b"user root", b'user "root;',
+])
+def test_root_derivation_rejects_missing_duplicate_nested_or_ambiguous_user_declarations(main):
+    with pytest.raises(gate.AdmissionError):
+        switch._root_worker_configuration({switch.CONFIG_TARGET: main, "/etc/nginx/mime.types": b"types {}"})
+
+
+@pytest.mark.parametrize("other", [b"user root;", b'"user" root;', b"types { user root; }"])
+def test_every_validated_closure_file_is_checked_for_additional_worker_directives(other):
+    with pytest.raises(gate.AdmissionError, match="retained root worker declaration differs"):
+        switch._root_worker_configuration({switch.CONFIG_TARGET: b"user root; events {}",
+                                           "/etc/nginx/mime.types": other})
+
+
+def test_worker_lexer_preserves_quotes_escapes_empty_tokens_and_only_ignores_real_comments():
+    switch._root_worker_configuration({switch.CONFIG_TARGET: b"# user nginx;\nuser root; events {}\nhttp { set $x 'user root;'; }"})
+    assert switch._worker_tokens(b'user root "";') == [("user", True), ("root", True), ("", False), (";", True)]
+    assert switch._worker_tokens(b'u\\ser "root";') == [("user", False), ("root", False), (";", True)]
+
+
+@pytest.mark.parametrize("separator", ["\u00a0", "\u1680", "\u2000", "\u2028", "\u3000"])
+def test_non_ascii_whitespace_is_never_normalized_into_a_root_worker_declaration(separator):
+    for statement in (f"user{separator}root;", f"user root{separator};", f"user{separator}root{separator};",
+                      f"{separator}user root;"):
+        with pytest.raises(gate.AdmissionError):
+            switch._root_worker_configuration({switch.CONFIG_TARGET: statement.encode()})
+
+
+@pytest.mark.parametrize("separator", [" ", "\t", "\r", "\n"])
+def test_ascii_worker_separators_keep_utf8_comments_and_ordinary_quoted_values(separator):
+    raw = (f"# \u4e2d\u6587\u6ce8\u91ca user\u3000root;\nuser{separator}root; events {{}} "
+           'http { set $label "\u4e3b\u9898 user\u00a0root;"; }').encode()
+    switch._root_worker_configuration({switch.CONFIG_TARGET: raw, "/etc/nginx/mime.types": "# \u4fdd\u7559\u6ce8\u91ca\ntypes {}".encode()})
+
+
+@pytest.mark.parametrize("fault", ["missing-policy", "unknown-policy", "explicit-default", "extra-field", "old-source", "wrong-template"])
+def test_root_plan_shape_source_and_config_are_all_bound_before_any_create(case, tmp_path, monkeypatch, fault):
+    p = _root_policy_case(case, tmp_path, monkeypatch)
+    if fault == "missing-policy":
+        del p.plan["worker_policy"]
+    elif fault == "unknown-policy":
+        p.plan["worker_policy"] = "root"
+    elif fault == "explicit-default":
+        p.plan["worker_policy"] = switch.DEFAULT_WORKER_POLICY
+    elif fault == "extra-field":
+        p.plan["unreviewed_root"] = True
+    elif fault == "old-source":
+        p.plan["source_sha256"] = "f" * 64
+    else:
+        p.plan["new_config"] = save(Path(p.plan["new_config"]["path"]), switch.render_config(
+            p.plan["operation_id"], p.plan["api_alias"]))
+    with pytest.raises(gate.AdmissionError):
+        adapter(p).switch()
+    assert not p.state.calls and not (p.evidence / "intent.json").exists()
+
+
+@pytest.mark.parametrize("fault", ["cap-add", "archive-proof-drift"])
+def test_root_variant_still_blocks_extra_capability_and_changed_archive_proof(case, tmp_path, monkeypatch, fault):
+    p = _root_policy_case(case, tmp_path, monkeypatch)
+    if fault == "cap-add":
+        p.old["HostConfig"]["CapAdd"] = ["CHOWN"]
+        p.plan["old_gateway_identity"] = switch.gateway_identity(p.old)
+        p.plan["old_config"]["container_identity"] = switch.gateway_identity(p.old)
+    else:
+        p.plan["old_config"]["archives"][switch.CONFIG_TARGET]["sha256"] = "f" * 64
+    with pytest.raises(gate.AdmissionError):
+        adapter(p).switch()
+    assert not p.state.calls and not (p.evidence / "intent.json").exists()
 
 
 def test_zero_mount_config_change_after_term_blocks_gateway_create(case, tmp_path, monkeypatch):

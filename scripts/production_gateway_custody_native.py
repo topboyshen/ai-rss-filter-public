@@ -286,15 +286,18 @@ def prepare_and_seal(harness, p):
     proof_path = root / "CONFIGURATION.json"
     gate._write(proof_path, proof)
     new_config = root / "new-nginx.conf"
-    gateway._save_raw(new_config, gateway.render_config(op, "ai-filter-api"))
+    worker_policy = gateway.derive_worker_policy(old, proof)
+    gateway._save_raw(new_config, gateway.render_config(op, "ai-filter-api", worker_policy=worker_policy))
     plan = {"schema": 1, "operation_id": op, "source_sha256": gateway.source_sha256(),
         "source_sha": p["source"]["source_sha"], "old_gateway_id": old["Id"],
         "old_gateway_identity": gateway.gateway_identity(old), "old_config": proof,
         "new_config": gateway.file_identity(new_config)[0], "api_alias": "ai-filter-api", "network_id": network["Id"],
         "wait_seconds": 10, "max_polls": 10, "window": p["custody_window"]}
+    if worker_policy == gateway.ROOT_WORKER_POLICY:
+        plan["worker_policy"] = worker_policy
     plan_path = root / "PLAN.json"
     gate._write(plan_path, plan)
-    gate._require(set(plan) == gateway.PLAN_KEYS, "complete custody plan required before seal")
+    gateway.validate_worker_policy(plan, old=old)
     topology = {name: {"mounts": service["volumes"], "networks": service["networks"], "ports": []}
                 for name, service in manifest["services"].items()}
     observed = private.runtime_topology(rows)
