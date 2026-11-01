@@ -1083,6 +1083,42 @@ def _failure_resources(value):
             "scope": RESOURCE_SCOPE}
 
 
+def _daemon_error_counts(raw, *, partial=False):
+    """Count matching complete lines, at most once per category per line."""
+    if type(raw) is not bytes or len(raw) > FAILURE_DAEMON_BYTES or type(partial) is not bool:
+        raise ValueError("fixed bounded daemon literal input required")
+    literals = {
+        "timeout_literal": (b"context deadline exceeded", b"i/o timeout", b"operation timed out",
+                            b"connection timed out", b"timeout awaiting response headers"),
+        "capacity_literal": (b"no space left on device", b"disk quota exceeded"),
+        "permission_literal": (b"permission denied", b"operation not permitted"),
+        "runtime_failure_literal": (b"failed to create shim task", b"failed to start shim",
+                                    b"oci runtime create failed", b"oci runtime exec failed",
+                                    b"runc create failed", b"runc exec failed"),
+        "memory_failure_literal": (b"cannot allocate memory", b"out of memory", b"memory allocation failed"),
+        "other_error_marker": (b"level=error", b'level="error"', b"level=fatal", b'level="fatal"',
+                               b"panic:", b"fatal error:"),
+    }
+    if partial:
+        boundary = raw.find(b"\n")
+        raw = raw[boundary + 1:] if boundary >= 0 else b""
+    counts = dict.fromkeys(literals, 0)
+    scanned = unmatched = 0
+    for line in raw.split(b"\n"):
+        if not line.strip():
+            continue
+        scanned += 1
+        lowered, matched = line.lower(), False
+        for category, choices in literals.items():
+            if any(choice in lowered for choice in choices):
+                counts[category] += 1
+                matched = True
+        unmatched += not matched
+    return {"schema": 1, "scope": "bounded_daemon_tail_literals_not_root_cause", "counts": counts,
+            "scanned_nonempty_lines": scanned, "unclassified_nonempty_lines": unmatched,
+            "window_partial": partial, "error_absence_not_proven": True}
+
+
 def failure_originals(root, records, profiles, deadline):
     """Only same-failure local originals; missing evidence never proves success."""
     name = "inner/activation/HARNESS_COMMAND_FAILURE.json"
@@ -1102,11 +1138,14 @@ def failure_originals(root, records, profiles, deadline):
             ("command", "inner/activation/command-%04d.json" % observation["sequence"], FAILURE_COMMAND_BYTES, None),
             ("daemon", "inner/daemon.stderr", 8 * 1024**2, FAILURE_DAEMON_BYTES),
             ("resources", "inner/RESOURCES_FINAL.json", FAILURE_COMMAND_BYTES, None)):
+        stage, item = "read_original", {"status": "evidence_insufficient"}
         try:
             data, proof, partial = _failure_original(root, relative, records, deadline, limit=limit, tail=tail)
             item = {"status": "available", "original": proof}
             if kind == "command":
+                stage = "parse_json"
                 value = json.loads(data)
+                stage = "validate_command"
                 gate._require(type(value) is dict and set(value) == {
                     "argv", "rc", "stdin_sha256", "elapsed_seconds", "utc", "stdout", "stderr"}
                     and type(value["argv"]) is list and len(value["argv"]) >= 4
@@ -1120,15 +1159,35 @@ def failure_originals(root, records, profiles, deadline):
                     and type(value["stdout"]) is str and type(value["utc"]) is str and len(value["utc"]) <= 64
                     and type(value["stderr"]) is str, "failure diagnostic command differs from observation")
                 raw = value["stderr"].encode()
+                stage = "render_text"
                 item.update(stderr_bytes=len(raw), stderr_sha256=hashlib.sha256(raw).hexdigest(),
                             **_failure_text(raw, FAILURE_STDERR_BYTES))
             elif kind == "daemon":
-                item.update(source_window="tail", **_failure_text(data, FAILURE_DAEMON_BYTES, partial=partial))
+                stage = "render_text"
+                item.update(source_window="tail", **_failure_text(data, FAILURE_DAEMON_BYTES, partial=partial),
+                            error_literals=_daemon_error_counts(data, partial=partial))
             else:
-                item["profile"] = _failure_resources(json.loads(data))
+                stage = "parse_json"
+                value = json.loads(data)
+                stage = "validate_resources"
+                item["profile"] = _failure_resources(value)
             result[kind] = item
         except (OSError, ValueError, TypeError, KeyError, gate.AdmissionError, host.ProofError) as error:
-            result[kind] = {"status": "evidence_insufficient", "error_type": error_type(error)}
+            message = str(error)
+            reason = {
+                "failure diagnostic original commitment missing": "original_commitment_missing",
+                "failure diagnostic original commitment invalid": "original_commitment_invalid",
+                "failure diagnostic original hash changed": "original_hash_changed",
+                "failure diagnostic original changed during read": "original_changed_during_read",
+                "full-host shared deadline expired or replaced": "shared_deadline_rejected",
+                "failure diagnostic command differs from observation": "command_observation_mismatch",
+                "failure diagnostic resource scope invalid": "resource_scope_invalid",
+                "failure diagnostic resource counters invalid": "resource_counters_invalid",
+            }.get(message, "stage_failure")
+            item.update(status="evidence_insufficient", error_type=error_type(error), stage=stage,
+                        reason_code="invalid_json" if isinstance(error, json.JSONDecodeError) else reason,
+                        error_sha256=hashlib.sha256(message.encode("utf-8", errors="backslashreplace")).hexdigest())
+            result[kind] = item
     if len(host.encoded(result)) > FAILURE_TEXT_BYTES:
         return {"status": "export_budget_exhausted"}
     return result

@@ -399,6 +399,9 @@ def test_failure_export_exact_command_hash_empty_stderr_and_supervisor_scope(fai
     assert result["resources"]["profile"]["memory.peak"] == 12345
     assert result["resources"]["profile"]["memory.events"]["max"] == 3
     assert result["resources"]["profile"]["scope"] == case.isolated.RESOURCE_SCOPE
+    for kind in ("command", "daemon", "resources"):
+        assert not {"stage", "reason_code", "error_sha256"} & result[kind].keys()
+    assert set(result["resources"]) == {"status", "original", "profile"}
     assert "DO-NOT-EXPORT" not in json.dumps(result)
     assert "sender" not in result["resources"]["profile"]["scope"]
 
@@ -599,3 +602,178 @@ def test_truncated_private_key_without_header_does_not_export_short_body(failure
     text = failure_export.isolated._failure_text(raw, 8192)["text"]
     assert "QUJDREVGR0hJSg==" not in text and "<sensitive-line-sha256:" in text
     assert "normal daemon" in text
+
+
+@pytest.mark.parametrize("fault,stage,reason,message", [
+    ("json", "parse_json", "invalid_json", None),
+    ("scope", "validate_resources", "resource_scope_invalid", "failure diagnostic resource scope invalid"),
+    ("counters", "validate_resources", "resource_counters_invalid", "failure diagnostic resource counters invalid"),
+])
+def test_failure_resource_parse_or_schema_keeps_verified_original(failure_export, fault, stage, reason, message):
+    import hashlib
+    import json
+
+    case = failure_export
+    path = case.root / "inner/RESOURCES_FINAL.json"
+    if fault == "json":
+        raw = b"{DO-NOT-EXPORT-RESOURCE-CONTENT"
+        with pytest.raises(json.JSONDecodeError) as invalid:
+            json.loads(raw)
+        message = str(invalid.value)
+    else:
+        if fault == "scope":
+            case.resources["scope"] = "DO-NOT-EXPORT-RESOURCE-CONTENT"
+        else:
+            case.resources["memory.events"]["oom"] = "DO-NOT-EXPORT-RESOURCE-CONTENT"
+        raw = json.dumps(case.resources).encode()
+    path.write_bytes(raw)
+    result = case.run()
+    item = result["resources"]
+    expected = next(row for row in case.records()
+                    if row["path_sha256"] == hashlib.sha256(b"inner/RESOURCES_FINAL.json").hexdigest())
+    assert item["status"] == "evidence_insufficient" and item["original"] == expected
+    assert item["stage"] == stage and item["reason_code"] == reason
+    assert item["error_sha256"] == hashlib.sha256(message.encode()).hexdigest()
+    assert "profile" not in item and "DO-NOT-EXPORT" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("fault,reason,proof_reads", [
+    ("missing_commitment", "original_commitment_missing", 0),
+    ("wrong_hash", "original_hash_changed", 1),
+    ("expired", "shared_deadline_rejected", 0),
+    ("missing_file", "stage_failure", 0),
+])
+def test_failure_resource_read_rejection_never_exports_a_partial_proof(
+        failure_export, monkeypatch, fault, reason, proof_reads):
+    import hashlib
+    import json
+
+    case = failure_export
+    path, relative = case.root / "inner/RESOURCES_FINAL.json", "inner/RESOURCES_FINAL.json"
+    rows, errors, observed_reads = case.records(), [], []
+    row = next(item for item in rows if item["path_sha256"] == hashlib.sha256(relative.encode()).hexdigest())
+    if fault == "missing_commitment":
+        rows.remove(row)
+    elif fault == "wrong_hash":
+        row["sha256"] = "f" * 64
+    elif fault == "missing_file":
+        path.unlink()
+    actual, actual_proof = case.isolated._failure_original, case.isolated.host.file_proof
+
+    def observe(root, name, records, deadline, **kwargs):
+        try:
+            return actual(root, name, records, 99 if name == relative and fault == "expired" else deadline, **kwargs)
+        except Exception as error:
+            if name == relative:
+                errors.append(error)
+            raise
+
+    def proof(file, *args, **kwargs):
+        if file == path:
+            observed_reads.append(file)
+        return actual_proof(file, *args, **kwargs)
+
+    monkeypatch.setattr(case.isolated, "_failure_original", observe)
+    monkeypatch.setattr(case.isolated.host, "file_proof", proof)
+    result = case.run(rows)
+    item = result["resources"]
+    assert len(errors) == 1 and len(observed_reads) == proof_reads
+    assert item["status"] == "evidence_insufficient" and item["stage"] == "read_original"
+    assert item["reason_code"] == reason and "original" not in item and "profile" not in item
+    assert item["error_sha256"] == hashlib.sha256(str(errors[0]).encode()).hexdigest()
+    assert str(path) not in json.dumps(result)
+
+
+@pytest.mark.parametrize("message", ["password=DO-NOT-EXPORT https://user:secret@example.invalid/private",
+                                     "DO-NOT-EXPORT-PRIVATE-PATH-/private/\udcff"])
+def test_failure_resource_unknown_sensitive_exception_is_hash_only(failure_export, monkeypatch, message):
+    import hashlib
+    import json
+
+    case = failure_export
+
+    def failed(_value):
+        raise gate.AdmissionError(message)
+
+    monkeypatch.setattr(case.isolated, "_failure_resources", failed)
+    result = case.run()
+    item = result["resources"]
+    assert item["status"] == "evidence_insufficient" and item["stage"] == "validate_resources"
+    assert item["reason_code"] == "stage_failure" and "original" in item and "profile" not in item
+    assert item["error_sha256"] == hashlib.sha256(message.encode("utf-8", errors="backslashreplace")).hexdigest()
+    assert "DO-NOT-EXPORT" not in json.dumps(result) and "secret" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("raw,category", [
+    (b"context deadline exceeded", "timeout_literal"),
+    (b"no space left on device", "capacity_literal"),
+    (b"permission denied", "permission_literal"),
+    (b"OCI runtime create failed", "runtime_failure_literal"),
+    (b"cannot allocate memory", "memory_failure_literal"),
+    (b"level=error", "other_error_marker"),
+])
+def test_daemon_literal_category_is_observation_not_cause(raw, category):
+    result = native.isolated._daemon_error_counts(raw)
+    assert result["counts"][category] == 1
+    assert result["scope"] == "bounded_daemon_tail_literals_not_root_cause"
+    assert result["error_absence_not_proven"] is True
+    assert "oom_proven" not in result and "status" not in result
+
+
+@pytest.mark.parametrize("raw,unclassified", [(b"", 0), (b"new unspecified failure", 1),
+    (b"<sensitive-line-sha256:" + b"a" * 64 + b">", 1)])
+def test_daemon_zero_or_hash_only_categories_never_claim_no_error(raw, unclassified):
+    result = native.isolated._daemon_error_counts(raw)
+    assert not any(result["counts"].values())
+    assert result["unclassified_nonempty_lines"] == unclassified
+    assert result["error_absence_not_proven"] is True
+
+
+def test_daemon_category_counts_per_complete_line_and_can_overlap():
+    raw = b"permission denied prefix\nlevel=error context deadline exceeded i/o timeout\n"
+    result = native.isolated._daemon_error_counts(raw, partial=True)
+    assert result["counts"]["permission_literal"] == 0
+    assert result["counts"]["timeout_literal"] == result["counts"]["other_error_marker"] == 1
+    assert result["scanned_nonempty_lines"] == 1 and result["window_partial"] is True
+    empty = native.isolated._daemon_error_counts(b"permission denied fragment", partial=True)
+    assert empty["scanned_nonempty_lines"] == 0 and empty["error_absence_not_proven"] is True
+
+
+@pytest.mark.parametrize("raw,partial", [(b"x" * 8193, False), ("not bytes", False), (b"x", 1)])
+def test_daemon_category_guard_rejects_input_outside_existing_tail_bound(raw, partial):
+    with pytest.raises(ValueError, match="fixed bounded daemon literal input required"):
+        native.isolated._daemon_error_counts(raw, partial=partial)
+
+
+def test_daemon_error_categories_keep_original_redaction_proof_and_four_read_calls(failure_export, monkeypatch):
+    import json
+
+    case, reads = failure_export, []
+    raw = b"level=error permission denied password=DO-NOT-EXPORT /PRIVATE/argv\n"
+    path = case.root / "inner/daemon.stderr"
+    path.write_bytes(raw)
+    rows = case.records()
+    original = case.isolated._failure_original
+    expected = next(item for item in rows if item["path_sha256"] ==
+                    case.isolated.hashlib.sha256(b"inner/daemon.stderr").hexdigest())
+    def observe(root, relative, records, deadline, **kwargs):
+        reads.append((relative, kwargs))
+        return original(root, relative, records, deadline, **kwargs)
+    monkeypatch.setattr(case.isolated, "_failure_original", observe)
+    result = case.run(rows)
+    assert len(reads) == 4 and reads[2] == ("inner/daemon.stderr", {"limit": 8 * 1024**2, "tail": 8192})
+    assert result["daemon"]["original"] == expected
+    assert result["daemon"]["redacted"] is True and "sensitive-line-sha256" in result["daemon"]["text"]
+    assert result["daemon"]["error_literals"]["counts"]["permission_literal"] == 1
+    assert result["daemon"]["error_literals"]["error_absence_not_proven"] is True
+    assert "DO-NOT-EXPORT" not in json.dumps(result) and "PRIVATE" not in json.dumps(result)
+    assert result["status"] == "diagnostic_only_not_execution_proof"
+
+
+def test_daemon_read_failure_never_produces_error_counts_or_partial_proof(failure_export):
+    case = failure_export
+    rows = case.records()
+    (case.root / "inner/daemon.stderr").unlink()
+    item = case.run(rows)["daemon"]
+    assert item["status"] == "evidence_insufficient" and item["stage"] == "read_original"
+    assert "original" not in item and "error_literals" not in item and "text" not in item
