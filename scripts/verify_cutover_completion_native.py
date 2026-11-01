@@ -568,17 +568,20 @@ TESTS = ("tests/test_independent_drain_inventory.py", "tests/test_frozen_cutover
          "tests/test_controlled_release_finalize_custody.py",
          "tests/test_production_sender_bootstrap_export.py",
          "tests/test_production_sender_bootstrap_pg_diagnostics.py",
-         "tests/test_production_sender_bootstrap_host_native.py")
+         "tests/test_production_sender_bootstrap_host_native.py",
+         "tests/test_release_gate_node.py")
 # Keep the original three bounded groups. Whole direct-131 and legacy-takeover
-# files belong to activation so adapters retain the unchanged 2,000-case limit
-# as full-identity regression coverage grows; no test file or case is omitted.
-TEST_GROUPS = (("foundation", TESTS[:22]), ("activation", TESTS[22:34] + TESTS[39:40] + TESTS[59:60]),
-               ("adapters", TESTS[34:39] + TESTS[40:59] + TESTS[60:]))
+# files and the complete gate-Node file belong to activation so adapters retain
+# the unchanged 2,000-case limit; no original test file or case is omitted.
+TEST_GROUPS = (("foundation", TESTS[:22]),
+               ("activation", TESTS[22:34] + TESTS[39:40] + TESTS[59:60] + TESTS[72:73]),
+               ("adapters", TESTS[34:39] + TESTS[40:59] + TESTS[60:72]))
 MOUNTS = ("scripts", "tests", "services", "routes", "core", "db", "utils", "workers", "modules",
           "templates", "app.py", "worker_main.py", "sse_engine.py", "logging_bootstrap.py",
           "scoring_provenance.py", "scoring_explanation.py", "config.yaml", "docker-compose.yml",
           "ops/isolation", "ops/miniflux", ".github/workflows", "gunicorn.conf.py",
-          "Dockerfile", "requirements-prod.txt", "start.sh")
+          "Dockerfile", "requirements-prod.txt", "start.sh", "pytest.ini")
+SOURCE_SUPPORT_FILES = ("scripts/run-release-gate.sh", "scripts/check-shell-syntax.sh", "pytest.ini")
 CONTAINER_TEST = r'''
 import json, os, pathlib, platform, sys, pytest, psycopg
 from scripts.verify_cutover_completion_native import NativeDiagnostics, NativeShortPaths, native_short_path_plugin, create_fixture_storage, retain_fixture_storage, confirm_fixture_storage, verify_git_fixture
@@ -663,7 +666,8 @@ frozen_test_files = ('tests/test_independent_drain_inventory.py',
  'tests/test_controlled_release_finalize_custody.py',
  'tests/test_production_sender_bootstrap_export.py',
  'tests/test_production_sender_bootstrap_pg_diagnostics.py',
- 'tests/test_production_sender_bootstrap_host_native.py')
+ 'tests/test_production_sender_bootstrap_host_native.py',
+ 'tests/test_release_gate_node.py')
 summary = NativeDiagnostics(frozen_test_files)
 short_paths = NativeShortPaths(fixtures, summary)
 try:
@@ -730,7 +734,7 @@ def run(repo, output):
                     ([repo / name] if (repo / name).is_file() else (repo / name).rglob("*.py"))}
                    | {str(path.relative_to(repo)) for path in (repo / "ops/miniflux").iterdir()
                       if path.is_file() and path.suffix in {".json", ".patch"}}
-                   | set(TESTS) | {"Dockerfile", "requirements.txt", "requirements-prod.txt", "requirements-ops.txt",
+                   | set(TESTS) | set(SOURCE_SUPPORT_FILES) | {"Dockerfile", "requirements.txt", "requirements-prod.txt", "requirements-ops.txt",
                                   "ops/isolation/Dockerfile.cutover-completion", ".github/workflows/cutover-completion.yml"})
     hashes = {name: hashlib.sha256((repo / name).read_bytes()).hexdigest() for name in files}
     base.save(output / "SOURCE.json", {"source_sha256": hashes, "production_access": False,

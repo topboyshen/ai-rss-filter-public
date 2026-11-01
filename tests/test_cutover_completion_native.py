@@ -77,14 +77,15 @@ class CompletionNativeGuards(unittest.TestCase):
                     "tests/test_controlled_release_finalize_custody.py",
                     "tests/test_production_sender_bootstrap_export.py",
                     "tests/test_production_sender_bootstrap_pg_diagnostics.py",
-                    "tests/test_production_sender_bootstrap_host_native.py"}
+                    "tests/test_production_sender_bootstrap_host_native.py",
+                    "tests/test_release_gate_node.py"}
         actual = {node.value for node in ast.walk(ast.parse(runner.CONTAINER_TEST))
                   if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.startswith("tests/")}
         self.assertEqual(set(runner.TESTS), expected)
         self.assertEqual(len(runner.TESTS), len(expected))
         self.assertEqual(actual, expected)
         for name in ("app.py", "worker_main.py", "core", "db", "services", "config.yaml", "modules",
-                     "ops/miniflux", ".github/workflows", "gunicorn.conf.py", "Dockerfile", "requirements-prod.txt", "start.sh"):
+                     "ops/miniflux", ".github/workflows", "gunicorn.conf.py", "Dockerfile", "requirements-prod.txt", "start.sh", "pytest.ini"):
             self.assertIn(name, runner.MOUNTS)
         self.assertIn("memory.peak", runner.CONTAINER_TEST)
         self.assertIn("memory.events", runner.CONTAINER_TEST)
@@ -131,6 +132,7 @@ def test_actual_resource_inspect_requires_exact_private_disk_fixture_alias(tmp_p
     import os
     import pytest
     base = runner.base_runner()
+    base.READONLY_MOUNTS = runner.MOUNTS
     root = tmp_path.resolve() / "evidence"
     root.mkdir(mode=0o700)
     base.disk_fixture_arguments(root, True)
@@ -143,6 +145,15 @@ def test_actual_resource_inspect_requires_exact_private_disk_fixture_alias(tmp_p
             {"Type": "bind", "RW": True, "Source": str(root), "Destination": "/evidence"},
             {"Type": "bind", "RW": True, "Source": str(root / "disk-fixtures"), "Destination": base.DISK_FIXTURE_TARGET}]}
     assert all(base.check_state(state, "sha256:fixture", disk_fixtures=True, evidence_root=root).values())
+    for omit in (False, True):
+        wrong = deepcopy(state)
+        row = next(item for item in wrong["Mounts"] if item["Destination"] == "/work/pytest.ini")
+        if omit:
+            wrong["Mounts"].remove(row)
+        else:
+            row["RW"] = True
+        with pytest.raises(ValueError):
+            base.check_state(wrong, "sha256:fixture", disk_fixtures=True, evidence_root=root)
     for field, value in (("Source", str(root)), ("Source", "/tmp"), ("Destination", "/tmp"), ("RW", False), ("Type", "volume")):
         wrong = deepcopy(state)
         wrong["Mounts"][-1][field] = value
@@ -560,11 +571,13 @@ def test_fixed_partition_keeps_every_file_once_and_programs_bind_collection():
     from collections import Counter
     runner.validate_groups()
     assert [(name, len(files)) for name, files in runner.TEST_GROUPS] == [
-        ("foundation", 22), ("activation", 14), ("adapters", 36)]
+        ("foundation", 22), ("activation", 15), ("adapters", 36)]
     assert "tests/test_production_sender_bootstrap_direct131.py" in dict(runner.TEST_GROUPS)["activation"]
     assert "tests/test_production_sender_bootstrap_direct131.py" not in dict(runner.TEST_GROUPS)["adapters"]
     assert "tests/test_production_legacy_takeover.py" in dict(runner.TEST_GROUPS)["activation"]
     assert "tests/test_production_legacy_takeover.py" not in dict(runner.TEST_GROUPS)["adapters"]
+    assert "tests/test_release_gate_node.py" in dict(runner.TEST_GROUPS)["activation"]
+    assert "tests/test_release_gate_node.py" not in dict(runner.TEST_GROUPS)["adapters"]
     selected = []
     for name, files in runner.TEST_GROUPS:
         program = runner.native_test_program(name)
@@ -858,6 +871,11 @@ def test_all_groups_required_and_first_failure_stops_later_stages(monkeypatch, t
         assert not any(name == "GROUPS_RESULT.json" for name, _value in saved)
     policy = next(value for name, value in saved if name == "TEST_GROUPS.json")
     assert policy["per_group_seconds"] == 180 and policy["memory"] == 768 * 1024**2 and policy["pids"] == 256
+    source = next(value for name, value in saved if name == "SOURCE.json")
+    required = ("scripts/run-release-gate.sh", "scripts/check-shell-syntax.sh", "pytest.ini")
+    assert runner.SOURCE_SUPPORT_FILES == required
+    for path in required:
+        assert source["source_sha256"][path] == hashlib.sha256((ROOT / path).read_bytes()).hexdigest()
 
 
 def short_path_case(tmp_path, nodeids):
@@ -1073,7 +1091,7 @@ def test_short_plugin_is_native_only_and_preserves_standard_factory_and_fixed_su
     source = Path(runner.__file__).read_text()
     assert 'path = factory.mktemp("t")' in source
     assert 'plugins=[summary, native_short_path_plugin(short_paths)]' in runner.CONTAINER_TEST
-    assert len(runner.TESTS) == 72 and sum(len(files) for _, files in runner.TEST_GROUPS) == 72
+    assert len(runner.TESTS) == 73 and sum(len(files) for _, files in runner.TEST_GROUPS) == 73
     assert '--basetemp=' in runner.CONTAINER_TEST and 'short_paths.confirm()' in runner.CONTAINER_TEST
     assert 'native_short_path_plugin' not in (ROOT / "tests/conftest.py").read_text()
     assert 'mktemp("runtime-image-input")' in (ROOT / "tests/test_production_admission_image_sources.py").read_text()
@@ -1330,3 +1348,47 @@ def test_second():
     assert not (fixtures / "p/t0").exists() and not (tmp_path / "should-not-run").exists()
     assert (fixtures / "TMP_PATH_MAP.jsonl").read_bytes() == b""
     assert not (fixtures / "TMP_PATH_MAP_FINAL.json").exists()
+
+
+@pytest.mark.parametrize("missing", ["scripts/run-release-gate.sh", "scripts/check-shell-syntax.sh", "pytest.ini"])
+def test_node_gate_support_hashing_refuses_missing_file_before_native_build(monkeypatch, tmp_path, missing):
+    repo = tmp_path / "small-repo"
+    repo.mkdir()
+    fixed = {"Dockerfile", "requirements.txt", "requirements-prod.txt", "requirements-ops.txt",
+             "ops/isolation/Dockerfile.cutover-completion", ".github/workflows/cutover-completion.yml",
+             *runner.TESTS, *runner.SOURCE_SUPPORT_FILES}
+    for name in fixed - {missing}:
+        path = repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"synthetic-source-binding")
+    (repo / "ops/miniflux").mkdir(parents=True)
+    calls = []
+    base = SimpleNamespace(DOCKER=["docker"], checked=lambda *_args: calls.append("build"))
+    monkeypatch.setattr(runner.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(runner.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(runner, "base_runner", lambda: base)
+    monkeypatch.setattr(runner.subprocess, "check_output", lambda *_args, **_kwargs: b"")
+    with pytest.raises(FileNotFoundError) as error:
+        runner.run(repo, tmp_path / "evidence")
+    assert Path(error.value.filename) == repo / missing
+    assert calls == []
+
+
+def test_node_gate_required_ini_is_a_single_readonly_root_mount():
+    assert runner.MOUNTS.count("pytest.ini") == 1
+    assert runner.MOUNTS.count("scripts") == 1
+    assert not any(path in runner.MOUNTS for path in runner.SOURCE_SUPPORT_FILES[:2])
+    assert runner.SOURCE_SUPPORT_FILES == ("scripts/run-release-gate.sh", "scripts/check-shell-syntax.sh", "pytest.ini")
+
+
+def test_gate_node_partition_cannot_omit_or_duplicate_the_new_whole_file(monkeypatch):
+    groups = dict(runner.TEST_GROUPS)
+    node = "tests/test_release_gate_node.py"
+    without = groups["activation"][:-1]
+    assert groups["activation"][-1] == node
+    for activation, adapters in [(without, groups["adapters"]),
+                                 (groups["activation"], groups["adapters"] + (node,))]:
+        monkeypatch.setattr(runner, "TEST_GROUPS", (("foundation", groups["foundation"]),
+                            ("activation", activation), ("adapters", adapters)))
+        with pytest.raises(ValueError, match="omit or duplicate"):
+            runner.validate_groups()
