@@ -361,8 +361,18 @@ def _create_old_sender(harness, p, directory):
 def legacy_plan(harness, p, daemon, private_digest, candidate_image):
     """Real registered file-cron and four runtime roles, never a fake receipt."""
     directory = p["directory"] / "legacy"
-    directory.mkdir(mode=0o700)
-    _create_old_sender(harness, p, directory)
+    gate._directory(directory)
+    sender = p.get("custody_roles", {}).get("sender")
+    name = harness.prefix + "-custody-old-sender"
+    gate._require(type(sender) is dict and gate.HEX64.fullmatch(str(sender.get("Id", "")))
+                  and sender.get("Image") == harness.python_id and sender.get("Name") == "/" + name
+                  and sender.get("Config", {}).get("Labels", {}).get(LABEL) == harness.owner
+                  and sender.get("State", {}).get("Running") is True and sender["State"].get("Status") == "running"
+                  and harness.names.get("custody-old-sender") == name
+                  and harness.images.get("custody-old-sender") == harness.python_id,
+                  "original pre-build old sender required")
+    gate._require(gate._read(directory / "SENDER_CREATED.json") == {"id": sender["Id"], "image_id": sender["Image"]},
+                  "original pre-build old sender creation receipt changed")
     record = bootstrap_native._record
     refresh = record(directory / "refresh", b"#!/bin/sh\nexit 0\n", 0o700)
     before = ("# synthetic file-only cron\n* * * * * " + refresh["path"] + "\n").encode()
@@ -543,6 +553,10 @@ def scenario(harness, output):
         harness.stage("custody_same_project_zero_mount_originals_and_seal")
         sealed = prepare_and_seal(harness, p)
         contract, _manifest, digest = private.load(sealed, harness.repo, require_fresh=True)
+        harness.stage("custody_old_sender_before_candidate_build")
+        legacy_directory = p["directory"] / "legacy"
+        legacy_directory.mkdir(mode=0o700)
+        _create_old_sender(harness, p, legacy_directory)
         harness.stage("custody_actual_source_bound_application_image")
         image = harness.private_host_context.build_candidate(p, sealed, digest)
         activation.startup_native.probe_candidate(contract, sealed.parent, image, p["directory"],

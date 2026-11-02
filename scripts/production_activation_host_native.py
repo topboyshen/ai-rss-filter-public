@@ -69,7 +69,7 @@ ACTIVATION_STAGES = {"actual_finite_admission_lease", "actual_go_to_real_worker_
     "bind_exact_migration_permit", "actual_locked_migration_create_grant_start", "actual_compose_parser_metadata",
     "bounded_internal_network_and_real_redis", "custody_never_opened_synthetic_storage_not_actual125",
     "custody_actual_sender_first_closed", "custody_same_project_zero_mount_originals_and_seal",
-    "custody_actual_source_bound_application_image"}
+    "custody_actual_source_bound_application_image", "custody_old_sender_before_candidate_build"}
 
 
 def phase(root, name):
