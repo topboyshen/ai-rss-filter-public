@@ -777,3 +777,182 @@ def test_daemon_read_failure_never_produces_error_counts_or_partial_proof(failur
     item = case.run(rows)["daemon"]
     assert item["status"] == "evidence_insufficient" and item["stage"] == "read_original"
     assert "original" not in item and "error_literals" not in item and "text" not in item
+
+
+def _resource_compat_record():
+    return {**native.isolated.SUPERVISOR, "scope": native.isolated.RESOURCE_SCOPE,
+        "memory.peak": "12345", "memory.events": {key: "0" for key in
+            ("low", "high", "max", "oom", "oom_kill", "oom_group_kill")}}
+
+
+@pytest.mark.parametrize("with_sock_counter", [False, True])
+def test_failure_resources_preserve_six_key_and_observed_seven_key_forms(with_sock_counter):
+    value = _resource_compat_record()
+    if with_sock_counter:
+        value["memory.events"]["sock_throttled"] = "0"
+    result = native.isolated._failure_resources(value)
+    assert result["memory.events"] == {key: 0 for key in value["memory.events"]}
+    assert result["memory.peak"] == 12345 and result["scope"] == native.isolated.RESOURCE_SCOPE
+
+
+def test_failure_resources_still_reject_unknown_event_even_with_observed_sock_counter():
+    value = _resource_compat_record()
+    value["memory.events"].update(sock_throttled="0", unreviewed_counter="0")
+    with pytest.raises(gate.AdmissionError, match="failure diagnostic resource counters invalid"):
+        native.isolated._failure_resources(value)
+
+
+def test_failure_resources_keep_canonical_decimal_type_and_length_guards():
+    for key in ("sock_throttled", "max"):
+        for invalid in ("-1", "01", "1.0", "1" * 21, "", 1, True, None):
+            value = _resource_compat_record()
+            value["memory.events"][key] = invalid
+            with pytest.raises(gate.AdmissionError, match="failure diagnostic resource counters invalid"):
+                native.isolated._failure_resources(value)
+
+
+class _ResourceCompatText:
+    """Synthetic fixed cgroup text only; no filesystem access."""
+    def __init__(self, values, name=""):
+        self.values, self.name = values, name
+
+    def __truediv__(self, name):
+        return type(self)(self.values, name)
+
+    def read_text(self):
+        return self.values[self.name]
+
+
+def _resource_compat_kernel(monkeypatch):
+    value = _resource_compat_record()
+    files = {**native.isolated.SUPERVISOR, "memory.peak": "12345\n",
+        "memory.events": "".join(key + " " + count + "\n" for key, count in value["memory.events"].items())
+            + "sock_throttled 7\n"}
+    monkeypatch.setattr(native.isolated.host, "CGROUP", _ResourceCompatText(files))
+    return files
+
+
+def test_nonzero_sock_counter_is_reported_without_becoming_an_oom_finding(monkeypatch):
+    _resource_compat_kernel(monkeypatch)
+    record = native.isolated.resource_check({"cgroup": "/synthetic"})
+    result = native.isolated._failure_resources(record)
+    assert result["memory.events"]["sock_throttled"] == 7
+    assert result["memory.events"]["oom"] == result["memory.events"]["oom_kill"] == 0
+    assert set(result) == set(native.isolated.SUPERVISOR) | {"memory.peak", "memory.events", "scope"}
+
+
+@pytest.mark.parametrize("key", ["oom", "oom_kill"])
+def test_observed_sock_counter_never_relaxes_operational_oom_stop(monkeypatch, key):
+    files = _resource_compat_kernel(monkeypatch)
+    files["memory.events"] = files["memory.events"].replace(key + " 0\n", key + " 1\n")
+    with pytest.raises(gate.AdmissionError, match="private host supervisor OOM"):
+        native.isolated.resource_check({"cgroup": "/synthetic"})
+
+
+def test_observed_sock_counter_never_relaxes_operational_resource_limits(monkeypatch):
+    files = _resource_compat_kernel(monkeypatch)
+    files["memory.max"] = "999999999"
+    with pytest.raises(gate.AdmissionError, match="private host supervisor resource drift"):
+        native.isolated.resource_check({"cgroup": "/synthetic"})
+
+
+# Optional resource original retention is diagnostic-only; no new execution or IO.
+def test_failure_resource_unknown_counter_preserves_exact_original_but_stays_insufficient(failure_export):
+    import hashlib
+    import json
+
+    case = failure_export
+    case.resources["memory.events"]["future_event"] = "7"
+    path = case.root / "inner/RESOURCES_FINAL.json"
+    raw = json.dumps(case.resources, sort_keys=True).encode()
+    path.write_bytes(raw)
+    result = case.run()
+    item = result["resources"]
+    assert item["status"] == "evidence_insufficient"
+    assert item["reason_code"] == "resource_counters_invalid" and "profile" not in item
+    payload = item["original_payload"]
+    assert payload["content"].encode(payload["encoding"]) == raw
+    assert payload["bytes"] == len(raw)
+    assert payload["sha256"] == item["original"]["sha256"] == hashlib.sha256(raw).hexdigest()
+    assert "original_payload" not in result["command"] and "original_payload" not in result["daemon"]
+    assert "DO-NOT-EXPORT" not in json.dumps(result)
+
+
+def test_failure_resource_valid_projection_shape_is_unchanged(failure_export):
+    result = failure_export.run()
+    assert set(result["resources"]) == {"status", "original", "profile"}
+
+
+@pytest.mark.parametrize("kind", ["duplicate_top", "duplicate_event", "malformed", "sensitive_name",
+    "sensitive_value", "wrong_scope", "wrong_limit", "integer_count", "leading_zero", "negative",
+    "non_ascii_name", "long_name", "too_many_events", "oversized_raw"])
+def test_failure_resource_payload_rejects_untrusted_raw_without_export(failure_export, kind):
+    import json
+
+    case = failure_export
+    case.resources["memory.events"]["future_event"] = "1"
+    value = deepcopy(case.resources)
+    if kind == "sensitive_name":
+        value["memory.events"]["api_token"] = "1"
+    elif kind == "sensitive_value":
+        value["memory.events"]["future_event"] = "PRIVATE-SECRET"
+    elif kind == "wrong_scope":
+        value["scope"] = "private scope"
+    elif kind == "wrong_limit":
+        value["memory.max"] = "1"
+    elif kind == "integer_count":
+        value["memory.events"]["future_event"] = 1
+    elif kind == "leading_zero":
+        value["memory.events"]["future_event"] = "01"
+    elif kind == "negative":
+        value["memory.events"]["future_event"] = "-1"
+    elif kind == "non_ascii_name":
+        value["memory.events"]["秘密"] = "1"
+    elif kind == "long_name":
+        value["memory.events"]["a" * 33] = "1"
+    elif kind == "too_many_events":
+        value["memory.events"] = {"oom": "0", "oom_kill": "0", **{chr(97 + i): "0" for i in range(15)}}
+    raw = json.dumps(value, ensure_ascii=True).encode()
+    if kind == "duplicate_top":
+        raw = b'{"scope":"PRIVATE-SECRET",' + raw[1:]
+    elif kind == "duplicate_event":
+        raw = raw.replace(b'"future_event": "1"', b'"future_event":"PRIVATE-SECRET","future_event":"1"')
+    elif kind == "malformed":
+        raw = raw[:-1]
+    elif kind == "oversized_raw":
+        raw += b" " * 4096
+    (case.root / "inner/RESOURCES_FINAL.json").write_bytes(raw)
+    result = case.run()
+    assert result["resources"]["status"] == "evidence_insufficient"
+    assert "original_payload" not in result["resources"]
+    assert "PRIVATE-SECRET" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("field", ["path_sha256", "sha256", "bytes"])
+def test_failure_resource_payload_requires_same_original_proof(failure_export, field):
+    import hashlib
+    import json
+
+    case = failure_export
+    case.resources["memory.events"]["future_event"] = "1"
+    raw = json.dumps(case.resources).encode()
+    proof = {"path_sha256": hashlib.sha256(b"inner/RESOURCES_FINAL.json").hexdigest(),
+             "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
+    proof[field] = proof[field] + 1 if field == "bytes" else "f" * 64
+    assert case.isolated._failure_resource_payload(raw, case.resources, proof) is None
+
+
+def test_failure_resource_payload_keeps_existing_combined_budget(failure_export, monkeypatch):
+    import json
+
+    case = failure_export
+    case.resources["memory.events"]["future_event"] = "1"
+    (case.root / "inner/RESOURCES_FINAL.json").write_text(json.dumps(case.resources))
+    assert case.isolated.FAILURE_TEXT_BYTES == 16 * 1024
+    actual = case.isolated.host.encoded
+    def encoded(value):
+        if type(value) is dict and value.get("scope") == "resource_original_only_not_counter_validation":
+            return b"x" * 4097
+        return actual(value)
+    monkeypatch.setattr(case.isolated.host, "encoded", encoded)
+    assert "original_payload" not in case.run()["resources"]

@@ -228,6 +228,8 @@ def test_old_sender_exact_id_is_preserved_before_start_ack_and_never_enters_gene
     def command(argv, **kwargs):
         calls.append(deepcopy(argv))
         if argv[0] == "create":
+            assert kwargs == {"timeout": 3}
+            assert "sender" not in p["custody_roles"] and h.names == h.images == {}
             assert "--memory" in argv and argv[argv.index("--memory") + 1] == str(768 * 1024**2)
             assert "--pids-limit" in argv and argv[argv.index("--pids-limit") + 1] == "256"
             return row["Id"]
@@ -795,3 +797,73 @@ def test_native_mount_order_classification_never_hides_real_or_unknown_changes(f
     if fault in {"mount-content", "mount-key-missing", "non-dict"}:
         obs["identity"]["mounts_sha256"] = gate._hash(obs["mounts"])
     assert native._observed_mount_order_only(p, capability, error) is False
+
+
+def _old_sender_create_boundary_setup():
+    from scripts.verify_miniflux_pause_native import LABEL
+    harness = SimpleNamespace(prefix="owned", python_id="sha256:" + "b" * 64, owner="c" * 32,
+                              network="owned-net", names={}, images={}, created=[])
+    row = {"Id": "a" * 64, "Image": harness.python_id, "Config": {"Labels": {LABEL: harness.owner}},
+           "State": {"Running": False}}
+    return harness, row, {"custody_roles": {"gateway": {"Id": "d" * 64}}}
+
+
+def test_old_sender_create_boundary_unknown_return_preserves_error_and_never_inspects_or_starts(tmp_path):
+    harness, _row, p = _old_sender_create_boundary_setup()
+    before, calls = deepcopy(p), []
+    original = RuntimeError("isolated command 117 failed rc=None")
+    def command(argv, **kwargs):
+        calls.append(deepcopy(argv))
+        assert argv[0] == "create" and kwargs == {"timeout": 3}
+        raise original
+    harness.command = command
+    with pytest.raises(RuntimeError) as caught:
+        native._create_old_sender(harness, p, tmp_path)
+    assert caught.value is original and len(calls) == 1
+    assert p == before and harness.names == harness.images == {} and harness.created == []
+    assert (tmp_path / "SENDER_CREATE_INTENT.json").exists()
+    assert not (tmp_path / "SENDER_CREATED.json").exists()
+
+
+@pytest.mark.parametrize("ack", ["", "a" * 63, "a" * 64 + "\n" + "b" * 64], ids=["empty", "short", "two-ids"])
+def test_old_sender_create_boundary_invalid_ack_never_inspects_or_starts(tmp_path, ack):
+    harness, _row, p = _old_sender_create_boundary_setup()
+    before, calls = deepcopy(p), []
+    def command(argv, **kwargs):
+        calls.append(deepcopy(argv))
+        assert argv[0] == "create" and kwargs == {"timeout": 3}
+        return ack
+    harness.command = command
+    with pytest.raises(gate.AdmissionError, match="create ACK unknown"):
+        native._create_old_sender(harness, p, tmp_path)
+    assert len(calls) == 1 and p == before
+    assert harness.names == harness.images == {} and harness.created == []
+    assert (tmp_path / "SENDER_CREATE_INTENT.json").exists()
+    assert not (tmp_path / "SENDER_CREATED.json").exists()
+
+
+@pytest.mark.parametrize("drift", ["id", "image", "owner"])
+def test_old_sender_create_boundary_identity_drift_never_registers_or_starts(tmp_path, drift):
+    from scripts.verify_miniflux_pause_native import LABEL
+    harness, row, p = _old_sender_create_boundary_setup()
+    before, calls, identifier = deepcopy(p), [], row["Id"]
+    if drift == "id":
+        row["Id"] = "e" * 64
+    elif drift == "image":
+        row["Image"] = "sha256:" + "e" * 64
+    else:
+        row["Config"]["Labels"][LABEL] = "e" * 32
+    def command(argv, **kwargs):
+        calls.append(deepcopy(argv))
+        assert kwargs["timeout"] == 3
+        if argv[0] == "create":
+            return identifier
+        assert argv == ["inspect", identifier]
+        return json.dumps([row])
+    harness.command = command
+    with pytest.raises(gate.AdmissionError, match="identity.*required|identity changed"):
+        native._create_old_sender(harness, p, tmp_path)
+    assert [argv[0] for argv in calls] == ["create", "inspect"] and p == before
+    assert harness.names == harness.images == {} and harness.created == []
+    assert (tmp_path / "SENDER_CREATE_INTENT.json").exists()
+    assert not (tmp_path / "SENDER_CREATED.json").exists()

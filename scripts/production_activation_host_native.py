@@ -1010,7 +1010,7 @@ def custody_completion_profile(root, records, deadline):
 FAILURE_COMMAND_BYTES, FAILURE_STDERR_BYTES, FAILURE_DAEMON_BYTES = 128 * 1024, 4096, 8192
 FAILURE_TEXT_BYTES = 16 * 1024
 RESOURCE_SCOPE = "supervisor_and_private_daemon_only_not_all_application_containers"
-RESOURCE_EVENTS = {"low", "high", "max", "oom", "oom_kill", "oom_group_kill"}
+RESOURCE_EVENTS = {"low", "high", "max", "oom", "oom_kill", "oom_group_kill", "sock_throttled"}
 
 
 def _failure_original(root, relative, records, deadline, *, limit, tail=None):
@@ -1068,6 +1068,47 @@ def _failure_text(raw, limit, *, partial=False):
     rendered = "\n".join(lines).encode()
     return {"text": rendered[:limit].decode("utf-8", errors="ignore"),
             "truncated": partial or len(rendered) > limit, "redacted": True}
+
+
+def _failure_resource_payload(raw, value, proof):
+    """Optional exact resource bytes; this never validates execution or counters."""
+    def unique_pairs(pairs):
+        result = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError("duplicate resource diagnostic key")
+            result[key] = item
+        return result
+
+    try:
+        if (type(raw) is not bytes or not 0 < len(raw) <= 4096 or type(proof) is not dict
+                or set(proof) != {"path_sha256", "sha256", "bytes"}
+                or proof["path_sha256"] != hashlib.sha256(b"inner/RESOURCES_FINAL.json").hexdigest()
+                or type(proof["bytes"]) is not int or proof["bytes"] != len(raw)
+                or proof["sha256"] != hashlib.sha256(raw).hexdigest()):
+            return None
+        text = raw.decode("ascii")
+        parsed = json.loads(text, object_pairs_hook=unique_pairs)
+        if (parsed != value or type(parsed) is not dict
+                or set(parsed) != set(SUPERVISOR) | {"memory.peak", "memory.events", "scope"}
+                or any(parsed.get(key) != expected for key, expected in SUPERVISOR.items())
+                or parsed.get("scope") != RESOURCE_SCOPE):
+            return None
+        peak, events = parsed["memory.peak"], parsed["memory.events"]
+        if (type(peak) is not str or not re.fullmatch(r"0|[1-9][0-9]{0,19}", peak)
+                or type(events) is not dict or not {"oom", "oom_kill"} <= set(events)
+                or len(events) > 16):
+            return None
+        for name, count in events.items():
+            if (type(name) is not str or not re.fullmatch(r"[a-z_]{1,32}", name)
+                    or re.search(r"authorization|bearer|cookie|password|passwd|pwd|secret|token|key|credential|session", name)
+                    or type(count) is not str or not re.fullmatch(r"0|[1-9][0-9]{0,19}", count)):
+                return None
+        payload = {"schema": 1, "scope": "resource_original_only_not_counter_validation",
+                   "encoding": "ascii", "bytes": len(raw), "sha256": proof["sha256"], "content": text}
+        return payload if len(host.encoded(payload)) <= 4096 else None
+    except (UnicodeError, ValueError, TypeError, KeyError):
+        return None
 
 
 def _failure_resources(value):
@@ -1169,8 +1210,12 @@ def failure_originals(root, records, profiles, deadline):
             else:
                 stage = "parse_json"
                 value = json.loads(data)
+                payload = _failure_resource_payload(data, value, proof)
+                if payload is not None:
+                    item["original_payload"] = payload
                 stage = "validate_resources"
                 item["profile"] = _failure_resources(value)
+                item.pop("original_payload", None)  # Successful projections retain their original shape.
             result[kind] = item
         except (OSError, ValueError, TypeError, KeyError, gate.AdmissionError, host.ProofError) as error:
             message = str(error)
