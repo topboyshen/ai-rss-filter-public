@@ -613,9 +613,14 @@ def restrict_private_ipv6(commands, root, plan, expected):
 
 
 def daemon_config(root, plan):
+    # overlay2: create is a metadata operation, while vfs copies the full image
+    # rootfs on every create. The old-sender create exceeded its bounded 3 s
+    # budget at 3.0054 s under vfs with the supervisor+daemon cgroup at its
+    # memory ceiling; the driver switch removes the copy path without changing
+    # any limit. The recorded DAEMON_INFO.json proves the actual driver.
     return {"hosts": ["unix:///var/run/docker.sock"], "data-root": str(root / "data"),
             "exec-root": str(root / "exec"), "pidfile": str(root / "daemon.pid"), "bridge": "none",
-            "storage-driver": "vfs", "exec-opts": ["native.cgroupdriver=cgroupfs"],
+            "storage-driver": "overlay2", "exec-opts": ["native.cgroupdriver=cgroupfs"],
             "cgroup-parent": plan["cgroup"] + "/containers", "iptables": True, "ip6tables": False,
             "ipv6": False, "userland-proxy": False, "live-restore": True, "dns": ["127.0.0.1"]}
 

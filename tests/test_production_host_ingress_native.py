@@ -100,7 +100,9 @@ def test_daemon_config_has_only_private_state_and_charged_driver(tmp_path, plan)
     assert config["hosts"] == ["unix:///var/run/docker.sock"]
     assert config["exec-opts"] == ["native.cgroupdriver=cgroupfs"]
     assert config["cgroup-parent"] == plan["cgroup"] + "/containers"
-    assert config["bridge"] == "none" and config["storage-driver"] == "vfs"
+    # overlay2 keeps bounded docker create metadata-only; vfs copies the full
+    # rootfs per create and missed the 3 s old-sender budget (3.0054 s).
+    assert config["bridge"] == "none" and config["storage-driver"] == "overlay2"
     assert config["dns"] == ["127.0.0.1"] and config["live-restore"] is True
     for key in ("data-root", "exec-root", "pidfile"):
         assert Path(config[key]).parent == tmp_path
