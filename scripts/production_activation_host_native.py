@@ -1234,7 +1234,9 @@ def failure_originals(root, records, profiles, deadline):
                         error_sha256=hashlib.sha256(message.encode("utf-8", errors="backslashreplace")).hexdigest())
             result[kind] = item
     if len(host.encoded(result)) > FAILURE_TEXT_BYTES:
-        return {"status": "export_budget_exhausted"}
+        result.get("resources", {}).pop("original_payload", None)
+        if len(host.encoded(result)) > FAILURE_TEXT_BYTES:
+            return {"status": "export_budget_exhausted"}
     return result
 
 

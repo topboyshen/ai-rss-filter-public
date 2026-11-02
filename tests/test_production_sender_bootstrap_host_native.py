@@ -956,3 +956,40 @@ def test_failure_resource_payload_keeps_existing_combined_budget(failure_export,
         return actual(value)
     monkeypatch.setattr(case.isolated.host, "encoded", encoded)
     assert "original_payload" not in case.run()["resources"]
+
+
+def test_optional_resource_original_cannot_displace_existing_failure_diagnostics(failure_export):
+    import json
+
+    case = failure_export
+    case.value["stderr"] = "safe diagnostic text line\n" * 300
+    case.command.write_text(json.dumps(case.value))
+    (case.root / "inner/daemon.stderr").write_text("safe daemon diagnostic line\n" * 400)
+    case.resources["memory.events"]["future_event"] = "1"
+    # This original is within its own 4 KiB cap; the full packet exceeds 16 KiB.
+    (case.root / "inner/RESOURCES_FINAL.json").write_bytes(json.dumps(case.resources).encode() + b" " * 2100)
+    result = case.run()
+    assert result["status"] == "diagnostic_only_not_execution_proof"
+    assert result["observation"] == case.observation
+    assert result["command"]["status"] == result["daemon"]["status"] == "available"
+    assert result["resources"]["status"] == "evidence_insufficient"
+    assert result["resources"]["reason_code"] == "resource_counters_invalid"
+    assert "original" in result["resources"] and "original_payload" not in result["resources"]
+    assert len(case.isolated.host.encoded(result)) <= 16 * 1024
+
+
+def test_original_combined_failure_budget_still_rejects_after_optional_payload_removed(failure_export, monkeypatch):
+    import json
+
+    case = failure_export
+    case.resources["memory.events"]["future_event"] = "1"
+    (case.root / "inner/RESOURCES_FINAL.json").write_text(json.dumps(case.resources))
+    actual, observed = case.isolated.host.encoded, []
+    def encoded(value):
+        if type(value) is dict and "observation" in value and "resources" in value:
+            observed.append("original_payload" in value["resources"])
+            return b"x" * (16 * 1024 + 1)
+        return actual(value)
+    monkeypatch.setattr(case.isolated.host, "encoded", encoded)
+    assert case.run() == {"status": "export_budget_exhausted"}
+    assert observed == [True, False]
