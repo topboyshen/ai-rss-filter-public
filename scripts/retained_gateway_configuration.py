@@ -648,9 +648,10 @@ class _ArchiveAuthority:
         if value[0] == 1 and 1 not in self.pidfds:
             self._anchor(1)
         with socket_diagnostics.phase("peer_confirm", self, value):
-            self.confirm()
+            self._confirm_static()
 
-    def confirm(self):
+    def _confirm_static(self):
+        """Pin path/process/FD authority before sending the fixed read request."""
         gate._require(time.monotonic() < self.deadline
                       and _stat_identity(os.lstat(SOCKET_PATH)) == _stat_identity(self.socket)
                       and _small(PIDFILE, 32) == (self.pid_raw, self.pid_metadata),
@@ -658,8 +659,7 @@ class _ArchiveAuthority:
         namespace = os.stat("/proc/self/ns/net")
         held_namespace = os.fstat(self.namespace_fd)
         gate._require((namespace.st_dev, namespace.st_ino) == self.namespace ==
-                      (held_namespace.st_dev, held_namespace.st_ino)
-                      and _current_listener() == self.listener_row, "Docker archive listener/namespace changed")
+                      (held_namespace.st_dev, held_namespace.st_ino), "Docker archive listener/namespace changed")
         for pid, fd in self.pidfds.items():
             _alive(fd)
             gate._require(_process(pid, systemd=pid == 1) == self.processes[pid],
@@ -667,6 +667,10 @@ class _ArchiveAuthority:
             for path, value in self.held[pid].items():
                 gate._require(_link_identity(path) == value, "Docker archive listener FD changed")
             _alive(fd)
+
+    def confirm(self):
+        self._confirm_static()
+        gate._require(_current_listener() == self.listener_row, "Docker archive listener/namespace changed")
 
     def close(self):
         for fd in self.pidfds.values():
@@ -795,12 +799,17 @@ def read_native_archive(identifier, container_path, consumer, *, deadline):
             connection.connect(SOCKET_PATH)
             raw = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
             gate._require(len(raw) == 12, "Docker archive peer credentials incomplete")
-            authority.peer(struct.unpack("3i", raw))
+            peer = struct.unpack("3i", raw)
+            authority.peer(peer)
             route = "/containers/" + identifier + "/archive?path=" + quote(container_path, safe="")
             connection.settimeout(max(0.001, deadline - time.monotonic()))
             connection.sendall(("GET " + route + " HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n").encode("ascii"))
             response = _ArchiveResponse(connection, (authority.pid, 0, 0), deadline, container_path)
             response.header()
+            # The writer-bound header proves accept has happened. Check the full
+            # table before consuming any payload; no pending/unknown row is waived.
+            with socket_diagnostics.phase("peer_confirm", authority, peer):
+                authority.confirm()
             result = consumer(response.read)
             response.finish()
             name = "conf.d" if container_path == DIRECTORY_PATH else Path(container_path).name

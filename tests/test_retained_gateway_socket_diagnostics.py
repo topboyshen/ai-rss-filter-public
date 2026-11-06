@@ -1,8 +1,13 @@
 import copy
 import json
+import os
 from pathlib import Path
 import signal
+import socket
 import stat
+import struct
+import subprocess
+import sys
 import tempfile
 import time
 from types import SimpleNamespace
@@ -404,3 +409,261 @@ def test_confirm_identity_drift_still_rejects_with_diagnostics_enabled(monkeypat
             current.confirm()
     assert len(calls) == (1 if changed == "listener" else 0)
     assert list(private_store.iterdir()) == []
+
+
+# Rootless native Linux mechanism, not a Docker/socket-authority substitute.
+# The dedicated child cannot accept until the parent explicitly grants it.
+_ORDER_SERVER = r'''
+import json, os, socket, struct, sys, time
+fd, path, deadline = int(sys.argv[1]), sys.argv[2], float(sys.argv[3])
+control = socket.socket(fileno=fd)
+def left():
+    value = deadline - time.monotonic()
+    assert value > 0
+    return value
+def emit(value):
+    control.settimeout(left())
+    raw = json.dumps(value).encode()
+    assert control.send(raw) == len(raw)
+def command(expected):
+    control.settimeout(left())
+    raw = control.recv(4097)
+    assert 0 < len(raw) <= 4096
+    value = json.loads(raw)
+    if value == {"command": "stop"}:
+        raise SystemExit(0)
+    assert value == {"command": expected}
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+    listener.bind(path)
+    os.chmod(path, 0o600)
+    listener.listen(2)
+    emit({"stage": "listening", "pid": os.getpid(), "listener_inode": os.fstat(listener.fileno()).st_ino})
+    command("accept")
+    listener.settimeout(left())
+    connection, _ = listener.accept()
+    with connection:
+        connection.settimeout(left())
+        assert connection.recv(1) == b"Q"
+        credentials = struct.pack("3i", os.getpid(), os.getuid(), os.getgid())
+        assert connection.sendmsg([b"R"], [(socket.SOL_SOCKET, socket.SCM_CREDENTIALS, credentials)]) == 1
+        emit({"stage": "response_sent", "accepted_inode": os.fstat(connection.fileno()).st_ino,
+              "listener_inode": os.fstat(listener.fileno()).st_ino})
+        command("finish")
+    emit({"stage": "finished"})
+control.close()
+'''
+
+
+class _LinuxSocketOrdering:
+    def __init__(self, path):
+        self.path = str(path)
+        self.deadline = time.monotonic() + 3.0
+        # Cleanup is inside the same fixed deadline, not an extra allowance.
+        self.work_deadline = self.deadline - 0.25
+        self.connections = []
+        self.finished = False
+        self.control, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        try:
+            self.process = subprocess.Popen(
+                [sys.executable, "-I", "-B", "-c", _ORDER_SERVER, str(child.fileno()),
+                 self.path, repr(self.work_deadline)], pass_fds=(child.fileno(),),
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        finally:
+            child.close()
+
+    def left(self):
+        value = self.work_deadline - time.monotonic()
+        assert value > 0, "fixed three-second native ordering deadline exhausted"
+        return value
+
+    def receive(self):
+        self.control.settimeout(self.left())
+        raw = self.control.recv(4097)
+        assert 0 < len(raw) <= 4096
+        return json.loads(raw)
+
+    def send(self, name):
+        self.control.settimeout(self.left())
+        raw = json.dumps({"command": name}).encode()
+        assert self.control.send(raw) == len(raw)
+
+    def identity(self):
+        info = os.lstat(self.path)
+        assert stat.S_ISSOCK(info.st_mode)
+        return info.st_dev, info.st_ino, info.st_uid, stat.S_IMODE(info.st_mode)
+
+    def table(self):
+        # Never export another process's row, pathname or kernel pointer.
+        with open("/proc/net/unix", "rb") as stream:
+            raw = stream.read(512 * 1024 + 1)
+        assert len(raw) <= 512 * 1024
+        lines = raw.decode("ascii", "strict").splitlines()
+        assert 0 < len(lines) <= 4096 and lines[0].split() == HEADER.decode().split()
+        selected = []
+        for line in lines[1:]:
+            row = line.split()
+            if len(row) >= 8 and row[7] == self.path:
+                assert len(row) == 8
+                row[0] = "00000000:"  # Pointer is irrelevant to the parser.
+                selected.append(" ".join(row))
+        return HEADER + ("\n".join(selected) + "\n").encode("ascii")
+
+    def connect(self):
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.connections.append(connection)
+        connection.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+        connection.settimeout(self.left())
+        connection.connect(self.path)
+        expected = self.process.pid, os.getuid(), os.getgid()
+        assert struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)) == expected
+        return connection
+
+    def serve(self, connection):
+        self.send("accept")
+        connection.settimeout(self.left())
+        connection.sendall(b"Q")
+        raw, controls, flags, _ = connection.recvmsg(1, socket.CMSG_SPACE(12))
+        assert raw == b"R" and flags == 0
+        assert len(controls) == 1 and controls[0][:2] == (socket.SOL_SOCKET, socket.SCM_CREDENTIALS)
+        assert len(controls[0][2]) == 12
+        assert struct.unpack("3i", controls[0][2]) == (self.process.pid, os.getuid(), os.getgid())
+        sent = self.receive()
+        assert sent["stage"] == "response_sent" and sent["accepted_inode"] > 0
+        return sent
+
+    def finish(self):
+        self.send("finish")
+        assert self.receive() == {"stage": "finished"}
+        assert self.process.wait(timeout=self.left()) == 0
+        self.finished = True
+
+    def cleanup(self):
+        try:
+            if not self.finished:
+                graceful_failure = None
+                try:
+                    self.send("stop")
+                    assert self.process.wait(timeout=self.left()) == 0
+                except (AssertionError, OSError, subprocess.TimeoutExpired) as exc:
+                    graceful_failure = exc
+                if self.process.poll() is None:
+                    # Own synthetic child only; TERM is never success evidence.
+                    self.process.terminate()
+                    try:
+                        self.process.wait(timeout=max(0.0, self.deadline - time.monotonic()))
+                    except subprocess.TimeoutExpired as exc:
+                        raise AssertionError("own synthetic child exit unconfirmed within fixed deadline") from exc
+                    raise AssertionError("own synthetic child required TERM; normal exit unconfirmed") from graceful_failure
+                if graceful_failure is not None:
+                    raise graceful_failure
+                assert self.process.returncode == 0
+            else:
+                assert self.process.poll() == 0
+        finally:
+            for connection in self.connections:
+                connection.close()
+            self.control.close()
+
+
+@pytest.mark.parametrize("case", ["normal", "already_finished", "terminated", "exit_unconfirmed"])
+def test_native_ordering_cleanup_reaps_within_original_deadline_and_never_hides_failure(monkeypatch, case):
+    native = object.__new__(_LinuxSocketOrdering)
+    native.deadline = 10.0
+    native.work_deadline = 9.75
+    native.finished = case == "already_finished"
+    events = []
+    native.connections = [SimpleNamespace(close=lambda: events.append("connection_closed"))]
+    native.control = SimpleNamespace(close=lambda: events.append("control_closed"))
+    monkeypatch.setattr(time, "monotonic", lambda: 9.9)
+
+    class Process:
+        returncode = 0 if native.finished else None
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            events.append("term")
+
+        def wait(self, *, timeout):
+            events.append(("wait", timeout))
+            if case == "exit_unconfirmed":
+                raise subprocess.TimeoutExpired("own synthetic child", timeout)
+            self.returncode = -signal.SIGTERM if "term" in events else 0
+            return self.returncode
+
+    native.process = Process()
+
+    def stop(name):
+        assert name == "stop"
+        if case in {"terminated", "exit_unconfirmed"}:
+            raise AssertionError("work deadline exhausted")
+
+    native.send = stop
+    native.left = lambda: 0.05
+    if case in {"normal", "already_finished"}:
+        native.cleanup()
+        assert "term" not in events and native.process.returncode == 0
+    else:
+        expected = "required TERM" if case == "terminated" else "exit unconfirmed within fixed deadline"
+        with pytest.raises(AssertionError, match=expected):
+            native.cleanup()
+        assert "term" in events
+        waits = [
+            event[1] for event in events if isinstance(event, tuple) and event[0] == "wait"
+        ]
+        assert waits == [pytest.approx(0.1)]
+    assert events[-2:] == ["connection_closed", "control_closed"]
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires actual Linux AF_UNIX lifecycle/procfs")
+@pytest.mark.parametrize("case", ["accepted", "other_pending", "second_listener"])
+def test_real_linux_connect_accept_order_and_conflicts_remain_strict(monkeypatch, case):
+    # A short private path also fits sockaddr_un in containerized CI.
+    with tempfile.TemporaryDirectory(prefix="socket-order-", dir="/tmp") as directory:
+        native = _LinuxSocketOrdering(Path(directory) / "own.sock")
+        monkeypatch.setattr(subject, "SOCKET_PATH", native.path)
+        extra_listener = None
+        try:
+            ready = native.receive()
+            assert ready["stage"] == "listening" and ready["pid"] == native.process.pid
+            initial_identity = native.identity()
+            initial = subject._listener(native.table())
+            assert initial["inode"] == ready["listener_inode"]
+            if case == "second_listener":
+                # Both listener FDs retain the same pathname in procfs. This
+                # only unlinks our temporary socket; no host socket is used.
+                os.unlink(native.path)
+                extra_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                extra_listener.bind(native.path)
+                extra_listener.listen(1)
+                assert native.identity() != initial_identity
+                with pytest.raises(gate.AdmissionError, match="listener is not unique"):
+                    subject._listener(native.table())
+                return
+            connection = native.connect()
+            pending = native.table()
+            rows = [line.split() for line in pending.decode().splitlines()[1:]]
+            assert sum(row[2:7] == ["00000000", "00000000", "0001", "02", "0"] for row in rows) == 1
+            assert native.identity() == initial_identity
+            with pytest.raises(gate.AdmissionError, match="identity ambiguous"):
+                subject._listener(pending)
+            sent = native.serve(connection)
+            accepted = native.table()
+            assert subject._listener(accepted) == initial
+            rows = [line.split() for line in accepted.decode().splitlines()[1:]]
+            assert sum(row[2:7] == ["00000000", "00000000", "0001", "03", str(sent["accepted_inode"])] for row in rows) == 1
+            assert sent["listener_inode"] == initial["inode"] and native.identity() == initial_identity
+            if case == "other_pending":
+                # Our authenticated response cannot excuse another connection
+                # still awaiting accept. No later retry may hide that row.
+                native.connect()
+                with pytest.raises(gate.AdmissionError, match="identity ambiguous"):
+                    subject._listener(native.table())
+            native.finish()
+            assert native.finished and native.process.returncode == 0
+        finally:
+            if extra_listener is not None:
+                extra_listener.close()
+            native.cleanup()

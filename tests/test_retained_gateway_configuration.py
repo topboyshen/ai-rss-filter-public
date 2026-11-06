@@ -462,7 +462,7 @@ def test_native_reader_uses_only_fixed_get_and_current_authority(credentials, mo
                                         deadline=time.monotonic() + 3)
     expected = ("GET /containers/" + "a" * 64 + "/archive?path=%2Fetc%2Fnginx%2Fnginx.conf HTTP/1.0\r\n"
                 "Host: localhost\r\nConnection: close\r\n\r\n").encode()
-    assert events == ["authority-enter", "peer", expected, "confirm", "close", "authority-exit"]
+    assert events == ["authority-enter", "peer", expected, "confirm", "confirm", "close", "authority-exit"]
     assert result["contents"] == {"nginx.conf": MAIN}
 
 
@@ -842,3 +842,215 @@ def test_actual_source_literal_guard_exports_only_the_fixed_link_diagnostic(mess
 def test_link_diagnostics_do_not_widen_actual_source_literal_export(message):
     from scripts.verify_production_activation_native import source_literal
     assert source_literal(message, Path(__file__).resolve().parents[1]) is None
+
+
+def archive_order_case(monkeypatch, *, static_failure=False, credentials=None, header_extra=b"",
+                       initial_rows=None, response_rows=None, final_rows=None, expired_header=False):
+    """Use the real bounded response/parser; only the host/socket carrier is synthetic."""
+    events, state = [], {"now": 100.0, "confirmations": 0}
+    body = archive_map()[subject.FILE_PATHS[0]]
+    payload = http(body, extra=header_extra)
+    header_size = len(payload) - len(body)
+    valid = unix_rows(LISTEN, ACCEPTED)
+    tables = {"initial": valid if initial_rows is None else initial_rows,
+              "response": valid if response_rows is None else response_rows,
+              "final": valid if final_rows is None else final_rows}
+
+    class Authority:
+        pid = 123
+
+        def __init__(self, deadline):
+            self.deadline = deadline
+            assert deadline == 102.0
+
+        def __enter__(self):
+            for stage in ("initial_listener", "initial_confirm"):
+                events.append(stage)
+                subject._listener(tables["initial"])
+            return self
+
+        def __exit__(self, *_args):
+            events.append("authority-exit")
+
+        def peer(self, value):
+            assert value == (123, 0, 0)
+            events.append("static-peer")
+            if static_failure:
+                raise gate.AdmissionUncertain("static peer identity unknown")
+
+        def confirm(self):
+            stage = "response" if state["confirmations"] == 0 else "final"
+            state["confirmations"] += 1
+            events.append(stage)
+            assert self.deadline == 102.0 and state["now"] < self.deadline
+            assert connection.offset == (header_size if stage == "response" else len(payload))
+            subject._listener(tables[stage])
+
+    class Connection(ResponseSocket):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            events.append("close")
+
+        def setsockopt(self, *_args):
+            pass
+
+        def connect(self, path):
+            assert path == subject.SOCKET_PATH
+            events.append("connect")
+
+        def getsockopt(self, *_args):
+            return struct.pack("3i", 123, 0, 0)
+
+        def sendall(self, raw):
+            assert raw == ("GET /containers/" + "a" * 64 +
+                           "/archive?path=%2Fetc%2Fnginx%2Fnginx.conf HTTP/1.0\r\n"
+                           "Host: localhost\r\nConnection: close\r\n\r\n").encode()
+            events.append("fixed-get")
+
+        def recvmsg(self, maximum, ancillary):
+            result = super().recvmsg(maximum, ancillary)
+            if expired_header and self.offset == header_size:
+                state["now"] = 102.001
+            return result
+
+    connection = Connection(payload, credentials=credentials)
+    monkeypatch.setattr(socket, "SO_PASSCRED", 16, raising=False)
+    monkeypatch.setattr(socket, "SO_PEERCRED", 17, raising=False)
+    monkeypatch.setattr(socket, "SCM_CREDENTIALS", 2, raising=False)
+    monkeypatch.setattr(subject, "_ArchiveAuthority", Authority)
+    monkeypatch.setattr(socket, "socket", lambda *_args: connection)
+    monkeypatch.setattr(subject.time, "monotonic", lambda: state["now"])
+    def consumer(read):
+        events.append("consumer")
+        return subject.parse_archive(read, subject.FILE_PATHS[0])
+    return events, lambda: subject.read_native_archive("a" * 64, subject.FILE_PATHS[0], consumer, deadline=102.0)
+
+
+def test_archive_body_waits_for_writer_header_and_full_confirmation(monkeypatch):
+    events, run = archive_order_case(monkeypatch)
+    assert run()["contents"] == {"nginx.conf": MAIN}
+    assert events == ["initial_listener", "initial_confirm", "connect", "static-peer", "fixed-get",
+                      "response", "consumer", "final", "close", "authority-exit"]
+
+
+def test_archive_peer_static_failure_prevents_even_fixed_get(monkeypatch):
+    events, run = archive_order_case(monkeypatch, static_failure=True)
+    with pytest.raises(gate.AdmissionUncertain, match="static peer"):
+        run()
+    assert "fixed-get" not in events and "consumer" not in events and events[-2:] == ["close", "authority-exit"]
+
+
+@pytest.mark.parametrize("fault", ["writer", "missing_credentials", "bad_header", "expired_header"])
+def test_archive_header_failure_never_reaches_consumer_or_full_response_confirmation(monkeypatch, fault):
+    kwargs = {"writer": {"credentials": [(socket.SOL_SOCKET, 2, struct.pack("3i", 999, 0, 0))]},
+              "missing_credentials": {"credentials": []}, "bad_header": {"header_extra": b"Transfer-Encoding: chunked\r\n"},
+              "expired_header": {"expired_header": True}}[fault]
+    events, run = archive_order_case(monkeypatch, **kwargs)
+    with pytest.raises(gate.AdmissionError):
+        run()
+    assert "response" not in events and "consumer" not in events and events[-2:] == ["close", "authority-exit"]
+
+
+@pytest.mark.parametrize("row", [ACCEPTED.replace("0001 03 124", "0001 02 0"),
+                                ACCEPTED.replace(" 124 ", " 0 "),
+                                LISTEN.replace(" 123 ", " 125 "),
+                                ACCEPTED.replace("/run/docker.sock", "/var/run/docker.sock"),
+                                ACCEPTED.replace("0001 03", "0002 03")])
+@pytest.mark.parametrize("stage", ["initial", "response", "final"])
+def test_unknown_rows_at_every_full_boundary_still_fail_closed(monkeypatch, row, stage):
+    events, run = archive_order_case(monkeypatch, **{stage + "_rows": unix_rows(LISTEN, row)})
+    with pytest.raises((gate.AdmissionError, gate.AdmissionUncertain)):
+        run()
+    if stage == "initial":
+        assert "connect" not in events
+    if stage != "final":
+        assert "consumer" not in events
+    else:
+        assert events[-4:] == ["consumer", "final", "close", "authority-exit"]
+
+
+def peer_static_case(monkeypatch):
+    info = SimpleNamespace(st_dev=3, st_ino=2, st_mode=stat.S_IFSOCK | 0o660,
+                           st_uid=0, st_gid=0, st_nlink=1, st_size=0, st_mtime_ns=0, st_ctime_ns=0)
+    authority = subject._ArchiveAuthority(time.monotonic() + 3)
+    authority.pid = 123
+    authority.socket, authority.pid_raw, authority.pid_metadata = info, b"123", ()
+    authority.namespace_fd, authority.namespace = 19, (3, 2)
+    authority.listener_row = {"inode": 123}
+    authority.pidfds, authority.processes = {123: 99}, {123: {"fixed": True}}
+    authority.held = {123: {"/fixed-private-fd": ("socket:[123]",)}}
+    state, events = {"fault": None}, []
+    def file_stat(_path):
+        return SimpleNamespace(**{**vars(info), "st_ino": 999}) if state["fault"] == "socket" else info
+    def alive(fd):
+        events.append(("alive", fd))
+        if state["fault"] == "pidfd_before" or (state["fault"] == "pidfd_after" and len(events) > 1):
+            raise gate.AdmissionUncertain("pidfd no longer alive")
+    monkeypatch.setattr(subject.os, "lstat", file_stat)
+    monkeypatch.setattr(subject, "_small", lambda *_a: (b"999" if state["fault"] == "pid" else b"123", ()))
+    monkeypatch.setattr(subject.os, "stat", lambda _p: SimpleNamespace(st_dev=3, st_ino=99)
+                        if state["fault"] == "namespace" else info)
+    monkeypatch.setattr(subject.os, "fstat", lambda _fd: SimpleNamespace(st_dev=3, st_ino=99)
+                        if state["fault"] == "held_namespace" else info)
+    monkeypatch.setattr(subject, "_current_listener", lambda: pytest.fail("peer must not inspect its pending connection"))
+    monkeypatch.setattr(subject, "_alive", alive)
+    monkeypatch.setattr(subject, "_process", lambda *_a, **_k: {"fixed": False}
+                        if state["fault"] == "process" else authority.processes[123])
+    monkeypatch.setattr(subject, "_link_identity", lambda _p: ("socket:[999]",)
+                        if state["fault"] == "listener_fd" else ("socket:[123]",))
+    return authority, state, events
+
+
+def test_recognized_peer_keeps_all_static_identity_checks_without_reading_pending_table(monkeypatch):
+    authority, _state, events = peer_static_case(monkeypatch)
+    authority.peer((123, 0, 0))
+    assert events == [("alive", 99), ("alive", 99)]
+
+
+@pytest.mark.parametrize("fault", ["deadline", "socket", "pid", "namespace", "held_namespace",
+                                  "pidfd_before", "process", "listener_fd", "pidfd_after"])
+def test_recognized_peer_static_drift_is_never_waived(monkeypatch, fault):
+    authority, state, _events = peer_static_case(monkeypatch)
+    state["fault"] = fault
+    if fault == "deadline":
+        authority.deadline = time.monotonic() - 1
+    with pytest.raises((gate.AdmissionError, gate.AdmissionUncertain)):
+        authority.peer((123, 0, 0))
+
+
+def test_inherited_peer_adds_systemd_anchor_and_rechecks_both_processes(monkeypatch):
+    authority, _state, events = peer_static_case(monkeypatch)
+    def anchor(pid):
+        assert pid == 1
+        events.append(("anchor", pid))
+        authority.pidfds[pid] = 88
+        authority.processes[pid] = {"fixed": True}
+        authority.held[pid] = {"/second-private-fd": ("socket:[123]",)}
+    monkeypatch.setattr(authority, "_anchor", anchor)
+    authority.peer((1, 0, 0))
+    assert events == [("anchor", 1), ("alive", 99), ("alive", 99), ("alive", 88), ("alive", 88)]
+
+
+def test_archive_authority_retains_initial_response_and_final_full_checks(monkeypatch):
+    authority, _state, events = peer_static_case(monkeypatch)
+    monkeypatch.setattr(subject.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(subject.os, "uname", lambda: SimpleNamespace(sysname="Linux"))
+    monkeypatch.setattr(subject.os, "pidfd_open", lambda *_a: 99, raising=False)
+    for name in ("SO_PEERCRED", "SO_PASSCRED", "SCM_CREDENTIALS"):
+        monkeypatch.setattr(socket, name, 1, raising=False)
+    monkeypatch.setattr(subject.os, "open", lambda *_a: 19)
+    monkeypatch.setattr(authority, "_anchor", lambda _pid: events.append("anchor"))
+    monkeypatch.setattr(authority, "close", lambda: events.append("close"))
+    def full_listener():
+        events.append("full-listener")
+        return {"inode": 123}
+    monkeypatch.setattr(subject, "_current_listener", full_listener)
+    with authority:
+        assert events.count("full-listener") == 2
+        authority.peer((123, 0, 0))
+        assert events.count("full-listener") == 2
+        authority.confirm()  # Full check after the writer-bound header.
+        authority.confirm()  # Full check after the complete response.
+    assert events.count("full-listener") == 4 and events[-1] == "close"
