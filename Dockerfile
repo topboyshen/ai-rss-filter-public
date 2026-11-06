@@ -71,6 +71,7 @@ COPY scripts/production_admission_supervisor.py ./scripts/production_admission_s
 COPY scripts/production_admission_watchdog.py ./scripts/production_admission_watchdog.py
 COPY scripts/sender_namespace_http.py ./scripts/sender_namespace_http.py
 COPY scripts/retained_gateway_configuration.py ./scripts/retained_gateway_configuration.py
+COPY scripts/retained_gateway_diagnostics.py ./scripts/retained_gateway_diagnostics.py
 COPY scripts/retained_gateway_custody.py ./scripts/retained_gateway_custody.py
 RUN chmod +x /app/start.sh && python -m py_compile app.py sse_engine.py worker_main.py gunicorn.conf.py scoring_provenance.py scoring_explanation.py core/*.py db/*.py utils/*.py routes/*.py services/*.py workers/*.py modules/*.py scripts/run_event_enrichment.py scripts/run_provenance_shadow.py scripts/export_score_gold_candidates.py scripts/import_score_gold_labels.py scripts/score_gold_metrics.py \
     && python -m py_compile scripts/run_controlled_startup.py \

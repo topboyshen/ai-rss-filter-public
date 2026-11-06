@@ -130,6 +130,7 @@ def test_unrelated_and_lookalike_paths_do_not_trigger(event, path):
 @pytest.mark.parametrize("event", ["push", "pull_request"])
 @pytest.mark.parametrize("path", [
     "scripts/retained_gateway_configuration.py", "scripts/retained_gateway_custody.py",
+    "scripts/retained_gateway_diagnostics.py", "tests/test_retained_gateway_socket_diagnostics.py",
     "tests/test_retained_gateway_configuration.py", "tests/test_retained_gateway_custody.py",
 ])
 @pytest.mark.parametrize("variant", ["exact", "suffix", "nested"])

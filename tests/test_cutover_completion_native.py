@@ -70,6 +70,7 @@ class CompletionNativeGuards(unittest.TestCase):
                     "tests/test_sender_host_loopback_pg_inventory.py", "tests/test_production_sender_bootstrap_host_pg.py",
                     "tests/test_sender_namespace_host_listener.py",
                     "tests/test_retained_gateway_configuration.py",
+                    "tests/test_retained_gateway_socket_diagnostics.py",
                     "tests/test_retained_gateway_custody.py",
                     "tests/test_production_gateway_custody_lifecycle.py",
                     "tests/test_production_gateway_custody_native.py",
@@ -571,13 +572,15 @@ def test_fixed_partition_keeps_every_file_once_and_programs_bind_collection():
     from collections import Counter
     runner.validate_groups()
     assert [(name, len(files)) for name, files in runner.TEST_GROUPS] == [
-        ("foundation", 22), ("activation", 16), ("adapters", 35)]
+        ("foundation", 22), ("activation", 17), ("adapters", 35)]
     assert "tests/test_production_sender_bootstrap_direct131.py" in dict(runner.TEST_GROUPS)["activation"]
     assert "tests/test_production_sender_bootstrap_direct131.py" not in dict(runner.TEST_GROUPS)["adapters"]
     assert "tests/test_production_legacy_takeover.py" in dict(runner.TEST_GROUPS)["activation"]
     assert "tests/test_production_legacy_takeover.py" not in dict(runner.TEST_GROUPS)["adapters"]
     assert "tests/test_release_gate_node.py" in dict(runner.TEST_GROUPS)["activation"]
     assert "tests/test_release_gate_node.py" not in dict(runner.TEST_GROUPS)["adapters"]
+    assert "tests/test_retained_gateway_socket_diagnostics.py" in dict(runner.TEST_GROUPS)["activation"]
+    assert "tests/test_retained_gateway_socket_diagnostics.py" not in dict(runner.TEST_GROUPS)["adapters"]
     assert "tests/test_production_sender_bootstrap_host_native.py" in dict(runner.TEST_GROUPS)["activation"]
     assert "tests/test_production_sender_bootstrap_host_native.py" not in dict(runner.TEST_GROUPS)["adapters"]
     selected = []
@@ -1093,7 +1096,7 @@ def test_short_plugin_is_native_only_and_preserves_standard_factory_and_fixed_su
     source = Path(runner.__file__).read_text()
     assert 'path = factory.mktemp("t")' in source
     assert 'plugins=[summary, native_short_path_plugin(short_paths)]' in runner.CONTAINER_TEST
-    assert len(runner.TESTS) == 73 and sum(len(files) for _, files in runner.TEST_GROUPS) == 73
+    assert len(runner.TESTS) == 74 and sum(len(files) for _, files in runner.TEST_GROUPS) == 74
     assert '--basetemp=' in runner.CONTAINER_TEST and 'short_paths.confirm()' in runner.CONTAINER_TEST
     assert 'native_short_path_plugin' not in (ROOT / "tests/conftest.py").read_text()
     assert 'mktemp("runtime-image-input")' in (ROOT / "tests/test_production_admission_image_sources.py").read_text()

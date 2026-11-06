@@ -28,6 +28,7 @@ def source_sha256():
              "scripts/production_sender_driver.py", "scripts/sender_drain_inventory.py",
              "scripts/sender_host_loopback_pg.py",
              "scripts/retained_gateway_configuration.py", "scripts/retained_gateway_custody.py",
+             "scripts/retained_gateway_diagnostics.py",
              "scripts/observe_handoff_capacity.py", "scripts/production_admission_supervisor.py", "scripts/production_admission_watchdog.py", "scripts/sender_namespace_http.py")
     return gate._hash({name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in names})
 
