@@ -94,7 +94,13 @@ class HostLoopbackHarness(Harness):
 
     def launch(self, name, image_id, extra=(), command=(), *, memory=768 * 1024**2, pids=256):
         if name not in {"pg", "old-sender"}:
-            return super().launch(name, image_id, extra, command, memory=memory, pids=pids)
+            row = super().launch(name, image_id, extra, command, memory=memory, pids=pids)
+            if name == "fixture" and self.private_host_context is not None:
+                bindings = getattr(self, "sender_readiness_launch_identities", {})
+                gate._require(name not in bindings, "fixture readiness launch identity already bound")
+                bindings[name] = self._sender_readiness_identity(row, name)
+                self.sender_readiness_launch_identities = bindings
+            return row
         actual = self.prefix + "-" + name
         self.names[name], self.images[name] = actual, image_id
         self.created.append(name)
@@ -147,6 +153,17 @@ class HostLoopbackHarness(Harness):
                       "owned running loopback PostgreSQL identity required")
         return {key: row[key] for key in ("Id", "Name", "Image", "Created", "RestartCount")} | {
             "Pid": state["Pid"], "StartedAt": state["StartedAt"]}
+
+    def fixture_ready(self):
+        if getattr(self, "private_host_context", None) is None:
+            return super().fixture_ready()
+        from scripts.verify_production_activation_native import ActivationHarness
+        return ActivationHarness.fixture_ready(self)
+
+    def _sender_readiness_identity(self, row, role):
+        gate._require(role == "fixture", "only the fixed host-loopback fixture may use this probe")
+        from scripts.verify_production_activation_native import ActivationHarness
+        return ActivationHarness._sender_readiness_identity(self, row, role)
 
     def _preserve_command_failure(self, observation):
         from scripts.verify_production_activation_native import ActivationHarness

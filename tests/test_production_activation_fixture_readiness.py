@@ -17,10 +17,12 @@ from scripts import verify_miniflux_pause_native as common
 from services import admission_fence as gate
 
 
-@pytest.fixture
-def rig(tmp_path, monkeypatch):
+@pytest.fixture(params=["activation", "host_loopback"])
+def rig(tmp_path, monkeypatch, request):
     previous = os.umask(0o077)
-    harness = object.__new__(native.ActivationHarness)
+    from scripts.production_sender_bootstrap_native import HostLoopbackHarness
+    cls = native.ActivationHarness if request.param == "activation" else HostLoopbackHarness
+    harness = object.__new__(cls)
     harness.output, harness.sequence, harness.started = tmp_path, 0, time.monotonic()
     harness.phase_deadline, harness.env = None, {}
     harness.password, harness.token, harness.auth = "unused-password", "unused-token", "private-synthetic-auth"
