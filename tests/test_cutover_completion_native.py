@@ -572,7 +572,7 @@ def test_fixed_partition_keeps_every_file_once_and_programs_bind_collection():
     from collections import Counter
     runner.validate_groups()
     assert [(name, len(files)) for name, files in runner.TEST_GROUPS] == [
-        ("foundation", 22), ("activation", 17), ("adapters", 35)]
+        ("foundation", 22), ("activation", 18), ("adapters", 34)]
     assert "tests/test_production_sender_bootstrap_direct131.py" in dict(runner.TEST_GROUPS)["activation"]
     assert "tests/test_production_sender_bootstrap_direct131.py" not in dict(runner.TEST_GROUPS)["adapters"]
     assert "tests/test_production_legacy_takeover.py" in dict(runner.TEST_GROUPS)["activation"]
@@ -581,6 +581,8 @@ def test_fixed_partition_keeps_every_file_once_and_programs_bind_collection():
     assert "tests/test_release_gate_node.py" not in dict(runner.TEST_GROUPS)["adapters"]
     assert "tests/test_retained_gateway_socket_diagnostics.py" in dict(runner.TEST_GROUPS)["activation"]
     assert "tests/test_retained_gateway_socket_diagnostics.py" not in dict(runner.TEST_GROUPS)["adapters"]
+    assert "tests/test_retained_gateway_configuration.py" in dict(runner.TEST_GROUPS)["activation"]
+    assert "tests/test_retained_gateway_configuration.py" not in dict(runner.TEST_GROUPS)["adapters"]
     assert "tests/test_production_sender_bootstrap_host_native.py" in dict(runner.TEST_GROUPS)["activation"]
     assert "tests/test_production_sender_bootstrap_host_native.py" not in dict(runner.TEST_GROUPS)["adapters"]
     selected = []
@@ -1397,3 +1399,34 @@ def test_gate_node_partition_cannot_omit_or_duplicate_the_new_whole_file(monkeyp
                             ("activation", activation), ("adapters", adapters)))
         with pytest.raises(ValueError, match="omit or duplicate"):
             runner.validate_groups()
+
+
+@pytest.mark.parametrize("drift", ["missing", "duplicate"])
+def test_gateway_configuration_repartition_cannot_omit_or_duplicate_whole_file(monkeypatch, drift):
+    groups = dict(runner.TEST_GROUPS)
+    moved = "tests/test_retained_gateway_configuration.py"
+    if drift == "missing":
+        groups["activation"] = tuple(path for path in groups["activation"] if path != moved)
+    else:
+        groups["adapters"] += (moved,)
+    monkeypatch.setattr(runner, "TEST_GROUPS", tuple(groups.items()))
+    with pytest.raises(ValueError, match="omit or duplicate"):
+        runner.validate_groups()
+
+
+@pytest.mark.parametrize("count,accepted", [(0, False), (2000, True), (2001, False)])
+def test_repartition_keeps_original_case_budget_boundary(tmp_path, count, accepted):
+    owner, _factory = short_path_case(tmp_path, ["initial"])
+    try:
+        assert owner.MAX_CASES == 2000
+        collection = SimpleNamespace(items=[SimpleNamespace(nodeid=f"case-{i}") for i in range(count)])
+        if accepted:
+            owner.bind_collection(collection)
+            assert len(owner.collection) == count
+        else:
+            with pytest.raises(ValueError, match="collection is invalid"):
+                owner.bind_collection(collection)
+        assert not owner.used and owner.path.read_bytes() == b""
+        assert not (owner.fixtures / "TMP_PATH_MAP_FINAL.json").exists()
+    finally:
+        owner.close()
