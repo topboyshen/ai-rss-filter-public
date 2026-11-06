@@ -80,7 +80,9 @@ def validate_image(row, *, expected_id=None):
 
 
 def source_sha256():
-    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    path = Path(__file__)
+    names = (path.name, "retained_gateway_diagnostics.py")
+    return gate._hash({name: hashlib.sha256(path.with_name(name).read_bytes()).hexdigest() for name in names})
 
 
 def identity(row):

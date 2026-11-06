@@ -217,6 +217,7 @@ def assert_runtime_image(value):
 
 def test_retained_gateway_helpers_import_only_from_actual_copy_layout(shared_image_input):
     """No host controller, Docker access, or ambient checkout may supply imports."""
+    from scripts import retained_gateway_configuration as retained
     value = shared_image_input
     check_shared_input(value)
     layout = value["layout"]
@@ -236,13 +237,51 @@ assert 'scripts.private_release_contract' not in sys.modules
 assert 'scripts.production_gateway_switch' not in sys.modules
 assert 'scripts.production_legacy_takeover' not in sys.modules
 assert sys.modules['scripts.retained_gateway_diagnostics']._SCOPE.get() is None
-print(json.dumps({'imported': list(names), 'host_controller_loaded': False}))
+print(json.dumps({'imported': list(names), 'host_controller_loaded': False,
+                  'retained_source_sha256': sys.modules['scripts.retained_gateway_configuration'].source_sha256()}))
 """
     result = subprocess.run([sys.executable, "-I", "-B", "-c", program, str(layout)], cwd="/",
                             capture_output=True, text=True, timeout=10, check=False)
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout) == {"imported": list(names), "host_controller_loaded": False}
+    assert json.loads(result.stdout) == {"imported": list(names), "host_controller_loaded": False,
+                                        "retained_source_sha256": retained.source_sha256()}
     check_shared_input(value)
+
+
+@pytest.mark.parametrize("name", ["retained_gateway_configuration.py", "retained_gateway_diagnostics.py"])
+@pytest.mark.parametrize("operation", ["modify", "remove"])
+def test_retained_hash_binds_each_runtime_sibling_input(tmp_path, shared_image_input, name, operation):
+    check_shared_input(shared_image_input)
+    projection = tmp_path / "isolated-retained-layout"
+    copy_image_directory(shared_image_input["layout"], projection)
+    program = """
+import hashlib, json, pathlib, sys
+layout, name, operation = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+sys.path.insert(0, str(layout))
+from scripts import retained_gateway_configuration as retained
+assert pathlib.Path(retained.__file__) == layout / 'scripts/retained_gateway_configuration.py'
+before = retained.source_sha256()
+path = layout / 'scripts' / name
+if operation == 'modify':
+    path.write_bytes(path.read_bytes() + b'\\n# synthetic dependency mutation\\n')
+    after = retained.source_sha256()
+    assert before != after
+    print(json.dumps({'changed': True, 'missing_rejected': False}))
+else:
+    path.unlink()
+    try:
+        retained.source_sha256()
+    except FileNotFoundError as error:
+        assert pathlib.Path(error.filename) == path
+        print(json.dumps({'changed': False, 'missing_rejected': True}))
+    else:
+        raise AssertionError('missing source dependency accepted')
+"""
+    result = subprocess.run([sys.executable, "-I", "-B", "-c", program, str(projection), name, operation],
+                            cwd="/", capture_output=True, text=True, timeout=10, check=False)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"changed": operation == "modify", "missing_rejected": operation == "remove"}
+    check_shared_input(shared_image_input)
 
 
 def missing_projection(tmp_path, shared, missing):
