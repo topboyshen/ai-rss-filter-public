@@ -326,6 +326,9 @@ def run_report(options, token):
     result["safe_evidence"] = packet
     if not packet["complete"]:
         result["execution_status"], result["status"] = result["status"], "unconfirmed"
+    if len(namespace._encoded(result)) + 1 > EXPORT_BYTES:
+        result.pop("locations", None)
+        result.pop("diagnostic_schema", None)
     gate._require(len(namespace._encoded(result)) + 1 <= EXPORT_BYTES, "safe stdout export bound")
     return result
 

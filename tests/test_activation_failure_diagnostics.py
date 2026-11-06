@@ -125,3 +125,17 @@ def test_namespace_locator_failure_keeps_primary_rejection(monkeypatch):
     result = namespace_native.run_report({}, "a" * 64)
     assert result["error_type"] == "AdmissionError" and result["locations"] == []
     assert "SECRET" not in json.dumps(result)
+
+
+def test_namespace_optional_locations_never_displace_original_safe_packet(monkeypatch):
+    evidence = {"complete": True, "padding": ""}
+    monkeypatch.setattr(namespace_native, "safe_export", lambda *a: dict(evidence))
+    monkeypatch.setattr(namespace_native, "execute_owned", lambda *a: namespace_native._receipt({}, {}, "", "", set()))
+    first = namespace_native.run_report({}, "a" * 64)
+    assert first.pop("locations")
+    first.pop("diagnostic_schema")
+    evidence["padding"] = "x" * (namespace_native.EXPORT_BYTES - 1 - len(namespace_native.namespace._encoded(first)))
+    value = namespace_native.run_report({}, "a" * 64)
+    assert len(namespace_native.namespace._encoded(value)) + 1 == namespace_native.EXPORT_BYTES
+    assert value["error_type"] == "AdmissionError" and value["error_sha256"] == first["error_sha256"]
+    assert value["safe_evidence"] == evidence and "locations" not in value and "diagnostic_schema" not in value
