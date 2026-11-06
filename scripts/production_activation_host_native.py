@@ -888,6 +888,9 @@ def safe_activation(value):
     failure = value.get("failure")
     if isinstance(failure, dict):
         result["failure_locations"] = safe_failure_locations(failure.get("locations"))
+        nested = startup.safe_nested_diagnostic(failure.get("native_command"))
+        if nested is not None:
+            result["failure_native_command"] = nested
         result["failure_message_sha256"] = (failure.get("message_sha256") if
             re.fullmatch(r"[0-9a-f]{64}", str(failure.get("message_sha256"))) else None)
         result["failure_type_sha256"] = hashlib.sha256(host.encoded(failure.get("type"))).hexdigest()

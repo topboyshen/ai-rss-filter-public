@@ -85,5 +85,69 @@ class OperationsNativeGateTests(unittest.TestCase):
         self.assertIn('"AI_FILTER_HANDOFF_EVIDENCE_DIR=/evidence"', source)
 
 
+class OperationsFailureDiagnosticTests(unittest.TestCase):
+    def summary(self, **changes):
+        import json
+        value = {"status": "failed", "tests_run": 3, "failures": 1, "errors": 0, "skipped": 0,
+                 "failure_coordinates": [], "secret": "SECRET_CANARY"}
+        value.update(changes)
+        return json.dumps(value) + "\n"
+
+    def diagnostic(self, stdout, state=None, rc=1, repo=None, files=()):
+        import io
+        import json
+        stream = io.StringIO()
+        with patch.object(MODULE.sys, "stderr", stream):
+            MODULE.emit_failure_diagnostic(stdout, state, rc, repo or Path("/nonexistent"), files)
+        self.assertLessEqual(len(stream.getvalue().encode()), 4096)
+        self.assertNotIn("SECRET", stream.getvalue())
+        value = json.loads(stream.getvalue())
+        self.assertIs(value["execution_proof"], False)
+        self.assertIs(value["full_raw_archive_verified"], False)
+        return value
+
+    def test_separate_exit_running_oom_and_client_outcomes(self):
+        for code, running, rc in ((1, False, 1), (0, True, None), (None, False, None)):
+            with self.subTest(code=code, running=running):
+                value = self.diagnostic(self.summary(), {"State": {"ExitCode": code, "Running": running,
+                                       "OOMKilled": False, "Error": "SECRET_CANARY"}}, rc)
+                self.assertEqual((value["exit_code"], value["running"], value["client_returncode"]), (code, running, rc))
+                self.assertEqual(value["tests"]["failures"], 1)
+
+    def test_untrusted_incomplete_ambiguous_and_oversize_summary(self):
+        for raw in (None, "", "SECRET" * 100000, self.summary()[:-4],
+                    self.summary().replace('"failures": 1', '"failures": 1,"failures": 0'),
+                    self.summary(tests_run=True), self.summary(failure_coordinates=[{}] * 9)):
+            with self.subTest(raw_length=len(raw) if raw else 0):
+                value = self.diagnostic(raw, {"State": {"ExitCode": True, "Running": "SECRET", "OOMKilled": 0}})
+                self.assertIsNone(value["tests"])
+                self.assertIsNone(value["exit_code"])
+                self.assertIsNone(value["running"])
+
+    def test_source_validated_coordinates_omit_arbitrary_names_and_text(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "tests").mkdir()
+            (repo / "tests/test_public.py").write_text("def test_public():\n    assert False, 'SECRET'\n")
+            rows = [{"file": "tests/test_public.py", "line": 2},
+                    {"file": "tests/test_public.py", "line": 999}, {"file": "/tmp/SECRET", "line": 1}]
+            value = self.diagnostic(self.summary(failure_coordinates=rows), repo=repo, files=("tests/test_public.py",))
+            self.assertEqual(value["tests"]["locations"], [{"file": "tests/test_public.py", "line": 2, "function": "test_public"}])
+
+    def test_subtest_parameters_and_exception_messages_never_project(self):
+        from types import SimpleNamespace
+        trace = '  File "/work/tests/test_handoff_operations_native.py", line 28, in test_exact_success\n    SECRET\nAssertionError: SECRET'
+        result = SimpleNamespace(failures=[(object(), trace)] * 20, errors=[(object(), "SECRET")])
+        rows = MODULE.test_failure_coordinates(result)
+        self.assertEqual(len(rows), 8)
+        self.assertEqual(rows[0], {"file": "tests/test_handoff_operations_native.py", "line": 28})
+
+    def test_diagnostic_output_failure_is_optional(self):
+        with patch.object(MODULE.sys, "stderr") as stream:
+            stream.write.side_effect = OSError("SECRET")
+            MODULE.emit_failure_diagnostic(self.summary(), None, None, Path("/unused"), ())
+
+
 if __name__ == "__main__":
     unittest.main()

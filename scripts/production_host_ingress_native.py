@@ -243,6 +243,34 @@ def retain_first_failure(root, error):
         error.add_note("first host-entry failure preservation failed: " + type(evidence_error).__name__)
 
 
+def safe_command_failure(value):
+    """Strict small projection; no argv, stream bytes, host identifiers or paths."""
+    keys = {"execution_proof", "operation", "sequence", "returncode", "elapsed_seconds", "budget_seconds", "error"}
+    if type(value) is not dict or set(value) != keys or value.get("execution_proof") is not False:
+        return None
+    if (type(value["operation"]) is not str or value["operation"] not in DIAGNOSTIC_OPERATIONS
+            or type(value["error"]) is not str or value["error"] not in DIAGNOSTIC_ERRORS | {"unrecognized"}
+            or type(value["sequence"]) is not int or not 1 <= value["sequence"] <= 1000000
+            or not (value["returncode"] is None or type(value["returncode"]) is int and -255 <= value["returncode"] <= 255)):
+        return None
+    for key in ("elapsed_seconds", "budget_seconds"):
+        number = value[key]
+        if type(number) not in (int, float) or not math.isfinite(number) or not 0 <= number <= 3600:
+            return None
+    return dict(value)
+
+
+def retain_command_failure(error, args, sequence, record):
+    try:
+        value = {"execution_proof": False, "operation": diagnostic_operation(args), "sequence": sequence,
+                 "returncode": record["returncode"], "elapsed_seconds": round(record["elapsed"], 6),
+                 "budget_seconds": round(record["deadline_monotonic"] - record["started_monotonic"], 6),
+                 "error": type(error).__name__ if type(error).__name__ in DIAGNOSTIC_ERRORS else "unrecognized"}
+        error.native_host_command = safe_command_failure(value)
+    except BaseException:
+        pass  # Neither observation nor attachment changes the command outcome.
+
+
 class Commands:
     def __init__(self, root, deadline):
         self.root, self.deadline, self.sequence, self.peer = root, deadline, 0, None
@@ -303,6 +331,7 @@ class Commands:
                 else:
                     failure = evidence_error
         if failure:
+            retain_command_failure(failure, args, self.sequence, record)
             raise failure
         return result
 

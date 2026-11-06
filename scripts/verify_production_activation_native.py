@@ -1052,6 +1052,9 @@ def record_failure(error, repo, output, stage, *, private_commands=None):
     commands = command_diagnostics.safe_summary(private_commands)
     if commands is not None:
         failure["private_commands"] = summary["private_commands"] = commands
+    nested = startup_native.safe_nested_diagnostic(getattr(error, "native_command_diagnostic", None))
+    if nested is not None:
+        failure["native_command"] = summary["native_command"] = nested
     socket_summary = socket_diagnostics.error_summary(error)
     if socket_summary is not None:
         failure["socket_listener"] = summary["socket_listener"] = socket_summary

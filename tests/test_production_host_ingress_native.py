@@ -1273,3 +1273,32 @@ def test_log_thread_creation_failure_registers_live_daemon_before_outermost_hold
             stream.close()
         for _read_fd, write_fd in pairs:
             os.close(write_fd)
+
+
+@pytest.mark.parametrize("field,value", [("operation", "SECRET"), ("error", "SECRET"),
+    ("execution_proof", True), ("sequence", True), ("returncode", True),
+    ("elapsed_seconds", float("inf")), ("budget_seconds", -1), ("extra", "SECRET")])
+def test_command_failure_rejects_unsafe_projection(field, value):
+    row = {"execution_proof": False, "operation": "docker_info", "sequence": 1, "returncode": None,
+           "elapsed_seconds": 3.01, "budget_seconds": 2.99, "error": "ProofError"}
+    row[field] = value
+    assert native.safe_command_failure(row) is None
+
+
+def test_real_failed_client_keeps_original_bytes_and_command_outcome(tmp_path):
+    commands = native.Commands(tmp_path, time.monotonic() + 5)
+    with pytest.raises(native.ProofError, match="command failed; outcome retained") as caught:
+        commands.run([sys.executable, "-c", "import sys;print('SECRET_CANARY');sys.exit(19)"])
+    row = caught.value.native_host_command
+    assert row["returncode"] == 19 and row["operation"] == "other" and row["execution_proof"] is False
+    assert 0 < row["budget_seconds"] <= 3 and "SECRET" not in json.dumps(row)
+    assert (tmp_path / "command-0001.stdout").read_bytes() == b"SECRET_CANARY\n"
+    assert commands.uncertain_mutation is False
+
+
+def test_command_diagnostic_attachment_failure_keeps_exact_error(monkeypatch):
+    error = native.ProofError("SECRET")
+    monkeypatch.setattr(native, "safe_command_failure", lambda *a: (_ for _ in ()).throw(OSError("SECRET")))
+    native.retain_command_failure(error, [*native.DOCKER, "info"], 1,
+        {"returncode": None, "elapsed": 3, "deadline_monotonic": 5, "started_monotonic": 2})
+    assert str(error) == "SECRET" and not hasattr(error, "native_host_command")

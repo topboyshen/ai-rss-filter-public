@@ -298,12 +298,21 @@ def _interface_names(error):
     return {"count": value["count"], "names": names}
 
 
+def failure_locations(error):
+    try:
+        from scripts.verify_production_startup_native import public_exception_locations
+        return public_exception_locations(error)
+    except BaseException:
+        return []  # Optional evidence never masks the original rejection.
+
+
 def run_report(options, token):
     """Both success and failure produce a bounded safe stdout evidence packet."""
     try:
         result = execute_owned(options, token)
     except BaseException as error:
-        result = {"status": "unconfirmed", "error_type": type(error).__name__,
+        result = {"status": "unconfirmed", "diagnostic_schema": "namespace-helper-v1",
+                  "locations": failure_locations(error), "error_type": type(error).__name__,
                   "error_sha256": hashlib.sha256(str(error).encode()).hexdigest(),
                   "error_message_literal": _literal_message(error)}
         interfaces = _interface_names(error)

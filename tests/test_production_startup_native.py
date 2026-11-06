@@ -995,3 +995,65 @@ def test_dockerfile_default_index_unchanged_and_ci_step_overrides():
     assert workflow.count("STARTUP_PIP_INDEX_URL: https://pypi.org/simple") == 1
     step = workflow.split("- name: Actual application image migration and closed multiworker startup", 1)[1].split("- name:", 1)[0]
     assert "STARTUP_PIP_INDEX_URL: https://pypi.org/simple" in step
+
+
+def test_nested_namespace_failure_survives_both_archive_layers(diagnostic_source, tmp_path, capsys):
+    from scripts import production_activation_host_native as host
+    from scripts import verify_production_activation_native as activation
+    frame = {"file": diagnostic_source.name, "line": 2, "function": "fail"}
+    packet = {"status": "unconfirmed", "diagnostic_schema": "namespace-helper-v1",
+              "error_type": "RuntimeError", "locations": [frame], "token": "SECRET_TOKEN_CANARY"}
+    raw = json.dumps(packet).encode() + b"\n"
+    with pytest.raises(private.ContractError) as caught:
+        native.archive_command([sys.executable, "-c", "import sys;sys.stdout.buffer.write(" + repr(raw) + ");sys.exit(3)"],
+                               tmp_path / "NAMESPACE_PROCESS")
+    first = json.loads(capsys.readouterr().err)
+    assert first["locations"] == [frame]
+    failure = activation.record_failure(caught.value, native.DIAGNOSTIC_ROOT, tmp_path, "actual_fixed_network_namespace_transport")
+    capsys.readouterr()
+    projected = host.safe_activation({"status": "failed_or_evidence_insufficient", "failure": failure})
+    assert projected["failure_native_command"]["locations"] == [frame]
+    outer = {"status": "failed_or_evidence_insufficient", "activation": projected}
+    native._emit_archive_diagnostic([json.dumps(outer).encode(), b""], True)
+    record = json.loads(capsys.readouterr().err)
+    assert record["nested_command"] == {"exception_type": "RuntimeError", "locations": [frame], "execution_proof": False}
+    assert record["execution_proof"] is False and "SECRET_" not in json.dumps(record)
+    assert Path(str(tmp_path / "NAMESPACE_PROCESS") + ".stdout").read_bytes() == raw
+
+
+@pytest.mark.parametrize("change", ["proof", "extra", "line", "function", "external", "incomplete", "oversize", "duplicate"])
+def test_nested_failure_rejects_untrusted_or_incomplete_fields(diagnostic_source, capsys, change):
+    frame = {"file": diagnostic_source.name, "line": 2, "function": "fail"}
+    nested = {"exception_type": "RuntimeError", "locations": [frame], "execution_proof": False}
+    if change == "proof":
+        nested["execution_proof"] = True
+    elif change == "extra":
+        nested["raw"] = "SECRET_TOKEN_CANARY"
+    elif change == "line":
+        frame["line"] = 999999
+    elif change == "function":
+        frame["function"] = "SECRET_TOKEN_CANARY"
+    elif change == "external":
+        frame["file"] = "/tmp/SECRET_TOKEN_CANARY.py"
+    elif change == "oversize":
+        nested["locations"] = [frame] * 65
+    packet = {"status": "failed_or_evidence_insufficient", "activation": {
+        "status": "failed_or_evidence_insufficient", "failure_native_command": nested}}
+    raw = json.dumps(packet).encode()
+    if change == "duplicate":
+        raw = raw.replace(b'"execution_proof": false', b'"execution_proof": false,"execution_proof": true')
+    native._emit_archive_diagnostic([raw, b""], change != "incomplete")
+    record = json.loads(capsys.readouterr().err)
+    assert "nested_command" not in record and record["execution_proof"] is False
+    assert "SECRET_" not in json.dumps(record)
+
+
+def test_host_command_candidate_is_bounded_separate_evidence(capsys):
+    value = {"execution_proof": False, "operation": "docker_info", "sequence": 12,
+             "returncode": None, "elapsed_seconds": 3.01, "budget_seconds": 2.999, "error": "ProofError"}
+    packet = {"status": "unconfirmed", "private_host": {"result": {
+        "status": "failed_or_evidence_insufficient", "command_failure": value}}}
+    native._emit_archive_diagnostic([json.dumps(packet).encode(), b""], True)
+    result = json.loads(capsys.readouterr().err)
+    assert result["host_command"] == value and result["execution_proof"] is False
+    assert result["status"] == "no_verified_frames"

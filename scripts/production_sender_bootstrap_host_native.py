@@ -172,6 +172,7 @@ def inner_execute(root, plan):
         "error_type": type(failure).__name__ if failure else None,
         "error_sha256": hashlib.sha256(str(failure).encode()).hexdigest() if failure else None,
         "error_locations": failure_locations(failure) if failure else [],
+        "command_failure": host.safe_command_failure(getattr(failure, "native_host_command", None)),
         "drain_observation": getattr(context, "drain_observation", None),
         "production_access": False, "real_models": 0, "existing_126_modified": False,
         "elapsed_seconds": time.monotonic() - plan["started"], "operation_seconds": MAX_SECONDS}
