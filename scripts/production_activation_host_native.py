@@ -1336,6 +1336,10 @@ def safe_inventory(root, deadline, *, gateway_custody=False):
     if len(host.encoded(packet)) > 384 * 1024:
         for profile in profiles.values():
             if type(profile) is dict:
+                profile.pop("failure_native_command", None)
+    if len(host.encoded(packet)) > 384 * 1024:
+        for profile in profiles.values():
+            if type(profile) is dict:
                 profile.pop("failure_socket_listener", None)
     if len(host.encoded(packet)) > 384 * 1024:
         packet["failure_originals"] = {"status": "export_budget_exhausted"}
@@ -1420,6 +1424,8 @@ def _main(argv=None, *, _cli_started=None):
                "error_type": error_type(failure) if failure else inner_profile and inner_profile["error_type"],
                "error_sha256": hashlib.sha256(str(failure).encode()).hexdigest() if failure else inner_profile and inner_profile["error_sha256"],
                "elapsed_seconds": time.monotonic() - started, "production_access": False, "real_models": 0, "existing_126_modified": False}
+    if len(host.encoded(summary)) > 512 * 1024 and type(summary.get("activation")) is dict:
+        summary["activation"].pop("failure_native_command", None)
     if len(host.encoded(summary)) > 512 * 1024 and type(summary.get("activation")) is dict:
         summary["activation"].pop("failure_socket_listener", None)
     gate._require(len(host.encoded(summary)) <= 512 * 1024, "full-host summary encoding bound")

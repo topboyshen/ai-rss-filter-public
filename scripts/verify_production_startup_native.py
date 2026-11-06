@@ -283,11 +283,11 @@ def _emit_archive_diagnostic(captured, complete):
     try:
         raw = json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
         if len(raw.encode()) > DIAGNOSTIC_BYTES:
-            record.pop("socket_listener", None)
-            raw = json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
-        if len(raw.encode()) > DIAGNOSTIC_BYTES:
             record.pop("nested_command", None)
             record.pop("host_command", None)
+            raw = json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+        if len(raw.encode()) > DIAGNOSTIC_BYTES:
+            record.pop("socket_listener", None)
             raw = json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
         if len(raw.encode()) <= DIAGNOSTIC_BYTES:
             sys.stderr.write(raw)

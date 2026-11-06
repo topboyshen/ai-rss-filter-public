@@ -1057,3 +1057,18 @@ def test_host_command_candidate_is_bounded_separate_evidence(capsys):
     result = json.loads(capsys.readouterr().err)
     assert result["host_command"] == value and result["execution_proof"] is False
     assert result["status"] == "no_verified_frames"
+
+
+def test_new_job_fields_drop_before_existing_socket_diagnostic(diagnostic_source, monkeypatch, capsys):
+    frame = {"file": diagnostic_source.name, "line": 2, "function": "fail"}
+    packet = {"status": "failed_or_evidence_insufficient", "activation": {
+        "status": "failed_or_evidence_insufficient", "failure_native_command": {
+            "execution_proof": False, "exception_type": "RuntimeError", "locations": [frame]}}}
+    monkeypatch.setattr(native, "_stdout_socket_diagnostic", lambda raw: {"fixed_test": True})
+    native._emit_archive_diagnostic([json.dumps(packet).encode(), b""], True)
+    initial = json.loads(capsys.readouterr().err)
+    initial.pop("nested_command")
+    encoded = json.dumps(initial, sort_keys=True, separators=(",", ":")) + "\n"
+    monkeypatch.setattr(native, "DIAGNOSTIC_BYTES", len(encoded.encode()))
+    native._emit_archive_diagnostic([json.dumps(packet).encode(), b""], True)
+    assert json.loads(capsys.readouterr().err) == initial

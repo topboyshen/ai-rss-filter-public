@@ -1277,7 +1277,7 @@ def test_log_thread_creation_failure_registers_live_daemon_before_outermost_hold
 
 @pytest.mark.parametrize("field,value", [("operation", "SECRET"), ("error", "SECRET"),
     ("execution_proof", True), ("sequence", True), ("returncode", True),
-    ("elapsed_seconds", float("inf")), ("budget_seconds", -1), ("extra", "SECRET")])
+    ("elapsed_seconds", float("inf")), ("elapsed_seconds", 10**400), ("budget_seconds", -1), ("extra", "SECRET")])
 def test_command_failure_rejects_unsafe_projection(field, value):
     row = {"execution_proof": False, "operation": "docker_info", "sequence": 1, "returncode": None,
            "elapsed_seconds": 3.01, "budget_seconds": 2.99, "error": "ProofError"}

@@ -255,7 +255,7 @@ def safe_command_failure(value):
         return None
     for key in ("elapsed_seconds", "budget_seconds"):
         number = value[key]
-        if type(number) not in (int, float) or not math.isfinite(number) or not 0 <= number <= 3600:
+        if type(number) not in (int, float) or not 0 <= number <= 3600 or not math.isfinite(number):
             return None
     return dict(value)
 

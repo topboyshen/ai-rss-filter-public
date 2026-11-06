@@ -1338,3 +1338,55 @@ def test_route_probe_record_is_exported_redacted(tmp_path, monkeypatch):
     assert [r["path"].rsplit("/", 1)[1] for r in rows] == ["route-probe.stderr"]
     assert '"status": 503' in rows[0]["text"] and "failed_checks" in rows[0]["text"]
     assert "leakme123" not in rows[0]["text"]
+
+
+def test_nested_optional_profiles_drop_before_existing_failure_evidence(tmp_path, monkeypatch):
+    root = tmp_path / "originals"
+    folder = root / "inner/activation"
+    folder.mkdir(parents=True)
+    native.record(folder / "FAILURE.json", {})
+    native.record(folder / "RESULT.json", {"status": "failed_or_evidence_insufficient"})
+    monkeypatch.setattr(native.time, "monotonic", lambda: 100)
+    monkeypatch.setattr(native, "safe_activation", lambda value: {
+        "status": "failed_or_evidence_insufficient", "failure_locations": [],
+        "failure_native_command": {"execution_proof": False, "padding": "x" * 1800}})
+    evidence = {"status": "original_error", "padding": ""}
+    monkeypatch.setattr(native, "failure_originals", lambda *a: dict(evidence))
+    initial = native.safe_inventory(root, 600)
+    assert len(initial["profiles"]) == 2
+    for profile in initial["profiles"].values():
+        profile.pop("failure_native_command")
+    evidence["padding"] = "x" * (384 * 1024 - len(native.host.encoded(initial)))
+    value = native.safe_inventory(root, 600)
+    assert len(native.host.encoded(value)) == 384 * 1024
+    assert value["failure_originals"] == evidence
+    assert all("failure_native_command" not in p for p in value["profiles"].values())
+    assert value["complete"] is False and value["full_raw_archive_verified"] is False
+
+
+def test_nested_optional_summary_drops_before_original_packet(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "originals"
+    root.mkdir()
+    result = {**failed_child_result(), "activation_result": {"status": "failed_or_evidence_insufficient"}}
+    monkeypatch.setattr(native, "_arguments", lambda argv: SimpleNamespace(output=root, inside=False))
+    monkeypatch.setattr(native.host, "private_directory", lambda *a, **kw: None)
+    monkeypatch.setattr(native, "outer_execute", lambda *a: result)
+    monkeypatch.setattr(native, "record", lambda *a, **kw: None)
+    monkeypatch.setattr(native.time, "monotonic", lambda: 100)
+    monkeypatch.setattr(native, "safe_activation", lambda value: {
+        "status": "failed_or_evidence_insufficient", "failure_locations": [],
+        "failure_native_command": {"execution_proof": False, "padding": "x" * 1800}})
+    evidence = {"complete": False, "padding": ""}
+    monkeypatch.setattr(native, "safe_inventory", lambda *a: dict(evidence))
+    assert native._main([]) == 1
+    first = json.loads(capsys.readouterr().out)
+    first["activation"].pop("failure_native_command")
+    evidence["padding"] = "x" * (512 * 1024 - len(native.host.encoded(first)))
+    root = tmp_path / "second-originals"
+    root.mkdir()
+    assert native._main([]) == 1
+    value = json.loads(capsys.readouterr().out)
+    assert len(native.host.encoded(value)) == 512 * 1024
+    assert value["safe_evidence"] == evidence
+    assert "failure_native_command" not in value["activation"]
+    assert value["full_activation_verified"] is False

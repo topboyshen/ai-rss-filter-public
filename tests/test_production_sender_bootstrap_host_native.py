@@ -1075,3 +1075,26 @@ def test_original_combined_failure_budget_still_rejects_after_optional_payload_r
     monkeypatch.setattr(case.isolated.host, "encoded", encoded)
     assert case.run() == {"status": "export_budget_exhausted"}
     assert observed == [True, False]
+
+
+def test_optional_command_packet_counts_final_newline(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "outer"
+    result = {"status": "failed_or_evidence_insufficient", "padding": "", "command_failure": {
+        "execution_proof": False, "operation": "docker_info", "sequence": 1, "returncode": None,
+        "elapsed_seconds": 3, "budget_seconds": 3, "error": "ProofError"}}
+    monkeypatch.setattr(native, "arguments", lambda argv: SimpleNamespace(output=root, inside=False))
+    monkeypatch.setattr(native.host, "private_directory", lambda path, **kw: path.mkdir())
+    monkeypatch.setattr(native, "outer_execute", lambda *args: deepcopy(result))
+    monkeypatch.setattr(native.time, "monotonic", lambda: 100)
+    assert native.main([]) == 3
+    raw = capsys.readouterr().out
+    assert raw.endswith("\n")
+    result["padding"] = "x" * (512 * 1024 - (len(raw.encode()) - 1))
+    root = tmp_path / "outer-second"
+    assert native.main([]) == 3
+    raw = capsys.readouterr().out
+    value = json.loads(raw)
+    assert len(raw.encode()) <= 512 * 1024
+    assert "command_failure" not in value["private_host"]["result"]
+    assert value["private_host"]["result"]["padding"] == result["padding"]
+    assert value["status"] == "unconfirmed"

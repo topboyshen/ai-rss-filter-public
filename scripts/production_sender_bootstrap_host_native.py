@@ -267,6 +267,8 @@ def main(argv=None):
         except BaseException as error:
             packet["status"] = "unconfirmed"
             packet["safe_evidence"] = {"complete": False, "files": {}, "error_type": type(error).__name__}
+    if result is not None and len(gate._encoded(packet)) + 1 > 512 * 1024:
+        result.pop("command_failure", None)  # Optional data must not consume the outer capture allowance.
     print(gate._encoded(packet).decode(), flush=True)
     return 0 if packet["status"] == "passed" else 3
 
