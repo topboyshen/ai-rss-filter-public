@@ -30,6 +30,14 @@ from scripts import private_release_contract as private  # noqa: E402
 MODE, MAX_SECONDS, FINAL_SECONDS = "private-host-loopback131-v1", 180, 20
 
 
+def failure_locations(error):
+    """Unavailable diagnostics must never replace the original failure."""
+    try:
+        return isolated.startup.public_exception_locations(error)
+    except Exception:
+        return []
+
+
 def native_host_identity(context):
     """A receipt cannot satisfy this capability: recheck the actual live host."""
     gate._require(type(context) is isolated.PrivateHostContext, "exact live private host context required")
@@ -163,7 +171,7 @@ def inner_execute(root, plan):
         "bootstrap_result": result, "daemon_stop": stopped,
         "error_type": type(failure).__name__ if failure else None,
         "error_sha256": hashlib.sha256(str(failure).encode()).hexdigest() if failure else None,
-        "error_locations": isolated.startup.public_exception_locations(failure) if failure else [],
+        "error_locations": failure_locations(failure) if failure else [],
         "drain_observation": getattr(context, "drain_observation", None),
         "production_access": False, "real_models": 0, "existing_126_modified": False,
         "elapsed_seconds": time.monotonic() - plan["started"], "operation_seconds": MAX_SECONDS}
@@ -246,7 +254,7 @@ def main(argv=None):
             result = outer_execute(args, root, started)
     except BaseException as error:
         failure = {"error_type": type(error).__name__, "error_sha256": hashlib.sha256(str(error).encode()).hexdigest(),
-                   "error_locations": isolated.startup.public_exception_locations(error)}
+                   "error_locations": failure_locations(error)}
     finally:
         os.umask(previous)
     packet = {"status": "passed" if failure is None and result and result["status"] == "passed" else "unconfirmed",

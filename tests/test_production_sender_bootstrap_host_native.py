@@ -13,7 +13,8 @@ from services import admission_fence as gate
 
 
 @pytest.mark.parametrize("state", ["normal", "running", "uncertain", "primary_failure"])
-def test_bootstrap_completion_and_daemon_drain_have_separate_diagnostics(tmp_path, monkeypatch, state):
+@pytest.mark.parametrize("locator_failure", [False, True])
+def test_bootstrap_completion_and_daemon_drain_have_separate_diagnostics(tmp_path, monkeypatch, state, locator_failure):
     from scripts import production_offline_registry as registry
     isolated = native.isolated
     calls, records = [], {}
@@ -44,6 +45,10 @@ def test_bootstrap_completion_and_daemon_drain_have_separate_diagnostics(tmp_pat
     monkeypatch.setattr(native.host, "RETAINERS", {44: (SimpleNamespace(wait=lambda timeout: 0),)})
     bootstrap_result = {"status": "passed", "failure": None, "errors": []}
     primary = ConnectionRefusedError("SECRET_CONNECTION_CANARY")
+    if locator_failure:
+        def unavailable(*args, **kwargs):
+            raise OSError("SECRET_DIAGNOSTIC_CANARY")
+        monkeypatch.setattr(isolated.startup, "public_exception_locations", unavailable)
     def execute(*args, **kwargs):
         if state == "primary_failure":
             raise primary
@@ -62,10 +67,29 @@ def test_bootstrap_completion_and_daemon_drain_have_separate_diagnostics(tmp_pat
         assert value["status"] == "failed_or_evidence_insufficient" and value["daemon_stop"] is None
         assert "peer_check" not in calls and isolated.signal.SIGTERM not in calls
         assert value["error_type"] == ("ConnectionRefusedError" if state == "primary_failure" else "AdmissionError")
-        assert value["error_locations"]
+        assert bool(value["error_locations"]) is not locator_failure
+        assert records["INNER_RESULT.json"] == value
+        assert "SECRET_DIAGNOSTIC_CANARY" not in json.dumps(value)
         assert "SECRET_CONNECTION_CANARY" not in json.dumps(value)
         if state == "primary_failure":
             assert primary.__notes__ == ["private daemon retained: AdmissionError"]
+
+
+@pytest.mark.parametrize("locator_error", [OSError("secret-source"), SyntaxError("secret-source")])
+def test_cli_diagnostic_failure_keeps_original_structured_refusal(monkeypatch, capsys, locator_error):
+    def refused(*args):
+        raise ConnectionRefusedError("SECRET_CONNECTION_CANARY")
+    def unavailable(*args):
+        raise locator_error
+    monkeypatch.setattr(native, "arguments", refused)
+    monkeypatch.setattr(native.isolated.startup, "public_exception_locations", unavailable)
+    assert native.main([]) == 3
+    packet = json.loads(capsys.readouterr().out)
+    failure = packet["private_host"]["failure"]
+    assert packet["status"] == "unconfirmed" and failure["error_type"] == "ConnectionRefusedError"
+    assert failure["error_locations"] == []
+    assert failure["error_sha256"] == native.hashlib.sha256(b"SECRET_CONNECTION_CANARY").hexdigest()
+    assert "SECRET_CONNECTION_CANARY" not in json.dumps(packet) and "secret-source" not in json.dumps(packet)
 
 
 @pytest.fixture
