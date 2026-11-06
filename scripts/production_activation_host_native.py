@@ -906,7 +906,7 @@ def safe_activation(value):
                                         and re.fullmatch(r"[ -~]+", item) and not re.search(r"[0-9a-fA-F]{32,}", item) else None)
     from scripts import private_release_diagnostics as command_diagnostics
     result["private_commands"] = command_diagnostics.safe_summary(value.get("private_commands"))
-    for key in ("pg_readiness", "sender_readiness"):
+    for key in ("pg_readiness", "sender_readiness", "fixture_readiness"):
         readiness = value.get(key)
         result[key] = (dict(readiness) if type(readiness) is dict and set(readiness) == {"ready", "not_ready"}
             and all(type(item) is int and 0 <= item <= 10000 for item in readiness.values()) else None)

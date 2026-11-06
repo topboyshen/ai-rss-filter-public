@@ -115,6 +115,39 @@ print(json.dumps({'schema':1,'probe':'sender_healthcheck','nonce':p['nonce'],
  'status':status,'reason':reason},separators=(',',':')))
 '''
 
+FIXTURE_READINESS_PROBE = r'''import errno,ipaddress,json,re,sys,urllib.error,urllib.request
+p=json.load(sys.stdin)
+if (type(p) is not dict or set(p)!={'nonce','fixture_ip'}
+    or type(p['nonce']) is not str or re.fullmatch(r'[0-9a-f]{64}',p['nonce']) is None
+    or type(p['fixture_ip']) is not str):
+ raise ValueError('fixed fixture readiness input required')
+address=ipaddress.IPv4Address(p['fixture_ip'])
+if str(address)!=p['fixture_ip'] or address.is_loopback or address.is_unspecified or address.is_multicast:
+ raise ValueError('owned fixture IPv4 required')
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+ def redirect_request(self,req,fp,code,msg,headers,newurl): return None
+opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),NoRedirect())
+request=urllib.request.Request('http://'+str(address)+':8080/health',method='GET')
+status,reason='unknown','unknown'
+try:
+ with opener.open(request,timeout=12) as response:
+  body=response.read(513)
+  if response.status==200 and body==b'{"status":"synthetic_fixture_ready"}':
+   status,reason='ready','http200'
+  elif response.status==503: status,reason='not_ready','http503'
+except urllib.error.HTTPError as error:
+ if error.code==503: status,reason='not_ready','http503'
+ error.close()
+except urllib.error.URLError as error:
+ if isinstance(error.reason,OSError) and type(error.reason.errno) is int and error.reason.errno==errno.ECONNREFUSED:
+  status,reason='not_ready','econnrefused'
+except Exception:
+ # A timeout, protocol mismatch or other unknown result must remain blocking.
+ pass
+print(json.dumps({'schema':1,'probe':'fixture_healthcheck','nonce':p['nonce'],
+ 'status':status,'reason':reason},separators=(',',':')))
+'''
+
 
 class ActivationHarness(Harness):
     sender_role = "miniflux"
@@ -337,6 +370,60 @@ class ActivationHarness(Harness):
             counts = getattr(self, "sender_readiness_counts", {"ready": 0, "not_ready": 0})
             counts[record["status"]] += 1
             self.sender_readiness_counts = counts
+            return result["status"] == "ready"
+        except BaseException as error:
+            context.commands.uncertain_mutation = True
+            try:
+                self._preserve_command_failure(observation)
+            except BaseException as diagnostic_error:
+                error.add_note("command failure diagnostic unavailable: " + type(diagnostic_error).__name__)
+            raise
+
+    def fixture_ready(self):
+        context = getattr(self, "private_host_context", None)
+        if context is None:
+            return super().fixture_ready()
+        expected, observation = {}, {}
+        try:
+            from scripts import production_host_ingress_native as host
+            from scripts.production_activation_host_native import remaining
+            context.check()
+            bound = self.sender_readiness_launch_identities["fixture"]
+            before = self._sender_readiness_identity(json.loads(self.command(["inspect", bound["Id"]]))[0], "fixture")
+            gate._require(all(before[key] == bound[key] for key in ("Id", "Name", "Image", "Created", "NetworkID")),
+                          "fixture readiness target changed after launch")
+            nonce = os.urandom(32).hex()
+            raw = Harness.command(self, ["exec", "-i", bound["Id"], "python", "-B", "-c", FIXTURE_READINESS_PROBE],
+                                  stdin=json.dumps({"nonce": nonce, "fixture_ip": before["IPAddress"]}),
+                                  timeout=min(15, remaining(context.plan["active_deadline"])), allowed_failure=True,
+                                  command_result=expected, command_observation=observation)
+            sequence = self.sequence
+            saved = read_command_result(self.output / f"command-{sequence:04d}.json", sequence, expected)
+            gate._require(saved["returncode"] == 0 and type(raw) is str and len(raw.encode()) <= 512,
+                          "fixture readiness transport unconfirmed")
+            result = json.loads(raw)
+            gate._require(type(result) is dict and set(result) == {"schema", "probe", "nonce", "status", "reason"}
+                          and type(result["schema"]) is int and result["schema"] == 1
+                          and result["probe"] == "fixture_healthcheck" and result["nonce"] == nonce
+                          and (result["status"], result["reason"]) in {
+                              ("ready", "http200"), ("not_ready", "http503"), ("not_ready", "econnrefused")},
+                          "fixture readiness completion unconfirmed")
+            gate._require(raw == json.dumps({"schema": 1, "probe": "fixture_healthcheck", "nonce": nonce,
+                                            "status": result["status"], "reason": result["reason"]},
+                                           separators=(",", ":")) + "\n",
+                          "fixture readiness completion encoding changed")
+            after = self._sender_readiness_identity(json.loads(self.command(["inspect", bound["Id"]]))[0], "fixture")
+            context.check()
+            gate._require(after == before, "fixture readiness identity changed during probe")
+            record = {"schema": 1, "probe": "fixture_healthcheck", "sequence": sequence,
+                      "status": result["status"], "reason": result["reason"], "transport_returncode": 0,
+                      "nonce_sha256": hashlib.sha256(nonce.encode()).hexdigest(),
+                      "container_sha256": hashlib.sha256(private.encoded(before)).hexdigest(),
+                      "command_original_sha256": saved["original"]["sha256"]}
+            host.durable(self.output / f"FIXTURE_READINESS_{sequence:04d}.json", record)
+            counts = getattr(self, "fixture_readiness_counts", {"ready": 0, "not_ready": 0})
+            counts[record["status"]] += 1
+            self.fixture_readiness_counts = counts
             return result["status"] == "ready"
         except BaseException as error:
             context.commands.uncertain_mutation = True
@@ -1103,6 +1190,7 @@ def execute(repo, source, image_id, binary, output, *, private_host_context=None
         "failure": failure, "private_commands": commands,
         "pg_readiness": getattr(harness, "pg_readiness_counts", None),
         "sender_readiness": getattr(harness, "sender_readiness_counts", None),
+        "fixture_readiness": getattr(harness, "fixture_readiness_counts", None),
         "evidence_errors": evidence_errors, "elapsed_seconds": time.monotonic() - harness.started,
         "last_stage": harness.current_stage,
         "synthetic_only": True, "production_access": False, "existing_126_modified": False, "real_models": 0,
