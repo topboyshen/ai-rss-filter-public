@@ -271,6 +271,65 @@ def retain_command_failure(error, args, sequence, record):
         pass  # Neither observation nor attachment changes the command outcome.
 
 
+CAPTURE_PHASES = {"popen", "capture", "wait", "returncode", "peer_after", "input_readback", "read_output", "receipt"}
+CAPTURE_STAGES = {"open", "register", "deadline", "select", "read_stdout", "read_stderr", "output_bound",
+                  "write_stdout", "write_stderr", "unregister_stdout", "unregister_stderr"}
+CAPTURE_FINAL_STAGES = {"flush_stdout", "sync_stdout", "flush_stderr", "sync_stderr", "close_stdout", "close_stderr"}
+
+
+def safe_capture_diagnostic(value):
+    """Fixed Docker-info facts only; byte counts are pipe reads, not durable bytes.
+
+    The last read may exceed the original output bound and never reach the file.
+    EOF and finalized streams do not prove process exit or Docker API readiness.
+    """
+    if (type(value) is not dict or set(value) != {"schema", "execution_proof", "operation", "sequence",
+            "budget_seconds", "elapsed_seconds", "failure_phase", "capture", "client"}
+            or type(value["schema"]) is not int or value["schema"] != 1
+            or value["execution_proof"] is not False or value["operation"] != "docker_info"
+            or type(value["sequence"]) is not int or not 1 <= value["sequence"] <= 1000000
+            or type(value["failure_phase"]) is not str or value["failure_phase"] not in CAPTURE_PHASES):
+        return None
+    for key in ("budget_seconds", "elapsed_seconds"):
+        number = value[key]
+        if type(number) not in (int, float) or not 0 <= number <= 3600 or not math.isfinite(number):
+            return None
+    capture, client = value["capture"], value["client"]
+    bool_keys = {"started", "stdout_eof", "stderr_eof", "loop_completed", "finalization_completed"}
+    if (type(capture) is not dict or set(capture) != bool_keys | {
+            "stdout_bytes", "stderr_bytes", "failure_stage", "finalization_stage"}
+            or any(type(capture[key]) is not bool for key in bool_keys)):
+        return None
+    for key in ("stdout_bytes", "stderr_bytes"):
+        if type(capture[key]) is not int or not 0 <= capture[key] <= OUTPUT_BYTES + 65536:
+            return None
+    if capture["stdout_bytes"] + capture["stderr_bytes"] > OUTPUT_BYTES + 65536:
+        return None
+    for key, choices in (("failure_stage", CAPTURE_STAGES), ("finalization_stage", CAPTURE_FINAL_STAGES)):
+        if capture[key] is not None and (type(capture[key]) is not str or capture[key] not in choices):
+            return None
+    if (type(client) is not dict or set(client) != {"popen_returned", "returncode", "term_sent"}
+            or type(client["popen_returned"]) is not bool or type(client["term_sent"]) is not bool
+            or not (client["returncode"] is None or type(client["returncode"]) is int
+                    and -255 <= client["returncode"] <= 255)):
+        return None
+    return {**value, "capture": dict(capture), "client": dict(client)}
+
+
+def capture_diagnostic(args, sequence, record, capture, phase, process):
+    """Optional diagnostic failure cannot replace the original command refusal."""
+    if args != [*DOCKER, "info", "--format", "{{json .}}"] or capture is None:
+        return None
+    try:
+        return safe_capture_diagnostic({"schema": 1, "execution_proof": False, "operation": "docker_info",
+            "sequence": sequence, "budget_seconds": round(record["deadline_monotonic"] - record["started_monotonic"], 6),
+            "elapsed_seconds": round(record["elapsed"], 6), "failure_phase": phase, "capture": capture,
+            "client": {"popen_returned": process is not None, "returncode": record["returncode"],
+                       "term_sent": record.get("client_term_sent") is True}})
+    except BaseException:
+        return None
+
+
 class Commands:
     def __init__(self, root, deadline):
         self.root, self.deadline, self.sequence, self.peer = root, deadline, 0, None
@@ -290,21 +349,34 @@ class Commands:
         diagnostic_command(args, self.sequence)
         source = os.open(input_path, os.O_RDONLY | os.O_NOFOLLOW) if input_path else subprocess.DEVNULL
         process, failure, result = None, None, None
+        phase, failure_phase = "input_readback", None
+        capture = ({"started": False, "stdout_bytes": 0, "stderr_bytes": 0, "stdout_eof": False,
+                    "stderr_eof": False, "loop_completed": False, "failure_stage": None,
+                    "finalization_stage": None, "finalization_completed": False}
+                   if args == [*DOCKER, "info", "--format", "{{json .}}"] else None)
         try:
             if input_path:
                 require(file_proof(input_path, fd=source) == input_proof, "actual load input fd differs")
+            phase = "popen"
             process = subprocess.Popen(args, stdin=source, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                        env=self.env, start_new_session=True)
-            self._capture(process, stdout, stderr, end, IMAGE_BYTES if transfer and output_path else OUTPUT_BYTES)
+            phase = "capture"
+            self._capture(process, stdout, stderr, end, IMAGE_BYTES if transfer and output_path else OUTPUT_BYTES,
+                          **({"observation": capture} if capture is not None else {}))
+            phase = "wait"
             record["returncode"] = process.wait(timeout=max(0.001, end - time.monotonic()))
+            phase = "returncode"
             require(record["returncode"] == 0, "command failed; outcome retained")
             if self.peer and args[:len(DOCKER)] == DOCKER:
+                phase = "peer_after"
                 self.peer()
             if input_path:
+                phase = "input_readback"
                 require(file_proof(input_path, fd=source) == input_proof, "actual load input fd changed")
+            phase = "read_output"
             result = b"" if output_path else stdout.read_bytes()
         except BaseException as error:
-            failure = error
+            failure, failure_phase = error, phase
         finally:
             if input_path:
                 os.close(source)
@@ -323,44 +395,90 @@ class Commands:
             if process:
                 record["returncode"] = process.poll()
             diagnostic_command(args, self.sequence, record, failure)
+            if failure is not None:
+                observed = capture_diagnostic(args, self.sequence, record, capture, failure_phase, process)
+                if observed is not None:
+                    record["capture_diagnostic"] = observed
             try:
                 durable(base.with_suffix(".json"), record)
             except BaseException as evidence_error:
                 if failure:
                     failure.add_note("command evidence failure: " + type(evidence_error).__name__)
                 else:
-                    failure = evidence_error
+                    failure, failure_phase = evidence_error, "receipt"
         if failure:
             retain_command_failure(failure, args, self.sequence, record)
+            observed = capture_diagnostic(args, self.sequence, record, capture, failure_phase, process)
+            if observed is not None:
+                try:
+                    failure.native_host_capture = observed
+                except BaseException:
+                    pass  # Diagnostics never replace the refusal.
             raise failure
         return result
 
     @staticmethod
-    def _capture(process, stdout, stderr, end, limit, *, close_pipes=True):
+    def _capture(process, stdout, stderr, end, limit, *, close_pipes=True, observation=None):
         count = 0
-        with open(stdout, "xb") as out, open(stderr, "xb") as err, selectors.DefaultSelector() as poll:
-            os.chmod(stdout, 0o600)
-            os.chmod(stderr, 0o600)
-            for stream, target in [(process.stdout, out), (process.stderr, err)]:
-                poll.register(stream, selectors.EVENT_READ, target)
-            try:
-                while poll.get_map():
-                    require(time.monotonic() < end, "command deadline; outcome unknown")
-                    for key, _ in poll.select(max(0, min(0.1, end - time.monotonic()))):
-                        data = os.read(key.fileobj.fileno(), 65536)
-                        count += len(data)
-                        require(count <= limit, "command output limit; partial retained")
-                        if data:
-                            key.data.write(data)
-                        else:
-                            poll.unregister(key.fileobj)
-            finally:
-                for stream in (out, err):
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                if close_pipes:
-                    process.stdout.close()
-                    process.stderr.close()
+        if observation is not None:
+            observation["started"] = True
+        stage = "open"
+        try:
+            with open(stdout, "xb") as out, open(stderr, "xb") as err, selectors.DefaultSelector() as poll:
+                os.chmod(stdout, 0o600)
+                os.chmod(stderr, 0o600)
+                for stream, target in [(process.stdout, out), (process.stderr, err)]:
+                    stage = "register"
+                    poll.register(stream, selectors.EVENT_READ, target)
+                try:
+                    while poll.get_map():
+                        stage = "deadline"
+                        require(time.monotonic() < end, "command deadline; outcome unknown")
+                        stage = "select"
+                        for key, _ in poll.select(max(0, min(0.1, end - time.monotonic()))):
+                            stream_name = "stdout" if key.data is out else "stderr"
+                            stage = "read_" + stream_name
+                            data = os.read(key.fileobj.fileno(), 65536)
+                            count += len(data)
+                            if observation is not None:
+                                observation[stream_name + "_bytes"] += len(data)
+                                if not data:
+                                    observation[stream_name + "_eof"] = True
+                            stage = "output_bound"
+                            require(count <= limit, "command output limit; partial retained")
+                            if data:
+                                stage = "write_" + stream_name
+                                key.data.write(data)
+                            else:
+                                stage = "unregister_" + stream_name
+                                poll.unregister(key.fileobj)
+                    if observation is not None:
+                        observation["loop_completed"] = True
+                except BaseException:
+                    if observation is not None:
+                        observation["failure_stage"] = stage
+                    raise
+                finally:
+                    for stream_name, stream in (("stdout", out), ("stderr", err)):
+                        if observation is not None:
+                            observation["finalization_stage"] = "flush_" + stream_name
+                        stream.flush()
+                        if observation is not None:
+                            observation["finalization_stage"] = "sync_" + stream_name
+                        os.fsync(stream.fileno())
+                    if close_pipes:
+                        if observation is not None:
+                            observation["finalization_stage"] = "close_stdout"
+                        process.stdout.close()
+                        if observation is not None:
+                            observation["finalization_stage"] = "close_stderr"
+                        process.stderr.close()
+                    if observation is not None:
+                        observation["finalization_completed"] = True
+        except BaseException:
+            if observation is not None and observation["failure_stage"] is None and not observation["loop_completed"]:
+                observation["failure_stage"] = stage
+            raise
 
     def docker(self, args, **kwargs):
         try:

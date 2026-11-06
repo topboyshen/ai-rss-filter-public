@@ -1098,3 +1098,163 @@ def test_optional_command_packet_counts_final_newline(tmp_path, monkeypatch, cap
     assert "command_failure" not in value["private_host"]["result"]
     assert value["private_host"]["result"]["padding"] == result["padding"]
     assert value["status"] == "unconfirmed"
+
+
+@pytest.mark.parametrize("diagnostic_error", [None, OSError("SECRET_DIAGNOSTIC"), TimeoutError("SECRET_TIMEOUT")])
+def test_early_projection_uses_original_remaining_hard_deadline_and_keeps_failure(tmp_path, monkeypatch, diagnostic_error):
+    from contextlib import contextmanager
+    from scripts import production_gateway_switch as switch
+    result = {"status": "failed_or_evidence_insufficient", "bootstrap_result": None, "daemon_stop": None,
+              "error_type": "ProofError", "error_sha256": "a" * 64}
+    failure = {"error_type": "ConnectionRefusedError", "error_sha256": "b" * 64}
+    packet = {"status": "unconfirmed", "private_host": {"result": deepcopy(result), "failure": deepcopy(failure)},
+              "safe_evidence": {"complete": False, "files": {}}}
+    entered = []
+    @contextmanager
+    def bounded(seconds):
+        entered.append(seconds)
+        yield
+        entered.append("exit")
+    def export(root, actual, end):
+        assert entered == [7.0] and end == 280 and actual == result
+        if diagnostic_error:
+            raise diagnostic_error
+        return {"complete": False, "execution_proof": False, "status": "diagnostic_only"}
+    monkeypatch.setattr(native.time, "monotonic", lambda: 273.0)
+    monkeypatch.setattr(switch, "_hard_deadline", bounded)
+    monkeypatch.setattr(native.early, "export", export)
+    monkeypatch.setattr(native.bootstrap, "safe_export", lambda *a: pytest.fail("no bootstrap original exists"))
+    native.export_diagnostics(packet, tmp_path, 280)
+    assert entered[0] == 7.0 and packet["private_host"] == {"result": result, "failure": failure}
+    assert packet["status"] == "unconfirmed" and not packet["safe_evidence"]["complete"]
+    assert "SECRET" not in json.dumps(packet)
+
+
+def test_expired_export_does_not_read_files_or_get_fresh_budget(tmp_path, monkeypatch):
+    from scripts import production_gateway_switch as switch
+    packet = {"status": "unconfirmed", "private_host": {"result": None, "failure": {"error_type": "ProofError"}},
+              "safe_evidence": {"complete": False, "files": {}}}
+    monkeypatch.setattr(native.time, "monotonic", lambda: 280.0)
+    monkeypatch.setattr(switch, "_hard_deadline", lambda *a: pytest.fail("expired run received a new deadline"))
+    monkeypatch.setattr(native.early, "export", lambda *a: pytest.fail("expired run attempted reads"))
+    native.export_diagnostics(packet, tmp_path, 280)
+    assert packet["early_diagnostics"]["status"] == "evidence_insufficient"
+    assert packet["private_host"]["failure"] == {"error_type": "ProofError"}
+
+
+@pytest.mark.parametrize("resource_failure", [False, True])
+def test_daemon_start_failure_records_resources_without_confirming_cleanup(tmp_path, monkeypatch, resource_failure):
+    from scripts import production_offline_registry as registry
+    records, actions = {}, []
+    plan = {"started": 100.0, "active_deadline": 260.0, "deadline": 280.0, "bundle": {}, "parent": {}}
+    primary = gate.AdmissionError("SECRET_PRIMARY")
+    primary.native_host_command = {"execution_proof": False, "operation": "docker_info", "sequence": 11,
+        "returncode": None, "elapsed_seconds": 3.001, "budget_seconds": 3.0, "error": "AdmissionError"}
+    monkeypatch.setattr(native.os, "setsid", lambda: None)
+    monkeypatch.setattr(native.time, "monotonic", lambda: 120.0)
+    monkeypatch.setattr(native.host, "proc_identity", lambda *a: {"netns": 3})
+    monkeypatch.setattr(native.host, "restrict_private_ipv6", lambda *a: None)
+    monkeypatch.setattr(native.isolated, "FullCommands", lambda *a: SimpleNamespace())
+    monkeypatch.setattr(native.isolated, "prepare_mounts", lambda *a: None)
+    monkeypatch.setattr(registry, "serve_bundle", lambda *a, **kw: nullcontext(SimpleNamespace(url="synthetic")))
+    def start(*args):
+        raise primary
+    monkeypatch.setattr(native.isolated, "start_daemon", start)
+    monkeypatch.setattr(native.isolated, "stop_daemon", lambda *a: pytest.fail("start did not return a context"))
+    def resources(actual):
+        actions.append("resources")
+        assert actual == plan
+        if resource_failure:
+            raise gate.AdmissionError("SECRET_RESOURCE_GUARD")
+        return {"fixed_counters": True}
+    monkeypatch.setattr(native.isolated, "resource_check", resources)
+    monkeypatch.setattr(native.isolated, "record", lambda path, value, **kw: records.update({path.name: deepcopy(value)}))
+    value = native.inner_execute(tmp_path, plan)
+    assert actions == ["resources"]
+    assert value["bootstrap_result"] is value["daemon_stop"] is value["drain_observation"] is None
+    assert value["status"] == "failed_or_evidence_insufficient"
+    assert value["error_sha256"] == native.hashlib.sha256(b"SECRET_PRIMARY").hexdigest()
+    assert value["command_failure"]["sequence"] == 11
+    assert ("RESOURCES_FINAL.json" in records) is not resource_failure
+    assert (value["resource_diagnostic_failure"] is not None) is resource_failure
+    assert "SECRET" not in json.dumps(value) and records["INNER_RESULT.json"] == value
+
+
+def test_bootstrap_export_also_stays_inside_original_hard_deadline(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    from scripts import production_gateway_switch as switch
+    path = tmp_path / "inner/bootstrap"
+    path.mkdir(parents=True)
+    (path / "RESULT.json").write_text("{}")
+    active = []
+    @contextmanager
+    def bounded(seconds):
+        assert seconds == 5
+        active.append(True)
+        yield
+        active.pop()
+    monkeypatch.setattr(native.time, "monotonic", lambda: 275.0)
+    monkeypatch.setattr(switch, "_hard_deadline", bounded)
+    monkeypatch.setattr(native.early, "export", lambda *a: {"status": "not_applicable_bootstrap_started"})
+    def export(path):
+        assert active == [True]
+        return {"complete": True, "files": {}}
+    monkeypatch.setattr(native.bootstrap, "safe_export", export)
+    packet = {"status": "passed", "private_host": {"result": {"bootstrap_result": {"status": "passed"}}}}
+    native.export_diagnostics(packet, tmp_path, 280.0)
+    assert packet["status"] == "passed" and packet["safe_evidence"]["complete"]
+
+
+def test_final_packet_budget_includes_later_bootstrap_export(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "first"
+    result = {"status": "passed", "bootstrap_result": {"status": "passed"}, "padding": ""}
+    safe = {"complete": True, "files": {"retained": "s" * (200 * 1024)}}
+    def directory(path, **kwargs):
+        leaf = path / "inner/bootstrap"
+        leaf.mkdir(parents=True)
+        (leaf / "RESULT.json").write_text("{}")
+    monkeypatch.setattr(native, "arguments", lambda argv: SimpleNamespace(output=root, inside=False))
+    monkeypatch.setattr(native.host, "private_directory", directory)
+    monkeypatch.setattr(native, "outer_execute", lambda *args: deepcopy(result))
+    monkeypatch.setattr(native.time, "monotonic", lambda: 100)
+    monkeypatch.setattr(native.early, "export", lambda *args: {"status": "diagnostic_only", "fixed": "d" * 15000})
+    monkeypatch.setattr(native.bootstrap, "safe_export", lambda *args: deepcopy(safe))
+    assert native.main([]) == 0
+    first = capsys.readouterr().out
+    result["padding"] = "p" * (512 * 1024 - len(first.encode()) + 1000)
+    root = tmp_path / "second"
+    assert native.main([]) == 0  # Optional diagnostics do not change the independent operational result.
+    raw = capsys.readouterr().out
+    packet = json.loads(raw)
+    assert len(raw.encode()) <= 512 * 1024
+    assert packet["early_diagnostics"]["reason_code"] == "outer_packet_budget_exhausted"
+    assert packet["early_diagnostics"]["status"] == "evidence_insufficient"
+    assert packet["private_host"]["result"] == result and packet["safe_evidence"] == safe
+
+
+def test_still_oversized_packet_is_refused_without_printing_success(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "oversize"
+    result = {"status": "passed", "padding": "p" * (512 * 1024)}
+    monkeypatch.setattr(native, "arguments", lambda argv: SimpleNamespace(output=root, inside=False))
+    monkeypatch.setattr(native.host, "private_directory", lambda path, **kw: path.mkdir())
+    monkeypatch.setattr(native, "outer_execute", lambda *args: deepcopy(result))
+    monkeypatch.setattr(native.time, "monotonic", lambda: 100)
+    monkeypatch.setattr(native.early, "export", lambda *args: {"status": "not_applicable_bootstrap_started"})
+    with pytest.raises(gate.AdmissionError, match="host131 output budget exhausted"):
+        native.main([])
+    assert capsys.readouterr().out == "" and result["padding"] == "p" * (512 * 1024)
+
+
+def test_caught_early_deadline_does_not_allow_subsequent_bootstrap_stat(tmp_path, monkeypatch):
+    now = [275.0]
+    packet = {"status": "unconfirmed", "private_host": {"result": None, "failure": {"error_type": "ProofError"}},
+              "safe_evidence": {"complete": False, "files": {}}}
+    monkeypatch.setattr(native.time, "monotonic", lambda: now[0])
+    def export(*args):
+        now[0] = 280.0
+        return {"status": "evidence_insufficient", "reason_code": "original_deadline_exhausted"}
+    monkeypatch.setattr(native.early, "export", export)
+    monkeypatch.setattr(Path, "exists", lambda *args: pytest.fail("deadline exhausted before next stat"))
+    native.export_diagnostics(packet, tmp_path, 280.0)
+    assert packet["status"] == "unconfirmed" and packet["safe_evidence"]["complete"] is False
+    assert packet["private_host"]["failure"] == {"error_type": "ProofError"}

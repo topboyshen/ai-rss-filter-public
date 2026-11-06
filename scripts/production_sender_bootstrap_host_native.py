@@ -26,6 +26,7 @@ from scripts import production_host_ingress_native as host  # noqa: E402
 from scripts import production_native_deadline as deadline  # noqa: E402
 from scripts import production_sender_bootstrap_native as bootstrap  # noqa: E402
 from scripts import private_release_contract as private  # noqa: E402
+from scripts import production_early_start_evidence as early  # noqa: E402
 
 MODE, MAX_SECONDS, FINAL_SECONDS = "private-host-loopback131-v1", 180, 20
 
@@ -140,7 +141,7 @@ def inner_execute(root, plan):
     host.restrict_private_ipv6(commands, root, plan, holder)
     isolated.prepare_mounts(commands, root)
     isolated.record(root / "HOLDER.json", holder)
-    process = context = logs = result = stopped = failure = None
+    process = context = logs = result = stopped = failure = resource_failure = None
     try:
         with registry.serve_bundle(root.parent / "bundle", plan["bundle"], expected_netns=holder["netns"],
                                    parent_identity=plan["parent"], deadline=plan["active_deadline"]) as mirror:
@@ -167,12 +168,20 @@ def inner_execute(root, plan):
                     failure.add_note("private daemon retained: " + type(error).__name__)
                 else:
                     failure = error
+        if failure is not None:
+            try:
+                isolated.remaining(plan["deadline"])
+                isolated.record(root / "RESOURCES_FINAL.json", isolated.resource_check(plan))
+            except BaseException as error:
+                resource_failure = early.failure(error)
     value = {"status": "passed" if failure is None and stopped is not None else "failed_or_evidence_insufficient",
         "bootstrap_result": result, "daemon_stop": stopped,
         "error_type": type(failure).__name__ if failure else None,
         "error_sha256": hashlib.sha256(str(failure).encode()).hexdigest() if failure else None,
         "error_locations": failure_locations(failure) if failure else [],
         "command_failure": host.safe_command_failure(getattr(failure, "native_host_command", None)),
+        "command_capture": host.safe_capture_diagnostic(getattr(failure, "native_host_capture", None)),
+        "resource_diagnostic_failure": resource_failure,
         "drain_observation": getattr(context, "drain_observation", None),
         "production_access": False, "real_models": 0, "existing_126_modified": False,
         "elapsed_seconds": time.monotonic() - plan["started"], "operation_seconds": MAX_SECONDS}
@@ -233,6 +242,25 @@ def arguments(argv=None):
     return args
 
 
+def export_diagnostics(packet, root, end):
+    """Diagnostic reads share the original deadline, including blocking I/O."""
+    from scripts.production_gateway_switch import _hard_deadline
+    if root is None:
+        packet["early_diagnostics"] = {"status": "evidence_insufficient", "execution_proof": False,
+                                       "reason_code": "original_root_unavailable"}
+        return
+    try:
+        with _hard_deadline(isolated.remaining(end)):
+            packet["early_diagnostics"] = early.export(root, packet["private_host"]["result"], end)
+            isolated.remaining(end)  # A caught diagnostic deadline must not permit another file read.
+            if (root / "inner/bootstrap/RESULT.json").exists():
+                packet["safe_evidence"] = bootstrap.safe_export(root / "inner/bootstrap")
+    except BaseException as error:
+        packet.setdefault("early_diagnostics", early.failure(error) | {"execution_proof": False})
+        packet["status"] = "unconfirmed"
+        packet["safe_evidence"] = {"complete": False, "files": {}, "error_type": type(error).__name__}
+
+
 def main(argv=None):
     started, previous = time.monotonic(), os.umask(0o077)
     root, failure, result = None, None, None
@@ -261,14 +289,13 @@ def main(argv=None):
     packet = {"status": "passed" if failure is None and result and result["status"] == "passed" else "unconfirmed",
         "private_host": {"mode": MODE, "operation_seconds": MAX_SECONDS,
                          "result": result, "failure": failure}, "safe_evidence": {"complete": False, "files": {}}}
-    if root is not None and (root / "inner/bootstrap/RESULT.json").exists():
-        try:
-            packet["safe_evidence"] = bootstrap.safe_export(root / "inner/bootstrap")
-        except BaseException as error:
-            packet["status"] = "unconfirmed"
-            packet["safe_evidence"] = {"complete": False, "files": {}, "error_type": type(error).__name__}
+    export_diagnostics(packet, root, started + MAX_SECONDS)
     if result is not None and len(gate._encoded(packet)) + 1 > 512 * 1024:
         result.pop("command_failure", None)  # Optional data must not consume the outer capture allowance.
+    if len(gate._encoded(packet)) + 1 > 512 * 1024:
+        packet["early_diagnostics"] = {"status": "evidence_insufficient", "execution_proof": False,
+                                       "reason_code": "outer_packet_budget_exhausted"}
+    gate._require(len(gate._encoded(packet)) + 1 <= 512 * 1024, "host131 output budget exhausted")
     print(gate._encoded(packet).decode(), flush=True)
     return 0 if packet["status"] == "passed" else 3
 
