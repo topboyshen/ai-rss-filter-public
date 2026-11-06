@@ -5,12 +5,16 @@ import hashlib
 import json
 from pathlib import Path
 import signal
+import subprocess
+import sys
 import time
 from types import SimpleNamespace
 
 import pytest
 
 from scripts import production_host_ingress_native as native
+
+REAL_POPEN = subprocess.Popen
 
 
 @pytest.fixture(autouse=True)
@@ -287,7 +291,7 @@ def test_fixed_daemon_start_diagnostics_export_redacted_text_and_info_receipt(tm
     root.mkdir()
     first = sample_failure()
     first.update(stage="daemon_start")
-    first["last_command"].update(operation="docker_info", sequence=14)
+    first["last_command"].update(operation="docker_info", sequence=14, elapsed_seconds=3.001197)
     raw = b'time="now" level=error msg="failed plugin load"\ntoken=private-token /private/daemon/path\n'
     native.durable(root / "daemon.stderr", raw)
     native.durable(root / "command-0014.json", {"argv": [*native.DOCKER, "info", "--format", "{{json .}}"],
@@ -304,7 +308,8 @@ def test_fixed_daemon_start_diagnostics_export_redacted_text_and_info_receipt(tm
     assert "failed plugin load" in rows["daemon.stderr"]["profile"]["text"]
     assert rows["command-0014.json"]["profile"] == {
         "operation": "docker_info", "returncode": None, "elapsed_seconds": 3.001197,
-        "client_term_sent": True, "outcome": "unknown", "execution_proof": False}
+        "client_term_sent": True, "outcome": "unknown", "execution_proof": False,
+        "capture_status": "not_present_unknown"}
     assert rows["STOP.json"]["profile"]["cleanup_claimed"] is True
     assert rows["STOP.json"]["profile"]["cleanup_confirmed"] is False
     assert result["cleanup_confirmed"] is False
@@ -411,3 +416,276 @@ def test_cleanup_claim_requires_independent_normal_daemon_and_retainer(tmp_path,
     result = {"cleanup_confirmed": False}
     native.failure_evidence(tmp_path, time.monotonic() + 2, result)
     assert result["cleanup_confirmed"] is confirmed
+
+
+def fixed_info_receipt():
+    capture = {"schema": 1, "execution_proof": False, "operation": "docker_info", "sequence": 14,
+        "budget_seconds": 3.0, "elapsed_seconds": 3.001197, "failure_phase": "capture",
+        "capture": {**native.capture_observation(), "started": True, "failure_stage": "deadline",
+                    "finalization_stage": "close_stderr", "finalization_completed": True},
+        "client": {"popen_returned": True, "returncode": None, "term_sent": True}}
+    return {"argv": [*native.DOCKER, "info", "--format", "{{json .}}"], "returncode": None,
+        "elapsed": 3.001197, "started_monotonic": 100.0, "deadline_monotonic": 103.0,
+        "transfer": False, "client_term_sent": True, "capture_diagnostic": capture}
+
+
+def test_fixed_info_capture_exports_bound_original_not_stream_contents(tmp_path):
+    value = fixed_info_receipt()
+    path = tmp_path / "command-0014.json"
+    native.durable(path, value)
+    raw = path.read_bytes()
+    profile = native.info_command_profile(path)
+    assert profile["capture_diagnostic"] == value["capture_diagnostic"]
+    assert profile["capture_status"] == "available" and profile["outcome"] == "unknown"
+    assert profile["capture_scope"] == "pipe_read_observations_not_durable_bytes"
+    assert profile["execution_proof"] is False and "argv" not in profile
+    assert path.read_bytes() == raw
+
+
+@pytest.mark.parametrize("fault", ["sequence", "budget", "elapsed", "returncode", "term", "transfer",
+    "nan", "infinity", "negative_budget", "over_budget", "boolean_rc", "term_string", "negative_clock",
+    "raw_extra", "unknown_phase", "bytes_limit"])
+def test_fixed_info_capture_conflicts_fail_without_replacing_original(tmp_path, fault):
+    value = fixed_info_receipt()
+    capture = value["capture_diagnostic"]
+    if fault in {"sequence", "budget", "elapsed"}:
+        capture[{"sequence": "sequence", "budget": "budget_seconds", "elapsed": "elapsed_seconds"}[fault]] += 1
+    elif fault == "returncode":
+        capture["client"]["returncode"] = 0
+    elif fault == "term":
+        capture["client"]["term_sent"] = False
+    elif fault == "transfer":
+        value["transfer"] = True
+    elif fault in {"nan", "infinity"}:
+        value["started_monotonic"] = float("nan" if fault == "nan" else "inf")
+    elif fault in {"negative_budget", "over_budget"}:
+        delta = -1 if fault == "negative_budget" else 4
+        value["deadline_monotonic"] = 100 + delta
+        capture["budget_seconds"] = delta
+    elif fault == "boolean_rc":
+        value["returncode"] = False
+    elif fault == "term_string":
+        value["client_term_sent"] = "false"
+        capture["client"]["term_sent"] = False
+    elif fault == "negative_clock":
+        value.update(started_monotonic=-4.0, deadline_monotonic=-1.0)
+    elif fault == "raw_extra":
+        capture["stdout"] = "private-message"
+    elif fault == "unknown_phase":
+        capture["failure_phase"] = "private-message"
+    else:
+        capture["capture"]["stdout_bytes"] = native.OUTPUT_BYTES + 65537
+    path = tmp_path / "command-0014.json"
+    raw = json.dumps(value).encode()
+    native.durable(path, raw)
+    with pytest.raises(native.ProofError):
+        native.info_command_profile(path)
+    assert path.read_bytes() == raw
+
+
+def resource_values():
+    return {"memory.max": str(native.MEMORY), "memory.swap.max": "0", "pids.max": str(native.PIDS),
+        "cpu.max": native.CPU, "memory.current": "100", "memory.peak": "200",
+        "memory.events": "low 0\nhigh 0\nmax 1\noom 1\noom_kill 1",
+        "pids.current": "6", "cpu.stat": "usage_usec 12\nuser_usec 10\nsystem_usec 2",
+        "cgroup.procs": ""}
+
+
+def private_resource_fixture(tmp_path, monkeypatch):
+    parent = tmp_path / "cgroup"
+    parent.mkdir(mode=0o700)
+    plan = {"owner": "a" * 32, "cgroup": "/ai-filter-host-" + "a" * 32,
+            "deadline": time.monotonic() + 20}
+    root = parent / plan["cgroup"].lstrip("/")
+    root.mkdir(mode=0o700)
+    for key, value in resource_values().items():
+        (root / key).write_text(value + "\n")
+    monkeypatch.setattr(native, "CGROUP", parent)
+    return plan, root
+
+
+def test_failure_resource_observation_preserves_oom_and_projects_only_counters(tmp_path, monkeypatch):
+    plan, _root = private_resource_fixture(tmp_path, monkeypatch)
+    raw = native.startup_resources(plan, plan["deadline"])
+    assert raw == resource_values() and raw["memory.events"].endswith("oom_kill 1")
+    raw["cgroup.procs"] = "987654321\n123456789"
+    projected = native.startup_resource_profile(raw)
+    assert projected["memory.events"]["oom"] == projected["memory.events"]["oom_kill"] == 1
+    assert projected["cgroup.procs"] == {"count": 2, "nonempty": True}
+    assert "987654321" not in json.dumps(projected) and "123456789" not in json.dumps(projected)
+
+
+@pytest.mark.parametrize("fault", ["owner", "path", "directory_link", "field_link", "hardlink", "writable", "over_limit", "expired"])
+def test_failure_resource_observation_never_follows_or_widens(tmp_path, monkeypatch, fault):
+    plan, root = private_resource_fixture(tmp_path, monkeypatch)
+    private = tmp_path / "private-original"
+    private.write_text("secret_token_do_not_read")
+    if fault == "owner":
+        plan["owner"] = "../../private-original"
+    elif fault == "path":
+        plan["cgroup"] = "/different"
+    elif fault == "directory_link":
+        root.rename(tmp_path / "original-resource-dir")
+        root.symlink_to(tmp_path / "original-resource-dir", target_is_directory=True)
+    elif fault == "field_link":
+        (root / "memory.max").unlink()
+        (root / "memory.max").symlink_to(private)
+    elif fault == "hardlink":
+        native.os.link(root / "memory.max", tmp_path / "field-alias")
+    elif fault == "writable":
+        (root / "memory.max").chmod(0o666)
+    elif fault == "over_limit":
+        (root / "memory.max").write_text("1" * 1025)
+    else:
+        plan["deadline"] = time.monotonic() - 1
+    with pytest.raises((OSError, native.ProofError)):
+        native.startup_resources(plan, plan["deadline"])
+    assert private.read_text() == "secret_token_do_not_read"
+
+
+@pytest.mark.parametrize("key,text", [("memory.max", "secret_token"), ("memory.current", "max"),
+    ("pids.max", "01"), ("cpu.max", "1 2 3"), ("memory.events", "oom 0\noom_kill 0\nprivate 2"),
+    ("memory.events", "oom 0\noom 1\noom_kill 0"), ("cpu.stat", "secret 1"),
+    ("cgroup.procs", "private"), ("cgroup.procs", "1\n1")])
+def test_startup_resource_public_profile_rejects_unknown_or_private_text(key, text):
+    values = resource_values()
+    values[key] = text
+    with pytest.raises(native.ProofError):
+        native.startup_resource_profile(values)
+
+
+def test_live_daemon_observation_shares_existing_reader_without_flush_or_wait(tmp_path, monkeypatch):
+    observation = {**native.capture_observation(), "started": True, "stderr_bytes": 14000}
+    logs = SimpleNamespace(observation=observation, thread=SimpleNamespace(is_alive=lambda: True), error=None)
+    process = SimpleNamespace(poll=lambda: None)
+    plan = {"owner": "a" * 32}
+    monkeypatch.setattr(native, "LIVE_DAEMONS", [(process, logs, tmp_path, plan)])
+    result = native.startup_stream_state(tmp_path, plan)
+    assert result["capture"] == observation and result["capture"] is not observation
+    assert result["thread_alive"] is True and result["daemon_returncode"] is None
+    assert result["execution_proof"] is False and result["capture"]["finalization_completed"] is False
+    assert native.startup_stream_state(tmp_path, dict(plan)) == {"status": "not_present_unknown"}
+
+
+def test_daemon_reader_passes_same_observation_without_extra_reader_or_flush(tmp_path, monkeypatch):
+    logs = object.__new__(native.DaemonLogs)
+    logs.process, logs.error, logs.observation = object(), None, native.capture_observation()
+    calls = []
+    def capture(process, stdout, stderr, end, limit, *, close_pipes, observation):
+        calls.append((process, stdout, stderr, end, limit, close_pipes))
+        assert observation is logs.observation
+        observation["started"] = True
+    monkeypatch.setattr(native.Commands, "_capture", capture)
+    logs._read(tmp_path)
+    assert len(calls) == 1 and calls[0][-1] is False and logs.observation["started"] is True
+
+
+@pytest.mark.parametrize("fault", [None, "resource", "write", "timer", "expired"])
+def test_early_start_snapshot_never_changes_primary_or_resets_deadline(tmp_path, monkeypatch, fault):
+    native.DIAGNOSTICS["stage"] = "daemon_start"
+    clock, budgets, calls = [100.0], [], []
+    monkeypatch.setattr(native.time, "monotonic", lambda: clock[0])
+    plan = {"deadline": 100.4}
+    primary = native.ProofError("primary-info-unknown")
+    @contextmanager
+    def bound(seconds):
+        budgets.append(seconds)
+        yield
+    monkeypatch.setattr(native.gateway, "_hard_deadline", bound)
+    def resources(_plan, end):
+        assert end == 100.4
+        calls.append("resources")
+        if fault == "timer":
+            raise native.gateway.gate.AdmissionUncertain("gateway blocking operation deadline; outcome unknown")
+        if fault == "resource":
+            raise PermissionError("private resource unavailable")
+        return resource_values()
+    monkeypatch.setattr(native, "startup_resources", resources)
+    monkeypatch.setattr(native, "startup_stream_state", lambda *_: calls.append("streams") or {"status": "not_present_unknown"})
+    if fault == "write":
+        monkeypatch.setattr(native, "durable", lambda *_: (_ for _ in ()).throw(OSError("write failed")))
+    if fault == "expired":
+        clock[0] = 101.0
+    native.retain_startup_observation(tmp_path, plan, primary)
+    assert str(primary) == "primary-info-unknown"
+    if fault in {"timer", "expired", "write"}:
+        assert hasattr(primary, "native_startup_observation_error")
+        assert not (tmp_path / "START_OBSERVATION.json").exists()
+    else:
+        value = json.loads((tmp_path / "START_OBSERVATION.json").read_bytes())
+        profile = native.startup_observation_profile(value)
+        assert profile["execution_proof"] is False
+        assert profile["status"] == ("evidence_insufficient" if fault == "resource" else "diagnostic_only")
+    assert budgets == ([] if fault == "expired" else [pytest.approx(0.4)])
+    if fault in {"timer", "expired"}:
+        assert "streams" not in calls
+
+
+def test_inner_start_failure_records_observation_but_never_enters_cleanup_or_next_stage(tmp_path, monkeypatch):
+    plan = {"owner": "a" * 32, "cgroup": "/ai-filter-host-" + "a" * 32,
+            "deadline": time.monotonic() + 20, "parent": {"netns": 1, "mntns": 1}}
+    primary, calls = native.ProofError("command deadline; outcome unknown"), []
+    monkeypatch.setattr(native, "Commands", lambda *_: SimpleNamespace())
+    monkeypatch.setattr(native, "proc_identity", lambda _: {"netns": 2, "mntns": 2,
+                        "cgroup": plan["cgroup"] + "/supervisor"})
+    monkeypatch.setattr(native, "restrict_private_ipv6", lambda *_: None)
+    def start(*_):
+        calls.append("start")
+        raise primary
+    monkeypatch.setattr(native, "start_daemon", start)
+    monkeypatch.setattr(native, "startup_resources", lambda *_: resource_values())
+    monkeypatch.setattr(native, "stop_owned", lambda *_: pytest.fail("unknown daemon cannot be cleaned up"))
+    with pytest.raises(native.ProofError) as caught:
+        native.inner_proof(tmp_path, plan)
+    assert caught.value is primary and calls == ["start"]
+    first = json.loads((tmp_path / "FIRST_FAILURE.json").read_bytes())
+    assert first["stage"] == "daemon_start" and first["error"]["literal"] == str(primary)
+    value = json.loads((tmp_path / "START_OBSERVATION.json").read_bytes())
+    assert native.startup_observation_profile(value)["resources"]["value"]["memory.events"]["oom_kill"] == 1
+    assert not (tmp_path / "CLEANUP.json").exists() and not (tmp_path / "RESULT.json").exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="requires SIGALRM hard deadline")
+@pytest.mark.parametrize("blocked", ["reader", "durable"])
+def test_real_alarm_bounds_startup_projection_and_keeps_original_error(tmp_path, monkeypatch, blocked):
+    monkeypatch.setattr(native.subprocess, "Popen", REAL_POPEN)
+    code = r'''
+import json, sys, time
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from scripts import production_host_ingress_native as h
+root, blocked = Path(sys.argv[2]), sys.argv[3]
+h.DIAGNOSTICS = {"stage": "daemon_start"}
+calls = []
+primary = h.ProofError("primary-info-unknown")
+def resources(*args):
+    calls.append("resources")
+    if blocked == "reader":
+        time.sleep(2)
+    return {}
+def streams(*args):
+    calls.append("streams")
+    return {}
+def write(*args):
+    calls.append("durable")
+    time.sleep(2)
+h.startup_resources, h.startup_stream_state, h.durable = resources, streams, write
+start = time.monotonic()
+try:
+    with h.gateway._hard_deadline(0.1):
+        h.retain_startup_observation(root, {"deadline": start + 1}, primary)
+except h.gateway.gate.AdmissionUncertain:
+    pass  # Original outer timer is never disabled/reset by the inner snapshot.
+print(json.dumps({"calls": calls, "elapsed": time.monotonic() - start, "primary": str(primary),
+                  "diagnostic_error": getattr(primary, "native_startup_observation_error", None)}))
+'''
+    result = subprocess.run([sys.executable, "-I", "-B", "-c", code,
+        str(Path(native.__file__).resolve().parents[1]), str(tmp_path), blocked],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3, check=False)
+    assert result.returncode == 0, result.stderr.decode()
+    observed = json.loads(result.stdout)
+    assert observed["calls"] == (["resources"] if blocked == "reader" else ["resources", "streams", "durable"])
+    assert 0.02 <= observed["elapsed"] < 0.75
+    assert observed["primary"] == "primary-info-unknown"
+    assert observed["diagnostic_error"]["type"] == "AdmissionUncertain"
+    assert list(tmp_path.iterdir()) == []

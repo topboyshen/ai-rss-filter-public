@@ -277,6 +277,30 @@ CAPTURE_STAGES = {"open", "register", "deadline", "select", "read_stdout", "read
 CAPTURE_FINAL_STAGES = {"flush_stdout", "sync_stdout", "flush_stderr", "sync_stderr", "close_stdout", "close_stderr"}
 
 
+def capture_observation():
+    return {"started": False, "stdout_bytes": 0, "stderr_bytes": 0, "stdout_eof": False,
+            "stderr_eof": False, "loop_completed": False, "failure_stage": None,
+            "finalization_stage": None, "finalization_completed": False}
+
+
+def safe_capture_state(capture):
+    bool_keys = {"started", "stdout_eof", "stderr_eof", "loop_completed", "finalization_completed"}
+    if (type(capture) is not dict or set(capture) != bool_keys | {
+            "stdout_bytes", "stderr_bytes", "failure_stage", "finalization_stage"}
+            or any(type(capture[key]) is not bool for key in bool_keys)):
+        return None
+    capture = dict(capture)  # Live daemon observation is not an atomic filesystem snapshot.
+    for key in ("stdout_bytes", "stderr_bytes"):
+        if type(capture[key]) is not int or not 0 <= capture[key] <= OUTPUT_BYTES + 65536:
+            return None
+    if capture["stdout_bytes"] + capture["stderr_bytes"] > OUTPUT_BYTES + 65536:
+        return None
+    for key, choices in (("failure_stage", CAPTURE_STAGES), ("finalization_stage", CAPTURE_FINAL_STAGES)):
+        if capture[key] is not None and (type(capture[key]) is not str or capture[key] not in choices):
+            return None
+    return capture
+
+
 def safe_capture_diagnostic(value):
     """Fixed Docker-info facts only; byte counts are pipe reads, not durable bytes.
 
@@ -294,20 +318,9 @@ def safe_capture_diagnostic(value):
         number = value[key]
         if type(number) not in (int, float) or not 0 <= number <= 3600 or not math.isfinite(number):
             return None
-    capture, client = value["capture"], value["client"]
-    bool_keys = {"started", "stdout_eof", "stderr_eof", "loop_completed", "finalization_completed"}
-    if (type(capture) is not dict or set(capture) != bool_keys | {
-            "stdout_bytes", "stderr_bytes", "failure_stage", "finalization_stage"}
-            or any(type(capture[key]) is not bool for key in bool_keys)):
+    capture, client = safe_capture_state(value["capture"]), value["client"]
+    if capture is None:
         return None
-    for key in ("stdout_bytes", "stderr_bytes"):
-        if type(capture[key]) is not int or not 0 <= capture[key] <= OUTPUT_BYTES + 65536:
-            return None
-    if capture["stdout_bytes"] + capture["stderr_bytes"] > OUTPUT_BYTES + 65536:
-        return None
-    for key, choices in (("failure_stage", CAPTURE_STAGES), ("finalization_stage", CAPTURE_FINAL_STAGES)):
-        if capture[key] is not None and (type(capture[key]) is not str or capture[key] not in choices):
-            return None
     if (type(client) is not dict or set(client) != {"popen_returned", "returncode", "term_sent"}
             or type(client["popen_returned"]) is not bool or type(client["term_sent"]) is not bool
             or not (client["returncode"] is None or type(client["returncode"]) is int
@@ -350,9 +363,7 @@ class Commands:
         source = os.open(input_path, os.O_RDONLY | os.O_NOFOLLOW) if input_path else subprocess.DEVNULL
         process, failure, result = None, None, None
         phase, failure_phase = "input_readback", None
-        capture = ({"started": False, "stdout_bytes": 0, "stderr_bytes": 0, "stdout_eof": False,
-                    "stderr_eof": False, "loop_completed": False, "failure_stage": None,
-                    "finalization_stage": None, "finalization_completed": False}
+        capture = (capture_observation()
                    if args == [*DOCKER, "info", "--format", "{{json .}}"] else None)
         try:
             if input_path:
@@ -547,6 +558,94 @@ def resource_snapshot(path):
     events = dict(line.split() for line in result["memory.events"].splitlines())
     require(events.get("oom") == events.get("oom_kill") == "0", "namespace resource OOM")
     return result
+
+
+START_RESOURCE_FIELDS = ("memory.max", "memory.swap.max", "pids.max", "cpu.max", "memory.current",
+                         "memory.peak", "memory.events", "pids.current", "cpu.stat", "cgroup.procs")
+
+
+def startup_resources(plan, end):
+    """Failure-only fixed owned cgroup snapshot; limits/OOM never become a pass."""
+    owner = plan.get("owner")
+    require(isinstance(owner, str) and re.fullmatch(r"[0-9a-f]{32}", owner)
+            and plan.get("cgroup") == "/ai-filter-host-" + owner, "startup resource owner differs")
+    parent = os.open(CGROUP, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    directory = None
+    try:
+        directory = os.open("ai-filter-host-" + owner,
+                            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+        before = os.fstat(directory)
+        require(before.st_uid == os.geteuid() and not before.st_mode & 0o022, "unsafe startup resource directory")
+        values = {}
+        for name in START_RESOURCE_FIELDS:
+            require(time.monotonic() < end, "startup observation original deadline")
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=directory)
+            try:
+                info = os.fstat(fd)
+                require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and info.st_nlink == 1
+                        and not info.st_mode & 0o022, "unsafe startup resource field")
+                raw = os.read(fd, 1025)
+                require(len(raw) <= 1024 and not os.read(fd, 1) and re.fullmatch(rb"[a-z_0-9 \n]*", raw),
+                        "startup resource field capacity/shape")
+                values[name] = raw.decode("ascii").strip()
+            finally:
+                os.close(fd)
+        after = os.stat("ai-filter-host-" + owner, dir_fd=parent, follow_symlinks=False)
+        require((before.st_dev, before.st_ino, before.st_uid, before.st_mode) ==
+                (after.st_dev, after.st_ino, after.st_uid, after.st_mode), "startup resource directory changed")
+        return values
+    finally:
+        if directory is not None:
+            os.close(directory)
+        os.close(parent)
+
+
+def startup_stream_state(root, plan):
+    require(len(LIVE_DAEMONS) <= 8, "startup daemon observation capacity")
+    matches = [(process, logs) for process, logs, owned, bound in LIVE_DAEMONS if owned == root and bound is plan]
+    require(len(matches) <= 1, "startup daemon observation identity ambiguous")
+    if not matches:
+        return {"status": "not_present_unknown"}
+    process, logs = matches[0]
+    code = process.poll()
+    require(code is None or type(code) is int and -255 <= code <= 255, "startup daemon returncode invalid")
+    state = safe_capture_state(getattr(logs, "observation", None))
+    thread = getattr(logs, "thread", None)
+    error = getattr(logs, "error", None)
+    return {"status": "bounded_nonatomic_observation", "daemon_returncode": code,
+            "thread_alive": thread.is_alive() if thread is not None else None, "capture": state,
+            "capture_error": diagnostic_error(error) if error is not None else None,
+            "scope": "pipe_reads_not_durable_bytes_or_readiness", "execution_proof": False,
+            "flush_eof_exit_not_inferred_from_file_size": True}
+
+
+def retain_startup_observation(root, plan, primary):
+    """No new time window, command, signal, pipe reader or flush on failure."""
+    if DIAGNOSTICS is None or DIAGNOSTICS.get("stage") != "daemon_start":
+        return
+    try:
+        require(type(plan.get("deadline")) in (int, float) and math.isfinite(plan["deadline"])
+                and 0 < plan["deadline"] - time.monotonic() <= 180, "startup observation original deadline")
+        end = min(plan["deadline"], time.monotonic() + 1)
+        require(time.monotonic() < end, "startup observation original deadline")
+        with gateway._hard_deadline(end - time.monotonic()):
+            record = {"schema": 1, "execution_proof": False, "status": "diagnostic_only"}
+            for name, reader in (("resources", lambda: startup_resources(plan, end)),
+                                 ("streams", lambda: startup_stream_state(root, plan))):
+                try:
+                    require(time.monotonic() < end, "startup observation original deadline")
+                    record[name] = {"status": "available", "value": reader()}
+                except BaseException as error:
+                    if isinstance(error, gateway.gate.AdmissionUncertain):
+                        raise  # An expired inherited timer cannot authorize another read/write.
+                    record[name] = {"status": "evidence_insufficient", "error": diagnostic_error(error)}
+                    record["status"] = "evidence_insufficient"
+            require(time.monotonic() < end, "startup observation original deadline")
+            durable(root / "START_OBSERVATION.json", record)
+            require(time.monotonic() < end, "startup observation original deadline")
+    except BaseException as error:
+        primary.native_startup_observation_error = diagnostic_error(error)
+        primary.add_note("startup observation incomplete: " + type(error).__name__)
 
 
 def process_snapshot(plan, netns, *, container_pid=None):
@@ -868,6 +967,7 @@ class DaemonLogs:
     """
     def __init__(self, process, root):
         self.error, self.process, self.thread = None, process, None
+        self.observation = capture_observation()
         self.thread = threading.Thread(target=self._read, args=(root,), daemon=True)
         self.thread.start()
 
@@ -876,7 +976,7 @@ class DaemonLogs:
             # Infinite deadline is only for passive pipe preservation. The active
             # protocol is bounded independently; the retained process is capped.
             Commands._capture(self.process, root / "daemon.stdout", root / "daemon.stderr", float("inf"), OUTPUT_BYTES,
-                              close_pipes=False)
+                              close_pipes=False, observation=self.observation)
         except BaseException as error:
             self.error = error
 
@@ -1195,6 +1295,7 @@ def inner_proof(root, plan):
     except BaseException as error:
         failure = error
         retain_first_failure(root, error)
+        retain_startup_observation(root, plan, error)
     finally:
         if daemon and actual:
             try:
@@ -1487,7 +1588,7 @@ def diagnostic_text_original(path):
     text = rendered[:DIAGNOSTIC_TEXT_BYTES].decode("utf-8", errors="ignore")
     return {"bytes": proof["size"], "sha256": proof["sha256"], "text": text,
             "truncated": truncated, "source_window": "tail", "redacted": True,
-            "execution_proof": False}
+            "execution_proof": False, "writer_flush_and_eof_unconfirmed": True}
 
 
 def info_command_profile(path):
@@ -1498,20 +1599,110 @@ def info_command_profile(path):
     require((code is None or type(code) is int and -255 <= code <= 255)
             and type(elapsed) in {int, float} and math.isfinite(elapsed) and 0 <= elapsed <= 180,
             "invalid fixed Docker info receipt")
-    return {"operation": "docker_info", "returncode": code, "elapsed_seconds": elapsed,
+    profile = {"operation": "docker_info", "returncode": code, "elapsed_seconds": elapsed,
             "client_term_sent": value.get("client_term_sent") is True,
             "outcome": "unknown" if code is None else "completed" if code == 0 else "failed",
             "execution_proof": False}
+    if "capture_diagnostic" not in value:
+        return {**profile, "capture_status": "not_present_unknown"}
+    capture = safe_capture_diagnostic(value["capture_diagnostic"])
+    times = [value.get("started_monotonic"), value.get("deadline_monotonic")]
+    require(capture is not None and re.fullmatch(r"command-[0-9]{4}\.json", path.name)
+            and capture["sequence"] == int(path.stem.split("-")[1]) and value.get("transfer") is False
+            and type(value.get("client_term_sent", False)) is bool
+            and all(type(number) in (int, float) and math.isfinite(number) and number >= 0 for number in times),
+            "fixed info capture receipt invalid")
+    budget = round(times[1] - times[0], 6)
+    require(0 <= budget <= 3 and budget == capture["budget_seconds"]
+            and round(elapsed, 6) == capture["elapsed_seconds"]
+            and type(code) is type(capture["client"]["returncode"]) and code == capture["client"]["returncode"]
+            and profile["client_term_sent"] == capture["client"]["term_sent"], "fixed info capture receipt differs")
+    return {**profile, "capture_status": "available", "capture_diagnostic": capture,
+            "capture_scope": "pipe_read_observations_not_durable_bytes"}
 
 
 def safe_stop_profile(value):
     require(type(value) is dict and value.get("status") == "unconfirmed", "invalid retained STOP profile")
     error_type, digest = value.get("error_type"), value.get("error_sha256")
-    return {"status": "unconfirmed", "cleanup_claimed": value.get("cleanup_confirmed") is True,
+    result = {"status": "unconfirmed", "cleanup_claimed": value.get("cleanup_confirmed") is True,
             "cleanup_confirmed": False, "execution_proof": False,
             "error_type": error_type if error_type in DIAGNOSTIC_ERRORS else None,
             "error_sha256": digest if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest) else None,
             "diagnostics": safe_failure_diagnostic(value["diagnostics"]) if "diagnostics" in value else None}
+    if "startup_observation_error" in value:
+        result["startup_observation_error"] = safe_start_error(value["startup_observation_error"])
+    return result
+
+
+def safe_start_error(value):
+    row = safe_failure_diagnostic({"schema": 1, "stage": "daemon_start", "last_command": None, "error": value})
+    return row["error"]
+
+
+def startup_resource_profile(values):
+    require(set(values) == set(START_RESOURCE_FIELDS) and all(type(text) is str and len(text) <= 1024
+            for text in values.values()), "startup resource profile differs")
+    result = {}
+    number = r"(?:0|[1-9][0-9]{0,19})"
+    for key in ("memory.max", "memory.swap.max", "pids.max", "memory.current", "memory.peak", "pids.current"):
+        require(re.fullmatch(number, values[key]) or key.endswith(".max") and values[key] == "max",
+                "startup resource scalar differs")
+        result[key] = values[key]
+    require(re.fullmatch(r"(?:max|[1-9][0-9]{0,19}) [1-9][0-9]{0,19}", values["cpu.max"]),
+            "startup CPU limit differs")
+    result["cpu.max"] = values["cpu.max"]
+    for key, allowed in (("memory.events", {"low", "high", "max", "oom", "oom_kill", "oom_group_kill"}),
+                         ("cpu.stat", {"usage_usec", "user_usec", "system_usec", "nr_periods", "nr_throttled",
+                                       "throttled_usec", "nr_bursts", "burst_usec"})):
+        counters = {}
+        for line in values[key].splitlines():
+            pair = line.split(" ")
+            require(len(pair) == 2 and pair[0] in allowed and pair[0] not in counters
+                    and re.fullmatch(number, pair[1]), "startup resource counter differs")
+            counters[pair[0]] = int(pair[1])
+        require(({"oom", "oom_kill"} if key == "memory.events" else {"usage_usec"}) <= counters.keys(),
+                "startup resource counters missing")
+        result[key] = counters
+    processes = values["cgroup.procs"].splitlines()
+    require(len(processes) <= PIDS and len(set(processes)) == len(processes)
+            and all(re.fullmatch(r"[1-9][0-9]{0,19}", row) for row in processes), "startup process counters differ")
+    result["cgroup.procs"] = {"count": len(processes), "nonempty": bool(processes)}
+    return result
+
+
+def startup_observation_profile(value):
+    require(type(value) is dict and set(value) == {"schema", "execution_proof", "status", "resources", "streams"}
+            and type(value["schema"]) is int and value["schema"] == 1 and value["execution_proof"] is False
+            and value["status"] in {"diagnostic_only", "evidence_insufficient"}, "startup observation shape differs")
+    result = {key: value[key] for key in ("schema", "execution_proof", "status")}
+    for name in ("resources", "streams"):
+        row = value[name]
+        require(type(row) is dict and row.get("status") in {"available", "evidence_insufficient"},
+                "startup observation section differs")
+        if row["status"] == "evidence_insufficient":
+            require(set(row) == {"status", "error"}, "startup observation error differs")
+            result[name] = {"status": "evidence_insufficient", "error": safe_start_error(row["error"])}
+            result["status"] = "evidence_insufficient"
+            continue
+        require(set(row) == {"status", "value"} and type(row["value"]) is dict, "startup observation value differs")
+        actual = row["value"]
+        if name == "resources":
+            actual = startup_resource_profile(actual)
+        elif actual != {"status": "not_present_unknown"}:
+            require(set(actual) == {"status", "daemon_returncode", "thread_alive", "capture", "capture_error",
+                    "scope", "execution_proof", "flush_eof_exit_not_inferred_from_file_size"}
+                    and actual["status"] == "bounded_nonatomic_observation"
+                    and (actual["daemon_returncode"] is None or type(actual["daemon_returncode"]) is int
+                         and -255 <= actual["daemon_returncode"] <= 255)
+                    and (actual["thread_alive"] is None or type(actual["thread_alive"]) is bool)
+                    and (actual["capture"] is None or safe_capture_state(actual["capture"]) is not None)
+                    and actual["scope"] == "pipe_reads_not_durable_bytes_or_readiness"
+                    and actual["execution_proof"] is False and actual["flush_eof_exit_not_inferred_from_file_size"] is True,
+                    "startup stream profile differs")
+            actual = {**actual, "capture": safe_capture_state(actual["capture"]) if actual["capture"] is not None else None,
+                      "capture_error": safe_start_error(actual["capture_error"]) if actual["capture_error"] is not None else None}
+        result[name] = {"status": "available", "value": actual}
+    return result
 
 
 def cleanup_completed(value):
@@ -1528,13 +1719,17 @@ def daemon_start_profiles(root, first):
         return None
     name = "command-%04d" % command["sequence"]
     result = {}
-    for filename in ("daemon.stderr", name + ".json", name + ".stderr", "STOP.json", "CLEANUP.json"):
+    for filename in ("daemon.stderr", name + ".json", name + ".stderr", "START_OBSERVATION.json", "STOP.json", "CLEANUP.json"):
         try:
             path = root / filename
             proof = file_proof(path, limit=OUTPUT_BYTES)
             value = profile_for(path)
             require(file_proof(path, limit=OUTPUT_BYTES) == proof, "startup diagnostic original changed")
             require(value is not None, "fixed startup diagnostic profile missing")
+            if filename == name + ".json":
+                require(round(value["elapsed_seconds"], 6) == command["elapsed_seconds"]
+                        and type(value["returncode"]) is type(command["returncode"])
+                        and value["returncode"] == command["returncode"], "startup command observation differs")
             result[filename] = {"status": "available", "original": {"bytes": proof["size"], "sha256": proof["sha256"]},
                                 "profile": value}
         except FileNotFoundError:
@@ -1563,6 +1758,8 @@ def profile_for(path):
         return safe_stop_profile(read_original_json(path))
     if name == "FIRST_FAILURE.json":
         return safe_failure_diagnostic(read_original_json(path))
+    if name == "START_OBSERVATION.json":
+        return startup_observation_profile(read_original_json(path))
     if name == "PRIVATE_IPV6_RESTRICTION.json":
         return safe_ipv6_restriction(read_original_json(path))
     if name in {"HTTP_AFTER.json", "PRESERVE_INSPECT.json", "STOPPED_INSPECT.json"}:
@@ -1706,6 +1903,8 @@ def _main(argv=None):
                    "next_action": "retain_originals_and_live_resources_no_retry_no_kill", "production_access": False,
                    "full_activation_verified": False}
         failure["diagnostics"] = (DIAGNOSTICS and DIAGNOSTICS.get("first_failure")) or failure_diagnostic(error)
+        if hasattr(error, "native_startup_observation_error"):
+            failure["startup_observation_error"] = error.native_startup_observation_error
         if not args.inside and not args.retain and root.is_dir() and not root.is_symlink():
             try:
                 failure_evidence(root, deadline, failure)
