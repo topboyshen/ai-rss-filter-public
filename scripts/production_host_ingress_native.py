@@ -585,7 +585,9 @@ def startup_resources(plan, end):
                 require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and info.st_nlink == 1
                         and not info.st_mode & 0o022, "unsafe startup resource field")
                 raw = os.read(fd, 1025)
-                require(len(raw) <= 1024 and not os.read(fd, 1) and re.fullmatch(rb"[a-z_0-9 \n]*", raw),
+                # Only cpu.stat has the observed core_sched.force_idle_usec key.
+                alphabet = rb"[a-z_0-9. \n]*" if name == "cpu.stat" else rb"[a-z_0-9 \n]*"
+                require(len(raw) <= 1024 and not os.read(fd, 1) and re.fullmatch(alphabet, raw),
                         "startup resource field capacity/shape")
                 values[name] = raw.decode("ascii").strip()
             finally:
@@ -1651,9 +1653,10 @@ def startup_resource_profile(values):
     require(re.fullmatch(r"(?:max|[1-9][0-9]{0,19}) [1-9][0-9]{0,19}", values["cpu.max"]),
             "startup CPU limit differs")
     result["cpu.max"] = values["cpu.max"]
-    for key, allowed in (("memory.events", {"low", "high", "max", "oom", "oom_kill", "oom_group_kill"}),
+    for key, allowed in (("memory.events", {"low", "high", "max", "oom", "oom_kill", "oom_group_kill", "sock_throttled"}),
                          ("cpu.stat", {"usage_usec", "user_usec", "system_usec", "nr_periods", "nr_throttled",
-                                       "throttled_usec", "nr_bursts", "burst_usec"})):
+                                       "throttled_usec", "nr_bursts", "burst_usec", "nice_usec",
+                                       "core_sched.force_idle_usec"})):
         counters = {}
         for line in values[key].splitlines():
             pair = line.split(" ")

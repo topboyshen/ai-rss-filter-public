@@ -515,6 +515,64 @@ def test_failure_resource_observation_preserves_oom_and_projects_only_counters(t
     assert "987654321" not in json.dumps(projected) and "123456789" not in json.dumps(projected)
 
 
+def observed_kernel_resource_values():
+    # Exact fixed-kernel fields from successful run 42214141017; no live reads.
+    return {**resource_values(), "memory.current": "325013504", "memory.peak": "466944000",
+        "pids.current": "3", "cpu.stat": "usage_usec 2587124\nuser_usec 1430855\nsystem_usec 1156268\n"
+        "nice_usec 0\ncore_sched.force_idle_usec 0\nnr_periods 87\nnr_throttled 11\n"
+        "throttled_usec 498645\nnr_bursts 0\nburst_usec 0",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\nsock_throttled 0"}
+
+
+def test_actual_kernel_counter_names_survive_fixed_read_and_projection(tmp_path, monkeypatch):
+    plan, directory = private_resource_fixture(tmp_path, monkeypatch)
+    values = observed_kernel_resource_values()
+    for key, value in values.items():
+        (directory / key).write_text(value + "\n")
+    raw = native.startup_resources(plan, plan["deadline"])
+    assert raw == values
+    projected = native.startup_resource_profile(raw)
+    assert projected["cpu.stat"] == {"usage_usec": 2587124, "user_usec": 1430855,
+        "system_usec": 1156268, "nice_usec": 0, "core_sched.force_idle_usec": 0,
+        "nr_periods": 87, "nr_throttled": 11, "throttled_usec": 498645,
+        "nr_bursts": 0, "burst_usec": 0}
+    assert projected["memory.events"]["sock_throttled"] == 0
+    assert projected["cgroup.procs"] == {"count": 0, "nonempty": False}
+    assert {key: (directory / key).read_text().strip() for key in values} == values
+
+
+@pytest.mark.parametrize("field,line", [
+    ("cpu.stat", "other.force_idle_usec 0"), ("cpu.stat", "core_sched.force_idle_usec.extra 0"),
+    ("cpu.stat", "nice_usec 1"), ("cpu.stat", "core_sched.force_idle_usec 1"),
+    ("memory.events", "sock_throttled 1"), ("memory.events", "socket_throttled 0"),
+    ("cpu.stat", "nice_usec -1"), ("cpu.stat", "core_sched.force_idle_usec nan"),
+    ("memory.events", "sock_throttled 1e2"),
+])
+def test_observed_counter_extensions_still_reject_unknown_duplicate_or_malformed(field, line):
+    values = observed_kernel_resource_values()
+    values[field] += "\n" + line
+    with pytest.raises(native.ProofError):
+        native.startup_resource_profile(values)
+
+
+@pytest.mark.parametrize("field,key,bad", [
+    ("cpu.stat", "nice_usec", "-1"), ("cpu.stat", "core_sched.force_idle_usec", "nan"),
+    ("memory.events", "sock_throttled", "01"), ("memory.events", "sock_throttled", "1e2"),
+])
+def test_observed_counter_value_is_canonical_without_duplicate(field, key, bad):
+    values = observed_kernel_resource_values()
+    values[field] = values[field].replace(key + " 0", key + " " + bad)
+    with pytest.raises(native.ProofError):
+        native.startup_resource_profile(values)
+
+
+def test_dot_byte_is_not_accepted_in_unrelated_resource_field(tmp_path, monkeypatch):
+    plan, directory = private_resource_fixture(tmp_path, monkeypatch)
+    (directory / "memory.current").write_text("1.0\n")
+    with pytest.raises(native.ProofError, match="capacity/shape"):
+        native.startup_resources(plan, plan["deadline"])
+
+
 @pytest.mark.parametrize("fault", ["owner", "path", "directory_link", "field_link", "hardlink", "writable", "over_limit", "expired"])
 def test_failure_resource_observation_never_follows_or_widens(tmp_path, monkeypatch, fault):
     plan, root = private_resource_fixture(tmp_path, monkeypatch)
