@@ -39,6 +39,7 @@ from routes.shared import (
     QUOTES_CACHE_TTL_SEC,
 )
 from db import database
+from services.navigation_origins import news_home_origin
 from db.database import db_lock, get_connection
 from scoring_provenance import (
     FORMAL_SIGNAL_SCORE_PATHS,
@@ -2063,6 +2064,7 @@ def dashboard():
         format_article_display_title=format_article_display_title,
         safe_http_url=safe_http_url,
         dashboard_auth_kind=auth.kind,
+        news_home_origin=news_home_origin(),
         dashboard_csrf_token=auth.csrf_token,
         release_version=release_version(),
     )

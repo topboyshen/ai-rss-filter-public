@@ -8,6 +8,17 @@ evidence remain unchanged.
 
 - `example.invalid` and `ai.example.invalid` are reserved examples, not a hosted
   demo. Replace them only in an independently reviewed deployment configuration.
+- Browser navigation uses explicit `AI_FILTER_PUBLIC_DASHBOARD_ORIGIN` (login,
+  event reports and neutral records) and `AI_FILTER_NEWS_HOME_ORIGIN` (news home
+  and its `/quality` page). Bind both on every rendering app role in the sealed
+  deployment manifest. Each must be an HTTP(S) origin only, with no credentials,
+  path other than `/`, query or fragment. Missing/invalid origins show an
+  unconfigured entry without a link. Same-origin dashboard navigation stays
+  relative. Neither `Host`, CORS nor the internal `AI_FILTER_WEB_BASE_URL` is a
+  browser-origin fallback. These settings only affect rendered links; they do
+  not make requests, alter scoring, or change existing snapshots until their
+  next normal publication. Candidate rendering and natural publication still
+  need separate verification with the actual deployment bindings.
 - The three `99000x` watchlist values are synthetic test/example identifiers,
   not an owner's holdings or a recommendation. Their length, matching boundaries,
   scores and no-model-bypass protection remain covered by regression tests.

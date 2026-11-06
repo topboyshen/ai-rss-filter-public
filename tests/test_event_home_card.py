@@ -20,6 +20,7 @@ def client(monkeypatch):
     monkeypatch.setenv("AI_FILTER_DASHBOARD_SNAPSHOTS", "1")
     monkeypatch.setenv("AI_FILTER_ROLE", "worker")
     monkeypatch.setenv("AI_FILTER_VERSION", "my-ai-filter:test")
+    monkeypatch.setenv("AI_FILTER_PUBLIC_DASHBOARD_ORIGIN", "https://dashboard.example.test")
     app = Flask(__name__, template_folder=str(Path(__file__).resolve().parents[1] / "templates"))
     app.config["TESTING"] = True
     app.register_blueprint(routes.event_radar_bp)
@@ -83,8 +84,11 @@ def test_real_worker_artifact_web_read_never_queries_or_rebuilds(client, monkeyp
     # Real loader, template, worker writer and Web reader. No simulated read envelope.
     digest = load_home_event_digest()
     built = client.get("/event-radar-card?limit=8").get_data(as_text=True)
+    assert 'href="https://dashboard.example.test/dashboard/events/daily?' in built
+    assert 'href="https://dashboard.example.test/dashboard/events/weekly?' in built
     snapshots.write_dashboard_snapshot("event_radar", built)
     monkeypatch.setenv("AI_FILTER_ROLE", "web")
+    monkeypatch.delenv("AI_FILTER_PUBLIC_DASHBOARD_ORIGIN")
 
     def forbidden(*_args, **_kwargs):
         pytest.fail("Web requests must use only the published artifact")
@@ -93,6 +97,7 @@ def test_real_worker_artifact_web_read_never_queries_or_rebuilds(client, monkeyp
     monkeypatch.setattr(routes, "load_daily_report", forbidden)
     monkeypatch.setattr(routes, "load_event_stream", forbidden)
     monkeypatch.setattr(coverage, "read_refresh_coverage", forbidden)
+    monkeypatch.setattr(routes, "dashboard_origin", forbidden)
     import db.database as database
     monkeypatch.setattr(database, "get_read_only_connection", forbidden)
     response = client.get("/event-radar-card?limit=8")

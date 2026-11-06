@@ -59,7 +59,7 @@ def _assert_dashboard_navigation(body):
     )
     assert len(links) == 3
     expected = [
-        ("https://example.invalid/", "返回新闻首页"),
+        ("https://news.example.test/", "返回新闻首页"),
         ("/dashboard/events", "事件雷达"),
         ("/briefing?format=html", "今日情报"),
     ]
@@ -78,6 +78,9 @@ def dashboard_browser(monkeypatch):
     import app as app_module
     import routes.browser_auth as browser_auth
     import routes.shared as shared
+
+    monkeypatch.setenv("AI_FILTER_NEWS_HOME_ORIGIN", "https://news.example.test")
+    monkeypatch.setenv("AI_FILTER_PUBLIC_DASHBOARD_ORIGIN", "https://dashboard.example.test")
 
     security = {
         "api_key": API_KEY,
@@ -485,7 +488,7 @@ def test_session_renders_full_dashboard_with_logout_csrf(dashboard_browser):
         r'<a\b[^>]*href="([^"]+)"[^>]*>\s*模型质量\s*</a>', body
     )
     assert quality_link is not None
-    assert quality_link.group(1) == "https://example.invalid/quality"
+    assert quality_link.group(1) == "https://news.example.test/quality"
     assert 'href="/score-quality"' not in body
     assert 'href="/dashboard/neutral-records"' in body
     records = client.get("/dashboard/neutral-records", base_url=BASE_URL)

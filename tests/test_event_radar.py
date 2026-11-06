@@ -65,6 +65,8 @@ def radar_client(database, monkeypatch):
     import routes.security as security
     from routes.browser_auth import DashboardAuth
 
+    monkeypatch.setenv("AI_FILTER_PUBLIC_DASHBOARD_ORIGIN", "https://dashboard.example.test")
+
     monkeypatch.setattr(
         radar_routes,
         "get_dashboard_auth",
@@ -1217,7 +1219,7 @@ def test_public_event_radar_card_is_summary_only_bounded_and_escaped(
     assert "处理审计" not in body
     assert "契约结清" not in body
     assert f"event_id={event_id}" in body
-    assert "https://ai.example.invalid/dashboard/events?has_stocks=1" in body
+    assert "https://dashboard.example.test/dashboard/events?has_stocks=1" in body
     assert "<script" not in body.lower()
 
     radar = radar_client.get(
