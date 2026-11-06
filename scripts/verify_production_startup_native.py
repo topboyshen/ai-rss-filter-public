@@ -136,7 +136,7 @@ def public_exception_locations(error, *, root=None):
     return _validated_diagnostic(type(error).__name__, frames, root=root)["locations"]
 
 
-def _stdout_diagnostic(raw):
+def _diagnostic_json(raw):
     def unique(pairs):
         value = {}
         for key, item in pairs:
@@ -144,7 +144,11 @@ def _stdout_diagnostic(raw):
                 raise ValueError("ambiguous diagnostic JSON")
             value[key] = item
         return value
-    packet = json.loads(raw, object_pairs_hook=unique)
+    return json.loads(raw, object_pairs_hook=unique)
+
+
+def _stdout_diagnostic(raw):
+    packet = _diagnostic_json(raw)
     if not isinstance(packet, dict) or packet.get("status") not in {"unconfirmed", "failed_or_evidence_insufficient"}:
         return None
     if packet.get("safe_export_complete") is False:
@@ -168,6 +172,17 @@ def _stdout_diagnostic(raw):
         if isinstance(result, dict) and result.get("status") == "failed_or_evidence_insufficient":
             return result.get("error_type"), result.get("error_locations", [])
     return None
+
+
+def _stdout_socket_diagnostic(raw):
+    from scripts import retained_gateway_diagnostics as socket_diagnostics
+    packet = _diagnostic_json(raw)
+    if type(packet) is not dict or packet.get("status") != "failed_or_evidence_insufficient":
+        return None
+    activation = packet.get("activation")
+    if type(activation) is not dict or activation.get("status") != "failed_or_evidence_insufficient":
+        return None
+    return socket_diagnostics.safe_summary(activation.get("failure_socket_listener"))
 
 
 def _stderr_diagnostic(raw):
@@ -212,8 +227,18 @@ def _emit_archive_diagnostic(captured, complete):
                 continue  # No child text or parser exception is printed.
     record = {"schema": 1, "native_command_diagnostic": "source_validated_candidates",
               "execution_proof": False, "status": "locations_available" if value["locations"] else "no_verified_frames", **value}
+    if complete and captured[0] is not None:
+        try:
+            socket_summary = _stdout_socket_diagnostic(bytes(captured[0]))
+            if socket_summary is not None:
+                record["socket_listener"] = socket_summary
+        except Exception:
+            pass  # Optional typed diagnostics never displace the original failure.
     try:
         raw = json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+        if len(raw.encode()) > DIAGNOSTIC_BYTES:
+            record.pop("socket_listener", None)
+            raw = json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
         if len(raw.encode()) <= DIAGNOSTIC_BYTES:
             sys.stderr.write(raw)
             sys.stderr.flush()

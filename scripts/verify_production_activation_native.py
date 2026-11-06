@@ -31,6 +31,7 @@ from scripts import verify_production_startup_native as startup_native  # noqa: 
 from scripts import production_gateway_native as gateway_native  # noqa: E402
 from scripts import production_native_deadline as native_deadline  # noqa: E402
 from scripts import private_release_diagnostics as command_diagnostics  # noqa: E402
+from scripts import retained_gateway_diagnostics as socket_diagnostics  # noqa: E402
 from scripts.verify_miniflux_pause_native import Harness, CLIENT, image_checks, source_binding, sha, read_command_result, resource_checks  # noqa: E402
 from scripts.miniflux_host_joint_native import component  # noqa: E402
 from scripts.miniflux_handoff_adapter import source_sha256 as bridge_source, CutoverError  # noqa: E402
@@ -1051,6 +1052,9 @@ def record_failure(error, repo, output, stage, *, private_commands=None):
     commands = command_diagnostics.safe_summary(private_commands)
     if commands is not None:
         failure["private_commands"] = summary["private_commands"] = commands
+    socket_summary = socket_diagnostics.error_summary(error)
+    if socket_summary is not None:
+        failure["socket_listener"] = summary["socket_listener"] = socket_summary
     print("activation_native_failure=" + json.dumps(summary, sort_keys=True), flush=True)
     fixture.save(output / "FAILURE.json", failure)
     return failure
@@ -1066,7 +1070,7 @@ def execute(repo, source, image_id, binary, output, *, private_host_context=None
     # Only the attested isolated host scenario opts in; default/production calls
     # do not create a collector or a file/environment-based diagnostic switch.
     context = command_diagnostics.scope() if private_host_context is not None else nullcontext(None)
-    with context as observation:
+    with context as observation, socket_diagnostics.scope(enabled=private_host_context is not None):
         try:
             harness.stage("actual_compose_parser_metadata")
             harness.compose_parser_evidence()

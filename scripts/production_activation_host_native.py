@@ -893,6 +893,10 @@ def safe_activation(value):
         result["failure_type_sha256"] = hashlib.sha256(host.encoded(failure.get("type"))).hexdigest()
         kind = failure.get("type")
         result["failure_type"] = kind if isinstance(kind, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]{0,80}", kind) else None
+        from scripts import retained_gateway_diagnostics as socket_diagnostics
+        socket_summary = socket_diagnostics.safe_summary(failure.get("socket_listener"))
+        if socket_summary is not None:
+            result["failure_socket_listener"] = socket_summary
         for key, limit in (("message_literal", 200), ("namespace_helper", 800), ("guardian_handoff", 1600)):
             item = failure.get(key)
             result["failure_" + key] = (item if isinstance(item, str) and 0 < len(item) <= limit
@@ -1327,6 +1331,10 @@ def safe_inventory(root, deadline, *, gateway_custody=False):
               "outer_build_command_stderr": outer_build_command_exports(outer_build_texts, deadline)}
     packet["failure_originals"] = failure_originals(root, records, profiles, deadline)
     if len(host.encoded(packet)) > 384 * 1024:
+        for profile in profiles.values():
+            if type(profile) is dict:
+                profile.pop("failure_socket_listener", None)
+    if len(host.encoded(packet)) > 384 * 1024:
         packet["failure_originals"] = {"status": "export_budget_exhausted"}
         if len(host.encoded(packet)) > 384 * 1024:
             del packet["failure_originals"]  # Optional diagnostics never displace the existing packet.
@@ -1409,6 +1417,8 @@ def _main(argv=None, *, _cli_started=None):
                "error_type": error_type(failure) if failure else inner_profile and inner_profile["error_type"],
                "error_sha256": hashlib.sha256(str(failure).encode()).hexdigest() if failure else inner_profile and inner_profile["error_sha256"],
                "elapsed_seconds": time.monotonic() - started, "production_access": False, "real_models": 0, "existing_126_modified": False}
+    if len(host.encoded(summary)) > 512 * 1024 and type(summary.get("activation")) is dict:
+        summary["activation"].pop("failure_socket_listener", None)
     gate._require(len(host.encoded(summary)) <= 512 * 1024, "full-host summary encoding bound")
     if root is not None and root.is_dir():
         try:

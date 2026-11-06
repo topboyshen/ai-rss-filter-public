@@ -23,6 +23,7 @@ import time
 from urllib.parse import quote
 
 from services import admission_fence as gate
+from scripts import retained_gateway_diagnostics as socket_diagnostics
 
 
 KIND = "retained_container_config_archive"
@@ -502,19 +503,23 @@ def _unix_table():
     gate._require(before.st_mode == stat.S_IFREG | 0o444 and before.st_uid == before.st_gid == 0
                   and before.st_nlink == 1 and before.st_size == 0, "unsafe Docker archive procfs table")
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    raw, eof = bytearray(), False
     try:
         _procfs(fd)
         fixed = _proc_identity(before)
         gate._require(_proc_identity(os.fstat(fd)) == fixed, "Docker archive procfs table open changed")
-        raw = bytearray()
         while len(raw) <= 512 * 1024:
             chunk = os.read(fd, min(4096, 512 * 1024 + 1 - len(raw)))
             if not chunk:
+                eof = True
                 break
             raw.extend(chunk)
         gate._require(len(raw) <= 512 * 1024 and _proc_identity(os.fstat(fd)) == fixed
                       and _proc_identity(os.lstat(path)) == fixed, "Docker archive procfs table changed/capacity")
         return bytes(raw), fixed
+    except BaseException as error:
+        socket_diagnostics.read_failed(error, raw, eof=eof)
+        raise
     finally:
         os.close(fd)
 
@@ -545,12 +550,23 @@ def _listener(raw):
 
 
 def _current_listener():
-    first, fixed = _unix_table()
-    second, second_fixed = _unix_table()
-    listener, other = _listener(first), _listener(second)
-    gate._require(listener == other and fixed == second_fixed,
-                  "Docker archive listener changed between complete reads")
-    return listener
+    first = second = fixed = second_fixed = None
+    failed_at = "first_read"
+    try:
+        first, fixed = _unix_table()
+        failed_at = "second_read"
+        second, second_fixed = _unix_table()
+        failed_at = "first_parse"
+        listener = _listener(first)
+        failed_at = "second_parse"
+        other = _listener(second)
+        failed_at = "comparison"
+        gate._require(listener == other and fixed == second_fixed,
+                      "Docker archive listener changed between complete reads")
+        return listener
+    except BaseException as error:
+        socket_diagnostics.capture(error, first, second, [fixed, second_fixed], failed_at)
+        raise
 
 
 def _alive(fd):
@@ -581,10 +597,12 @@ class _ArchiveAuthority:
             self.namespace_fd = os.open("/proc/self/ns/net", os.O_RDONLY | os.O_CLOEXEC)
             namespace = os.fstat(self.namespace_fd)
             self.namespace = namespace.st_dev, namespace.st_ino
-            self.listener_row = _current_listener()
+            with socket_diagnostics.phase("initial_listener", self):
+                self.listener_row = _current_listener()
             self.listener = self.listener_row["inode"]
             self._anchor(self.pid)
-            self.confirm()
+            with socket_diagnostics.phase("initial_confirm", self):
+                self.confirm()
             return self
         except BaseException:
             self.close()
@@ -627,7 +645,8 @@ class _ArchiveAuthority:
         gate._require(value in {(self.pid, 0, 0), (1, 0, 0)}, "Docker archive socket peer not recognized")
         if value[0] == 1 and 1 not in self.pidfds:
             self._anchor(1)
-        self.confirm()
+        with socket_diagnostics.phase("peer_confirm", self, value):
+            self.confirm()
 
     def confirm(self):
         gate._require(time.monotonic() < self.deadline
@@ -788,5 +807,6 @@ def read_native_archive(identifier, container_path, consumer, *, deadline):
                           and member["mtime"] == response.path_stat["mtime_epoch"]
                           and (container_path == DIRECTORY_PATH or member["size"] == response.path_stat["size"]),
                           "Docker archive header and actual path stat disagree")
-            authority.confirm()
+            with socket_diagnostics.phase("final_confirm", authority):
+                authority.confirm()
             return result
