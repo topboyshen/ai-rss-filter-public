@@ -9,8 +9,8 @@ from utils.helpers import escape_html, plain_text_from_markup
 _PATH_LABELS = {
     "llm": "模型评分", "stage2": "模型二阶段评分",
     "fast_pass": "本地快速规则", "local_reject": "本地拒绝规则",
-    "fallback_local": "本地兜底", "similarity": "相似结果复用",
-    "radar": "雷达路径", "parse_error": "解析失败",
+    "fallback_local": "系统兜底", "similarity": "相似结果复用",
+    "radar": "雷达路径", "parse_error": "处理异常（解析失败）",
     "quality_quarantine": "质量隔离",
 }
 
@@ -23,7 +23,7 @@ def render_evidence_context(entry: dict) -> str:
     has_title = isinstance(raw_title, str) and bool(plain_text_from_markup(raw_title).strip())
     path = str(entry.get("score_path") or "").strip().casefold()
     if path in NON_SUBSTANTIVE_SCORE_PATHS:
-        path_label = "缓存处理记录：系统兜底（保守中性）"
+        path_label = "缓存处理记录：保守中性"
     else:
         path_label = "缓存处理记录：" + _PATH_LABELS.get(path, "未知")
     title_label = "本卡片提供原始标题" if has_title else "本卡片未提供原始标题"

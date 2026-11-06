@@ -85,7 +85,8 @@ def test_all_safe_neutral_paths_keep_recorded_reason_separate(reading, path, rea
     # assert that the unchanged public selection admits safe-neutral entries.
     html = _render_cards([_entry(score_path=path, safe_neutral_reason=reason)], reading=reading)
     context, = _contexts(html)
-    assert "缓存处理记录：系统兜底（保守中性）" in context
+    assert "缓存处理记录：保守中性" in context
+    assert "缓存处理记录：系统兜底" not in context
     assert "缓存处理记录：模型评分" not in context
     assert "保守中性是处理结果，不表示新闻不重要" in context
     assert expected in html and expected not in context
@@ -95,8 +96,8 @@ def test_all_safe_neutral_paths_keep_recorded_reason_separate(reading, path, rea
 @pytest.mark.parametrize("path,label", [
     ("llm", "模型评分"), ("stage2", "模型二阶段评分"),
     ("fast_pass", "本地快速规则"), ("local_reject", "本地拒绝规则"),
-    ("fallback_local", "本地兜底"), ("similarity", "相似结果复用"),
-    ("radar", "雷达路径"), ("parse_error", "解析失败"),
+    ("fallback_local", "系统兜底"), ("similarity", "相似结果复用"),
+    ("radar", "雷达路径"), ("parse_error", "处理异常（解析失败）"),
     ("quality_quarantine", "质量隔离"),
     ("unexpected-private-path", "未知"), ("", "未知"), (None, "未知"),
 ])
@@ -106,6 +107,57 @@ def test_cached_path_has_bounded_labels_not_per_field_model_attribution(path, la
     assert "unexpected-private-path" not in html
     assert "当前展示分数与方向的逐项生成来源未确认" in html
     assert "分数仅为阅读优先级" in html
+
+
+@pytest.mark.parametrize("reading", [False, True])
+@pytest.mark.parametrize("path,label", [
+    (" LLM_SAFE_NEUTRAL_INITIAL ", "保守中性"),
+    (" STAGE2_SAFE_NEUTRAL_GROUNDING ", "保守中性"),
+    ("fallback_local", "系统兜底"), ("parse_error", "处理异常（解析失败）"),
+    ("radar", "雷达路径"), ("quality_quarantine", "质量隔离"),
+    ("llm", "模型评分"), ("stage2", "模型二阶段评分"),
+    ("unrecognized", "未知"),
+])
+def test_layouts_preserve_distinct_cached_treatment_without_rewriting_values(reading, path, label):
+    entry = _entry(score_path=path, raw_title="", direction="看空", score=6.8, importance_score=6.8)
+    before = deepcopy(entry)
+    html = _render_cards([entry], reading=reading)
+    context, = _contexts(html)
+    assert f"缓存处理记录：{label}<br>" in context
+    assert "系统兜底（保守中性）" not in context
+    assert "本卡片未提供原始标题" in context
+    assert "当前展示分数与方向的逐项生成来源未确认" in context
+    assert "6.8/10" in html and "看空" in html and entry == before
+    if label in {"保守中性", "系统兜底", "处理异常（解析失败）", "未知"}:
+        assert "缓存处理记录：模型" not in context
+
+
+def test_snapshot_preserves_distinct_treatment_labels_without_runtime_reinterpretation(mention_snapshot_env, monkeypatch):
+    from services import dashboard_snapshots as snapshots
+
+    app, directory, database_path = mention_snapshot_env
+    entries = [_entry(score_path=path, link=f"https://example.org/{number}")
+               for number, path in enumerate(("llm_safe_neutral_initial", "fallback_local", "parse_error"))]
+    html = _render_cards(entries, reading=True)
+    snapshots.write_dashboard_snapshot("realtime", html, generated_at=_fresh_snapshot_generated_at(),
+                                       snapshot_dir=directory, db_path=database_path)
+    monkeypatch.setenv("AI_FILTER_ROLE", "web")
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("Persisted card treatment must not trigger read-time rendering or scoring")
+
+    monkeypatch.setattr(sse_engine, "_render_cards", forbidden)
+    monkeypatch.setattr(sse_engine, "_load_from_db", forbidden)
+    monkeypatch.setattr(news_reading, "render_evidence_context", forbidden)
+    response = app.test_client().get("/glance-sse")
+    assert response.status_code == 200 and response.headers["X-Card-Snapshot-State"] == "ready"
+    assert response.get_data(as_text=True) == html
+    contexts = _contexts(html)
+    assert len(contexts) == 3
+    for context, label in zip(contexts, ("保守中性", "系统兜底", "处理异常（解析失败）")):
+        assert f"缓存处理记录：{label}<br>" in context
+        assert "当前展示分数与方向的逐项生成来源未确认" in context
+    assert "系统兜底（保守中性）" not in html
 
 
 def test_legacy_entry_without_metadata_keeps_unknowns():
