@@ -543,8 +543,10 @@ def stop_daemon(context, process, logs):
     context.check(final=True)
     context.commands.deadline = context.plan["deadline"]
     ids = context.commands.docker(["ps", "--quiet", "--no-trunc"]).splitlines()
-    record(context.root / "DRAIN_OBSERVATION.json", {"schema": 1, "running_count": len(ids),
-        "uncertain_mutation": context.commands.uncertain_mutation})
+    observation = {"schema": 1, "running_count": len(ids),
+                   "uncertain_mutation": context.commands.uncertain_mutation}
+    record(context.root / "DRAIN_OBSERVATION.json", observation)
+    context.drain_observation = observation  # Diagnostic only, after original persistence.
     gate._require(ids == [] and not context.commands.uncertain_mutation, "running or uncertain containers: retain private daemon")
     host.check_peer(process.pid, context.daemon)
     process.send_signal(signal.SIGTERM)

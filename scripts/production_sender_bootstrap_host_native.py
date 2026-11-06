@@ -163,6 +163,8 @@ def inner_execute(root, plan):
         "bootstrap_result": result, "daemon_stop": stopped,
         "error_type": type(failure).__name__ if failure else None,
         "error_sha256": hashlib.sha256(str(failure).encode()).hexdigest() if failure else None,
+        "error_locations": isolated.startup.public_exception_locations(failure) if failure else [],
+        "drain_observation": getattr(context, "drain_observation", None),
         "production_access": False, "real_models": 0, "existing_126_modified": False,
         "elapsed_seconds": time.monotonic() - plan["started"], "operation_seconds": MAX_SECONDS}
     isolated.record(root / "INNER_RESULT.json", value, sealed=True)
@@ -243,7 +245,8 @@ def main(argv=None):
         with _hard_deadline(isolated.remaining(started + MAX_SECONDS)):
             result = outer_execute(args, root, started)
     except BaseException as error:
-        failure = {"error_type": type(error).__name__, "error_sha256": hashlib.sha256(str(error).encode()).hexdigest()}
+        failure = {"error_type": type(error).__name__, "error_sha256": hashlib.sha256(str(error).encode()).hexdigest(),
+                   "error_locations": isolated.startup.public_exception_locations(error)}
     finally:
         os.umask(previous)
     packet = {"status": "passed" if failure is None and result and result["status"] == "passed" else "unconfirmed",

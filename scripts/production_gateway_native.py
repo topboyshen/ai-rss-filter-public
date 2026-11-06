@@ -493,8 +493,17 @@ def bind_plan(p, permit):
 
 def _cleanup_identity(row):
     """Stable original identity across TERM; process exit is checked separately."""
-    return {key: deepcopy(row[key]) for key in (
-        "Id", "Name", "Image", "Config", "HostConfig", "Mounts", "RestartCount")}, row["State"]["StartedAt"]
+    identity = {key: deepcopy(row[key]) for key in (
+        "Id", "Name", "Image", "Config", "HostConfig", "Mounts", "RestartCount")}
+    # Engine inspect can enumerate the same mounts in a different order, even
+    # between two reads while the container is running. Preserve every field
+    # and duplicate record; only the enumeration order is not an identity.
+    mounts = identity["Mounts"]
+    gate._require(type(mounts) is list and all(type(mount) is dict for mount in mounts),
+                  "owned cleanup mount records malformed")
+    identity["Mounts"] = sorted(mounts, key=lambda mount: json.dumps(
+        mount, sort_keys=True, separators=(",", ":"), allow_nan=False))
+    return identity, row["State"]["StartedAt"]
 
 
 def _normal_cleanup_exit(row, original, *, purpose):

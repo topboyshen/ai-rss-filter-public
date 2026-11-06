@@ -1,5 +1,7 @@
 """Local control-logic tests only, never an actual private-daemon execution."""
 from copy import deepcopy
+from contextlib import nullcontext
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,6 +10,62 @@ import pytest
 from scripts import production_sender_bootstrap_host_native as native
 from scripts import sender_host_loopback_pg as pg
 from services import admission_fence as gate
+
+
+@pytest.mark.parametrize("state", ["normal", "running", "uncertain", "primary_failure"])
+def test_bootstrap_completion_and_daemon_drain_have_separate_diagnostics(tmp_path, monkeypatch, state):
+    from scripts import production_offline_registry as registry
+    isolated = native.isolated
+    calls, records = [], {}
+    plan = {"started": 100, "active_deadline": 260, "deadline": 280, "repo": str(tmp_path),
+            "source": str(tmp_path), "binary": str(tmp_path / "binary"),
+            "build_evidence": str(tmp_path), "sender": {"Id": "sha256:" + "a" * 64}, "bundle": {}}
+    commands = SimpleNamespace(deadline=260, uncertain_mutation=state == "uncertain",
+        docker=lambda args: "a" * 64 if state == "running" else "")
+    context = SimpleNamespace(root=tmp_path, plan=plan, commands=commands, daemon={"pid": 44},
+                              check=lambda **kw: calls.append("check"))
+    process = SimpleNamespace(pid=44, send_signal=lambda sig: calls.append(sig),
+                              wait=lambda timeout: calls.append("daemon_wait") or 0)
+    monkeypatch.setattr(native.os, "setsid", lambda: None)
+    monkeypatch.setattr(native.time, "monotonic", lambda: 100)
+    monkeypatch.setattr(native.host, "proc_identity", lambda pid: {"netns": 3})
+    monkeypatch.setattr(native.host, "restrict_private_ipv6", lambda *a: None)
+    monkeypatch.setattr(isolated, "prepare_mounts", lambda *a: None)
+    monkeypatch.setattr(isolated, "FullCommands", lambda *a: commands)
+    monkeypatch.setattr(isolated, "PrivateHostContext", lambda *a: context)
+    monkeypatch.setattr(isolated, "record", lambda path, value, **kw: records.update({path.name: deepcopy(value)}))
+    logs = SimpleNamespace(finish=lambda end: calls.append("logs_finish"))
+    monkeypatch.setattr(isolated, "start_daemon", lambda *a: (process, context.daemon, logs))
+    monkeypatch.setattr(isolated, "load_dependencies", lambda *a: None)
+    monkeypatch.setattr(registry, "serve_bundle", lambda *a, **kw: nullcontext(SimpleNamespace(url="synthetic")))
+    monkeypatch.setattr(native.deadline, "scope", lambda *a: nullcontext())
+    monkeypatch.setattr(native.bootstrap.local_pg, "native_private_host", lambda *a: nullcontext())
+    monkeypatch.setattr(native.host, "check_peer", lambda *a: calls.append("peer_check"))
+    monkeypatch.setattr(native.host, "RETAINERS", {44: (SimpleNamespace(wait=lambda timeout: 0),)})
+    bootstrap_result = {"status": "passed", "failure": None, "errors": []}
+    primary = ConnectionRefusedError("SECRET_CONNECTION_CANARY")
+    def execute(*args, **kwargs):
+        if state == "primary_failure":
+            raise primary
+        return bootstrap_result
+    monkeypatch.setattr(native.bootstrap, "execute", execute)
+    value = native.inner_execute(tmp_path, plan | {"parent": {}})
+    assert value["bootstrap_result"] == (None if state == "primary_failure" else bootstrap_result)
+    assert value["drain_observation"] == records["DRAIN_OBSERVATION.json"] == {
+        "schema": 1, "running_count": int(state == "running"),
+        "uncertain_mutation": state in {"uncertain", "primary_failure"}}
+    if state == "normal":
+        assert value["status"] == "passed" and value["daemon_stop"]["daemon_returncode"] == 0
+        assert calls[-4:] == ["peer_check", isolated.signal.SIGTERM, "daemon_wait", "logs_finish"]
+        assert value["error_locations"] == []
+    else:
+        assert value["status"] == "failed_or_evidence_insufficient" and value["daemon_stop"] is None
+        assert "peer_check" not in calls and isolated.signal.SIGTERM not in calls
+        assert value["error_type"] == ("ConnectionRefusedError" if state == "primary_failure" else "AdmissionError")
+        assert value["error_locations"]
+        assert "SECRET_CONNECTION_CANARY" not in json.dumps(value)
+        if state == "primary_failure":
+            assert primary.__notes__ == ["private daemon retained: AdmissionError"]
 
 
 @pytest.fixture

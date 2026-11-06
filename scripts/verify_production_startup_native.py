@@ -73,11 +73,12 @@ def _diagnostic_source(name, root):
 
 
 def _diagnostic_frame(frame, root):
-    if not isinstance(frame, dict) or set(frame) != {"file", "line", "function"}:
+    if not isinstance(frame, dict) or set(frame) not in ({"file", "line"}, {"file", "line", "function"}):
         return None
-    line, function = frame["line"], frame["function"]
-    if (type(line) is not int or not 0 < line <= 1_000_000 or not isinstance(function, str)
-            or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,100}|<module>", function)):
+    line, function = frame["line"], frame.get("function")
+    if (type(line) is not int or not 0 < line <= 1_000_000
+            or ("function" in frame and (not isinstance(function, str)
+                or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,100}|<module>", function)))):
         return None
     source = _diagnostic_source(frame["file"], root)
     if source is None:
@@ -89,7 +90,9 @@ def _diagnostic_frame(frame, root):
     scopes = [node for node in nodes if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
               and node.lineno <= line <= node.end_lineno]
     scope = min(scopes, key=lambda node: node.end_lineno - node.lineno).name if scopes else "<module>"
-    if function != scope:
+    # The activation exporter intentionally omits caller-supplied function
+    # names. Recover that coordinate only from the bounded local source AST.
+    if "function" in frame and function != scope:
         return None
     classes = {name for name, value in vars(builtins).items()
                if isinstance(value, type) and issubclass(value, BaseException)}
@@ -142,10 +145,13 @@ def _stdout_diagnostic(raw):
             value[key] = item
         return value
     packet = json.loads(raw, object_pairs_hook=unique)
-    if not isinstance(packet, dict) or packet.get("status") != "unconfirmed":
+    if not isinstance(packet, dict) or packet.get("status") not in {"unconfirmed", "failed_or_evidence_insufficient"}:
         return None
     if packet.get("safe_export_complete") is False:
         return packet.get("error_type"), packet.get("locations", [])
+    activation = packet.get("activation")
+    if isinstance(activation, dict) and activation.get("status") == "failed_or_evidence_insufficient":
+        return activation.get("failure_type"), activation.get("failure_locations", [])
     files = packet.get("safe_evidence", {}).get("files", {})
     failure = files.get("FAILURE.json", {}).get("content")
     if failure is None:
@@ -153,6 +159,14 @@ def _stdout_diagnostic(raw):
         failure = result.get("failure")
     if isinstance(failure, dict):
         return failure.get("type"), failure.get("locations", [])
+    private_host = packet.get("private_host")
+    if isinstance(private_host, dict):
+        failure = private_host.get("failure")
+        if isinstance(failure, dict):
+            return failure.get("error_type"), failure.get("error_locations", [])
+        result = private_host.get("result")
+        if isinstance(result, dict) and result.get("status") == "failed_or_evidence_insufficient":
+            return result.get("error_type"), result.get("error_locations", [])
     return None
 
 

@@ -79,6 +79,55 @@ def test_complete_structured_child_failure_is_only_diagnostic_candidates(diagnos
     assert "SECRET_" not in json.dumps(record) and Path(str(path) + ".stdout").read_bytes() == raw
 
 
+@pytest.mark.parametrize("kind", ["activation", "host_result", "host_failure", "legacy_host_result"])
+def test_host_stdout_schemas_export_only_source_validated_candidates(diagnostic_source, tmp_path, capsys, kind):
+    frame = {"file": diagnostic_source.name, "line": 2, "function": "fail"}
+    failure = {"error_type": "RuntimeError", "error_locations": [frame], "error_sha256": "a" * 64,
+               "error_message": "SECRET_MESSAGE_CANARY"}
+    if kind == "activation":
+        packet = {"status": "failed_or_evidence_insufficient", "activation": {
+            "status": "failed_or_evidence_insufficient", "failure_type": "RuntimeError",
+            "failure_locations": [{"file": frame["file"], "line": frame["line"]}],
+            "failure_message_literal": "SECRET_MESSAGE_CANARY"}}
+    else:
+        if kind == "legacy_host_result":
+            failure.pop("error_locations")  # Historical hashes do not invent a traceback.
+        packet = {"status": "unconfirmed", "safe_evidence": {"complete": True, "files": {
+            "RESULT.json": {"content": {"status": "passed", "failure": None}}}},
+            "private_host": {"failure": failure if kind == "host_failure" else None,
+                "result": {"status": "failed_or_evidence_insufficient", "bootstrap_result": {"status": "passed"},
+                           **failure}}}
+    raw = json.dumps(packet).encode() + b"\n"
+    path = tmp_path / kind
+    with pytest.raises(private.ContractError):
+        native.archive_command([sys.executable, "-c", "import sys;sys.stdout.buffer.write(" + repr(raw) + ");sys.exit(3)"], path)
+    record = diagnostic_record(capsys)
+    assert record["locations"] == ([] if kind == "legacy_host_result" else [frame])
+    assert record["exception_type"] == "RuntimeError"
+    assert "SECRET_" not in json.dumps(record)
+    assert Path(str(path) + ".stdout").read_bytes() == raw
+
+
+@pytest.mark.parametrize("change", ["extra", "path", "line", "function", "too_many", "passed"])
+def test_activation_coordinates_cannot_export_unverified_frames(diagnostic_source, capsys, change):
+    frame = {"file": diagnostic_source.name, "line": 2}
+    if change == "extra":
+        frame["secret"] = "SECRET_CANARY"
+    elif change == "path":
+        frame["file"] = "/outside/public_failure.py"
+    elif change == "line":
+        frame["line"] = True
+    elif change == "function":
+        frame["function"] = "SECRET_CANARY"
+    packet = {"status": "passed" if change == "passed" else "failed_or_evidence_insufficient",
+              "activation": {"status": "failed_or_evidence_insufficient", "failure_type": "RuntimeError",
+                             "failure_locations": [frame] * (65 if change == "too_many" else 1)}}
+    native._emit_archive_diagnostic([json.dumps(packet).encode(), b""], True)
+    record = diagnostic_record(capsys)
+    assert record["locations"] == [] and record["status"] == "no_verified_frames"
+    assert "SECRET" not in json.dumps(record)
+
+
 @pytest.mark.parametrize("change", ["external", "fake_project_path", "function", "line", "truncated", "no_exception", "prefix", "unknown_class"])
 def test_fake_or_partial_stderr_never_exports_unverified_text(diagnostic_source, tmp_path, capsys, change):
     file = "/outside/SECRET_PATH/public_failure.py" if change == "external" else str(diagnostic_source)
