@@ -139,7 +139,10 @@ def test_child_malformed_input_has_fixed_diagnostic_without_private_values():
     result = subprocess.run([sys.executable, "-I", "-B", namespace.__file__, "--client"],
                             input=b'{"secret":"' + TOKEN.encode() + b'"}', capture_output=True, timeout=3)
     assert result.returncode == 3 and result.stdout == b""
-    assert result.stderr == b"sender namespace client unconfirmed\n" and TOKEN.encode() not in result.stderr
+    diagnostic = json.loads(result.stderr)
+    assert namespace._safe_child_diagnostic(diagnostic) == diagnostic
+    assert diagnostic["stage"] == "main" and diagnostic["kind"] == "NamespaceUncertain"
+    assert TOKEN.encode() not in result.stderr
 
 
 @pytest.fixture
@@ -275,3 +278,173 @@ def test_child_response_budget_status_and_duplicates_fail_closed(http_case, raw,
     with pytest.raises(namespace.NamespaceUncertain):
         namespace._http(p.value)
     assert p.closed and p.listener_released and not p.listener_live and not p.listener_confirmed
+
+
+def _capture_failure(script, *, operation="namespace_http", seconds=3, max_bytes=namespace.MAX_OUTPUT):
+    with pytest.raises(namespace.NamespaceUncertain) as caught:
+        namespace._capture([sys.executable, "-I", "-B", "-c", script], operation=operation,
+                           deadline=time.monotonic() + seconds, max_bytes=max_bytes)
+    diagnostic = caught.value.namespace_diagnostic
+    assert namespace.safe_namespace_diagnostic(diagnostic) == diagnostic
+    return diagnostic
+
+
+def test_child_real_failure_preserves_fixed_kind_and_source_position_only():
+    with pytest.raises(namespace.NamespaceUncertain) as caught:
+        namespace._capture([sys.executable, "-I", "-B", namespace.__file__, "--client"],
+                           input_bytes=json.dumps({"secret": TOKEN}).encode(), operation="namespace_http",
+                           deadline=time.monotonic() + 3)
+    diagnostic = caught.value.namespace_diagnostic
+    assert namespace.safe_namespace_diagnostic(diagnostic) == diagnostic
+    assert diagnostic["returncode"] == 3 and diagnostic["stage"] == "exit_and_deadline"
+    assert diagnostic["stdout_eof"] and diagnostic["stderr_eof"] and not diagnostic["deadline_expired"]
+    assert diagnostic["child_status"] == "valid" and diagnostic["child"]["stage"] == "main"
+    assert TOKEN not in json.dumps(diagnostic) and "secret" not in json.dumps(diagnostic)
+
+
+def test_capture_unknown_stderr_never_exports_private_text():
+    value = _capture_failure("import sys;sys.stderr.write('PRIVATE_TOKEN_URL_BODY');sys.exit(7)")
+    assert value["returncode"] == 7 and value["child_status"] == "invalid" and value["child"] is None
+    assert value["stdout_bytes"] == 0 and value["stderr_bytes"] == 22
+    assert "PRIVATE_TOKEN_URL_BODY" not in json.dumps(value)
+
+
+def test_capture_stderr_prefix_is_inside_original_output_bound():
+    value = _capture_failure("import sys;sys.stderr.write('PRIVATE'*20000)", max_bytes=1024)
+    assert value["stage"] == "output_bound" and value["stderr_bytes"] == 1025
+    assert value["child_status"] == "invalid" and value["child"] is None
+    assert "PRIVATE" not in json.dumps(value)
+
+
+def test_capture_truncated_diagnostic_is_unknown_not_a_child_result():
+    value = _capture_failure("import sys;sys.stderr.write('x'*4097);sys.exit(3)")
+    assert value["child_status"] == "truncated" and value["child"] is None
+
+
+def test_capture_timeout_keeps_partial_pipe_counts_and_unknown_exit():
+    value = _capture_failure("import sys,time;sys.stdout.write('partial');sys.stdout.flush();time.sleep(30)", seconds=0.2)
+    assert value["deadline_expired"] and value["returncode"] is None and value["stage"] == "pipe_select"
+    assert value["stdout_bytes"] == 7 and value["stderr_bytes"] == 0
+    assert value["child_status"] == "absent" and not value["stdout_eof"]
+
+
+def test_parseable_child_json_without_stderr_eof_is_not_a_complete_report():
+    child = {"schema": 1, "stage": "unclassified", "kind": "other", "errno": None, "location": None}
+    script = "import sys,time;sys.stderr.write(" + repr(json.dumps(child)) + ");sys.stderr.flush();time.sleep(30)"
+    value = _capture_failure(script, seconds=0.2)
+    assert value["deadline_expired"] and value["returncode"] is None and not value["stderr_eof"]
+    assert value["child_status"] == "invalid" and value["child"] is None
+
+
+def test_zero_exit_after_deadline_is_still_refused(monkeypatch):
+    clock = [0.0]
+    class Process:
+        stdin = None
+        def __init__(self):
+            streams = []
+            for _ in range(2):
+                read, write = os.pipe()
+                os.close(write)
+                streams.append(os.fdopen(read, "rb"))
+            self.stdout, self.stderr = streams
+        def wait(self, timeout):
+            clock[0] = 3.1
+            return 0
+        def poll(self):
+            return 0
+    monkeypatch.setattr(namespace.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(namespace.subprocess, "Popen", lambda *args, **kwargs: Process())
+    with pytest.raises(namespace.NamespaceUncertain) as caught:
+        namespace._capture(["unused"], deadline=3)
+    value = caught.value.namespace_diagnostic
+    assert value["returncode"] == 0 and value["deadline_expired"] and value["remaining_seconds"] == 0
+    assert value["stage"] == "exit_and_deadline" and value["stdout_eof"] and value["stderr_eof"]
+
+
+def test_capture_budget_counts_process_creation(monkeypatch):
+    original = namespace.subprocess.Popen
+    stamp = []
+    def spawned(*args, **kwargs):
+        stamp.append(time.monotonic())
+        return original(*args, **kwargs)
+    monkeypatch.setattr(namespace.subprocess, "Popen", spawned)
+    start = time.monotonic()
+    value = _capture_failure("import sys;sys.exit(2)")
+    assert value["capture_elapsed_seconds"] >= time.monotonic() - stamp[0] - 0.05
+    assert value["capture_budget_seconds"] > 2.9 and time.monotonic() - start < 3
+
+
+def test_unrelated_disappearing_fd_is_diagnosed_but_not_ignored(monkeypatch):
+    import errno
+    listener = namespace._PinnedListener({"pid": 321}, 8910, time.monotonic() + 2)
+    monkeypatch.setattr(listener, "_window", lambda: None)
+    @contextmanager
+    def entries(path):
+        yield iter([SimpleNamespace(name="5", path="/private/path/canary")])
+    def disappeared(path):
+        raise FileNotFoundError(errno.ENOENT, "PRIVATE_FILENAME_CANARY")
+    monkeypatch.setattr(namespace.os, "scandir", entries)
+    monkeypatch.setattr(namespace.os, "readlink", disappeared)
+    with pytest.raises(FileNotFoundError) as caught:
+        listener._owned_fds(999)
+    value = namespace._child_diagnostic(caught.value)
+    assert value["stage"] == "_PinnedListener._owned_fds" and value["kind"] == "OSError" and value["errno"] == errno.ENOENT
+    assert namespace._safe_child_diagnostic(value) == value
+    assert "PRIVATE" not in json.dumps(value) and "canary" not in json.dumps(value)
+
+
+@pytest.mark.parametrize("change", [
+    {"kind": []}, {"kind": "PRIVATE"}, {"stage": []}, {"stage": "PRIVATE"}, {"errno": True}, {"errno": 4096},
+    {"location": {"function": [], "line": 1}}, {"location": {"function": "main", "line": 999999}},
+    {"location": {"function": "main", "line": True}}, {"token": TOKEN}, {"schema": True},
+])
+def test_child_diagnostic_rejects_non_source_or_private_fields(change):
+    value = {"schema": 1, "stage": "unclassified", "kind": "other", "errno": None, "location": None}
+    assert namespace._safe_child_diagnostic({**value, **change}) is None
+
+
+@pytest.mark.parametrize("field,value", [
+    ("operation", []), ("operation", "PRIVATE"), ("stage", {}), ("stage", "PRIVATE"),
+    ("child_status", []), ("child_status", "PRIVATE"), ("capture_elapsed_seconds", float("nan")),
+    ("remaining_seconds", float("inf")), ("stdout_bytes", True), ("returncode", True),
+    ("returncode", 256), ("stderr_eof", 1), ("schema", True), ("token", TOKEN),
+    ("child_status", "valid"), ("deadline_expired", True), ("remaining_seconds", 4), ("capture_budget_seconds", 3.001),
+])
+def test_parent_projection_rejects_malformed_diagnostic(field, value):
+    fixed = {"schema": 1, "operation": "namespace_http", "stage": "exit_and_deadline", "capture_elapsed_seconds": 0.1,
+             "capture_budget_seconds": 3, "remaining_seconds": 2.9, "deadline_expired": False,
+             "returncode": 3, "stdout_bytes": 0, "stderr_bytes": 0, "stdout_eof": True, "stderr_eof": True,
+             "stdin_complete": True, "child_status": "absent", "child": None}
+    assert namespace.safe_namespace_diagnostic({**fixed, field: value}) is None
+
+
+def test_diagnostic_failure_does_not_replace_primary_refusal(monkeypatch):
+    from scripts import production_sender_bootstrap_native as native
+    def fail(value):
+        raise RuntimeError("PRIVATE_DIAGNOSTIC_FAILURE")
+    monkeypatch.setattr(namespace, "safe_namespace_diagnostic", fail)
+    with pytest.raises(namespace.NamespaceUncertain, match="query original") as caught:
+        namespace._capture([sys.executable, "-I", "-B", "-c", "import sys;sys.exit(7)"], deadline=time.monotonic() + 3)
+    assert caught.value.namespace_diagnostic is None and "PRIVATE" not in str(caught.value)
+    assert native._namespace_failure(caught.value) == {"namespace_diagnostic_status": "evidence_insufficient"}
+    assert native._namespace_failure(RuntimeError("not a namespace observation")) == {}
+
+
+@pytest.mark.parametrize("failure", ["classify", "encode", "write"])
+def test_child_diagnostic_fault_still_returns_three_without_traceback(monkeypatch, failure):
+    from io import BytesIO, StringIO
+    stderr = StringIO()
+    monkeypatch.setattr(namespace.sys, "argv", ["client", "--client"])
+    monkeypatch.setattr(namespace.sys, "stdin", SimpleNamespace(buffer=BytesIO(b'{"private":"SECRET"}')))
+    monkeypatch.setattr(namespace.sys, "stderr", stderr)
+    def bad(*args, **kwargs):
+        raise RuntimeError("PRIVATE_DIAGNOSTIC_ERROR")
+    if failure == "classify":
+        monkeypatch.setattr(namespace, "_child_diagnostic", bad)
+    elif failure == "encode":
+        monkeypatch.setattr(namespace, "_encoded", bad)
+    else:
+        monkeypatch.setattr(stderr, "write", bad)
+    assert namespace.main() == 3
+    assert "SECRET" not in stderr.getvalue() and "PRIVATE" not in stderr.getvalue()
+    assert "Traceback" not in stderr.getvalue()

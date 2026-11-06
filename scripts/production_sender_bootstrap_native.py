@@ -953,6 +953,7 @@ def execute(repo, source, image_id, binary, output, build_evidence, *, predecess
             **_command_reference(harness, error),
             "locations": [{"file": Path(row.filename).name, "function": row.name, "line": row.lineno}
                           for row in traceback.extract_tb(error.__traceback__) if Path(row.filename).resolve().is_relative_to(repo)]}
+        failure.update(_namespace_failure(error))
         _save(output / "FAILURE.json", failure)
     finally:
         from scripts import production_native_deadline as native_budget
@@ -983,6 +984,21 @@ def execute(repo, source, image_id, binary, output, build_evidence, *, predecess
                    "postgres_memory": 384 * 1024**2, "postgres_pids": 64, "operation_seconds": MAX_SECONDS}}
     _save(output / "RESULT.json", result)
     return result
+
+
+def _namespace_failure(error):
+    try:
+        from scripts.sender_namespace_http import safe_namespace_diagnostic
+        missing = object()
+        observed = getattr(error, "namespace_diagnostic", missing)
+        if observed is missing:
+            return {}
+        value = safe_namespace_diagnostic(observed)
+        if value is not None:
+            return {"namespace_diagnostic": value}
+    except Exception:
+        pass
+    return {"namespace_diagnostic_status": "evidence_insufficient"}
 
 
 def safe_export(root):

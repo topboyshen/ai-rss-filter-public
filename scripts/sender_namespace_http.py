@@ -9,6 +9,7 @@ from __future__ import annotations
 import ctypes
 import http.client
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -37,6 +38,105 @@ class NamespaceUncertain(RuntimeError):
     """Only fixed diagnostics may cross this boundary."""
 
 
+_CHILD_KINDS = frozenset({"NamespaceUncertain", "OSError", "TimeoutError", "ConnectionError",
+                         "JSONDecodeError", "ValueError", "KeyError", "TypeError", "other"})
+_CAPTURE_STAGES = frozenset({"spawn", "pipe_select", "stdin_write", "stdout_read", "stderr_read",
+                           "output_bound", "wait_exit", "exit_and_deadline"})
+
+
+def _diagnostic_codes():
+    """Only positions in this exact loaded source can appear in a child report."""
+    result = {name: globals()[name].__code__ for name in
+              ("main", "_http", "_validate_request", "_parsed", "_encoded", "_process_identity",
+               "_filesystem_type", "_duplicate_process_fd")}
+    result.update({"_PinnedListener." + name: getattr(_PinnedListener, name).__code__ for name in
+                   ("_window", "_read_table", "_table_listener", "_owned_fds", "confirm", "__enter__", "__exit__")})
+    return result
+
+
+def _child_diagnostic(error):
+    codes = _diagnostic_codes()
+    location = None
+    current = error.__traceback__
+    while current is not None:
+        for name, code in codes.items():
+            if current.tb_frame.f_code is code:
+                location = {"function": name, "line": current.tb_lineno}
+        current = current.tb_next
+    kind = ("NamespaceUncertain" if isinstance(error, NamespaceUncertain) else
+            "TimeoutError" if isinstance(error, TimeoutError) else
+            "ConnectionError" if isinstance(error, ConnectionError) else
+            "OSError" if isinstance(error, OSError) else
+            "JSONDecodeError" if isinstance(error, json.JSONDecodeError) else
+            type(error).__name__ if type(error) in (ValueError, KeyError, TypeError) else "other")
+    number = error.errno if isinstance(error, OSError) else None
+    number = number if type(number) is int and 0 < number <= 4095 else None
+    return {"schema": 1, "stage": "unclassified" if location is None else location["function"],
+            "kind": kind, "errno": number, "location": location}
+
+
+def _safe_child_diagnostic(value):
+    if not isinstance(value, dict) or set(value) != {"schema", "stage", "kind", "errno", "location"}:
+        return None
+    if (type(value["schema"]) is not int or value["schema"] != 1
+            or not isinstance(value["kind"], str) or value["kind"] not in _CHILD_KINDS):
+        return None
+    number, location = value["errno"], value["location"]
+    if number is not None and (type(number) is not int or not 0 < number <= 4095):
+        return None
+    if number is not None and value["kind"] not in {"OSError", "TimeoutError", "ConnectionError"}:
+        return None
+    if location is not None:
+        if not isinstance(location, dict) or set(location) != {"function", "line"}:
+            return None
+        code = _diagnostic_codes().get(location["function"]) if isinstance(location["function"], str) else None
+        if code is None or type(location["line"]) is not int or location["line"] not in {row[2] for row in code.co_lines()}:
+            return None
+    if value["stage"] != ("unclassified" if location is None else location["function"]):
+        return None
+    return {"schema": 1, "stage": value["stage"], "kind": value["kind"], "errno": number,
+            "location": None if location is None else dict(location)}
+
+
+def safe_namespace_diagnostic(value):
+    """Strict allowlist: never serialize stderr, argv, request, headers or exception text."""
+    keys = {"schema", "operation", "stage", "capture_elapsed_seconds", "capture_budget_seconds",
+            "remaining_seconds", "deadline_expired", "returncode", "stdout_bytes", "stderr_bytes",
+            "stdout_eof", "stderr_eof", "stdin_complete", "child_status", "child"}
+    if not isinstance(value, dict) or set(value) != keys:
+        return None
+    if (type(value["schema"]) is not int or value["schema"] != 1
+            or not isinstance(value["operation"], str) or value["operation"] not in {"docker_inspect", "namespace_http", "other"}
+            or not isinstance(value["stage"], str) or value["stage"] not in _CAPTURE_STAGES):
+        return None
+    for key in ("capture_elapsed_seconds", "capture_budget_seconds", "remaining_seconds"):
+        # Elapsed may record an overrun; budget/remaining can never grant more
+        # than the unchanged TOTAL_SECONDS=3 (inner HTTP_SECONDS remains 2).
+        ceiling = 60 if key == "capture_elapsed_seconds" else TOTAL_SECONDS
+        if type(value[key]) not in (int, float) or not math.isfinite(value[key]) or not 0 <= value[key] <= ceiling:
+            return None
+    if value["returncode"] is not None and (type(value["returncode"]) is not int or not -64 <= value["returncode"] <= 255):
+        return None
+    if any(type(value[key]) is not int or not 0 <= value[key] <= 1024**2 + 1 for key in ("stdout_bytes", "stderr_bytes")):
+        return None
+    if any(type(value[key]) is not bool for key in ("deadline_expired", "stdout_eof", "stderr_eof", "stdin_complete")):
+        return None
+    if not isinstance(value["child_status"], str) or value["child_status"] not in {"absent", "valid", "invalid", "truncated"}:
+        return None
+    child = _safe_child_diagnostic(value["child"]) if value["child"] is not None else None
+    if (value["child_status"] == "valid") != (child is not None) or (value["child"] is not None and child is None):
+        return None
+    if child is not None and (value["operation"] != "namespace_http" or not value["stderr_eof"] or value["returncode"] != 3):
+        return None
+    if (value["stdout_bytes"] + value["stderr_bytes"] > 1024**2 + 1
+            or (value["child_status"] == "absent") != (value["stderr_bytes"] == 0)
+            or (value["child_status"] == "truncated") != (value["stderr_bytes"] > 4096)
+            or value["remaining_seconds"] > value["capture_budget_seconds"]
+            or value["deadline_expired"] != (value["remaining_seconds"] == 0)):
+        return None
+    return {**value, "child": child}
+
+
 def require(condition):
     if not condition:
         raise NamespaceUncertain("sender namespace request unconfirmed; query original operation only")
@@ -58,9 +158,10 @@ def _parsed(raw):
     return value
 
 
-def _capture(argv, *, deadline, input_bytes=None, max_bytes=MAX_OUTPUT, pass_fds=()):
+def _capture(argv, *, deadline, input_bytes=None, max_bytes=MAX_OUTPUT, pass_fds=(), operation="other"):
     require(input_bytes is None or len(input_bytes) <= MAX_INPUT)
     require(time.monotonic() < deadline)
+    started, stage = time.monotonic(), "spawn"
     try:
         process = subprocess.Popen(argv, stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False, start_new_session=True,
@@ -68,6 +169,39 @@ def _capture(argv, *, deadline, input_bytes=None, max_bytes=MAX_OUTPUT, pass_fds
     except OSError:
         raise NamespaceUncertain("sender namespace client unavailable") from None
     output, total, sent = bytearray(), 0, 0
+    # A diagnostic prefix is retained inside, not in addition to, MAX_OUTPUT.
+    # Counts describe pipe reads; a rejected output is never a successful result.
+    diagnostic_stderr, counts, eof = bytearray(), {"stdout": 0, "stderr": 0}, {"stdout": False, "stderr": False}
+
+    def observation():
+        now = time.monotonic()
+        child, child_status = None, "absent"
+        if counts["stderr"] > 4096:
+            child_status = "truncated"
+        elif diagnostic_stderr:
+            child_status = "invalid"
+            try:
+                if operation == "namespace_http" and eof["stderr"] and process.poll() == 3:
+                    child = _safe_child_diagnostic(_parsed(bytes(diagnostic_stderr)))
+            except (ValueError, TypeError, NamespaceUncertain):
+                pass
+            if child is not None:
+                child_status = "valid"
+        value = {"schema": 1, "operation": operation, "stage": stage,
+                 "capture_elapsed_seconds": max(0.0, now - started), "capture_budget_seconds": max(0.0, deadline - started),
+                 "remaining_seconds": max(0.0, deadline - now), "deadline_expired": now >= deadline,
+                 "returncode": process.poll(), "stdout_bytes": counts["stdout"], "stderr_bytes": counts["stderr"],
+                 "stdout_eof": eof["stdout"], "stderr_eof": eof["stderr"],
+                 "stdin_complete": input_bytes is None or sent == len(input_bytes), "child_status": child_status, "child": child}
+        return safe_namespace_diagnostic(value)
+
+    def annotate(error):
+        try:
+            error.namespace_diagnostic = observation()
+        except Exception:
+            # Observation failure never hides or changes the primary refusal.
+            error.namespace_diagnostic = None
+
     try:
         with selectors.DefaultSelector() as selector:
             for stream in (process.stdout, process.stderr):
@@ -77,10 +211,12 @@ def _capture(argv, *, deadline, input_bytes=None, max_bytes=MAX_OUTPUT, pass_fds
                 os.set_blocking(process.stdin.fileno(), False)
                 selector.register(process.stdin, selectors.EVENT_WRITE)
             while selector.get_map():
+                stage = "pipe_select"
                 remaining = deadline - time.monotonic()
                 require(remaining > 0)
                 for key, _mask in selector.select(min(0.2, remaining)):
                     if key.fileobj is process.stdin:
+                        stage = "stdin_write"
                         try:
                             sent += os.write(key.fd, input_bytes[sent:])
                         except BlockingIOError:
@@ -90,21 +226,35 @@ def _capture(argv, *, deadline, input_bytes=None, max_bytes=MAX_OUTPUT, pass_fds
                             process.stdin.close()
                         continue
                     try:
+                        stream_name = "stdout" if key.fileobj is process.stdout else "stderr"
+                        stage = stream_name + "_read"
                         chunk = os.read(key.fd, min(65536, max_bytes + 1 - total))
                     except BlockingIOError:
                         continue
                     if not chunk:
+                        eof[stream_name] = True
                         selector.unregister(key.fileobj)
                         continue
                     total += len(chunk)
+                    counts[stream_name] += len(chunk)
+                    if stream_name == "stderr":
+                        diagnostic_stderr.extend(chunk[:max(0, 4096 - len(diagnostic_stderr))])
+                    stage = "output_bound"
                     require(total <= max_bytes)
                     if key.fileobj is process.stdout:
                         output.extend(chunk)
-            require(process.wait(timeout=max(0.001, deadline - time.monotonic())) == 0
-                    and time.monotonic() < deadline)
+            stage = "wait_exit"
+            returncode = process.wait(timeout=max(0.001, deadline - time.monotonic()))
+            stage = "exit_and_deadline"
+            require(returncode == 0 and time.monotonic() < deadline)
         return bytes(output)
+    except NamespaceUncertain as error:
+        annotate(error)
+        raise
     except (OSError, ValueError, subprocess.TimeoutExpired):
-        raise NamespaceUncertain("sender namespace request unconfirmed; query original operation only") from None
+        error = NamespaceUncertain("sender namespace request unconfirmed; query original operation only")
+        annotate(error)
+        raise error from None
     finally:
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGKILL)  # Only our local nsenter/client process group.
@@ -116,7 +266,7 @@ def _capture(argv, *, deadline, input_bytes=None, max_bytes=MAX_OUTPUT, pass_fds
 
 def _inspect(container_id, deadline):
     raw = _capture(["/usr/bin/docker", "--host", "unix:///var/run/docker.sock", "inspect", container_id],
-                   deadline=deadline, max_bytes=1024**2)
+                   deadline=deadline, max_bytes=1024**2, operation="docker_inspect")
     rows = _parsed(raw)
     require(isinstance(rows, list) and len(rows) == 1 and rows[0]["Id"] == container_id)
     row, state = rows[0], rows[0]["State"]
@@ -317,7 +467,7 @@ def request(container_id, port, method, path, token, payload=None):
         value = {"port": port, "method": method, "path": path, "token": token, "payload": payload, "owner": owner}
         argv = ["/usr/bin/nsenter", "--target", str(before["pid"]), f"--net=/proc/self/fd/{fd}", "--",
                 str(Path(sys.executable).resolve()), "-I", "-B", str(Path(__file__).resolve()), "--client"]
-        raw = _capture(argv, deadline=deadline, input_bytes=_encoded(value), pass_fds=(fd,))
+        raw = _capture(argv, deadline=deadline, input_bytes=_encoded(value), pass_fds=(fd,), operation="namespace_http")
         require(_inspect(container_id, deadline) == before and _process_identity(before["pid"]) == owner)
         result = _parsed(raw)
         require(isinstance(result, dict) and set(result) == {"status", "body"}
@@ -376,9 +526,16 @@ def main():
         require(isinstance(value, dict) and set(value) == {"port", "method", "path", "token", "payload", "owner"})
         sys.stdout.buffer.write(_encoded(_http(value)))
         return 0
-    except Exception:
+    except Exception as error:
         # A traceback could include private request data. Keep diagnostics fixed.
-        sys.stderr.write("sender namespace client unconfirmed\n")
+        try:
+            message = _encoded(_child_diagnostic(error)).decode("ascii")
+        except Exception:
+            message = "sender namespace client unconfirmed"
+        try:
+            sys.stderr.write(message + "\n")
+        except Exception:
+            pass  # Even an unavailable diagnostic stream cannot change rc=3.
         return 3
 
 

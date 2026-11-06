@@ -1,7 +1,9 @@
 """Synthetic failure reporting and private seal tests without invoking Docker."""
 
 import json
+import io
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -48,6 +50,165 @@ def test_unexpected_failure_has_no_exception_message_or_arbitrary_frame_path():
     assert details["kind"] == "unexpected_error"
     assert details["locations"] == []
     assert "SECRET" not in json.dumps(details)
+
+
+def failed_build(tmp_path, monkeypatch, stdout=b"", stderr=b"", code=1, error=None):
+    workspace = tmp_path / "private-build"
+    workspace.mkdir(mode=0o700)
+    report, calls = {}, []
+    def run(args, **kwargs):
+        calls.append((args, kwargs))
+        if error:
+            raise error
+        return subprocess.CompletedProcess(args, code, stdout, stderr)
+    monkeypatch.setattr(native.subprocess, "run", run)
+    with pytest.raises(type(error) if error else native.private.ContractError) as caught:
+        native.run_candidate_build(["docker", "build", "synthetic"], workspace, report)
+    assert len(calls) == 1 and calls[0][1] == {"capture_output": True, "timeout": 1200, "check": False}
+    return workspace, report["candidate_build_failure"], caught.value
+
+
+def test_nonzero_build_keeps_private_originals_and_only_fixed_public_locations(tmp_path, monkeypatch):
+    raw = (b"#11 [4/38] RUN pip install sensitive-inline-value\n"
+           b"#11 0.5 ReadTimeoutError: https://token:private@private.invalid/simple\n"
+           b"#11 1.5 [Errno 101] Network is unreachable\nDockerfile:36\n"
+           b"runtime.yaml LLM_API_KEY=secret-value\nUNKNOWN-BARE-SECRET\n")
+    workspace, report, error = failed_build(tmp_path, monkeypatch, stderr=raw, code=1)
+    assert str(error) == "native candidate build failed"
+    assert report["returncode"] == 1 and report["outcome"] == "nonzero_exit"
+    assert report["elapsed_seconds"] >= 0 and report["container_build_completion"] == "unconfirmed"
+    assert report["streams"]["stderr"]["events"] == [
+        {"kind": "build_step", "step": 11, "position": 4, "total": 38, "instruction": "RUN"},
+        {"kind": "dockerfile_location", "line": 36}]
+    assert report["streams"]["stderr"]["marker_line_counts"] == {"network_timeout": 1, "network_unreachable": 1}
+    public = json.dumps(report)
+    for secret in ("sensitive-inline-value", "private.invalid", "runtime.yaml", "LLM_API_KEY", "secret-value", "UNKNOWN-BARE-SECRET"):
+        assert secret not in public
+    assert (workspace / "candidate-build.stderr").read_bytes() == raw
+    assert (workspace / "candidate-build.stdout").read_bytes() == b""
+    assert all(path.stat().st_mode & 0o777 == 0o600 for path in workspace.iterdir())
+    assert report["streams"]["stderr"]["complete_capture_sha256"] == private.sha(raw)
+    assert report["retention"] == "private_bounded_copies_confirmed"
+    assert not report["raw_private_workspace_uploaded"] and not report["execution_proof"]
+    published = tmp_path / "report.json"
+    native.fail_stage(published, {"candidate_build_failure": report}, error)
+    assert json.loads(published.read_text())["status"] == "failed"
+    assert "secret-value" not in published.read_text() and str(workspace) not in published.read_text()
+
+
+@pytest.mark.parametrize("output", [None, b"partial output", "unexpected secret text"])
+def test_build_timeout_preserves_original_exception_and_unknown_completion(tmp_path, monkeypatch, output):
+    original = subprocess.TimeoutExpired(["docker", "build", "SECRET"], 1200, output=output, stderr=b"partial secret stderr")
+    workspace, report, caught = failed_build(tmp_path, monkeypatch, error=original)
+    assert caught is original and report["timed_out"] and report["returncode"] is None
+    assert report["outcome"] == "timeout_unknown" and report["container_build_completion"] == "unconfirmed"
+    assert report["streams"]["stdout"]["eof"] is None
+    assert "SECRET" not in json.dumps(report) and "partial secret" not in json.dumps(report)
+    assert (workspace / "candidate-build.stderr").read_bytes() == b"partial secret stderr"
+    assert (workspace / "candidate-build.stdout").exists() == (type(output) is bytes)
+
+
+def test_build_output_cap_is_explicit_and_total_preservation_stays_below_eight_mib(tmp_path, monkeypatch):
+    raw = b"x" * (native.BUILD_STREAM_BYTES + 1)
+    workspace, report, _ = failed_build(tmp_path, monkeypatch, stdout=raw, stderr=raw)
+    for name in ("stdout", "stderr"):
+        profile = report["streams"][name]
+        assert profile["truncated"] and profile["observed_bytes"] == len(raw)
+        assert profile["complete_capture_sha256"] is None and profile["retained_bytes"] == native.BUILD_STREAM_BYTES
+        assert (workspace / ("candidate-build." + name)).read_bytes() == raw[:native.BUILD_STREAM_BYTES]
+    assert sum(p.stat().st_size for p in workspace.iterdir()) + len(private.encoded(report)) <= 8 * 1024 * 1024
+    assert "not_stream_bounded" in report["capture_behavior"]
+
+
+@pytest.mark.parametrize("fault", ["write", "sync", "directory_sync", "replaced", "permissions",
+    "existing", "symlink", "parent_mode", "projection"])
+def test_build_preservation_failure_never_replaces_primary_or_retries(tmp_path, monkeypatch, fault):
+    original = native.retain_build_outputs
+    def broken(workspace, streams, profiles):
+        if fault == "write":
+            monkeypatch.setattr(native.os, "write", lambda *args: (_ for _ in ()).throw(OSError("secret disk error")))
+        elif fault == "sync":
+            monkeypatch.setattr(native.os, "fsync", lambda *args: (_ for _ in ()).throw(OSError("secret sync error")))
+        elif fault == "directory_sync":
+            sync = native.os.fsync
+            calls = []
+            def fail_directory(fd):
+                calls.append(fd)
+                if len(calls) == 3:
+                    raise OSError("secret directory sync error")
+                sync(fd)
+            monkeypatch.setattr(native.os, "fsync", fail_directory)
+        elif fault in {"replaced", "permissions"}:
+            sync = native.os.fsync
+            def mutate_after_sync(fd):
+                sync(fd)
+                if fault == "permissions":
+                    native.os.fchmod(fd, 0o644)
+                else:
+                    path = workspace / "candidate-build.stdout"
+                    path.rename(workspace / "candidate-build.stdout.before")
+                    path.write_bytes(b"replacement")
+            monkeypatch.setattr(native.os, "fsync", mutate_after_sync)
+        elif fault == "existing":
+            (workspace / "candidate-build.stdout").write_bytes(b"original evidence")
+        elif fault == "symlink":
+            (workspace / "candidate-build.stdout").symlink_to(tmp_path / "forbidden")
+        elif fault == "parent_mode":
+            workspace.chmod(0o755)
+        return original(workspace, streams, profiles)
+    monkeypatch.setattr(native, "retain_build_outputs", broken)
+    if fault == "projection":
+        monkeypatch.setattr(native, "build_failure_diagnostic", lambda *args: (_ for _ in ()).throw(ValueError("secret projection")))
+    workspace, report, error = failed_build(tmp_path, monkeypatch, stdout=b"captured", stderr=b"second")
+    assert str(error) == "native candidate build failed"
+    assert report.get("retention", report.get("status")) == "evidence_insufficient"
+    assert "secret" not in json.dumps(report) and not (tmp_path / "forbidden").exists()
+    assert (workspace / "candidate-build.stderr").exists() == (fault == "directory_sync")
+    if fault == "directory_sync":
+        assert all(row["retention"] == "file_synced_directory_pending" for row in report["streams"].values())
+    if fault == "existing":
+        assert (workspace / "candidate-build.stdout").read_bytes() == b"original evidence"
+
+
+def test_successful_build_adds_no_failure_evidence(tmp_path, monkeypatch):
+    monkeypatch.setattr(native.subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, b"secret", b""))
+    report = {}
+    native.run_candidate_build(["docker", "build", "synthetic"], tmp_path, report)
+    assert not report and not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("line", [b"Dockerfile:9 secret", b"#1 [4/38] EVIL secret", b"secret token",
+    b"#1 [secret.domain 4/38] RUN secret", b"#1 [4/38] RUN secret\x00suffix", b"\xff\x00secret token\xfe"])
+def test_unknown_build_lines_are_not_public_text(line):
+    profile = native.build_output_profile(line)
+    assert "secret" not in json.dumps(profile) and "EVIL" not in json.dumps(profile)
+
+
+def test_candidate_build_uses_fixed_official_index_not_ambient_environment(tmp_path, monkeypatch):
+    class Producer:
+        stdout = io.BytesIO(b"synthetic archive")
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return None
+        def wait(self):
+            return 0
+    monkeypatch.setattr(native.subprocess, "Popen", lambda *args, **kwargs: Producer())
+    monkeypatch.setattr(native.subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess(args, 0))
+    monkeypatch.setenv("PIP_INDEX_URL", "https://secret.example.invalid/simple")
+    monkeypatch.setenv("STARTUP_PIP_INDEX_URL", "https://other.example.invalid/simple")
+    seen = []
+    def build(args, workspace, report):
+        seen.extend(args)
+        raise private.ContractError("stop before inspect")
+    monkeypatch.setattr(native, "run_candidate_build", build)
+    source = {"source_sha": "a" * 40, "example_config_sha256": "b" * 64}
+    contract = {"files": {"compose.json": "c" * 64, "runtime.yaml": "d" * 64}}
+    with pytest.raises(private.ContractError, match="stop before inspect"):
+        native.build_candidate(tmp_path, tmp_path, source, "synthetic:1", contract, "e" * 64, {})
+    assert seen[:4] == ["docker", "build", "--platform", "linux/amd64"]
+    assert [value for value in seen if value.startswith("PIP_INDEX_URL=")] == ["PIP_INDEX_URL=https://pypi.org/simple"]
+    assert not any("secret.example" in value or "other.example" in value for value in seen)
 
 
 def test_fixed_image_pull_failure_is_separate_from_start_and_preserved(tmp_path, monkeypatch):

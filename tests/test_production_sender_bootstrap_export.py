@@ -7,10 +7,52 @@ import stat
 
 import pytest
 
+
 from scripts import production_sender_bootstrap_native as native
 from scripts.verify_miniflux_pause_native import save
 from services import admission_fence as gate
 from test_production_sender_bootstrap_native import _fallback_arguments, failed_command
+
+@pytest.mark.parametrize("valid", [True, False])
+def test_namespace_failure_projection_is_strict_and_survives_safe_export(tmp_path, valid):
+    from scripts import sender_namespace_http as namespace
+    value = {"schema": 1, "operation": "namespace_http", "stage": "exit_and_deadline", "capture_elapsed_seconds": 0.1,
+             "capture_budget_seconds": 3, "remaining_seconds": 2.9, "deadline_expired": False,
+             "returncode": 3, "stdout_bytes": 0, "stderr_bytes": 0, "stdout_eof": True, "stderr_eof": True,
+             "stdin_complete": True, "child_status": "absent", "child": None}
+    error = namespace.NamespaceUncertain("PRIVATE_PRIMARY_CANARY")
+    error.namespace_diagnostic = value if valid else {**value, "token": "PRIVATE_TOKEN_CANARY"}
+    projection = native._namespace_failure(error)
+    assert projection == ({"namespace_diagnostic": value} if valid else {"namespace_diagnostic_status": "evidence_insufficient"})
+    tmp_path.chmod(0o700)
+    previous = os.umask(0o077)
+    try:
+        failure = {"type": "NamespaceUncertain", "message_sha256": hashlib.sha256(str(error).encode()).hexdigest(), **projection}
+        native._save(tmp_path / "FAILURE.json", failure)
+        native._save(tmp_path / "RESULT.json", {"status": "unconfirmed", "failure": failure, "errors": []})
+    finally:
+        os.umask(previous)
+    packet = native.safe_export(tmp_path)
+    assert packet["files"]["FAILURE.json"]["content"] == failure
+    assert packet["files"]["RESULT.json"]["content"]["status"] == "unconfirmed"
+    assert "PRIVATE_" not in json.dumps(packet)
+
+
+@pytest.mark.parametrize("failure", ["getattr", "validator"])
+def test_namespace_projection_fault_never_replaces_primary_failure(monkeypatch, failure):
+    from scripts import sender_namespace_http as namespace
+    class BadAttribute(RuntimeError):
+        @property
+        def namespace_diagnostic(self):
+            raise RuntimeError("PRIVATE_ATTRIBUTE_CANARY")
+    error = BadAttribute("primary") if failure == "getattr" else RuntimeError("primary")
+    if failure == "validator":
+        error.namespace_diagnostic = {"invalid": True}
+        def bad(value):
+            raise RuntimeError("PRIVATE_VALIDATOR_CANARY")
+        monkeypatch.setattr(namespace, "safe_namespace_diagnostic", bad)
+    assert native._namespace_failure(error) == {"namespace_diagnostic_status": "evidence_insufficient"}
+    assert str(error) == "primary"
 
 
 def snapshot(root):
