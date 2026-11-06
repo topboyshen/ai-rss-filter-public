@@ -1,6 +1,7 @@
 import copy
 import json
 from pathlib import Path
+import signal
 import stat
 import tempfile
 import time
@@ -192,7 +193,8 @@ def test_blocking_write_is_bounded_by_original_deadline(monkeypatch, private_sto
     error = reject(monkeypatch, seconds=0.03)
     assert time.monotonic() - started < 0.4
     assert str(error) == "Docker archive socket table identity ambiguous"
-    assert diagnostic.error_summary(error)["retention"] == "deadline_exhausted"
+    assert diagnostic.error_summary(error) is None
+    assert error.gateway_socket_diagnostic["retention"] == "deadline_exhausted"
 
 
 @pytest.mark.parametrize("limit", ["PRIVATE_BYTES", "PRIVATE_EVENTS"])
@@ -204,9 +206,61 @@ def test_private_capacity_failure_does_not_grant_success(monkeypatch, private_st
 
 
 def test_expired_deadline_never_creates_files(monkeypatch, private_store):
+    monkeypatch.setattr(diagnostic, "conditions", lambda _raw: pytest.fail("no projection after deadline"))
+    monkeypatch.setattr(diagnostic, "sha", lambda _raw: pytest.fail("no hashing after deadline"))
     error = reject(monkeypatch, seconds=-1)
-    assert diagnostic.error_summary(error)["retention"] == "deadline_exhausted"
+    assert diagnostic.error_summary(error) is None
+    assert error.gateway_socket_diagnostic["retention"] == "deadline_exhausted"
+    assert error.gateway_socket_diagnostic["reads"][0]["raw"] == BAD
     assert list(private_store.iterdir()) == []
+
+
+def test_slow_projection_is_bounded_before_any_file_write(monkeypatch, private_store):
+    monkeypatch.setattr(diagnostic, "conditions", lambda _raw: time.sleep(1))
+    started = time.monotonic()
+    error = reject(monkeypatch, seconds=0.03)
+    assert time.monotonic() - started < 0.4
+    assert str(error) == "Docker archive socket table identity ambiguous"
+    assert diagnostic.error_summary(error) is None
+    assert error.gateway_socket_diagnostic["retention"] == "deadline_exhausted"
+    assert list(private_store.iterdir()) == []
+
+
+def test_earlier_outer_alarm_is_never_touched_or_consumed(monkeypatch, private_store):
+    calls = []
+    monkeypatch.setattr(diagnostic.signal, "getsignal", lambda _sig: lambda *_a: None)
+    monkeypatch.setattr(diagnostic.signal, "getitimer", lambda _which: (0.01, 0.0))
+    monkeypatch.setattr(diagnostic.signal, "signal", lambda *_a: calls.append("handler"))
+    monkeypatch.setattr(diagnostic.signal, "setitimer", lambda *_a: calls.append("timer"))
+    monkeypatch.setattr(diagnostic, "conditions", lambda _raw: pytest.fail("no projection before earlier cancellation"))
+    error = reject(monkeypatch)
+    assert calls == [] and diagnostic.error_summary(error) is None
+    assert error.gateway_socket_diagnostic["retention"] == "deadline_exhausted"
+    assert list(private_store.iterdir()) == []
+
+
+def test_later_outer_alarm_handler_and_remaining_time_are_restored(monkeypatch, private_store):
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    assert previous_timer[0] == 0
+    calls = []
+    def handler(*_a):
+        calls.append("outer")
+    signal.signal(signal.SIGALRM, handler)
+    signal.setitimer(signal.ITIMER_REAL, 1.0)
+    started = time.monotonic()
+    try:
+        monkeypatch.setattr(diagnostic, "conditions", lambda _raw: time.sleep(0.5))
+        error = reject(monkeypatch, seconds=0.03)
+        elapsed = time.monotonic() - started
+        remaining = signal.getitimer(signal.ITIMER_REAL)[0]
+        assert diagnostic.error_summary(error) is None and calls == []
+        assert signal.getsignal(signal.SIGALRM) is handler
+        assert 0 < remaining <= 1.0 - elapsed + 0.005
+        assert elapsed < 0.4
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 def test_default_production_path_has_no_collector_or_writes(monkeypatch, private_store):

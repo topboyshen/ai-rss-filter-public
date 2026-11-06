@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import tempfile
 import threading
 import time
@@ -183,6 +184,39 @@ def _retain(event, deadline, budget):
     return "retained_privately"
 
 
+class _DiagnosticTimeout(Exception):
+    pass
+
+
+@contextmanager
+def _bounded(deadline):
+    """Do not consume an earlier outer cancellation or extend its timer."""
+    started = time.monotonic()
+    if type(deadline) not in (int, float) or not started < deadline:
+        yield False
+        return
+    old_handler, old_timer = signal.getsignal(signal.SIGALRM), signal.getitimer(signal.ITIMER_REAL)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or (old_timer[0] and old_timer[0] <= remaining):
+        yield False
+        return
+
+    def expired(_signal, _frame):
+        raise _DiagnosticTimeout()
+
+    signal.signal(signal.SIGALRM, expired)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, max(0.000001, deadline - time.monotonic()))
+        yield True
+        if time.monotonic() >= deadline:
+            raise _DiagnosticTimeout()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old_handler)
+        if old_timer[0]:
+            signal.setitimer(signal.ITIMER_REAL, max(0.000001, old_timer[0] - (time.monotonic() - started)), old_timer[1])
+
+
 def capture(error, first, second, metadata, failed_at):
     """First observation stays attached to this error; no cross-attempt overwrite."""
     budget = _SCOPE.get()
@@ -198,24 +232,28 @@ def capture(error, first, second, metadata, failed_at):
             index = failed_at == "second_read"
             failed = getattr(error, "gateway_socket_read", None)
             reads[index] = failed if type(failed) is dict and set(failed) == {"raw", "state", "eof", "truncated"} else reading(state="unavailable")
-        summary = {"schema": 1, "execution_proof": False, "full_raw_archive_verified": False, "stage": stage,
-                   "failed_at": failed_at, "identity_sha256": sha(encoded(identity)),
-                   "reads": [public_read(x) for x in reads], "retention": "not_attempted"}
-        event = {"summary": summary, "reads": reads, "identity": identity, "metadata": metadata}
+        event = {"summary": None, "reads": reads, "identity": identity, "metadata": metadata,
+                 "stage": stage, "failed_at": failed_at, "retention": "not_attempted"}
         error.gateway_socket_diagnostic = event
         try:
-            if type(deadline) not in (int, float) or not time.monotonic() < deadline:
-                summary["retention"] = "deadline_exhausted"
-            elif threading.current_thread() is not threading.main_thread():
-                summary["retention"] = "write_failed"
-            else:
-                from scripts.production_gateway_switch import _hard_deadline
-                with _hard_deadline(deadline - time.monotonic()):
-                    summary["retention"] = _retain(event, deadline, budget)
-        except TimeoutError:
-            summary["retention"] = "deadline_exhausted"
+            if threading.current_thread() is not threading.main_thread():
+                event["retention"] = "write_failed"
+                return
+            with _bounded(deadline) as available:
+                if not available:
+                    event["retention"] = "deadline_exhausted"
+                    return
+                summary = {"schema": 1, "execution_proof": False, "full_raw_archive_verified": False, "stage": stage,
+                           "failed_at": failed_at, "identity_sha256": sha(encoded(identity)),
+                           "reads": [public_read(x) for x in reads], "retention": "not_attempted"}
+                event["summary"] = summary
+                summary["retention"] = event["retention"] = _retain(event, deadline, budget)
+        except (_DiagnosticTimeout, TimeoutError):
+            event["retention"], event["summary"] = "deadline_exhausted", None
         except Exception:
-            summary["retention"] = "deadline_exhausted" if type(deadline) in (int, float) and time.monotonic() >= deadline else "write_failed"
+            event["retention"] = "deadline_exhausted" if type(deadline) in (int, float) and time.monotonic() >= deadline else "write_failed"
+            if event["summary"] is not None:
+                event["summary"]["retention"] = event["retention"]
     except Exception:
         pass  # The caller re-raises the original error unconditionally.
 
