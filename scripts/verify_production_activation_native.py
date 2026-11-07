@@ -1145,6 +1145,9 @@ def record_failure(error, repo, output, stage, *, private_commands=None):
     socket_summary = socket_diagnostics.error_summary(error)
     if socket_summary is not None:
         failure["socket_listener"] = summary["socket_listener"] = socket_summary
+    anchor_summary = socket_diagnostics.error_anchor(error)
+    if anchor_summary is not None:
+        failure["archive_anchor"] = summary["archive_anchor"] = anchor_summary
     print("activation_native_failure=" + json.dumps(summary, sort_keys=True), flush=True)
     fixture.save(output / "FAILURE.json", failure)
     return failure
