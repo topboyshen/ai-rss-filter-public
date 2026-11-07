@@ -488,6 +488,16 @@ def _proc_identity(info):
     return tuple(getattr(info, "st_" + key) for key in ("dev", "ino", "mode", "uid", "gid", "nlink", "size"))
 
 
+def _anchor_directory_stable(directory, fdroot, fixed):
+    """Post-failure restat only; it is not the exact evaluation that rejected."""
+    if directory is None or fixed is None:
+        return None
+    try:
+        return _proc_identity(os.fstat(directory)) == _proc_identity(os.lstat(fdroot)) == fixed
+    except OSError:
+        return False
+
+
 def _procfs(fd):
     library = ctypes.CDLL(None, use_errno=True)
     function = library.fstatfs
@@ -618,29 +628,49 @@ class _ArchiveAuthority:
                       "Docker archive authority process uses another network namespace")
         fdroot = f"/proc/{pid}/fd"
         before, held = os.lstat(fdroot), {}
-        gate._require(stat.S_ISDIR(before.st_mode) and before.st_uid == before.st_gid == 0,
-                      "unsafe Docker archive FD directory")
-        directory = os.open(fdroot, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        # Failure facts only: counts and one-way digests, never a path or link
+        # target. `reason` is bookkeeping for the packet, not an extra check;
+        # every condition below is unchanged from the reviewed version.
+        scan, reason, directory, fixed = (
+            socket_diagnostics.AnchorScan(pid, self.listener, self.deadline), "unsafe_directory", None, None)
         try:
+            gate._require(stat.S_ISDIR(before.st_mode) and before.st_uid == before.st_gid == 0,
+                          "unsafe Docker archive FD directory")
+            reason = "directory_open"
+            directory = os.open(fdroot, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            reason = "not_procfs"
             _procfs(directory)
             fixed = _proc_identity(before)
+            reason = "directory_open_changed"
             gate._require(_proc_identity(os.fstat(directory)) == fixed, "Docker archive FD directory open changed")
+            reason = "fd_scan"
             with os.scandir(directory) as entries:
                 for index, entry in enumerate(entries):
+                    reason = "fd_scan_limit"
                     gate._require(index < 256 and time.monotonic() < self.deadline,
                                   "Docker archive FD scan capacity/deadline")
+                    reason = "fd_name"
                     gate._require(entry.name.isdigit(), "unexpected Docker archive FD name")
                     path = fdroot + "/" + entry.name
+                    reason = "fd_link"
                     try:
                         value = _link_identity(path)
                     except FileNotFoundError:
+                        reason = "fd_inventory"
                         raise gate.AdmissionUncertain("Docker archive FD inventory changed") from None
+                    scan.observe(value[-1])
                     if value[-1] == f"socket:[{self.listener}]":
                         held[path] = value
+            reason = "fd_ownership"
             gate._require(held and _proc_identity(os.fstat(directory)) == _proc_identity(os.lstat(fdroot)) == fixed,
                           "Docker archive listener FD ownership unconfirmed")
+        except BaseException as error:
+            socket_diagnostics.anchor_failed(error, scan, reason,
+                                             directory_stable=_anchor_directory_stable(directory, fdroot, fixed))
+            raise
         finally:
-            os.close(directory)
+            if directory is not None:
+                os.close(directory)
         self.held[pid] = held
 
     def peer(self, value):

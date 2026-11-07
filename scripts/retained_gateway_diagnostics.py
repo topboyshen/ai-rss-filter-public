@@ -2,6 +2,8 @@
 
 Raw originals stay in new private /tmp directories OUTSIDE fixture/upload roots.
 Only bounded typed counts, conditions and hashes may enter public evidence.
+The anchor packet below retains no raw value at all, so it can be attached to
+any rejected FD-ownership scan without starting a private capture.
 """
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -25,6 +27,11 @@ RETENTION = {"retained_privately", "deadline_exhausted", "capacity_exhausted", "
 COUNTS = {"target_rows", "bad_columns", "bad_inode", "duplicate_inode", "duplicate_positive_inode",
           "pending_zero", "unknown_shape", "listeners", "alias_rows"}
 REASONS = {"ascii", "header", "rows", "columns", "inode", "duplicate", "shape", "listener_count", "alias", "none"}
+ANCHOR_REASONS = {"unsafe_directory", "directory_open", "not_procfs", "directory_open_changed", "fd_scan",
+                  "fd_scan_limit", "fd_name", "fd_inventory", "fd_link", "fd_ownership", "unspecified"}
+ANCHOR_FIELDS = {"schema", "execution_proof", "stage", "reason", "pid", "listener_inode_sha256", "fd_entries",
+                 "socket_entries", "listener_entries", "directory_stable", "link_set_sha256",
+                 "deadline_remaining_ms"}
 _SCOPE = ContextVar("gateway_socket_diagnostic_scope", default=None)
 _PHASE = ContextVar("gateway_socket_diagnostic_phase", default=("unspecified", None, {}))
 
@@ -305,5 +312,108 @@ def _safe_read(value):
 def error_summary(error):
     try:
         return safe_summary(error.gateway_socket_diagnostic["summary"])
+    except Exception:
+        return None
+
+
+class AnchorScan:
+    """Counts and one-way digests for one rejected /proc/<pid>/fd ownership scan.
+
+    Consumers pass only the link target of each FD already validated by the
+    caller. No file name, link target or path is retained, and the link set is
+    hashed incrementally so an aborted scan cannot grow memory.
+    """
+    LIMIT = 256
+
+    def __init__(self, pid, listener, deadline=None):
+        self.pid, self.listener, self.deadline = pid, listener, deadline
+        self.entries = self.sockets = self.matches = 0
+        self._links = hashlib.sha256()
+
+    def observe(self, target):
+        try:
+            if type(target) is not str or len(target) > 4096 or self.entries >= self.LIMIT:
+                return
+            raw = target.encode("utf-8", "surrogateescape")
+            self.entries += 1
+            self._links.update(len(raw).to_bytes(4, "big"))
+            self._links.update(raw)
+            if target.startswith("socket:["):
+                self.sockets += 1
+            if target == f"socket:[{self.listener}]":
+                self.matches += 1
+        except Exception:
+            pass  # Facts are optional and never replace the original failure.
+
+    def remaining_ms(self):
+        if type(self.deadline) not in (int, float):
+            return None
+        try:
+            return max(-60000, min(60000, int((self.deadline - time.monotonic()) * 1000)))
+        except (OverflowError, ValueError):
+            return None
+
+    def packet(self, reason, directory_stable=None):
+        try:
+            if type(self.pid) is not int or not 1 <= self.pid < 2**64:
+                return None
+            if type(self.listener) is not int or not 0 <= self.listener < 2**64:
+                return None
+            value = {"schema": 1, "execution_proof": False, "stage": "anchor",
+                     "reason": reason if reason in ANCHOR_REASONS else "unspecified",
+                     "pid": self.pid, "listener_inode_sha256": sha(str(self.listener).encode()),
+                     "fd_entries": self.entries, "socket_entries": self.sockets,
+                     "listener_entries": self.matches,
+                     "directory_stable": directory_stable if type(directory_stable) is bool else None,
+                     "link_set_sha256": self._links.hexdigest(),
+                     "deadline_remaining_ms": self.remaining_ms()}
+            return safe_anchor(value)
+        except Exception:
+            return None
+
+
+def safe_anchor(value):
+    """Strictly validate one bounded anchor packet; never copy unknown fields."""
+    try:
+        if type(value) is not dict or set(value) != ANCHOR_FIELDS:
+            return None
+        if type(value["schema"]) is not int or value["schema"] != 1:
+            return None
+        if value["execution_proof"] is not False or value["stage"] != "anchor" or value["reason"] not in ANCHOR_REASONS:
+            return None
+        if type(value["pid"]) is not int or not 1 <= value["pid"] < 2**64:
+            return None
+        for key in ("listener_inode_sha256", "link_set_sha256"):
+            if type(value[key]) is not str or not re.fullmatch(r"[0-9a-f]{64}", value[key]):
+                return None
+        for key in ("fd_entries", "socket_entries", "listener_entries"):
+            if type(value[key]) is not int or not 0 <= value[key] <= AnchorScan.LIMIT:
+                return None
+        if type(value["directory_stable"]) is not bool and value["directory_stable"] is not None:
+            return None
+        remaining = value["deadline_remaining_ms"]
+        if remaining is not None and (type(remaining) is not int or not -60000 <= remaining <= 60000):
+            return None
+        raw = encoded(value)
+        return json.loads(raw) if len(raw) <= PUBLIC_BYTES else None
+    except Exception:
+        return None
+
+
+def anchor_failed(error, scan, reason, *, directory_stable=None):
+    """Attach the first bounded packet only; never raise over the rejection."""
+    try:
+        if hasattr(error, "gateway_anchor_diagnostic"):
+            return
+        packet = scan.packet(reason, directory_stable)
+        if packet is not None:
+            error.gateway_anchor_diagnostic = packet
+    except Exception:
+        pass
+
+
+def error_anchor(error):
+    try:
+        return safe_anchor(error.gateway_anchor_diagnostic)
     except Exception:
         return None
