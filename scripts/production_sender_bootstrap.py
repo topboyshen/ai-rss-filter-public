@@ -45,6 +45,7 @@ PG_SQL = """SELECT current_database(),current_schema(),(SELECT system_identifier
 
 def source_sha256():
     names = ("scripts/production_sender_bootstrap.py", "scripts/production_legacy_takeover.py", "scripts/private_release_contract.py",
+             "scripts/sender_host_loopback_pg.py",
              "scripts/production_sender_driver.py", "scripts/sender_namespace_http.py", "scripts/sender_drain_inventory.py",
              "scripts/handoff_runtime_adapter.py", "scripts/miniflux_handoff_adapter.py", "ops/miniflux/Dockerfile",
              "ops/miniflux/pause-source-lock.json")
@@ -88,14 +89,22 @@ def _postgres(plan, *, after=False):
     secret = gate._read(Path(plan["dsn_file"]))
     gate._require(set(secret) == {"dsn"} and isinstance(secret["dsn"], str) and 0 < len(secret["dsn"]) <= 8192, "private sender DSN required")
     deadline = time.monotonic() + 10
+    transport = None
+    if "postgres_transport" in plan:
+        from scripts.sender_host_loopback_pg import HostLoopbackPostgres
+        transport = HostLoopbackPostgres(plan["postgres_transport"])
+        transport.check(secret["dsn"], deadline=deadline)
     with psycopg.connect(secret["dsn"], connect_timeout=3, autocommit=True) as connection:
         try:
             connection.execute("BEGIN READ ONLY")
             connection.execute("SET LOCAL statement_timeout='3000ms'")
             connection.execute("SET LOCAL lock_timeout='1000ms'")
             base = dict(zip(PG_KEYS, connection.execute(PG_SQL).fetchone()))
+            if transport is not None:
+                with connection.cursor() as cursor:
+                    transport.check_connection(cursor, plan["postgres_before"])
             versions = connection.execute("SELECT version FROM schema_version LIMIT 2").fetchall()
-            gate._require(len(versions) == 1 and versions[0][0] in {"132", "133", "134", "135"},
+            gate._require(len(versions) == 1 and versions[0][0] in {"131", "132", "133", "134", "135"},
                           "sender predecessor schema lacks this bootstrap's verified upgrade coverage")
             actual = {**base, "schema_version": int(versions[0][0])}
             wanted = plan["postgres_before"]
@@ -112,6 +121,8 @@ def _postgres(plan, *, after=False):
                         gate._require(not connection.execute("SELECT 1 FROM " + table + " LIMIT 1").fetchall(),
                                       "existing control history cannot be initialized/reset")
             gate._require(time.monotonic() < deadline, "sender PG metadata deadline")
+            if transport is not None:
+                transport.check(secret["dsn"], deadline=deadline)
             return actual
         finally:
             connection.execute("ROLLBACK")
@@ -119,11 +130,15 @@ def _postgres(plan, *, after=False):
 
 def _manifest(plan, raw, environment):
     manifest = gate._parsed(raw)
+    host_local = plan["network"]["Name"] == plan["network"]["Driver"] == "host"
+    networks = {} if host_local else {"sender": {"name": plan["network"]["Name"], "external": True}}
     gate._require(set(manifest) == {"services", "networks"} and set(manifest["services"]) == {plan["service"]}
-                  and manifest["networks"] == {"sender": {"name": plan["network"]["Name"], "external": True}},
+                  and manifest["networks"] == networks,
                   "one new sender service on one existing network required")
     service = manifest["services"][plan["service"]]
-    gate._require(set(service) == SERVICE_KEYS and service["networks"] == ["sender"] and service["platform"] == "linux/amd64"
+    service_keys = (SERVICE_KEYS - {"networks"}) | {"network_mode"} if host_local else SERVICE_KEYS
+    topology = service.get("network_mode") == "host" if host_local else service.get("networks") == ["sender"]
+    gate._require(set(service) == service_keys and topology and service["platform"] == "linux/amd64"
                   and service["restart"] == "no" and service["read_only"] is True and service["user"] == "65534:65534"
                   and service["cap_drop"] == ["ALL"] and service["security_opt"] == ["no-new-privileges:true"]
                   and service["healthcheck"] == {"disable": True}, "exact closed sender execution scope required")
@@ -155,6 +170,17 @@ def _manifest(plan, raw, environment):
     dsn = gate._read(Path(plan["dsn_file"]))
     gate._require(set(dsn) == {"dsn"} and env.get("DATABASE_URL") == dsn["dsn"],
                   "sender and independent metadata reader must use the same sealed DSN")
+    gate._require(host_local == ("postgres_transport" in plan), "host-network sender requires exact PostgreSQL capability")
+    if host_local:
+        from scripts.sender_host_loopback_pg import validate
+        from services.sender_drain_contract import host_loopback_postgres_identity
+        capability = validate(plan["postgres_transport"])
+        gate._require(not any(key.startswith("PG") for key in env),
+                      "host-loopback sender cannot inherit PostgreSQL environment overrides")
+        endpoint_identity = host_loopback_postgres_identity(dsn["dsn"], service["read_only"], "host")
+        gate._require(service["volumes"] == service["ports"] == []
+                      and endpoint_identity["dsn_sha256"] == capability["dsn_sha256"],
+                      "host-loopback sender must retain zero mounts and zero published ports")
     gate._require(not env.get("DATABASE_URL_FILE") and env.get("CREATE_ADMIN", "0") == "0",
                   "bootstrap cannot override PG identity through files or create admin business rows")
     wanted = {"HANDOFF_ENABLED": "1", "WEBHOOK_OUTBOX": "1", "RUN_MIGRATIONS": "1", "HANDOFF_MANIFEST": plan["manifest"],
@@ -187,7 +213,8 @@ def _load(legacy, plan, root, *, active=True):
     gate._require(type(legacy) is LegacyTakeover, "real retained legacy takeover capability required")
     legacy.check(active=active)
     stopped = legacy.check_stopped()
-    gate._require(set(plan) == PLAN_KEYS and plan["schema"] == SCHEMA and plan["source_sha256"] == source_sha256()
+    gate._require(set(plan) in (PLAN_KEYS, PLAN_KEYS | {"postgres_transport"})
+                  and plan["schema"] == SCHEMA and plan["source_sha256"] == source_sha256()
                   and gate.HEX64.fullmatch(plan["operation_id"]) and re.fullmatch(r"[0-9a-f]{40}", plan["revision"])
                   and plan["legacy_operation_id"] == stopped["operation_id"]
                   and plan["legacy_plan_sha256"] == stopped["plan_sha256"], "exact bootstrap source/legacy binding required")
@@ -244,6 +271,9 @@ def _verify(plan, inputs, row, *, running):
     if running:
         gate._require(set(networks) == {plan["network"]["Name"]}
                       and networks[plan["network"]["Name"]]["NetworkID"] == plan["network"]["Id"], "actual sender network ID differs")
+        if "postgres_transport" in plan:
+            from scripts.sender_host_loopback_pg import HostLoopbackPostgres
+            HostLoopbackPostgres(plan["postgres_transport"]).check_sender(row)
 
 
 def _binary(identifier, expected):
@@ -318,13 +348,15 @@ def _driver(legacy, plan, root, *, recovery=False):
                "entrances": ["miniflux_scheduler", "miniflux_manual", "legacy_async_sender"]}
     driver_plan = {"schema": 1, "scope": "instrumented_sender_only", "binding": binding,
                    "postgres_identity": identity, "window": plan["window"], "sources": sources()}
+    if "postgres_transport" in plan:
+        driver_plan["postgres_transport"] = plan["postgres_transport"]
     if gate._present(path):
         gate._require(durable.read_confirmed(path) == driver_plan, "retained sender driver identity changed")
     else:
         gate._require(not recovery, "no retained sender binding; no bootstrap mutation in query")
         gate._write(path, driver_plan)
     transport = NativeSenderActivationTransport(plan["control_url"], plan["token_file"], container_id=row["Id"])
-    return SenderActivationDriver(driver_plan, transport, PostgresReader(plan["dsn_file"], identity), root / "driver")
+    return SenderActivationDriver(driver_plan, transport, PostgresReader.from_plan(plan["dsn_file"], driver_plan), root / "driver")
 
 
 def initialize(legacy, plan, evidence_root):
@@ -373,9 +405,15 @@ def _component(row):
             "user": row["Config"]["User"], "memory": row["HostConfig"]["Memory"], "pids": row["HostConfig"]["PidsLimit"],
             "mounts": [{key: item[key] for key in ("Type", "Source", "Destination", "RW")} for item in row["Mounts"]]}
     if row["Mounts"] == []:
-        from services.sender_drain_contract import external_postgres_identity
+        from services.sender_drain_contract import external_postgres_identity, host_loopback_postgres_identity
         values = private.runtime_environment(row["Config"]["Env"])
-        value["external_postgres"] = external_postgres_identity(values.get("DATABASE_URL"), row["HostConfig"].get("ReadonlyRootfs"))
+        if row["HostConfig"].get("NetworkMode") == "host":
+            gate._require(not any(key.startswith("PG") for key in values),
+                          "host-loopback sender cannot inherit PostgreSQL environment overrides")
+            value["host_loopback_postgres"] = host_loopback_postgres_identity(
+                values.get("DATABASE_URL"), row["HostConfig"].get("ReadonlyRootfs"), row["HostConfig"]["NetworkMode"])
+        else:
+            value["external_postgres"] = external_postgres_identity(values.get("DATABASE_URL"), row["HostConfig"].get("ReadonlyRootfs"))
     return value
 
 

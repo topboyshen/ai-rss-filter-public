@@ -11,7 +11,9 @@ from copy import deepcopy
 import json
 import os
 from pathlib import Path
+import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -21,6 +23,13 @@ import traceback
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import private_release_contract as private  # noqa: E402
+
+
+BUILD_TIMEOUT = 1200
+BUILD_EVIDENCE_BYTES = 8 * 1024 * 1024
+BUILD_REPORT_BYTES = 64 * 1024
+BUILD_STREAM_BYTES = (BUILD_EVIDENCE_BYTES - BUILD_REPORT_BYTES) // 2
+BUILD_PIP_INDEX = "https://pypi.org/simple"
 
 
 def save(path, data):
@@ -83,14 +92,125 @@ def verify_config_reader_identity(image, config_path, user):
                     "reviewed UID cannot read its sealed config")
 
 
-def build_candidate(root, workspace, source, image, contract, contract_sha):
+def build_output_profile(raw):
+    """Only fixed classifications and numeric locations; never publish a line."""
+    if type(raw) is not bytes:
+        return {"status": "not_captured_unknown", "eof": None}
+    retained = raw[:BUILD_STREAM_BYTES]
+    lines = retained.splitlines()
+    events, categories = [], {}
+    markers = (("network_timeout", (b"ReadTimeoutError", b"Read timed out", b"read timed out", b"TLS handshake timeout")),
+               ("network_unreachable", (b"[Errno 101] Network is unreachable", b"network is unreachable")),
+               ("dns_resolution_failed", (b"Temporary failure in name resolution", b"Could not resolve host")),
+               ("certificate_verification_failed", (b"CERTIFICATE_VERIFY_FAILED",)),
+               ("pip_resolution_failed", (b"No matching distribution found", b"Could not find a version that satisfies")))
+    for line in lines:
+        step = re.fullmatch(rb"#([0-9]{1,6}) \[(?:[A-Za-z0-9_-]{1,64} )?([0-9]{1,4})/([0-9]{1,4})\] "
+                            rb"(FROM|RUN|COPY|ADD|WORKDIR|ARG|ENV|USER|EXPOSE|CMD|ENTRYPOINT|LABEL)(?: .*)?", line)
+        location = re.fullmatch(rb"Dockerfile:([0-9]{1,6})", line)
+        if len(events) < 64 and step:
+            events.append({"kind": "build_step", "step": int(step[1]), "position": int(step[2]),
+                           "total": int(step[3]), "instruction": step[4].decode("ascii")})
+        elif len(events) < 64 and location:
+            events.append({"kind": "dockerfile_location", "line": int(location[1])})
+        for category, needles in markers:
+            if any(needle in line for needle in needles):
+                categories[category] = categories.get(category, 0) + 1
+    return {"status": "bounded_capture_projection", "observed_bytes": len(raw), "retained_bytes": len(retained),
+            "retained_sha256": private.sha(retained), "complete_capture_sha256": private.sha(raw) if len(raw) <= BUILD_STREAM_BYTES else None,
+            "truncated": len(raw) > BUILD_STREAM_BYTES, "eof": None, "line_count_in_retained_prefix": len(lines),
+            "events": events, "events_capped": len(events) == 64, "marker_line_counts": categories,
+            "marker_counts_are_not_root_cause_proof": True, "unclassified_text_not_published": True}
+
+
+def retain_build_outputs(workspace, streams, profiles):
+    """Bounded private copies only; the original subprocess capture is unchanged."""
+    root_fd = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(root_fd)
+        private.require(info.st_uid == os.geteuid() and not info.st_mode & 0o077, "unsafe build evidence directory")
+        for name in ("stdout", "stderr"):
+            raw = streams[name]
+            if type(raw) is not bytes:
+                continue
+            filename = "candidate-build." + name
+            fd = os.open(filename, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=root_fd)
+            try:
+                view = memoryview(raw)[:BUILD_STREAM_BYTES]
+                while view:
+                    count = os.write(fd, view)
+                    private.require(count > 0, "build evidence short write")
+                    view = view[count:]
+                os.fsync(fd)
+                written = os.fstat(fd)
+                linked = os.stat(filename, dir_fd=root_fd, follow_symlinks=False)
+                private.require(stat.S_ISREG(written.st_mode) and written.st_nlink == 1
+                                and written.st_uid == os.geteuid() and not written.st_mode & 0o077
+                                and (written.st_dev, written.st_ino) == (linked.st_dev, linked.st_ino)
+                                and written.st_size == profiles[name]["retained_bytes"], "build evidence identity differs")
+            finally:
+                os.close(fd)
+            profiles[name]["private_file"] = filename
+            profiles[name]["retention"] = "file_synced_directory_pending"
+        os.fsync(root_fd)
+        current = os.stat(workspace, follow_symlinks=False)
+        private.require((info.st_dev, info.st_ino) == (current.st_dev, current.st_ino), "build evidence directory changed")
+        for profile in profiles.values():
+            if "private_file" in profile:
+                profile["retention"] = "confirmed_private_only"
+    finally:
+        os.close(root_fd)
+
+
+def build_failure_diagnostic(error, result, started, workspace):
+    timed_out = isinstance(error, subprocess.TimeoutExpired)
+    streams = {name: getattr(error if timed_out else result, name, None) for name in ("stdout", "stderr")}
+    profiles = {name: build_output_profile(raw) for name, raw in streams.items()}
+    code = getattr(result, "returncode", None)
+    diagnostic = {"schema": 1, "operation": "docker_build", "stage": "build_and_check_candidate_image", "execution_proof": False,
+        "outcome": "timeout_unknown" if timed_out else "nonzero_exit" if type(code) is int else "execution_error_unknown",
+        "returncode": code if type(code) is int else None, "elapsed_seconds": round(time.monotonic() - started, 6),
+        "timeout_seconds": BUILD_TIMEOUT, "timed_out": timed_out,
+        "container_build_completion": "unconfirmed", "streams": profiles,
+        "capture_behavior": "original_subprocess_run_capture_output_not_stream_bounded",
+        "preservation_budget_bytes": BUILD_EVIDENCE_BYTES, "raw_private_workspace_uploaded": False}
+    try:
+        retain_build_outputs(workspace, streams, profiles)
+        diagnostic["retention"] = ("private_bounded_copies_confirmed" if any(type(raw) is bytes for raw in streams.values())
+                                   else "not_captured_unknown")
+    except Exception as preservation_error:
+        diagnostic["retention"] = "evidence_insufficient"
+        diagnostic["preservation_error"] = {"kind": "os_error" if isinstance(preservation_error, OSError)
+            else "contract_refusal" if isinstance(preservation_error, private.ContractError) else "unexpected_error",
+            "message_sha256": private.sha(str(preservation_error).encode())}
+    private.require(len(private.encoded(diagnostic)) <= BUILD_REPORT_BYTES, "build failure projection capacity")
+    return diagnostic
+
+
+def run_candidate_build(args, workspace, report):
+    started, result = time.monotonic(), None
+    try:
+        result = subprocess.run(args, capture_output=True, timeout=BUILD_TIMEOUT, check=False)
+        private.require(result.returncode == 0, "native candidate build failed")
+    except Exception as error:
+        try:
+            report["candidate_build_failure"] = build_failure_diagnostic(error, result, started, workspace)
+        except Exception as diagnostic_error:
+            report["candidate_build_failure"] = {"schema": 1, "operation": "docker_build", "execution_proof": False,
+                "status": "evidence_insufficient", "primary_failure_preserved": True,
+                "diagnostic_error_sha256": private.sha(str(diagnostic_error).encode())}
+        raise
+
+
+def build_candidate(root, workspace, source, image, contract, contract_sha, report):
     context = workspace / "context"
     context.mkdir(mode=0o700)
     with subprocess.Popen(["git", "-C", str(root), "archive", "--format=tar", source["source_sha"]], stdout=subprocess.PIPE) as producer:
         subprocess.run(["tar", "-xf", "-", "-C", str(context)], stdin=producer.stdout, check=True)
         producer.stdout.close()
         private.require(producer.wait() == 0, "source archive failed")
-    args = ["docker", "build", "--platform", "linux/amd64", "--tag", image]
+    args = ["docker", "build", "--platform", "linux/amd64", "--tag", image,
+            "--build-arg", "PIP_INDEX_URL=" + BUILD_PIP_INDEX]
     labels = {"AI_FILTER_BUILD_VERSION": image, "AI_FILTER_BUILD_GIT_SHA": source["source_sha"],
               "AI_FILTER_BUILD_SOURCE_ID": source["source_sha"] + ":clean",
               "AI_FILTER_BUILD_MANIFEST_SHA": contract["files"]["compose.json"],
@@ -100,8 +220,7 @@ def build_candidate(root, workspace, source, image, contract, contract_sha):
     for key, value in labels.items():
         args += ["--build-arg", key + "=" + value]
     # Native image builds can exceed the bounded Docker inspection timeout.
-    result = subprocess.run([*args, str(context)], capture_output=True, timeout=1200, check=False)
-    private.require(result.returncode == 0, "native candidate build failed")
+    run_candidate_build([*args, str(context)], workspace, report)
     image_info = json.loads(private.run(["docker", "image", "inspect", image]))[0]
     digest = image_info["Id"]
     for key, value in {"io.ai-filter.private-release.sha256": contract_sha,
@@ -196,7 +315,7 @@ def execute(root, output):
         verify_config_reader_identity(base_image, sealed.parent / "runtime.yaml", service["user"])
         report["checks"].append("mismatched_uid_denied_reviewed_uid_reads_private_config")
         advance_stage(report_path, report, "build_and_check_candidate_image")
-        digest = build_candidate(root, workspace, source, image, contract, contract_sha)
+        digest = build_candidate(root, workspace, source, image, contract, contract_sha, report)
         advance_stage(report_path, report, "probe_private_runtime_config")
         private.image_probe(contract, sealed.parent, digest)
         report["checks"].append("real_image_labels_embedded_example_and_private_loader_hash")

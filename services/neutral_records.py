@@ -1,16 +1,15 @@
 """Presentation for recorded neutral decisions, not a second quality verdict."""
 
 from datetime import datetime
+from html import escape
 from zoneinfo import ZoneInfo
 
 from db.database import canonical_feed_url
 from utils.helpers import format_article_display_title, safe_http_url
+from services.navigation_origins import dashboard_origin
 
 
 NEUTRAL_RECORDS_PATH = "/dashboard/neutral-records"
-# Match the existing event-radar links: widgets are embedded on the Glance
-# origin, while browser login and authenticated pages live on this origin.
-NEUTRAL_RECORDS_URL = "https://ai.example.invalid" + NEUTRAL_RECORDS_PATH
 NEUTRAL_REASON_TEXT = {
     "theme": "保守处理说明：主题关联未通过现有来源校验",
     "facts": "保守处理说明：事实表述未通过现有来源校验",
@@ -22,13 +21,18 @@ NEUTRAL_REASON_TEXT = {
 
 def render_neutral_records_entry() -> str:
     """Static public link only; no private query, JS, credential or record cache."""
+    origin = dashboard_origin()
+    entry = (
+        f'<a href="{escape(origin + NEUTRAL_RECORDS_PATH, quote=True)}" target="_blank" rel="noopener noreferrer">'
+        '查看记录（需后台登录）</a>'
+        if origin else '<span>后台入口未配置</span>'
+    )
     return (
         '<details class="neutral-records-entry" style="margin:12px 0;font-size:13px;line-height:1.7;">'
         '<summary style="cursor:pointer;font-weight:650;">保守处理记录</summary>'
         '<p>查看当前评分契约下，近24小时收录的保守中性记录及已记录原因。'
         '这是处理过程说明，不是新闻真实性或价值结论。</p>'
-        f'<a href="{NEUTRAL_RECORDS_URL}" target="_blank" rel="noopener noreferrer">'
-        '查看记录（需后台登录）</a></details>'
+        f'{entry}</details>'
     )
 
 

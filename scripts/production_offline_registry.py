@@ -30,6 +30,8 @@ FIXED_REFERENCES = (
     "redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99",
     "nginx:stable-alpine@sha256:0d3b80406a13a767339fbe2f41406d6c7da727ab89cf8fae399e81f780f814d1",
 )
+MINIFLUX131_REF = "miniflux/miniflux@sha256:cd353a6af9ce663291f405eddef26fa0d567f486b521c5d34e3fb50e41938b9a"
+NAMED_PROFILES = frozenset({"host-loopback131", "actual125-compatibility"})
 INDEX_TYPES = {"application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json"}
 MANIFEST_TYPES = {"application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json"}
 MEDIA_TYPES = INDEX_TYPES | MANIFEST_TYPES
@@ -47,6 +49,22 @@ class RegistryError(RuntimeError):
 def require(value, message):
     if not value:
         raise RegistryError(message)
+
+
+def profile_references(profile="default"):
+    require(type(profile) is str and profile in {"default", *NAMED_PROFILES}, "unknown frozen registry profile")
+    if profile == "host-loopback131":
+        return (*FIXED_REFERENCES[:2], MINIFLUX131_REF)
+    if profile == "actual125-compatibility":
+        return (*FIXED_REFERENCES, MINIFLUX131_REF)
+    return FIXED_REFERENCES
+
+
+def _repository(reference):
+    require(reference in (*FIXED_REFERENCES, MINIFLUX131_REF), "unknown frozen registry reference")
+    if reference == MINIFLUX131_REF:
+        return "miniflux/miniflux"
+    return "library/" + reference.split("@", 1)[0].split(":", 1)[0]
 
 
 def remaining(deadline):
@@ -287,8 +305,8 @@ def _descriptor(row, *, config=False):
 
 
 def _image(root, reference, token, objects, deadline):
-    name, digest = reference.split("@")
-    repository = "library/" + name.split(":", 1)[0]
+    _, digest = reference.split("@")
+    repository = _repository(reference)
     _download(root, repository, "manifests", digest, None, None, token, objects, deadline)
     top = _manifest(root, digest)
     manifest_digest = digest
@@ -307,21 +325,23 @@ def _image(root, reference, token, objects, deadline):
         _download(root, repository, "blobs", digest, size, media, token, objects, deadline)
 
 
-def prepare_bundle(root, references, deadline):
+def prepare_bundle(root, references, deadline, *, profile="default"):
     remaining(deadline)
-    require(tuple(references) == FIXED_REFERENCES, "only complete frozen public dependency set permitted")
+    expected = profile_references(profile)
+    require(tuple(references) == expected, "only complete frozen public dependency set permitted")
     _private_root(root, fresh=True)
     (root / "objects").mkdir(mode=0o700)
-    _save(root / "PREPARE_STARTED.json", {"schema": 1, "references": list(references), "deadline": deadline})
+    selected = {"profile": profile} if profile != "default" else {}
+    _save(root / "PREPARE_STARTED.json", {"schema": 1, "references": list(references), "deadline": deadline, **selected})
     objects = {}
     try:
         for reference in references:
-            repository = "library/" + reference.split(":", 1)[0].split("@", 1)[0]
+            repository = _repository(reference)
             _image(root, reference, _token(repository, deadline), objects, deadline)
-        value = {"schema": 1, "references": list(references), "objects": objects,
+        value = {"schema": 1, "references": list(references), "objects": objects, **selected,
                  "total_bytes": sum(row["size"] for row in objects.values())}
         sha = _save(root / "BUNDLE.json", value)
-        return {"schema": 1, "path": str(root / "BUNDLE.json"), "sha256": sha}
+        return {"schema": 1, "path": str(root / "BUNDLE.json"), "sha256": sha, **selected}
     except BaseException as error:
         try:
             _save(root / "FAILURE.json", {"type": type(error).__name__, "message_sha256": hashlib.sha256(str(error).encode()).hexdigest()})
@@ -347,7 +367,7 @@ def _route(routes, repository, kind, digest, objects, *, size=None, media=None):
 
 
 def _image_routes(reference, objects, routes):
-    repository = "library/" + reference.split("@", 1)[0].split(":", 1)[0]
+    repository = _repository(reference)
     digest = reference.split("@", 1)[1]
     used = {digest}
     top = _json_fd(_route(routes, repository, "manifests", digest, objects))
@@ -386,7 +406,11 @@ def validate_bundle(root, descriptor, deadline):
     remaining(deadline)
     _private_root(root)
     _private_root(root / "objects")
-    require(isinstance(descriptor, dict) and set(descriptor) == {"schema", "path", "sha256"}
+    require(isinstance(descriptor, dict), "sealed bundle descriptor differs")
+    profile = descriptor.get("profile", "default")
+    references = profile_references(profile)
+    selected = {"profile"} if profile != "default" else set()
+    require(set(descriptor) == {"schema", "path", "sha256"} | selected
             and descriptor["schema"] == 1 and descriptor["path"] == str(root / "BUNDLE.json")
             and re.fullmatch(r"[0-9a-f]{64}", str(descriptor["sha256"])), "sealed bundle descriptor differs")
     size = (root / "BUNDLE.json").lstat().st_size
@@ -396,8 +420,9 @@ def validate_bundle(root, descriptor, deadline):
         value = _json(os.pread(fd, size + 1, 0))
     finally:
         os.close(fd)
-    require(isinstance(value, dict) and set(value) == {"schema", "references", "objects", "total_bytes"}
-            and value["schema"] == 1 and value["references"] == list(FIXED_REFERENCES)
+    require(isinstance(value, dict) and set(value) == {"schema", "references", "objects", "total_bytes"} | selected
+            and value.get("profile", "default") == profile
+            and value["schema"] == 1 and value["references"] == list(references)
             and isinstance(value["objects"], dict) and 0 < len(value["objects"]) <= MAX_OBJECTS, "bundle identity differs")
     objects, routes, total = {}, {}, 0
     try:
@@ -412,7 +437,7 @@ def validate_bundle(root, descriptor, deadline):
             objects[digest] = {**row, "fd": fd, "identity": identity, "path": path}
         require(type(value["total_bytes"]) is int and value["total_bytes"] == total, "bundle total bytes differ")
         used = set()
-        for reference in FIXED_REFERENCES:
+        for reference in references:
             used |= _image_routes(reference, objects, routes)
         require(used == objects.keys(), "bundle contains unreferenced image objects")
         return ValidatedBundle(root, objects, routes)

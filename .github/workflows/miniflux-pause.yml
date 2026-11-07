@@ -192,6 +192,7 @@ jobs:
           source_sha=$(git rev-parse HEAD)
           git archive --format=tar "$source_sha" | tar -xf - -C "$RUNNER_TEMP/joint-receiver-context"
           docker --host unix:///var/run/docker.sock build --platform=linux/amd64 --pull=false \
+            --build-arg PIP_INDEX_URL=https://pypi.org/simple \
             --build-arg "AI_FILTER_BUILD_GIT_SHA=$source_sha" --build-arg AI_FILTER_BUILD_VERSION=joint-native \
             -t "ai-filter-joint-native:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" "$RUNNER_TEMP/joint-receiver-context" \
             2>&1 | tee "$RUNNER_TEMP/joint-receiver-build/BUILD.log"

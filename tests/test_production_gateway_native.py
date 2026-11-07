@@ -121,7 +121,7 @@ def case(tmp_path, monkeypatch):
         if args[0] == "kill":
             assert args == ["kill", "--signal", "TERM", identifier]
             state.kills += 1
-            state.rows[identifier]["State"].update(Running=False, Status="exited", ExitCode=143)
+            state.rows[identifier]["State"].update(Running=False, Status="exited", ExitCode=143, FinishedAt="2026-10-31T13:00:00.123456789Z")
             if state.fail == "term":
                 raise TimeoutError("synthetic TERM ACK lost")
             return identifier
@@ -244,7 +244,11 @@ def test_unknown_fixture_mutation_retained_without_repeat_or_forced_cleanup(case
     with pytest.raises(TimeoutError, match="ACK lost"):
         native.prepare(c.harness, c.p)
     count = len([args for args, _ in c.state.calls if args[0] == stage or (stage == "term" and args[0] == "kill")])
-    native.preserve(c.harness, c.p)
+    if stage == "create":
+        with pytest.raises(gate.AdmissionError, match="normal owned"):
+            native.preserve(c.harness, c.p)
+    else:
+        native.preserve(c.harness, c.p)
     assert (
         len([args for args, _ in c.state.calls if args[0] == stage or (stage == "term" and args[0] == "kill")]) == count
     )
@@ -686,3 +690,72 @@ def test_failed_diagnostic_stdout_cannot_hide_original_durability_error(case, mo
         native.prepare(case.harness, case.p)
     assert caught.value is original
     assert case.state.kills == 0 and "gateway_preparation" not in case.p
+
+
+@pytest.mark.parametrize("change", ["exit", "oom", "created", "dead", "paused", "restarting", "unfinished", "invalid_time"])
+def test_preserve_already_stopped_requires_real_normal_exit(case, change):
+    native.prepare(case.harness, case.p)
+    row = case.state.rows[case.identifier]
+    if change == "exit":
+        row["State"]["ExitCode"] = 137
+    elif change == "created":
+        row["State"]["Status"] = "created"
+    elif change == "unfinished":
+        row["State"]["FinishedAt"] = "0001-01-01T00:00:00Z"
+    elif change == "invalid_time":
+        row["State"]["FinishedAt"] = "not-a-time"
+    else:
+        row["State"][{"oom": "OOMKilled", "dead": "Dead", "paused": "Paused", "restarting": "Restarting"}[change]] = True
+    kills = case.state.kills
+    with pytest.raises(gate.AdmissionError, match="normal owned"):
+        native.preserve(case.harness, case.p)
+    assert not (case.p["gateway_native_root"] / "STOPPED_old.json").exists()
+    assert case.state.kills == kills
+    assert (case.p["gateway_native_root"] / "FINAL_old.json").exists()
+
+
+@pytest.mark.parametrize("field", ["Image", "Config", "HostConfig", "Mounts", "RestartCount", "Name", "StartedAt"])
+def test_preserve_identity_drift_after_original_is_retained_blocks_success(case, field):
+    native.prepare(case.harness, case.p)
+    original = case.harness.command
+    def command(args, **kwargs):
+        if args[0] == "logs":
+            row = case.state.rows[case.identifier]
+            if field == "StartedAt":
+                row["State"][field] = "changed"
+            elif field == "RestartCount":
+                row[field] += 1
+            elif field == "Mounts":
+                row[field] = [{"Destination": "/changed"}]
+            elif field in {"Config", "HostConfig"}:
+                row[field] = {**row[field], "changed": True}
+            else:
+                row[field] = "changed"
+        return original(args, **kwargs)
+    case.harness.command = command
+    kills = case.state.kills
+    with pytest.raises(gate.AdmissionError, match="identity changed"):
+        native.preserve(case.harness, case.p)
+    assert case.state.kills == kills
+    assert not (case.p["gateway_native_root"] / "STOPPED_old.json").exists()
+
+
+@pytest.mark.parametrize("exit_code", [0, 143])
+def test_preserve_config_test_requires_zero_even_if_other_gateway_term_is_normal(case, monkeypatch, exit_code):
+    native.prepare(case.harness, case.p)
+    op = gate._read(case.p["gateway_native_root"] / "PREPARE_INTENT.json")["operation_id"]
+    case.p["gateway_plan"] = {"operation_id": op}
+    row = deepcopy(case.state.rows[case.identifier])
+    row.update(Id="f" * 64, Name="/" + gateway.gateway_name(op) + "-config-test")
+    row["Config"]["Labels"]["io.ai-filter.gateway.plan"] = gate._hash(case.p["gateway_plan"])
+    row["State"]["ExitCode"] = exit_code
+    case.state.rows[row["Id"]] = row
+    monkeypatch.setattr(gateway.NativeTransport, "find", lambda _self, _operation, purpose: deepcopy(row) if purpose == "config-test" else None)
+    if exit_code:
+        with pytest.raises(gate.AdmissionError, match="normal owned"):
+            native.preserve(case.harness, case.p)
+        assert not (case.p["gateway_native_root"] / "STOPPED_config-test.json").exists()
+    else:
+        native.preserve(case.harness, case.p)
+        assert (case.p["gateway_native_root"] / "STOPPED_config-test.json").exists()
+    assert case.state.kills == 1

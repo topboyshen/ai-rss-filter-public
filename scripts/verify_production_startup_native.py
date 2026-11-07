@@ -73,11 +73,12 @@ def _diagnostic_source(name, root):
 
 
 def _diagnostic_frame(frame, root):
-    if not isinstance(frame, dict) or set(frame) != {"file", "line", "function"}:
+    if not isinstance(frame, dict) or set(frame) not in ({"file", "line"}, {"file", "line", "function"}):
         return None
-    line, function = frame["line"], frame["function"]
-    if (type(line) is not int or not 0 < line <= 1_000_000 or not isinstance(function, str)
-            or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,100}|<module>", function)):
+    line, function = frame["line"], frame.get("function")
+    if (type(line) is not int or not 0 < line <= 1_000_000
+            or ("function" in frame and (not isinstance(function, str)
+                or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,100}|<module>", function)))):
         return None
     source = _diagnostic_source(frame["file"], root)
     if source is None:
@@ -89,7 +90,9 @@ def _diagnostic_frame(frame, root):
     scopes = [node for node in nodes if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
               and node.lineno <= line <= node.end_lineno]
     scope = min(scopes, key=lambda node: node.end_lineno - node.lineno).name if scopes else "<module>"
-    if function != scope:
+    # The activation exporter intentionally omits caller-supplied function
+    # names. Recover that coordinate only from the bounded local source AST.
+    if "function" in frame and function != scope:
         return None
     classes = {name for name, value in vars(builtins).items()
                if isinstance(value, type) and issubclass(value, BaseException)}
@@ -133,7 +136,7 @@ def public_exception_locations(error, *, root=None):
     return _validated_diagnostic(type(error).__name__, frames, root=root)["locations"]
 
 
-def _stdout_diagnostic(raw):
+def _diagnostic_json(raw):
     def unique(pairs):
         value = {}
         for key, item in pairs:
@@ -141,11 +144,20 @@ def _stdout_diagnostic(raw):
                 raise ValueError("ambiguous diagnostic JSON")
             value[key] = item
         return value
-    packet = json.loads(raw, object_pairs_hook=unique)
-    if not isinstance(packet, dict) or packet.get("status") != "unconfirmed":
+    return json.loads(raw, object_pairs_hook=unique)
+
+
+def _stdout_diagnostic(raw):
+    packet = _diagnostic_json(raw)
+    if not isinstance(packet, dict) or packet.get("status") not in {"unconfirmed", "failed_or_evidence_insufficient"}:
         return None
     if packet.get("safe_export_complete") is False:
         return packet.get("error_type"), packet.get("locations", [])
+    if packet.get("diagnostic_schema") == "namespace-helper-v1":
+        return packet.get("error_type"), packet.get("locations", [])
+    activation = packet.get("activation")
+    if isinstance(activation, dict) and activation.get("status") == "failed_or_evidence_insufficient":
+        return activation.get("failure_type"), activation.get("failure_locations", [])
     files = packet.get("safe_evidence", {}).get("files", {})
     failure = files.get("FAILURE.json", {}).get("content")
     if failure is None:
@@ -153,7 +165,64 @@ def _stdout_diagnostic(raw):
         failure = result.get("failure")
     if isinstance(failure, dict):
         return failure.get("type"), failure.get("locations", [])
+    private_host = packet.get("private_host")
+    if isinstance(private_host, dict):
+        failure = private_host.get("failure")
+        if isinstance(failure, dict):
+            return failure.get("error_type"), failure.get("error_locations", [])
+        result = private_host.get("result")
+        if isinstance(result, dict) and result.get("status") == "failed_or_evidence_insufficient":
+            return result.get("error_type"), result.get("error_locations", [])
     return None
+
+
+def safe_nested_diagnostic(value):
+    """One bounded child failure only; no raw text or recursive diagnostics."""
+    if (type(value) is not dict or set(value) != {"exception_type", "locations", "execution_proof"}
+            or value.get("execution_proof") is not False):
+        return None
+    try:
+        checked = _validated_diagnostic(value["exception_type"], value["locations"])
+    except BaseException:
+        return None
+    if not checked["locations"]:
+        return None
+    return {**checked, "execution_proof": False}
+
+
+def _stdout_host_command(raw):
+    from scripts.production_host_ingress_native import safe_command_failure
+    packet = _diagnostic_json(raw)
+    if type(packet) is not dict or packet.get("status") != "unconfirmed":
+        return None
+    private_host = packet.get("private_host")
+    if type(private_host) is not dict:
+        return None
+    result = private_host.get("result")
+    if type(result) is not dict or result.get("status") != "failed_or_evidence_insufficient":
+        return None
+    return safe_command_failure(result.get("command_failure"))
+
+
+def _stdout_nested_diagnostic(raw):
+    packet = _diagnostic_json(raw)
+    if type(packet) is not dict or packet.get("status") != "failed_or_evidence_insufficient":
+        return None
+    activation = packet.get("activation")
+    if type(activation) is not dict or activation.get("status") != "failed_or_evidence_insufficient":
+        return None
+    return safe_nested_diagnostic(activation.get("failure_native_command"))
+
+
+def _stdout_socket_diagnostic(raw):
+    from scripts import retained_gateway_diagnostics as socket_diagnostics
+    packet = _diagnostic_json(raw)
+    if type(packet) is not dict or packet.get("status") != "failed_or_evidence_insufficient":
+        return None
+    activation = packet.get("activation")
+    if type(activation) is not dict or activation.get("status") != "failed_or_evidence_insufficient":
+        return None
+    return socket_diagnostics.safe_summary(activation.get("failure_socket_listener"))
 
 
 def _stderr_diagnostic(raw):
@@ -198,13 +267,34 @@ def _emit_archive_diagnostic(captured, complete):
                 continue  # No child text or parser exception is printed.
     record = {"schema": 1, "native_command_diagnostic": "source_validated_candidates",
               "execution_proof": False, "status": "locations_available" if value["locations"] else "no_verified_frames", **value}
+    if complete and captured[0] is not None:
+        try:
+            host_command = _stdout_host_command(bytes(captured[0]))
+            if host_command is not None:
+                record["host_command"] = host_command
+            nested = _stdout_nested_diagnostic(bytes(captured[0]))
+            if nested is not None:
+                record["nested_command"] = nested
+            socket_summary = _stdout_socket_diagnostic(bytes(captured[0]))
+            if socket_summary is not None:
+                record["socket_listener"] = socket_summary
+        except Exception:
+            pass  # Optional typed diagnostics never displace the original failure.
     try:
         raw = json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+        if len(raw.encode()) > DIAGNOSTIC_BYTES:
+            record.pop("nested_command", None)
+            record.pop("host_command", None)
+            raw = json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+        if len(raw.encode()) > DIAGNOSTIC_BYTES:
+            record.pop("socket_listener", None)
+            raw = json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
         if len(raw.encode()) <= DIAGNOSTIC_BYTES:
             sys.stderr.write(raw)
             sys.stderr.flush()
     except Exception:
         pass  # Diagnostic output must never replace the original failure.
+    return {**value, "execution_proof": False}
 
 
 def wait_for_slots(session, p, expected, *, attempts=None, seconds=40):
@@ -389,7 +479,7 @@ def _finish_archive_outputs(files, path, failure, captured, complete):
         errors.append(error)
     if failure is not None:
         try:
-            _emit_archive_diagnostic(captured, complete)
+            failure.native_command_diagnostic = _emit_archive_diagnostic(captured, complete)
         except BaseException as error:
             errors.append(error)
         for error in errors:

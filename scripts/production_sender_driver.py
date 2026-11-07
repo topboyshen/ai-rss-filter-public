@@ -20,6 +20,7 @@ from miniflux_handoff_adapter import MinifluxDrainControl, MinifluxActivationCon
 from production_receiver_driver import _capture
 from sender_drain_inventory import PostgresReader
 import sender_namespace_http
+from scripts import sender_host_loopback_pg
 from services import sender_drain_contract as contract
 
 MAX_SAMPLES = 32
@@ -28,17 +29,24 @@ MAX_SAMPLES = 32
 def sources():
     names = ("production_sender_driver.py", "sender_drain_inventory.py", "miniflux_handoff_adapter.py",
              "handoff_runtime_adapter.py", "handoff_host_cron.py", "durable_handoff_cutover.py", "observe_handoff_capacity.py",
-             "production_receiver_driver.py", "sender_namespace_http.py")
+             "production_receiver_driver.py", "sender_namespace_http.py", "sender_host_loopback_pg.py")
     return {**{name: hashlib.sha256((Path(__file__).parent/name).read_bytes()).hexdigest() for name in names},
             "sender_drain_contract": contract.source_sha256()}
 
 
 def validate_plan(plan):
-    require(isinstance(plan, dict) and set(plan) == {"schema", "scope", "binding", "postgres_identity", "window", "sources"}
+    keys = {"schema", "scope", "binding", "postgres_identity", "window", "sources"}
+    require(isinstance(plan, dict) and set(plan) in (keys, keys | {"postgres_transport"})
             and type(plan["schema"]) is int and plan["schema"] == 1 and plan["scope"] == "instrumented_sender_only"
             and plan["sources"] == sources(), "exact source-bound sender plan required")
     binding = checked_binding(plan["binding"], scope="instrumented_sender_only")
     require(binding["source_sha256"] == bridge_source(), "sender bridge source changed")
+    local = binding["component"].get("host_loopback_postgres")
+    require((local is not None) == ("postgres_transport" in plan),
+            "host-loopback component and independent PostgreSQL transport must bind together")
+    if local is not None:
+        transport = sender_host_loopback_pg.validate(plan["postgres_transport"])
+        require(transport["dsn_sha256"] == local["dsn_sha256"], "sender and PostgreSQL transport DSN differ")
     lock = Path(__file__).resolve().parents[1]/"ops/miniflux/pause-source-lock.json"
     require(binding["application_source_sha256"] == hashlib.sha256(lock.read_bytes()).hexdigest(), "sender patch lock differs")
     contract.validate_identity(plan["postgres_identity"])
@@ -120,6 +128,12 @@ class SenderDriver:
         self.plan = validate_plan(parsed(encoded(plan)))
         require(isinstance(postgres, PostgresReader), "fixed sender PostgreSQL reader required")
         require(postgres.expected == self.plan["postgres_identity"], "sender reader targets different database")
+        require(getattr(postgres, "transport_binding", None) == self.plan.get("postgres_transport"),
+                "sender reader PostgreSQL transport differs")
+        if "postgres_transport" in self.plan:
+            require(type(getattr(postgres, "transport_guard", None)) is sender_host_loopback_pg.HostLoopbackPostgres
+                    and postgres.transport_guard.binding == self.plan["postgres_transport"],
+                    "actual host-loopback PostgreSQL guard required")
         self.transport, self.postgres, self.root = transport, postgres, Path(evidence_root)
         private_directory(self.root, create=True)
         self.deadline = time.monotonic() + max(0, self.plan["window"]["expires_at"]-time.time())
@@ -131,7 +145,14 @@ class SenderDriver:
         durable_write(path, self.plan)
 
     def _inspect(self):
-        return self.transport.inspect(self.plan["binding"]["component"]["id"])
+        rows = self.transport.inspect(self.plan["binding"]["component"]["id"])
+        if "postgres_transport" in self.plan:
+            guard = self.postgres.transport_guard
+            require(type(guard) is sender_host_loopback_pg.HostLoopbackPostgres
+                    and guard.binding == self.plan["postgres_transport"], "sender transport guard changed")
+            require(isinstance(rows, list) and len(rows) == 1, "one exact host-loopback sender required")
+            guard.check_sender(rows[0])
+        return rows
 
     def _window(self):
         require(self.plan["window"]["not_before"] <= time.time() < self.plan["window"]["expires_at"]
@@ -142,7 +163,8 @@ class SenderDriver:
         require(contract.digest(self.plan) == self.plan_sha256, "sender plan mutated")
         binding = self.plan["binding"]
         rows = self._inspect()
-        inspect_binding(rows, {binding["component_name"]:binding["component"]}, allow_external_postgres=True)
+        inspect_binding(rows, {binding["component_name"]:binding["component"]}, allow_external_postgres=True,
+                        allow_host_loopback_postgres=True)
         for row in rows:
             env = dict(item.split("=",1) for item in row["Config"]["Env"])
             require(env.get("HANDOFF_ENABLED") == "1" and env.get("HANDOFF_MANIFEST") == binding["manifest"],
@@ -258,7 +280,8 @@ class SenderActivationDriver(SenderDriver):
         require(contract.digest(self.plan) == self.plan_sha256, "activation plan mutated")
         binding = self.plan["binding"]
         rows = self._inspect()
-        inspect_binding(rows, {binding["component_name"]:binding["component"]}, allow_external_postgres=True)
+        inspect_binding(rows, {binding["component_name"]:binding["component"]}, allow_external_postgres=True,
+                        allow_host_loopback_postgres=True)
         for row in rows:
             env = dict(item.split("=",1) for item in row["Config"]["Env"])
             require(env.get("HANDOFF_ENABLED") == "1" and env.get("HANDOFF_MANIFEST") == binding["manifest"],

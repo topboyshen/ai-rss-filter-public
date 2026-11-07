@@ -264,7 +264,8 @@ def test_baseline_build_records_sanitized_origin_without_old_git_archive(driver,
     def forbidden(*_args, **_kwargs):
         raise AssertionError("the old Git commit must not be extracted or fetched")
 
-    source_identity = driver.BASELINE + ":public-baseline:" + driver.BASELINE_ARCHIVE_SHA256
+    source_identity = (driver.BASELINE + ":public-baseline:" + driver.BASELINE_ARCHIVE_SHA256
+                       + ":derived-download-index-only:" + driver.BASELINE_DERIVED_DOCKERFILE_SHA256)
 
     def command(argv, *_args, **_kwargs):
         calls.append(argv)
@@ -281,8 +282,132 @@ def test_baseline_build_records_sanitized_origin_without_old_git_archive(driver,
     assert result["source_identity"] == source_identity
     assert "AI_FILTER_BUILD_SOURCE_ID=" + source_identity in calls[0]
     assert "--platform=linux/amd64" in calls[0]
+    assert result["build_recipe"]["kind"] == "derived-download-index-only"
+    assert result["build_recipe"]["url_replacements"] == 2
+    assert result["build_recipe"]["original_context_unchanged"] is True
+    assert calls[0][calls[0].index("--file") + 1] == str(tmp_path / "baseline/Dockerfile.download-index-only")
+    saved = json.loads((tmp_path / "baseline/BUILD_PROVENANCE.json").read_text())
+    assert saved["source_identity"] == result["source_identity"]
+    assert saved["build_recipe"] == result["build_recipe"]
 
 
 def test_unknown_baseline_revision_is_rejected_before_build(driver, tmp_path):
     with pytest.raises(ValueError, match="revision is fixed"):
         driver.build_image(["docker"], ROOT, tmp_path, "baseline", "f" * 40, "test")
+
+
+@pytest.mark.parametrize("role", ["candidate", "baseline"])
+def test_ci_build_index_is_fixed_for_candidate_without_rewriting_baseline(driver, monkeypatch, tmp_path, role):
+    revision = "b" * 40 if role == "candidate" else driver.BASELINE
+    source_identity = (revision + ":clean" if role == "candidate" else
+                       revision + ":public-baseline:" + driver.BASELINE_ARCHIVE_SHA256
+                       + ":derived-download-index-only:" + driver.BASELINE_DERIVED_DOCKERFILE_SHA256)
+    calls = []
+    monkeypatch.setenv("PIP_INDEX_URL", "https://untrusted.invalid/simple")
+    monkeypatch.setenv("STARTUP_PIP_INDEX_URL", "https://untrusted.invalid/simple")
+
+    def extract(_repo, _revision, context):
+        return driver.extract_baseline(ROOT, context)["archive_sha256"]
+
+    def command(argv, _folder, **kwargs):
+        calls.append((argv, kwargs))
+        if "inspect" in argv:
+            return json.dumps([{"Id": "sha256:synthetic", "Architecture": "amd64", "Created": "synthetic",
+                                "Config": {"Labels": {"org.opencontainers.image.revision": revision,
+                                                       "io.ai-filter.source.identity": source_identity}}}])
+        return ""
+
+    monkeypatch.setattr(driver, "extract_revision", extract)
+    monkeypatch.setattr(driver, "command", command)
+    driver.build_image(["docker"], ROOT, tmp_path, role, revision, "test")
+    argv, options = calls[0]
+    index_values = [argv[i + 1] for i, value in enumerate(argv[:-1])
+                    if value == "--build-arg" and argv[i + 1].startswith("PIP_INDEX_URL=")]
+    assert index_values == (["PIP_INDEX_URL=https://pypi.org/simple"] if role == "candidate" else [])
+    assert "untrusted.invalid" not in " ".join(argv)
+    assert options == {"timeout": 900}
+    assert len(calls) == 2  # One build, then its existing identity inspection; no retry.
+    assert "--platform=linux/amd64" in argv and "--pull=false" in argv
+    assert ("--file" in argv) is (role == "baseline")
+
+
+def test_immutable_baseline_has_no_index_override_capability(driver):
+    manifest, data = driver.baseline_inputs(ROOT)
+    sources = {row["path"]: value for row, value in driver.baseline_members(manifest, data)}
+    dockerfile = sources["Dockerfile"].decode()
+    assert "ARG PIP_INDEX_URL" not in dockerfile
+    assert dockerfile.count("-i https://pypi.tuna.tsinghua.edu.cn/simple") == 2
+    assert digest(sources["Dockerfile"]) == "ce77e9153b6c16744f48a11d8f9bfab8716cc831da27270dcac385e482b8c851"
+
+
+def test_baseline_download_derivation_preserves_all_original_context_and_archive_bytes(driver, tmp_path):
+    folder = tmp_path / "case"
+    folder.mkdir(mode=0o700)
+    context = folder / "source"
+    driver.extract_baseline(ROOT, context)
+    original = {path.relative_to(context): path.read_bytes() for path in context.rglob("*") if path.is_file()}
+    manifest, archive = driver.baseline_inputs(ROOT)
+    path, recipe = driver.baseline_build_recipe(context, folder)
+    assert path.parent == folder and path.parent != context
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert path.read_bytes() == original[Path("Dockerfile")].replace(
+        b"https://pypi.tuna.tsinghua.edu.cn/simple", b"https://pypi.org/simple")
+    assert driver.sha(path) == recipe["derived_dockerfile_sha256"] == driver.BASELINE_DERIVED_DOCKERFILE_SHA256
+    assert driver.sha(context / "Dockerfile") == recipe["original_dockerfile_sha256"] == driver.BASELINE_DOCKERFILE_SHA256
+    assert {p.relative_to(context): p.read_bytes() for p in context.rglob("*") if p.is_file()} == original
+    assert driver.baseline_inputs(ROOT) == (manifest, archive)
+    assert digest(archive) == driver.BASELINE_ARCHIVE_SHA256
+    with pytest.raises(FileExistsError):
+        driver.baseline_build_recipe(context, folder)
+
+
+@pytest.mark.parametrize("kind", ["unknown_url", "extra_url", "one_replacement", "other_bytes", "not_bytes"])
+def test_baseline_derivation_rejects_any_nonfixed_source(driver, kind):
+    manifest, archive = driver.baseline_inputs(ROOT)
+    raw = next(value for row, value in driver.baseline_members(manifest, archive) if row["path"] == "Dockerfile")
+    old = driver.BASELINE_PIP_INDEX.encode()
+    if kind == "unknown_url":
+        raw = raw.replace(old, b"https://untrusted.invalid/simple")
+    elif kind == "extra_url":
+        raw += b"\n# " + old
+    elif kind == "one_replacement":
+        raw = raw.replace(old, b"https://pypi.org/simple", 1)
+    elif kind == "other_bytes":
+        raw += b"\n"
+    else:
+        raw = raw.decode()
+    with pytest.raises(ValueError, match="identity mismatch"):
+        driver.derive_baseline_dockerfile(raw)
+
+
+@pytest.mark.parametrize("count", [0, 1, 3])
+def test_baseline_derivation_independently_requires_exactly_two_url_replacements(driver, monkeypatch, count):
+    raw = (b"-i " + driver.BASELINE_PIP_INDEX.encode() + b" \\\n") * count
+    monkeypatch.setattr(driver, "BASELINE_DOCKERFILE_SHA256", digest(raw))
+    with pytest.raises(ValueError, match="replacement count mismatch"):
+        driver.derive_baseline_dockerfile(raw)
+
+
+def test_baseline_derivation_rejects_changed_derived_digest(driver, monkeypatch):
+    manifest, archive = driver.baseline_inputs(ROOT)
+    raw = next(value for row, value in driver.baseline_members(manifest, archive) if row["path"] == "Dockerfile")
+    monkeypatch.setattr(driver, "BASELINE_DERIVED_DOCKERFILE_SHA256", "f" * 64)
+    with pytest.raises(ValueError, match="derived baseline Dockerfile identity mismatch"):
+        driver.derive_baseline_dockerfile(raw)
+
+
+def test_baseline_build_refuses_image_claiming_the_untouched_original_identity(driver, monkeypatch, tmp_path):
+    original_identity = driver.BASELINE + ":public-baseline:" + driver.BASELINE_ARCHIVE_SHA256
+
+    def command(argv, _folder, **_kwargs):
+        if "inspect" in argv:
+            return json.dumps([{"Id": "sha256:synthetic", "Architecture": "amd64", "Created": "synthetic",
+                                "Config": {"Labels": {"org.opencontainers.image.revision": driver.BASELINE,
+                                                       "io.ai-filter.source.identity": original_identity}}}])
+        return ""
+
+    monkeypatch.setattr(driver, "command", command)
+    with pytest.raises(ValueError, match="platform/revision identity mismatch"):
+        driver.build_image(["docker"], ROOT, tmp_path, "baseline", driver.BASELINE, "test")
+    assert (tmp_path / "baseline/BUILD_PROVENANCE.json").is_file()
+    assert not (tmp_path / "baseline/IMAGE.json").exists()

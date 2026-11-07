@@ -80,6 +80,119 @@ def test_fixed_public_allowlist_and_download_limits_are_exact():
     assert (registry.MAX_TOTAL, registry.MAX_BLOB, registry.MAX_OBJECTS) == (1024**3, 256 * 1024**2, 256)
 
 
+def test_named_profiles_are_exact_and_do_not_replace_the_default_four():
+    old = "miniflux/miniflux@sha256:cd353a6af9ce663291f405eddef26fa0d567f486b521c5d34e3fb50e41938b9a"
+    assert registry.MINIFLUX131_REF == old
+    assert registry.profile_references() == registry.FIXED_REFERENCES
+    assert registry.profile_references("host-loopback131") == (*registry.FIXED_REFERENCES[:2], old)
+    assert registry.profile_references("actual125-compatibility") == (*registry.FIXED_REFERENCES, old)
+    assert registry._repository(old) == "miniflux/miniflux"
+    assert all(registry._repository(ref).startswith("library/") for ref in registry.FIXED_REFERENCES)
+
+
+@pytest.fixture
+def named_dataset(dataset, monkeypatch):
+    refs, data, urls = dataset
+    config = encoded({"os": "linux", "architecture": "amd64", "name": "miniflux/miniflux"})
+    layer = b"fixed-miniflux131-layer"
+    manifest = encoded({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": descriptor(config, "application/vnd.oci.image.config.v1+json"),
+        "layers": [descriptor(layer, "application/vnd.oci.image.layer.v1.tar+gzip")]})
+    platform = descriptor(manifest, "application/vnd.oci.image.manifest.v1+json")
+    platform["platform"] = {"os": "linux", "architecture": "amd64"}
+    index = encoded({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json", "manifests": [platform]})
+    old = "miniflux/miniflux@" + digest(index)
+    monkeypatch.setattr(registry, "MINIFLUX131_REF", old)
+    for kind, raw, media in [("manifests", index, "application/vnd.oci.image.index.v1+json"),
+                             ("manifests", manifest, "application/vnd.oci.image.manifest.v1+json"),
+                             ("blobs", config, "application/octet-stream"), ("blobs", layer, "application/octet-stream")]:
+        data["https://registry-1.docker.io/v2/miniflux/miniflux/" + kind + "/" + digest(raw)] = (raw, media)
+
+    @contextmanager
+    def response(url, headers, deadline, *, token=False):
+        registry.remaining(deadline)
+        urls.append(url)
+        assert headers.get("Accept-Encoding") == "identity"
+        if token:
+            assert url.startswith("https://auth.docker.io/token?service=registry.docker.io&scope=repository%3A")
+            raw, media = b'{"token":"public.synthetic.token"}', "application/json"
+        else:
+            assert headers["Authorization"] == "Bearer public.synthetic.token"
+            raw, media = data[url]
+        stream = io.BytesIO(raw)
+        stream.getheader = lambda key, default=None: {"Content-Length": str(len(raw)), "Content-Type": media}.get(key, default)
+        yield stream, SimpleNamespace(sock=SimpleNamespace(settimeout=lambda value: None))
+
+    monkeypatch.setattr(registry, "_response", response)
+    return refs, data, urls
+
+
+@pytest.mark.parametrize("profile,count", [("host-loopback131", 3), ("actual125-compatibility", 5)])
+def test_named_profile_roundtrip_binds_complete_set_and_repository(named_dataset, tmp_path, profile, count):
+    _, _, urls = named_dataset
+    refs = registry.profile_references(profile)
+    root, end = tmp_path / "named", time.monotonic() + 30
+    proof = registry.prepare_bundle(root, refs, end, profile=profile)
+    value = json.loads((root / "BUNDLE.json").read_bytes())
+    assert proof["profile"] == value["profile"] == profile and value["references"] == list(refs)
+    assert json.loads((root / "PREPARE_STARTED.json").read_bytes())["deadline"] == end
+    assert len(urls) == count * 5 and len(urls) == len(set(urls))
+    assert any("scope=repository%3Aminiflux%2Fminiflux%3Apull" in url for url in urls)
+    assert not any("library/miniflux" in url for url in urls)
+    valid = registry.validate_bundle(root, proof, end)
+    try:
+        assert len(valid.routes) == count * 4
+        assert any(path.startswith("/v2/miniflux/miniflux/") for path in valid.routes)
+        if profile == "host-loopback131":
+            assert not any("/redis/" in path or "/nginx/" in path for path in valid.routes)
+    finally:
+        valid.close()
+
+
+@pytest.mark.parametrize("profile", ["default", "host-loopback131", "actual125-compatibility"])
+@pytest.mark.parametrize("fault", ["subset", "reorder", "extra", "different_profile"])
+def test_named_profile_never_accepts_generic_or_partial_sets(named_dataset, tmp_path, profile, fault):
+    refs, urls = registry.profile_references(profile), named_dataset[2]
+    if fault == "subset":
+        refs = refs[:-1]
+    elif fault == "reorder":
+        refs = tuple(reversed(refs))
+    elif fault == "extra":
+        refs = (*refs, "arbitrary@sha256:" + "a" * 64)
+    else:
+        refs = registry.profile_references("actual125-compatibility" if profile != "actual125-compatibility" else "default")
+    with pytest.raises(registry.RegistryError, match="complete frozen public dependency set"):
+        registry.prepare_bundle(tmp_path / "invalid", refs, time.monotonic() + 30, profile=profile)
+    assert urls == [] and not (tmp_path / "invalid").exists()
+
+
+@pytest.mark.parametrize("profile", [None, {}, [], True, "all", "host-loopback131-extra"])
+def test_unknown_registry_profile_fails_before_io(named_dataset, tmp_path, profile):
+    with pytest.raises(registry.RegistryError, match="unknown frozen registry profile"):
+        registry.prepare_bundle(tmp_path / "invalid", named_dataset[0], time.monotonic() + 30, profile=profile)
+    assert named_dataset[2] == [] and not (tmp_path / "invalid").exists()
+
+
+@pytest.mark.parametrize("fault", ["descriptor_profile", "missing_descriptor_profile", "bundle_profile", "default_profile_field"])
+def test_profile_is_sealed_in_both_descriptor_and_original(named_dataset, tmp_path, fault):
+    root, end = tmp_path / "named", time.monotonic() + 30
+    profile = "default" if fault == "default_profile_field" else "host-loopback131"
+    proof = registry.prepare_bundle(root, registry.profile_references(profile), end, profile=profile)
+    if fault == "descriptor_profile":
+        proof["profile"] = "actual125-compatibility"
+    elif fault == "missing_descriptor_profile":
+        proof.pop("profile")
+    elif fault == "default_profile_field":
+        proof["profile"] = "default"
+    else:
+        value = json.loads((root / "BUNDLE.json").read_bytes())
+        value["profile"] = "actual125-compatibility"
+        (root / "BUNDLE.json").write_bytes(registry._encoded(value))
+        proof["sha256"] = hashlib.sha256((root / "BUNDLE.json").read_bytes()).hexdigest()
+    with pytest.raises(registry.RegistryError):
+        registry.validate_bundle(root, proof, end)
+
+
 def test_prepare_keeps_all_original_bytes_and_same_deadline(bundle, dataset):
     root, descriptor, end = bundle
     record = json.loads((root / "PREPARE_STARTED.json").read_bytes())

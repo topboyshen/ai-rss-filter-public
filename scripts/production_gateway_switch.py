@@ -24,12 +24,14 @@ import time
 
 from services import admission_fence as gate, production_activation as runtime
 from services.production_activation_control import ReceiverActivationSession
-from scripts import private_release_contract as private
+from scripts import private_release_contract as private, retained_gateway_configuration as retained_config
 
 NGINX_REF = "nginx:stable-alpine@sha256:0d3b80406a13a767339fbe2f41406d6c7da727ab89cf8fae399e81f780f814d1"
 DOCKER = ("/usr/bin/docker", "--host", "unix:///var/run/docker.sock")
 MAX_OUTPUT = 4 * 1024**2
 CONFIG_TARGET = "/etc/nginx/nginx.conf"
+DEFAULT_WORKER_POLICY = "image-default-v1"
+ROOT_WORKER_POLICY = "retained-root-capdrop-all-v1"
 PLAN_KEYS = {
     "schema",
     "operation_id",
@@ -77,14 +79,16 @@ def gateway_name(operation):
     return "controlled-gateway-" + operation[:12] + "-gateway"
 
 
-def render_config(operation, api_alias):
+def render_config(operation, api_alias, *, worker_policy=DEFAULT_WORKER_POLICY):
     """Frozen before build; actual DNS ownership is independently checked later."""
     gateway_name(operation)
     gate._require(
         isinstance(api_alias, str) and re.fullmatch(r"[a-z][a-z0-9_-]{0,62}", api_alias),
         "fixed candidate API DNS alias required",
     )
-    return (
+    gate._require(type(worker_policy) is str and worker_policy in {DEFAULT_WORKER_POLICY, ROOT_WORKER_POLICY},
+                  "fixed gateway worker policy required")
+    raw = (
         """worker_processes 1;
 worker_shutdown_timeout 10s;
 pid /tmp/nginx.pid;
@@ -122,6 +126,115 @@ http {
 }
 """.replace("OPERATION", operation).replace("API_ALIAS", api_alias)
     ).encode()
+    return (b"user root;\n" if worker_policy == ROOT_WORKER_POLICY else b"") + raw
+
+
+def plan_worker_policy(plan):
+    """The sole optional plan variant is a recorded, separately verified derivation."""
+    gate._require(type(plan) is dict, "exact source-bound gateway plan required")
+    if set(plan) == PLAN_KEYS:
+        return DEFAULT_WORKER_POLICY
+    gate._require(set(plan) == PLAN_KEYS | {"worker_policy"} and plan["worker_policy"] == ROOT_WORKER_POLICY,
+                  "exact source-bound gateway plan required")
+    return ROOT_WORKER_POLICY
+
+
+def _worker_tokens(raw):
+    """Retain empty, quoted and escaped tokens rather than folding them into plain names."""
+    gate._require(type(raw) is bytes and len(raw) <= retained_config.MAX_FILE, "bounded gateway worker source required")
+    text = raw.decode("utf-8", "strict")
+    gate._require(all(ord(char) >= 32 or char in "\t\r\n" for char in text) and "\x7f" not in text,
+                  "gateway worker source contains control bytes")
+    tokens, token, started, plain, quoted, escaped, comment = [], [], False, True, None, False, False
+
+    def flush():
+        nonlocal started, plain
+        if started:
+            tokens.append(("".join(token), plain))
+        token.clear()
+        started, plain = False, True
+
+    for char in text:
+        if comment:
+            comment = char != "\n"
+        elif escaped:
+            token.append(char)
+            escaped = False
+        elif char == "\\":
+            started, plain, escaped = True, False, True
+        elif quoted:
+            if char == quoted:
+                quoted = None
+            else:
+                token.append(char)
+        elif char in "\"'":
+            started, plain, quoted = True, False, char
+        elif char == "#":
+            flush()
+            comment = True
+        elif char in " \t\r\n;{}":
+            flush()
+            if char in ";{}":
+                tokens.append((char, True))
+        else:
+            token.append(char)
+            started = True
+    gate._require(not quoted and not escaped, "gateway worker source quoting uncertain")
+    flush()
+    return tokens
+
+
+def _root_worker_configuration(files):
+    found = 0
+    gate._require(type(files) is dict and CONFIG_TARGET in files, "complete gateway worker sources required")
+    for path, raw in files.items():
+        statement, depth = [], 0
+        for token in _worker_tokens(raw):
+            value, plain = token
+            if plain and value in {";", "{", "}"}:
+                if statement and statement[0][0] == "user":
+                    gate._require(path == CONFIG_TARGET and depth == 0 and value == ";"
+                                  and statement == [("user", True), ("root", True)],
+                                  "retained root worker declaration differs")
+                    found += 1
+                if value == "{":
+                    depth += 1
+                elif value == "}":
+                    depth -= 1
+                    gate._require(depth >= 0, "gateway worker source braces uncertain")
+                statement = []
+            else:
+                statement.append(token)
+        gate._require(not statement and depth == 0, "gateway worker source incomplete")
+    gate._require(found == 1, "one explicit retained root worker required")
+
+
+def derive_worker_policy(old, proof):
+    """A root renderer is supported only by the exact protected retained predecessor."""
+    if (old["Config"].get("User", "") != "0:0" or old["HostConfig"].get("CapDrop") != ["ALL"]
+            or proof.get("kind") != retained_config.KIND):
+        return DEFAULT_WORKER_POLICY
+    configuration = retained_config.validate(proof)
+    gate._require(configuration["container_identity"] == gateway_identity(old) and old["Image"] in retained_config.IMAGE_IDS,
+                  "retained worker predecessor identity differs")
+    execution = _execution(old)
+    gate._require(execution["user"] == "0:0" and execution["cap_drop"] == ["ALL"], "retained worker execution differs")
+    _root_worker_configuration(configuration["files"])
+    return ROOT_WORKER_POLICY
+
+
+def validate_worker_policy(plan, *, old=None):
+    policy = plan_worker_policy(plan)
+    if policy == ROOT_WORKER_POLICY:
+        proof = plan["old_config"]
+        gate._require(proof.get("kind") == retained_config.KIND, "retained root worker archive required")
+        configuration = retained_config.validate(proof)
+        gate._require(configuration["container_identity"] == plan["old_gateway_identity"],
+                      "retained worker proof identity differs")
+        _root_worker_configuration(configuration["files"])
+    if old is not None:
+        gate._require(derive_worker_policy(old, plan["old_config"]) == policy, "actual retained worker policy differs")
+    return policy
 
 
 def file_identity(path):
@@ -231,11 +344,19 @@ class NativeTransport:
         gate._require(len(rows) == 1 and rows[0]["Id"] == identifier, "exact gateway container missing")
         return rows[0]
 
-    def image(self):
-        rows = json.loads(self.run(["image", "inspect", NGINX_REF]))
-        gate._require(
-            len(rows) == 1 and re.fullmatch(r"sha256:[0-9a-f]{64}", rows[0]["Id"]), "fixed nginx image missing"
-        )
+    def archive(self, identifier, container_path, consumer):
+        """Fixed tar GET only, with no CLI/buffered payload prefetch."""
+        deadline = min(self.deadline, time.monotonic() + 3)
+        with _hard_deadline(deadline - time.monotonic()):
+            return retained_config.read_native_archive(identifier, container_path, consumer, deadline=deadline)
+
+    def image(self, expected_id):
+        # Retain the sealed predecessor image; a registry manifest digest is
+        # not interchangeable with a daemon-local config/image identifier.
+        gate._require(expected_id in retained_config.IMAGE_IDS, "fixed nginx image identity required")
+        rows = json.loads(self.run(["image", "inspect", expected_id]))
+        gate._require(isinstance(rows, list) and len(rows) == 1, "fixed nginx image missing")
+        retained_config.validate_image(rows[0], expected_id=expected_id)
         return rows[0]
 
     def network_members(self, identifier):
@@ -437,7 +558,7 @@ class GatewaySwitch:
         )
         gate._require(
             isinstance(plan, dict)
-            and set(plan) == PLAN_KEYS
+            and set(plan) in (PLAN_KEYS, PLAN_KEYS | {"worker_policy"})
             and type(plan["schema"]) is int
             and plan["schema"] == 1
             and plan["source_sha256"] == source_sha256(),
@@ -471,7 +592,7 @@ class GatewaySwitch:
             <= receiver_session.permit["expires_at"],
             "gateway window exceeds activation permission",
         )
-        self.config = render_config(self.operation, plan["api_alias"])
+        self.config = render_config(self.operation, plan["api_alias"], worker_policy=plan_worker_policy(plan))
 
     @contextmanager
     def _exclusive(self):
@@ -510,11 +631,19 @@ class GatewaySwitch:
                 self.plan["window"]["not_before"] <= time.time() < self.plan["window"]["expires_at"],
                 "gateway write window expired",
             )
-        for field in ("old_config", "new_config"):
-            record, raw = file_identity(self.plan[field]["path"])
-            gate._require(record == self.plan[field], "gateway original config inode or bytes changed")
-            if field == "new_config":
-                gate._require(raw == self.config, "gateway config is not the fixed reviewed routing template")
+        old = self.plan["old_config"]
+        if old.get("kind") == retained_config.KIND:
+            result = retained_config.validate(old)
+            gate._require(result["container_identity"] == self.plan["old_gateway_identity"]
+                          and result["container_identity"]["id"] == self.plan["old_gateway_id"]
+                          and result["network_id"] == self.plan["network_id"], "gateway archive proof binding differs")
+        else:
+            record, _raw = file_identity(old["path"])
+            gate._require(record == old, "gateway original config inode or bytes changed")
+        validate_worker_policy(self.plan)
+        record, raw = file_identity(self.plan["new_config"]["path"])
+        gate._require(record == self.plan["new_config"], "gateway original config inode or bytes changed")
+        gate._require(raw == self.config, "gateway config is not the fixed reviewed routing template")
 
     def _api(self, *, gateway_id=None):
         owners = self.session._owners()
@@ -588,14 +717,18 @@ class GatewaySwitch:
             gateway_identity(row) == self.plan["old_gateway_identity"], "retained old gateway identity changed"
         )
         mounts = row["Mounts"]
-        gate._require(
-            len(mounts) == 1
-            and mounts[0]["Type"] == "bind"
-            and mounts[0]["Destination"] == CONFIG_TARGET
-            and mounts[0]["Source"] == self.plan["old_config"]["path"]
-            and not mounts[0]["RW"],
-            "old gateway configuration is not the retained bound mount",
-        )
+        if self.plan["old_config"].get("kind") == retained_config.KIND:
+            retained_config.verify(self.plan["old_config"], row, inspect=self.transport.inspect,
+                                   archive=self.transport.archive)
+        else:
+            gate._require(
+                len(mounts) == 1
+                and mounts[0]["Type"] == "bind"
+                and mounts[0]["Destination"] == CONFIG_TARGET
+                and mounts[0]["Source"] == self.plan["old_config"]["path"]
+                and not mounts[0]["RW"],
+                "old gateway configuration is not the retained bound mount",
+            )
         gate._require(
             not row["State"].get("Paused")
             and not row["State"].get("Restarting")
@@ -603,6 +736,7 @@ class GatewaySwitch:
             and not row["State"].get("OOMKilled"),
             "old gateway state uncertain",
         )
+        validate_worker_policy(self.plan, old=row)
         return row
 
     def _argv(self, execution, image, api, purpose):
@@ -854,7 +988,8 @@ class GatewaySwitch:
             "gateway attempted or receiver already open; query original only",
         )
         self.session.check_receiver_resume(active=True)
-        old, image, api = self._old(), self.transport.image(), self._api()
+        old = self._old()
+        image, api = self.transport.image(self.plan["old_gateway_identity"]["image_id"]), self._api()
         gate._require(
             old["Image"] == image["Id"]
             and self.project != old["Config"]["Labels"].get("com.docker.compose.project")
@@ -876,7 +1011,12 @@ class GatewaySwitch:
             "ports": _ports(old),
             "old_was_running": old["State"]["Running"],
         }
-        _save_raw(self.root / "old-nginx.conf", file_identity(self.plan["old_config"]["path"])[1])
+        if self.plan["old_config"].get("kind") == retained_config.KIND:
+            original = retained_config.validate(self.plan["old_config"])["files"][CONFIG_TARGET]
+            gate._write(self.root / "old-configuration-proof.json", self.plan["old_config"])
+        else:
+            original = file_identity(self.plan["old_config"]["path"])[1]
+        _save_raw(self.root / "old-nginx.conf", original)
         _save_raw(self.root / "new-nginx.conf", self.config)
         gate._write(self.root / "intent.json", self.intent)
         test = self._create("config-test")
@@ -915,6 +1055,26 @@ class GatewaySwitch:
         with self._exclusive():
             return self._query()
 
+    @contextmanager
+    def retained_verification(self, receiver_session):
+        """Hold real gateway custody throughout independent application verify."""
+        gate._require(receiver_session is self.session, "same live gateway receiver capability required")
+        with self._exclusive():
+            result = self._query()
+            gate._require(result["status"] == "gateway_switched", "actual gateway cutover is not confirmed")
+            receipt = {key: value for key, value in result.items() if key != "query_only"}
+            expected = gate._hash(receipt)
+            # A caller may retain a snapshot, never the mutable internal proof.
+            provided = gate._parsed(gate._encoded(receipt))
+            try:
+                yield provided
+            finally:
+                self.check()
+                self._predecessors()
+                after = self._route(self.transport.inspect(receipt["gateway_id"]))
+                gate._require(gate._hash(provided) == expected and gate._hash(after) == expected,
+                              "gateway custody changed during independent verification")
+
     def _query(self):
         self.check()
         self.intent = runtime.read_confirmed(self.root / "intent.json")
@@ -930,7 +1090,7 @@ class GatewaySwitch:
             and self.intent["schema"] == 1
             and self.intent["plan"] == self.plan
             and type(self.intent["old_was_running"]) is bool
-            and self.intent["image_id"] == old["Image"] == self.transport.image()["Id"]
+            and self.intent["image_id"] == old["Image"] == self.transport.image(self.plan["old_gateway_identity"]["image_id"])["Id"]
             and self.intent["execution"] == _execution(old)
             and self.intent["ports"] == _ports(old),
             "query original gateway intent only",

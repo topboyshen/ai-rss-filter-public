@@ -4,10 +4,12 @@ from copy import deepcopy
 import json
 import fcntl
 import hashlib
+import io
 import os
 from pathlib import Path
 import signal
 import time
+import tarfile
 from types import SimpleNamespace
 
 import pytest
@@ -109,6 +111,10 @@ def _mock_transport(monkeypatch, state, network, old_id, image, new_config):
                 Entrypoint=["nginx"],
                 Cmd=["-t", "-c", switch.CONFIG_TARGET] if purpose == "config-test" else ["-g", "daemon off;"],
             )
+            if "--user" in args:
+                row["Config"]["User"] = args[args.index("--user") + 1]
+            if "--cap-drop" in args:
+                row["HostConfig"]["CapDrop"] = [args[args.index("--cap-drop") + 1]]
             row["State"].update(Status="created", StartedAt="", FinishedAt="")
             row["HostConfig"]["RestartPolicy"] = {"Name": "no"}
             if purpose == "config-test":
@@ -153,7 +159,10 @@ def _mock_transport(monkeypatch, state, network, old_id, image, new_config):
 
     monkeypatch.setattr(switch.NativeTransport, "inspect", inspect)
     monkeypatch.setattr(switch.NativeTransport, "network_members", members)
-    monkeypatch.setattr(switch.NativeTransport, "image", lambda _self: {"Id": image})
+    def exact_image(_self, expected_id):
+        assert expected_id == image
+        return {"Id": image}
+    monkeypatch.setattr(switch.NativeTransport, "image", exact_image)
     monkeypatch.setattr(switch.NativeTransport, "find", find)
     monkeypatch.setattr(switch.NativeTransport, "run", run)
     monkeypatch.setattr(switch.NativeTransport, "health", health)
@@ -600,3 +609,333 @@ def test_probe_observation_bounds_and_short_body_only():
     assert long_row["failed_checks"] == ["body_sha256", "operation", "status", "upstream"]
     short = switch._probe_observation({}, {"status": 503}, expected, b"NOT READY")
     assert short["body_text"] == "NOT READY" and short["upstream"] is None
+
+
+def test_retained_verification_holds_control_lock_and_rechecks_actual_endpoint(case):
+    p = case
+    subject = adapter(p)
+    subject.switch()
+    before = list(p.state.calls)
+    previous_http = list(p.state.http)
+    with subject.retained_verification(p.session) as proof:
+        assert proof["status"] == "gateway_switched" and proof["old_gateway_retained"] == p.old["Id"]
+        fd = os.open(p.evidence / "control.lock", os.O_RDWR)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(fd)
+    assert p.state.calls == before
+    assert p.state.http == previous_http * 3  # Actual two-port checks at enter and exit, no mutation.
+
+
+@pytest.mark.parametrize("change", ["other_session", "mutated_receipt", "restarted", "wrong_route"])
+def test_retained_verification_never_accepts_forged_or_changed_custody(case, change):
+    p = case
+    subject = adapter(p)
+    subject.switch()
+    with pytest.raises(gate.AdmissionError):
+        with subject.retained_verification(object() if change == "other_session" else p.session) as proof:
+            if change == "mutated_receipt":
+                proof["gateway_id"] = "0" * 64
+            elif change == "restarted":
+                p.state.rows["6" * 64]["RestartCount"] += 1
+            else:
+                p.state.wrong_http = True
+
+
+def test_native_archive_keeps_original_deadline_and_fixed_reader(case, monkeypatch):
+    p = case
+    captured = []
+
+    def read(identifier, path, consumer, *, deadline):
+        captured.append((identifier, path, deadline))
+        return consumer(lambda _size: b"")
+
+    monkeypatch.setattr(switch.retained_config, "read_native_archive", read)
+    p.transport.deadline = time.monotonic() + 0.5
+    assert p.transport.archive(p.old["Id"], switch.CONFIG_TARGET, lambda _read: "proof") == "proof"
+    assert captured[0][:2] == (p.old["Id"], switch.CONFIG_TARGET)
+    assert captured[0][2] == p.transport.deadline
+
+
+def _zero_mount_case(p, tmp_path, monkeypatch, *, profile=switch.retained_config.DEFAULT_PROFILE, main_prefix=b""):
+    main = b"events {}\nhttp { include /etc/nginx/mime.types; include /etc/nginx/conf.d/*.conf; }\n"
+    mime = b"types { text/plain txt; }\n"
+    original = b"server { listen 5000; location / { proxy_pass http://old-api:5000; } }\n"
+
+    def tar(entries):
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+            for name, data in entries:
+                value = tarfile.TarInfo(name)
+                value.type = tarfile.DIRTYPE if data is None else tarfile.REGTYPE
+                value.mode = 0o755 if data is None else 0o644
+                value.size = len(data) if data is not None else 0
+                archive.addfile(value, io.BytesIO(data) if data is not None else None)
+        return output.getvalue()
+
+    paths = switch.retained_config.FILE_PATHS
+    raw = {paths[0]: tar([("nginx.conf", main_prefix + main)]), paths[1]: tar([("mime.types", mime)]),
+           paths[2]: tar([("default.conf", original)]),
+           switch.retained_config.DIRECTORY_PATH: tar([("conf.d", None), ("conf.d/default.conf", original)])}
+    if profile == switch.retained_config.MIME_ONLY_PROFILE:
+        main = b"events {}\nhttp { include /etc/nginx/mime.types; " + original + b"}\n"
+        raw = {paths[0]: tar([("nginx.conf", main_prefix + main)]), paths[1]: tar([("mime.types", mime)])}
+    files = {}
+    for index, (path, value) in enumerate(raw.items()):
+        output = tmp_path / f"retained-original-{index}.tar"
+        output.write_bytes(value)
+        output.chmod(0o600)
+        files[path] = output
+    p.old.update(Mounts=[], Image=switch.retained_config.IMAGE_ID)
+    p.plan["old_gateway_identity"] = switch.gateway_identity(p.old)
+    p.plan["old_config"] = switch.retained_config.describe(p.old, p.plan["network_id"], files, profile=profile)
+    previous_run = switch.NativeTransport.run
+
+    def run(self, args, **kwargs):
+        result = previous_run(self, args, **kwargs)
+        if args[0] == "create":
+            p.state.rows[result.decode().strip()]["Image"] = switch.retained_config.IMAGE_ID
+        return result
+
+    def archive(_self, identifier, path, consume):
+        assert identifier == p.old["Id"] and path in switch.retained_config.archive_paths(profile)
+        p.state.archive_calls.append((path, p.old["State"]["Running"]))
+        return consume(io.BytesIO(raw[path]).read)
+
+    p.state.archive_calls = []
+    def exact_image(_self, expected_id):
+        assert expected_id == switch.retained_config.IMAGE_ID
+        return {"Id": switch.retained_config.IMAGE_ID}
+    monkeypatch.setattr(switch.NativeTransport, "image", exact_image)
+    monkeypatch.setattr(switch.NativeTransport, "archive", archive)
+    monkeypatch.setattr(switch.NativeTransport, "run", run)
+    return raw, run
+
+
+def test_zero_mount_archive_branch_rechecks_before_after_stop_and_retains_originals(case, tmp_path, monkeypatch):
+    p = case
+    p.old["State"].update(Running=True, Status="running")
+    _zero_mount_case(p, tmp_path, monkeypatch)
+    subject = adapter(p)
+    assert subject.switch()["status"] == "gateway_switched"
+    assert (p.evidence / "old-configuration-proof.json").exists()
+    assert (p.evidence / "old-nginx.conf").read_bytes().startswith(b"events {}")
+    assert {running for _path, running in p.state.archive_calls} == {True, False}
+    with subject.retained_verification(p.session) as result:
+        assert result["old_config"]["kind"] == switch.retained_config.KIND
+    assert p.old["Mounts"] == [] and not p.old["State"]["Running"]
+    creates = [args for args in p.state.calls if args[0] == "create"]
+    assert len(creates) == 2 and all("dst=/etc/nginx/nginx.conf,readonly" in args[args.index("--mount") + 1]
+                                    for args in creates)
+    assert all("retained-original" not in " ".join(args) for args in creates)
+
+
+def _root_policy_case(p, tmp_path, monkeypatch, *, user="0:0", cap_drop=None,
+                      profile=switch.retained_config.DEFAULT_PROFILE):
+    p.old["Config"]["User"] = user
+    p.old["HostConfig"]["CapDrop"] = ["ALL"] if cap_drop is None else cap_drop
+    _zero_mount_case(p, tmp_path, monkeypatch, profile=profile, main_prefix=b"user root;\n")
+    p.plan["worker_policy"] = switch.ROOT_WORKER_POLICY
+    p.plan["new_config"] = save(Path(p.plan["new_config"]["path"]), switch.render_config(
+        p.plan["operation_id"], p.plan["api_alias"], worker_policy=switch.ROOT_WORKER_POLICY))
+    return p
+
+
+def test_default_rendering_is_unchanged_and_root_is_the_only_named_template_addition():
+    default = switch.render_config("a" * 64, "candidate-api")
+    assert switch.render_config("a" * 64, "candidate-api", worker_policy=switch.DEFAULT_WORKER_POLICY) == default
+    assert switch.render_config("a" * 64, "candidate-api", worker_policy=switch.ROOT_WORKER_POLICY) == b"user root;\n" + default
+    assert not default.startswith(b"user ")
+    for unknown in (None, "root", "user root;", "future-policy", {}):
+        with pytest.raises(gate.AdmissionError, match="fixed gateway worker policy"):
+            switch.render_config("a" * 64, "candidate-api", worker_policy=unknown)
+
+
+@pytest.mark.parametrize("profile", [switch.retained_config.DEFAULT_PROFILE, switch.retained_config.MIME_ONLY_PROFILE])
+def test_root_worker_switch_derives_from_actual_protected_predecessor_without_changing_execution(case, tmp_path, monkeypatch, profile):
+    p = _root_policy_case(case, tmp_path, monkeypatch, profile=profile)
+    original = deepcopy(p.old)
+    assert switch.derive_worker_policy(p.old, p.plan["old_config"]) == switch.ROOT_WORKER_POLICY
+    result = adapter(p).switch()
+    assert result["status"] == "gateway_switched"
+    creates = [args for args in p.state.calls if args[0] == "create"]
+    assert len(creates) == 2
+    assert all(args[args.index("--user") + 1] == "0:0" and args[args.index("--cap-drop") + 1] == "ALL" for args in creates)
+    assert all("--cap-add" not in args and args[args.index("--security-opt") + 1] == "no-new-privileges:true" for args in creates)
+    assert p.old == original and p.plan["old_gateway_identity"] == switch.gateway_identity(original)
+    assert (p.evidence / "new-nginx.conf").read_bytes().startswith(b"user root;\n")
+    assert len(p.state.http) == 2
+
+
+@pytest.mark.parametrize("user", ["", "101", "101:101", "root", "root:root", "0"])
+def test_root_policy_field_cannot_authorize_nonroot_or_unknown_predecessor(case, tmp_path, monkeypatch, user):
+    p = _root_policy_case(case, tmp_path, monkeypatch, user=user)
+    with pytest.raises(gate.AdmissionError, match="actual retained worker policy differs"):
+        adapter(p).switch()
+    assert not p.state.calls and not (p.evidence / "intent.json").exists()
+
+
+@pytest.mark.parametrize("cap_drop", [[], ["CHOWN"], ["ALL", "CHOWN"]])
+def test_named_root_policy_never_replaces_exact_cap_drop_all(case, tmp_path, monkeypatch, cap_drop):
+    p = _root_policy_case(case, tmp_path, monkeypatch, cap_drop=cap_drop)
+    with pytest.raises(gate.AdmissionError, match="actual retained worker policy differs"):
+        adapter(p).switch()
+    assert not p.state.calls
+
+
+@pytest.mark.parametrize("main", [
+    b"events {}", b"user nginx;", b"user root; user root;", b"http { user root; }",
+    b'"user" root;', b"user 'root';", b"user r\\oot;", b"u\\ser root;", b'user root "";',
+    b"# user root;\nevents {}", b"user root # misleading\n nginx;", b"user root; http { user root; }",
+    b"user root", b'user "root;',
+])
+def test_root_derivation_rejects_missing_duplicate_nested_or_ambiguous_user_declarations(main):
+    with pytest.raises(gate.AdmissionError):
+        switch._root_worker_configuration({switch.CONFIG_TARGET: main, "/etc/nginx/mime.types": b"types {}"})
+
+
+@pytest.mark.parametrize("other", [b"user root;", b'"user" root;', b"types { user root; }"])
+def test_every_validated_closure_file_is_checked_for_additional_worker_directives(other):
+    with pytest.raises(gate.AdmissionError, match="retained root worker declaration differs"):
+        switch._root_worker_configuration({switch.CONFIG_TARGET: b"user root; events {}",
+                                           "/etc/nginx/mime.types": other})
+
+
+def test_worker_lexer_preserves_quotes_escapes_empty_tokens_and_only_ignores_real_comments():
+    switch._root_worker_configuration({switch.CONFIG_TARGET: b"# user nginx;\nuser root; events {}\nhttp { set $x 'user root;'; }"})
+    assert switch._worker_tokens(b'user root "";') == [("user", True), ("root", True), ("", False), (";", True)]
+    assert switch._worker_tokens(b'u\\ser "root";') == [("user", False), ("root", False), (";", True)]
+
+
+@pytest.mark.parametrize("separator", ["\u00a0", "\u1680", "\u2000", "\u2028", "\u3000"])
+def test_non_ascii_whitespace_is_never_normalized_into_a_root_worker_declaration(separator):
+    for statement in (f"user{separator}root;", f"user root{separator};", f"user{separator}root{separator};",
+                      f"{separator}user root;"):
+        with pytest.raises(gate.AdmissionError):
+            switch._root_worker_configuration({switch.CONFIG_TARGET: statement.encode()})
+
+
+@pytest.mark.parametrize("separator", [" ", "\t", "\r", "\n"])
+def test_ascii_worker_separators_keep_utf8_comments_and_ordinary_quoted_values(separator):
+    raw = (f"# \u4e2d\u6587\u6ce8\u91ca user\u3000root;\nuser{separator}root; events {{}} "
+           'http { set $label "\u4e3b\u9898 user\u00a0root;"; }').encode()
+    switch._root_worker_configuration({switch.CONFIG_TARGET: raw, "/etc/nginx/mime.types": "# \u4fdd\u7559\u6ce8\u91ca\ntypes {}".encode()})
+
+
+@pytest.mark.parametrize("fault", ["missing-policy", "unknown-policy", "explicit-default", "extra-field", "old-source", "wrong-template"])
+def test_root_plan_shape_source_and_config_are_all_bound_before_any_create(case, tmp_path, monkeypatch, fault):
+    p = _root_policy_case(case, tmp_path, monkeypatch)
+    if fault == "missing-policy":
+        del p.plan["worker_policy"]
+    elif fault == "unknown-policy":
+        p.plan["worker_policy"] = "root"
+    elif fault == "explicit-default":
+        p.plan["worker_policy"] = switch.DEFAULT_WORKER_POLICY
+    elif fault == "extra-field":
+        p.plan["unreviewed_root"] = True
+    elif fault == "old-source":
+        p.plan["source_sha256"] = "f" * 64
+    else:
+        p.plan["new_config"] = save(Path(p.plan["new_config"]["path"]), switch.render_config(
+            p.plan["operation_id"], p.plan["api_alias"]))
+    with pytest.raises(gate.AdmissionError):
+        adapter(p).switch()
+    assert not p.state.calls and not (p.evidence / "intent.json").exists()
+
+
+@pytest.mark.parametrize("fault", ["cap-add", "archive-proof-drift"])
+def test_root_variant_still_blocks_extra_capability_and_changed_archive_proof(case, tmp_path, monkeypatch, fault):
+    p = _root_policy_case(case, tmp_path, monkeypatch)
+    if fault == "cap-add":
+        p.old["HostConfig"]["CapAdd"] = ["CHOWN"]
+        p.plan["old_gateway_identity"] = switch.gateway_identity(p.old)
+        p.plan["old_config"]["container_identity"] = switch.gateway_identity(p.old)
+    else:
+        p.plan["old_config"]["archives"][switch.CONFIG_TARGET]["sha256"] = "f" * 64
+    with pytest.raises(gate.AdmissionError):
+        adapter(p).switch()
+    assert not p.state.calls and not (p.evidence / "intent.json").exists()
+
+
+def test_zero_mount_config_change_after_term_blocks_gateway_create(case, tmp_path, monkeypatch):
+    p = case
+    p.old["State"].update(Running=True, Status="running")
+    raw, original_run = _zero_mount_case(p, tmp_path, monkeypatch)
+
+    def changed(self, args, **kwargs):
+        result = original_run(self, args, **kwargs)
+        if args[0] == "kill":
+            raw[switch.CONFIG_TARGET] = raw[switch.CONFIG_TARGET].replace(b"events", b"EVENTS")
+        return result
+
+    monkeypatch.setattr(switch.NativeTransport, "run", changed)
+    with pytest.raises(gate.AdmissionError, match="archive bytes changed"):
+        adapter(p).switch()
+    assert p.old["Mounts"] == [] and p.old["State"]["ExitCode"] == 143
+    assert len([args for args in p.state.calls if args[0] == "create"]) == 1
+    assert (p.evidence / "old-configuration-proof.json").exists()
+    assert not (p.evidence / "result.json").exists()
+
+
+@pytest.mark.parametrize("identifier", ["index", "config"])
+def test_native_image_lookup_reuses_exact_sealed_id_not_registry_reference(monkeypatch, identifier):
+    from tests.test_retained_gateway_configuration import fixed_image
+    expected = switch.retained_config.IMAGE_ID if identifier == "index" else switch.retained_config.IMAGE_CONFIG_ID
+    calls = []
+    def run(_self, argv):
+        calls.append(argv)
+        return json.dumps([fixed_image(expected)])
+    monkeypatch.setattr(switch.NativeTransport, "run", run)
+    assert switch.NativeTransport().image(expected)["Id"] == expected
+    assert calls == [["image", "inspect", expected]]
+    assert expected != switch.NGINX_REF
+
+
+def test_native_image_lookup_cannot_substitute_another_fixed_chain_member(monkeypatch):
+    from tests.test_retained_gateway_configuration import fixed_image
+    monkeypatch.setattr(switch.NativeTransport, "run", lambda _self, _argv: json.dumps([
+        fixed_image(switch.retained_config.IMAGE_CONFIG_ID)]))
+    with pytest.raises(gate.AdmissionError, match="image content or exact identity"):
+        switch.NativeTransport().image(switch.retained_config.IMAGE_ID)
+
+
+def test_unreviewed_image_is_rejected_before_any_lookup(monkeypatch):
+    monkeypatch.setattr(switch.NativeTransport, "run", lambda *_a: pytest.fail("must not inspect unreviewed image"))
+    with pytest.raises(gate.AdmissionError, match="image identity required"):
+        switch.NativeTransport().image("sha256:" + "f" * 64)
+
+
+def test_mime_only_gateway_switch_retains_profile_and_exact_two_live_archives(case, tmp_path, monkeypatch):
+    p = case
+    p.old["State"].update(Running=True, Status="running")
+    _zero_mount_case(p, tmp_path, monkeypatch, profile=switch.retained_config.MIME_ONLY_PROFILE)
+    subject = adapter(p)
+    result = subject.switch()
+    assert result["status"] == "gateway_switched" and result["old_config"]["profile"] == switch.retained_config.MIME_ONLY_PROFILE
+    assert set(result["old_config"]["archives"]) == set(switch.retained_config.MIME_ONLY_PATHS)
+    with subject.retained_verification(p.session) as verified:
+        assert verified["old_config"] == p.plan["old_config"]
+    assert {path for path, _running in p.state.archive_calls} == set(switch.retained_config.MIME_ONLY_PATHS)
+    assert {running for _path, running in p.state.archive_calls} == {True, False}
+
+
+@pytest.mark.parametrize("fault", ["remove", "unknown", "source", "hash"])
+def test_mime_gateway_static_profile_confusion_stops_before_mutation(case, tmp_path, monkeypatch, fault):
+    p = case
+    p.old["State"].update(Running=True, Status="running")
+    _zero_mount_case(p, tmp_path, monkeypatch, profile=switch.retained_config.MIME_ONLY_PROFILE)
+    proof = p.plan["old_config"]
+    if fault == "remove":
+        proof.pop("profile")
+    elif fault == "unknown":
+        proof["profile"] = switch.retained_config.DEFAULT_PROFILE
+    elif fault == "source":
+        proof["source_sha256"] = "f" * 64
+    else:
+        proof["closure_sha256"] = "f" * 64
+    before = list(p.state.calls)
+    with pytest.raises(gate.AdmissionError):
+        adapter(p).switch()
+    assert p.state.calls == before and p.old["State"]["Running"] is True

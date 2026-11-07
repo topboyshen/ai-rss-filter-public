@@ -17,7 +17,7 @@ from tests.test_dashboard_browser_auth import (
 
 dashboard_browser = browser_auth_tests.dashboard_browser
 PAGE_PATH = "/dashboard/neutral-records"
-PAGE_URL = BASE_URL + PAGE_PATH
+PAGE_URL = "https://dashboard.example.test" + PAGE_PATH
 STRATEGY = "score:neutral-route-test"
 FEED_URL = "https://example.test/feed"
 FACTS_TEXT = "保守处理说明：事实表述未通过现有来源校验"

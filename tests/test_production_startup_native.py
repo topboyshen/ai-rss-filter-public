@@ -79,6 +79,55 @@ def test_complete_structured_child_failure_is_only_diagnostic_candidates(diagnos
     assert "SECRET_" not in json.dumps(record) and Path(str(path) + ".stdout").read_bytes() == raw
 
 
+@pytest.mark.parametrize("kind", ["activation", "host_result", "host_failure", "legacy_host_result"])
+def test_host_stdout_schemas_export_only_source_validated_candidates(diagnostic_source, tmp_path, capsys, kind):
+    frame = {"file": diagnostic_source.name, "line": 2, "function": "fail"}
+    failure = {"error_type": "RuntimeError", "error_locations": [frame], "error_sha256": "a" * 64,
+               "error_message": "SECRET_MESSAGE_CANARY"}
+    if kind == "activation":
+        packet = {"status": "failed_or_evidence_insufficient", "activation": {
+            "status": "failed_or_evidence_insufficient", "failure_type": "RuntimeError",
+            "failure_locations": [{"file": frame["file"], "line": frame["line"]}],
+            "failure_message_literal": "SECRET_MESSAGE_CANARY"}}
+    else:
+        if kind == "legacy_host_result":
+            failure.pop("error_locations")  # Historical hashes do not invent a traceback.
+        packet = {"status": "unconfirmed", "safe_evidence": {"complete": True, "files": {
+            "RESULT.json": {"content": {"status": "passed", "failure": None}}}},
+            "private_host": {"failure": failure if kind == "host_failure" else None,
+                "result": {"status": "failed_or_evidence_insufficient", "bootstrap_result": {"status": "passed"},
+                           **failure}}}
+    raw = json.dumps(packet).encode() + b"\n"
+    path = tmp_path / kind
+    with pytest.raises(private.ContractError):
+        native.archive_command([sys.executable, "-c", "import sys;sys.stdout.buffer.write(" + repr(raw) + ");sys.exit(3)"], path)
+    record = diagnostic_record(capsys)
+    assert record["locations"] == ([] if kind == "legacy_host_result" else [frame])
+    assert record["exception_type"] == "RuntimeError"
+    assert "SECRET_" not in json.dumps(record)
+    assert Path(str(path) + ".stdout").read_bytes() == raw
+
+
+@pytest.mark.parametrize("change", ["extra", "path", "line", "function", "too_many", "passed"])
+def test_activation_coordinates_cannot_export_unverified_frames(diagnostic_source, capsys, change):
+    frame = {"file": diagnostic_source.name, "line": 2}
+    if change == "extra":
+        frame["secret"] = "SECRET_CANARY"
+    elif change == "path":
+        frame["file"] = "/outside/public_failure.py"
+    elif change == "line":
+        frame["line"] = True
+    elif change == "function":
+        frame["function"] = "SECRET_CANARY"
+    packet = {"status": "passed" if change == "passed" else "failed_or_evidence_insufficient",
+              "activation": {"status": "failed_or_evidence_insufficient", "failure_type": "RuntimeError",
+                             "failure_locations": [frame] * (65 if change == "too_many" else 1)}}
+    native._emit_archive_diagnostic([json.dumps(packet).encode(), b""], True)
+    record = diagnostic_record(capsys)
+    assert record["locations"] == [] and record["status"] == "no_verified_frames"
+    assert "SECRET" not in json.dumps(record)
+
+
 @pytest.mark.parametrize("change", ["external", "fake_project_path", "function", "line", "truncated", "no_exception", "prefix", "unknown_class"])
 def test_fake_or_partial_stderr_never_exports_unverified_text(diagnostic_source, tmp_path, capsys, change):
     file = "/outside/SECRET_PATH/public_failure.py" if change == "external" else str(diagnostic_source)
@@ -946,3 +995,80 @@ def test_dockerfile_default_index_unchanged_and_ci_step_overrides():
     assert workflow.count("STARTUP_PIP_INDEX_URL: https://pypi.org/simple") == 1
     step = workflow.split("- name: Actual application image migration and closed multiworker startup", 1)[1].split("- name:", 1)[0]
     assert "STARTUP_PIP_INDEX_URL: https://pypi.org/simple" in step
+
+
+def test_nested_namespace_failure_survives_both_archive_layers(diagnostic_source, tmp_path, capsys):
+    from scripts import production_activation_host_native as host
+    from scripts import verify_production_activation_native as activation
+    frame = {"file": diagnostic_source.name, "line": 2, "function": "fail"}
+    packet = {"status": "unconfirmed", "diagnostic_schema": "namespace-helper-v1",
+              "error_type": "RuntimeError", "locations": [frame], "token": "SECRET_TOKEN_CANARY"}
+    raw = json.dumps(packet).encode() + b"\n"
+    with pytest.raises(private.ContractError) as caught:
+        native.archive_command([sys.executable, "-c", "import sys;sys.stdout.buffer.write(" + repr(raw) + ");sys.exit(3)"],
+                               tmp_path / "NAMESPACE_PROCESS")
+    first = json.loads(capsys.readouterr().err)
+    assert first["locations"] == [frame]
+    failure = activation.record_failure(caught.value, native.DIAGNOSTIC_ROOT, tmp_path, "actual_fixed_network_namespace_transport")
+    capsys.readouterr()
+    projected = host.safe_activation({"status": "failed_or_evidence_insufficient", "failure": failure})
+    assert projected["failure_native_command"]["locations"] == [frame]
+    outer = {"status": "failed_or_evidence_insufficient", "activation": projected}
+    native._emit_archive_diagnostic([json.dumps(outer).encode(), b""], True)
+    record = json.loads(capsys.readouterr().err)
+    assert record["nested_command"] == {"exception_type": "RuntimeError", "locations": [frame], "execution_proof": False}
+    assert record["execution_proof"] is False and "SECRET_" not in json.dumps(record)
+    assert Path(str(tmp_path / "NAMESPACE_PROCESS") + ".stdout").read_bytes() == raw
+
+
+@pytest.mark.parametrize("change", ["proof", "extra", "line", "function", "external", "incomplete", "oversize", "duplicate"])
+def test_nested_failure_rejects_untrusted_or_incomplete_fields(diagnostic_source, capsys, change):
+    frame = {"file": diagnostic_source.name, "line": 2, "function": "fail"}
+    nested = {"exception_type": "RuntimeError", "locations": [frame], "execution_proof": False}
+    if change == "proof":
+        nested["execution_proof"] = True
+    elif change == "extra":
+        nested["raw"] = "SECRET_TOKEN_CANARY"
+    elif change == "line":
+        frame["line"] = 999999
+    elif change == "function":
+        frame["function"] = "SECRET_TOKEN_CANARY"
+    elif change == "external":
+        frame["file"] = "/tmp/SECRET_TOKEN_CANARY.py"
+    elif change == "oversize":
+        nested["locations"] = [frame] * 65
+    packet = {"status": "failed_or_evidence_insufficient", "activation": {
+        "status": "failed_or_evidence_insufficient", "failure_native_command": nested}}
+    raw = json.dumps(packet).encode()
+    if change == "duplicate":
+        raw = raw.replace(b'"execution_proof": false', b'"execution_proof": false,"execution_proof": true')
+    native._emit_archive_diagnostic([raw, b""], change != "incomplete")
+    record = json.loads(capsys.readouterr().err)
+    assert "nested_command" not in record and record["execution_proof"] is False
+    assert "SECRET_" not in json.dumps(record)
+
+
+def test_host_command_candidate_is_bounded_separate_evidence(capsys):
+    value = {"execution_proof": False, "operation": "docker_info", "sequence": 12,
+             "returncode": None, "elapsed_seconds": 3.01, "budget_seconds": 2.999, "error": "ProofError"}
+    packet = {"status": "unconfirmed", "private_host": {"result": {
+        "status": "failed_or_evidence_insufficient", "command_failure": value}}}
+    native._emit_archive_diagnostic([json.dumps(packet).encode(), b""], True)
+    result = json.loads(capsys.readouterr().err)
+    assert result["host_command"] == value and result["execution_proof"] is False
+    assert result["status"] == "no_verified_frames"
+
+
+def test_new_job_fields_drop_before_existing_socket_diagnostic(diagnostic_source, monkeypatch, capsys):
+    frame = {"file": diagnostic_source.name, "line": 2, "function": "fail"}
+    packet = {"status": "failed_or_evidence_insufficient", "activation": {
+        "status": "failed_or_evidence_insufficient", "failure_native_command": {
+            "execution_proof": False, "exception_type": "RuntimeError", "locations": [frame]}}}
+    monkeypatch.setattr(native, "_stdout_socket_diagnostic", lambda raw: {"fixed_test": True})
+    native._emit_archive_diagnostic([json.dumps(packet).encode(), b""], True)
+    initial = json.loads(capsys.readouterr().err)
+    initial.pop("nested_command")
+    encoded = json.dumps(initial, sort_keys=True, separators=(",", ":")) + "\n"
+    monkeypatch.setattr(native, "DIAGNOSTIC_BYTES", len(encoded.encode()))
+    native._emit_archive_diagnostic([json.dumps(packet).encode(), b""], True)
+    assert json.loads(capsys.readouterr().err) == initial

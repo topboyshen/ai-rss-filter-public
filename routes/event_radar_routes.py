@@ -34,6 +34,7 @@ from services.event_daily_report import load_daily_report
 from services.event_home_digest import load_home_event_digest
 from services.event_weekly_report import load_weekly_report
 from services.release_info import release_version
+from services.navigation_origins import dashboard_origin
 from utils.report_paging import parse_report_paging, parse_weekly_paging
 
 
@@ -55,7 +56,6 @@ _CARD_EXCLUDED_EVENT_TYPES = ("海外无关消息",)
 _CARD_EVIDENCE_RELATIONS = frozenset(
     {"direct", "direct_impact", "affected", "upstream", "downstream", "ecosystem"}
 )
-_DASHBOARD_ORIGIN = "https://ai.example.invalid"
 _SOURCE_LABELS = {
     "gelonghui": "格隆汇",
     "wallstreetcn": "华尔街见闻",
@@ -759,7 +759,7 @@ def _home_event_changes_response() -> Response:
         return response
     coverage_state, coverage_text = read_refresh_coverage()
     rendered = render_template(
-        "event_home_digest.html", digest=digest, dashboard_origin=_DASHBOARD_ORIGIN,
+        "event_home_digest.html", digest=digest, dashboard_origin=dashboard_origin(),
         coverage_state=coverage_state, coverage_text=coverage_text,
     )
     response = Response(rendered, mimetype="text/html")
@@ -830,7 +830,7 @@ def event_radar_card() -> Response:
         "event_radar_card.html",
         events=events,
         has_more=bool((model.get("pagination") or {}).get("has_more")),
-        dashboard_origin=_DASHBOARD_ORIGIN,
+        dashboard_origin=dashboard_origin(),
     )
     response = Response(rendered, mimetype="text/html")
     response.headers["Widget-Title"] = "Event Radar"

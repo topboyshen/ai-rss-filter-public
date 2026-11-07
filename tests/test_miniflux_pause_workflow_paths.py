@@ -116,6 +116,19 @@ class MinifluxPauseWorkflowPathsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             matches_path("README.md", "!README.md")
 
+    def test_only_application_receiver_build_uses_fixed_official_python_index(self):
+        workflow = yaml.load((ROOT / WORKFLOW_PATH).read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+        steps = workflow["jobs"]["native-fixed-image"]["steps"]
+        receiver = next(step["run"] for step in steps if step.get("name") ==
+                        "Build actual receiver image for the separate joint synthetic scenario")
+        sender = next(step["run"] for step in steps if step.get("name") == "Build new isolated sender image only")
+        self.assertEqual(receiver.count("--build-arg PIP_INDEX_URL=https://pypi.org/simple"), 1)
+        self.assertNotIn("PIP_INDEX_URL", sender)
+        self.assertNotIn("--build-arg PIP_INDEX_URL=\"$", receiver)
+        self.assertNotIn("--build-arg PIP_INDEX_URL=${", receiver)
+        self.assertIn("--platform=linux/amd64 --pull=false", receiver)
+        self.assertIn('git archive --format=tar "$source_sha"', receiver)
+
 
 if __name__ == "__main__":
     unittest.main()

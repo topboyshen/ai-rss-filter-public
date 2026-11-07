@@ -36,8 +36,10 @@ PRIORITY_BYTES = 512 * 1024
 PRIORITY_SUMMARY_BYTES = 16 * 1024
 PRIORITY_SUMMARY = 'PRIORITY_DIAGNOSTICS.json'
 IDENTITY_FIELDS = ('dev', 'ino', 'mode', 'nlink', 'size', 'mtime_ns', 'ctime_ns')
-INVENTORY_HEADER = {'schema': 1, 'columns': ['path', 'kind', 'identity', 'target'],
-                    'identity_fields': list(IDENTITY_FIELDS), 'format': 'canonical-jsonl'}
+LEGACY_INVENTORY_HEADER = {'schema': 1, 'columns': ['path', 'kind', 'identity', 'target'],
+                           'identity_fields': list(IDENTITY_FIELDS), 'format': 'canonical-jsonl'}
+INVENTORY_HEADER = {**LEGACY_INVENTORY_HEADER, 'schema': 2,
+                    'path_encoding': 'previous-path-character-prefix'}
 DIAGNOSTIC_PHASES = frozenset(('priority_diagnostics', 'priority_final_verification',
                              'source_inventory', 'source_processing', 'source_recheck',
                              'output_verification', 'completion'))
@@ -115,17 +117,37 @@ def inventory_record(name, row):
     return [name, kind, [info[key] for key in IDENTITY_FIELDS], target]
 
 
-def decoded_inventory_record(raw):
+def encoded_inventory_record(name, row, previous='', schema=2):
+    record = inventory_record(name, row)
+    if schema == 2:
+        shared = 0
+        for left, right in zip(name, previous):
+            if left != right:
+                break
+            shared += 1
+        short = [shared, name[shared:]]
+        if len(encoded(short)) < len(encoded(name)):
+            record[0] = short
+    return encoded(record) + b'\n'
+
+
+def decoded_inventory_record(raw, previous='', schema=2):
     try:
         record = json.loads(raw)
         require(isinstance(record, list) and len(record) == 4 and isinstance(record[2], list)
                 and len(record[2]) == len(IDENTITY_FIELDS), 'inventory_record_invalid')
+        name = record[0]
+        if schema == 2 and isinstance(name, list):
+            require(len(name) == 2 and type(name[0]) is int and 0 <= name[0] <= len(previous)
+                    and isinstance(name[1], str), 'inventory_record_invalid')
+            name = previous[:name[0]] + name[1]
         row = {'kind': record[1], 'identity': dict(zip(IDENTITY_FIELDS, record[2], strict=True))}
         if record[1] == 'symlink':
             row['target'] = record[3]
-        require(inventory_record(record[0], row) == record, 'inventory_record_invalid')
-        require(encoded(record) + b'\n' == raw, 'inventory_noncanonical')
-        return record[0], row
+        full = inventory_record(name, row)
+        require(full[1:] == record[1:], 'inventory_record_invalid')
+        require(encoded_inventory_record(name, row, previous, schema) == raw, 'inventory_noncanonical')
+        return name, row
     except (TypeError, KeyError, UnicodeError, json.JSONDecodeError) as exc:
         raise EvidenceError('inventory_record_invalid') from exc
 
@@ -134,13 +156,19 @@ class CompactInventory(Mapping):
     """Actual canonical JSONL bytes plus bounded offsets; rows decode on demand.
 
     The 8 MiB charge is the real lossless layout, including its field table.
+    Schema 2 shares only the preceding path's character prefix; all paths and
+    identities remain exactly recoverable. Schema 1 originals remain readable.
     The index has at most MAX_ENTRIES names and MAX_METADATA path bytes; it
     never retains expanded per-entry identity dictionaries or follows links.
     """
 
-    def __init__(self, budget=None):
-        self._raw = bytearray(encoded(INVENTORY_HEADER) + b'\n')
+    def __init__(self, budget=None, *, schema=2):
+        require(type(schema) is int and schema in (1, 2), 'inventory_schema_invalid')
+        self.schema = schema
+        header = INVENTORY_HEADER if schema == 2 else LEGACY_INVENTORY_HEADER
+        self._raw = bytearray(encoded(header) + b'\n')
         self._index = {}
+        self._names = []
         self.path_bytes = 0
         if budget is not None:
             budget['metadata'] += len(self._raw)
@@ -148,7 +176,8 @@ class CompactInventory(Mapping):
         require(len(self._raw) <= MAX_METADATA, 'metadata_bound')
 
     def add(self, name, row, budget):
-        raw = encoded(inventory_record(name, row)) + b'\n'
+        previous = self._names[-1] if self._names else ''
+        raw = encoded_inventory_record(name, row, previous, self.schema)
         require(name not in self._index, 'inventory_duplicate_path')
         require(len(self._index) < MAX_ENTRIES, 'entry_count_bound')
         charge_entry(row, budget, len(raw))
@@ -157,12 +186,14 @@ class CompactInventory(Mapping):
         require(path_bytes <= MAX_INDEX_PATH_BYTES, 'inventory_index_path_bound')
         start = len(self._raw)
         self._raw.extend(raw)
-        self._index[name] = (start, len(self._raw))
+        self._index[name] = (start, len(self._raw), len(self._names))
+        self._names.append(name)
         self.path_bytes = path_bytes
 
     def __getitem__(self, name):
-        start, end = self._index[name]
-        return decoded_inventory_record(bytes(self._raw[start:end]))[1]
+        start, end, ordinal = self._index[name]
+        previous = self._names[ordinal - 1] if ordinal else ''
+        return decoded_inventory_record(bytes(self._raw[start:end]), previous, self.schema)[1]
 
     def __iter__(self):
         return iter(self._index)
@@ -178,7 +209,7 @@ class CompactInventory(Mapping):
         return bytes(self._raw)
 
     def proof(self):
-        return {'schema': 1, 'format': 'canonical-jsonl', 'bytes': len(self._raw),
+        return {'schema': self.schema, 'format': 'canonical-jsonl', 'bytes': len(self._raw),
                 'entries': len(self), 'index_path_bytes': self.path_bytes,
                 'sha256': hashlib.sha256(self._raw).hexdigest()}
 
@@ -188,17 +219,23 @@ class CompactInventory(Mapping):
         require(type(raw) is bytes and len(raw) <= MAX_METADATA, 'metadata_bound')
         require(expected_sha256 is None or hashlib.sha256(raw).hexdigest() == expected_sha256,
                 'inventory_digest_mismatch')
-        header = encoded(INVENTORY_HEADER) + b'\n'
-        require(raw.startswith(header), 'inventory_schema_invalid')
-        result = cls()
+        header_end = raw.find(b'\n')
+        require(header_end >= 0, 'inventory_truncated')
+        header = raw[:header_end + 1]
+        headers = {encoded(value) + b'\n': value['schema']
+                   for value in (LEGACY_INVENTORY_HEADER, INVENTORY_HEADER)}
+        require(header in headers, 'inventory_schema_invalid')
+        result = cls(schema=headers[header])
         budget = {'entries': 0, 'bytes': 0, 'metadata': len(header)}
         start = len(header)
         while start < len(raw):
             end = raw.find(b'\n', start)
             require(end >= start, 'inventory_truncated')
-            name, row = decoded_inventory_record(raw[start:end + 1])
+            previous = result._names[-1] if result._names else ''
+            name, row = decoded_inventory_record(raw[start:end + 1], previous, result.schema)
             result.add(name, row, budget)
             start = end + 1
+        require(start == len(raw) and result._raw == raw, 'inventory_noncanonical')
         return result
 
 

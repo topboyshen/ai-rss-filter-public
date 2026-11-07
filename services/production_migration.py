@@ -560,13 +560,14 @@ def locked_session(root, permit, *, release_lock=None):
 def _postgres_reader(permit):
     from scripts.sender_drain_inventory import PostgresReader
     sender = permit["sender"]
-    gate._require(set(sender) == {"dsn_file", "dsn_sha256", "expected_identity", "closed_operation_id", "manifest"},
+    keys = {"dsn_file", "dsn_sha256", "expected_identity", "closed_operation_id", "manifest"}
+    gate._require(set(sender) in (keys, keys | {"postgres_transport"}),
                   "invalid sender lock specification")
     path = Path(sender["dsn_file"])
     file_identity(path)
     gate._require(path.stat().st_size <= 16384 and hashlib.sha256(path.read_bytes()).hexdigest() == sender["dsn_sha256"],
                   "sender credentials reference changed")
-    return PostgresReader(path, sender["expected_identity"])
+    return PostgresReader(path, sender["expected_identity"], transport_binding=sender.get("postgres_transport"))
 
 
 def _retain_inventory(session, stack):

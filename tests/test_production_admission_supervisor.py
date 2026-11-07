@@ -207,3 +207,200 @@ def test_non_operator_stop_marker_does_not_authorize_retry(prepared, monkeypatch
     assert not supervisor.operator_stop_marked(root, authority)
     gate._write(root / "STOP.json", {**gate._read(root / "STOP.json"), "authority_sha256": "0" * 64})
     assert not supervisor.operator_stop_marked(root, authority)
+
+
+def _live_tick_and_operator_marker(p, monkeypatch):
+    """Original live owner, then operator crashes immediately after durable STOP."""
+    plan, root, authority = supervisor.load(p.plan_path)
+    owner = {"pid": 123, "synthetic": True}
+    monkeypatch.setattr(supervisor, "process_identity", lambda pid=None: owner)
+    monkeypatch.setattr(supervisor, "sender_from_plan", lambda _plan: p.sender)
+    value = {"schema": supervisor.SCHEMA, "plan_sha256": gate._hash(plan), "owner": deepcopy(owner),
+             "clock": life._clock_now(), "result": {
+                 "status": "live", "authority_sha256": gate._hash(authority),
+                 "receipt_sha256": gate._hash(life._current(root, authority))}}
+    gate._write(root / "supervisor.tick.json", value)
+    digest = gate._hash(authority)
+    gate._write(root / "STOP.json", {
+        "schema": life.SCHEMA, "authority_sha256": digest, "reason_code": "operator",
+        "sender_stop_operation": gate._hash({"authority": digest, "action": "sender_stop_new"}),
+        "receiver_stop_operation": gate._hash({"authority": digest, "action": "receiver_stop_new"})})
+    p.stop_call_baseline = deepcopy(p.transport.calls)
+    return plan, root, authority, value
+
+
+def _always_busy(monkeypatch):
+    from contextlib import contextmanager
+    attempts = []
+    @contextmanager
+    def locked(*args, **kwargs):
+        attempts.append(1)
+        raise gate.AdmissionBusy("active work/lock did not drain within bound")
+        yield  # pragma: no cover - the real controller remains held elsewhere.
+    monkeypatch.setattr(supervisor, "locked_activation", locked)
+    monkeypatch.setattr(supervisor, "restrictive_stop", lambda *a, **k: pytest.fail("competing unlocked stop"))
+    return attempts
+
+
+def _advance_clock(p, seconds):
+    p.clock["wall"] += seconds
+    p.clock["elapsed"] += seconds
+
+
+def test_repeated_busy_operator_stop_is_pending_not_live_or_drained_and_never_renews(prepared, monkeypatch):
+    p = prepared
+    _plan, root, _authority, original = _live_tick_and_operator_marker(p, monkeypatch)
+    attempts = _always_busy(monkeypatch)
+    lease = (root / "current.json").read_bytes()
+    for seconds in (0, 15, 15):
+        _advance_clock(p, seconds)
+        value = supervisor.tick(p.plan_path)
+        assert value["result"]["status"] == "operator_stop_in_progress"
+        assert value["result"]["pending_clock"] == original["clock"]
+        assert value["result"]["queue_checked"] is value["result"]["drained"] is False
+        with pytest.raises(gate.AdmissionError, match="actual live"):
+            supervisor.query_started(p.plan_path, 123)
+    assert len(attempts) == 6  # Exactly the existing two lock attempts per tick.
+    assert (root / "current.json").read_bytes() == lease
+    assert p.transport.calls == p.stop_call_baseline
+    assert p.transport.state == p.fence.snapshot()["phase"] == "open"
+
+
+@pytest.mark.parametrize("age", [45, 46, 3600])
+def test_persistent_operator_stop_expires_original_anchor_without_unlocked_retry(prepared, monkeypatch, age):
+    p = prepared
+    _live_tick_and_operator_marker(p, monkeypatch)
+    _always_busy(monkeypatch)
+    assert supervisor.tick(p.plan_path)["result"]["status"] == "operator_stop_in_progress"
+    _advance_clock(p, age)
+    value = supervisor.tick(p.plan_path)
+    assert value["result"]["status"] == "stop_unconfirmed"
+    assert value["result"]["trigger"]["type"] == "AdmissionError"
+    assert value["result"]["queue_checked"] is value["result"]["drained"] is False
+    assert p.transport.calls == p.stop_call_baseline
+
+
+@pytest.mark.parametrize("change", ["missing", "schema", "plan", "owner", "authority", "status", "clock", "boot"])
+def test_busy_stop_requires_same_owner_authority_and_original_valid_live_anchor(prepared, monkeypatch, change):
+    p = prepared
+    _plan, root, _authority, value = _live_tick_and_operator_marker(p, monkeypatch)
+    if change == "missing":
+        (root / "supervisor.tick.json").unlink()
+    else:
+        if change == "schema":
+            value["schema"] = "other"
+        elif change == "plan":
+            value["plan_sha256"] = "0" * 64
+        elif change == "owner":
+            value["owner"]["pid"] = 999
+        elif change == "authority":
+            value["result"]["authority_sha256"] = "0" * 64
+        elif change == "status":
+            value["result"]["status"] = "stop_unconfirmed"
+        elif change == "clock":
+            value["clock"]["elapsed"] = "not-a-clock"
+        else:
+            value["clock"]["boot_id"] = "linux:" + "f" * 36
+        gate._write(root / "supervisor.tick.json", value)
+    _always_busy(monkeypatch)
+    result = supervisor.tick(p.plan_path)["result"]
+    assert result["status"] == "stop_unconfirmed" and "operator_stop" in result["errors"]
+    assert p.transport.calls == p.stop_call_baseline
+
+
+def test_pending_stop_stops_at_original_authority_expiry_even_with_fresh_anchor(prepared, monkeypatch):
+    p = prepared
+    _advance_clock(p, p.policy["expires_at"] - p.clock["wall"] - 5)
+    _live_tick_and_operator_marker(p, monkeypatch)
+    _always_busy(monkeypatch)
+    assert supervisor.tick(p.plan_path)["result"]["status"] == "operator_stop_in_progress"
+    _advance_clock(p, 5)
+    assert supervisor.tick(p.plan_path)["result"]["status"] == "stop_unconfirmed"
+    assert p.transport.calls == p.stop_call_baseline
+
+
+@pytest.mark.parametrize("drift_at", [2, 3])
+def test_marker_drift_during_continuous_busy_is_unconfirmed_without_competing_stop(prepared, monkeypatch, drift_at):
+    p = prepared
+    _live_tick_and_operator_marker(p, monkeypatch)
+    _always_busy(monkeypatch)
+    original, checks = supervisor.operator_stop_marked, []
+    def marked(*args):
+        checks.append(1)
+        return False if len(checks) == drift_at else original(*args)
+    monkeypatch.setattr(supervisor, "operator_stop_marked", marked)
+    result = supervisor.tick(p.plan_path)["result"]
+    assert result["status"] == "stop_unconfirmed" and p.transport.calls == p.stop_call_baseline
+
+
+def test_operator_crash_after_marker_is_finished_only_under_same_lock_and_not_renewed(prepared, monkeypatch):
+    from contextlib import contextmanager
+    p = prepared
+    _plan, root, _authority, _value = _live_tick_and_operator_marker(p, monkeypatch)
+    held = []
+    @contextmanager
+    def locked(*args, **kwargs):
+        held.append(True)
+        try:
+            yield p.session
+        finally:
+            held.pop()
+    original = life.stop_new
+    def stop(*args, **kwargs):
+        assert held == [True]
+        return original(*args, **kwargs)
+    monkeypatch.setattr(supervisor, "locked_activation", locked)
+    monkeypatch.setattr(life, "stop_new", stop)
+    monkeypatch.setattr(life, "supervise_step", lambda *a: pytest.fail("STOP cannot renew or report live"))
+    monkeypatch.setattr(supervisor, "restrictive_stop", lambda *a, **k: pytest.fail("must use held lock"))
+    lease = (root / "current.json").read_bytes()
+    assert supervisor.tick(p.plan_path)["result"]["status"] == "producers_stopped_drain_pending"
+    assert supervisor.tick(p.plan_path)["result"]["status"] == "producers_stopped_drain_pending"
+    assert [row[1] for row in p.transport.calls if row[0] == "POST"] == ["/stop-new"]
+    assert p.transport.state == p.fence.snapshot()["phase"] == "draining"
+    assert (root / "current.json").read_bytes() == lease
+
+
+def test_busy_then_same_locked_stop_recovers_original_lost_ack_without_reposting(prepared, monkeypatch):
+    from contextlib import contextmanager
+    p = prepared
+    _live_tick_and_operator_marker(p, monkeypatch)
+    p.transport.lost = True
+    assert life.stop_new(p.session, p.sender)["status"] == "stop_unconfirmed"
+    state = {"attempts": 0}
+    @contextmanager
+    def locked(*args, **kwargs):
+        state["attempts"] += 1
+        if state["attempts"] <= 2:
+            raise gate.AdmissionBusy("active work/lock did not drain within bound")
+        yield p.session
+    monkeypatch.setattr(supervisor, "locked_activation", locked)
+    monkeypatch.setattr(supervisor, "restrictive_stop", lambda *a, **k: pytest.fail("must use held lock"))
+    assert supervisor.tick(p.plan_path)["result"]["status"] == "operator_stop_in_progress"
+    _advance_clock(p, 15)
+    value = supervisor.tick(p.plan_path)
+    assert value["result"]["status"] == "producers_stopped_drain_pending"
+    assert value["result"]["queue_checked"] is value["result"]["drained"] is False
+    assert state["attempts"] == 3
+    assert [row[1] for row in p.transport.calls if row[0] == "POST"] == ["/stop-new"]
+
+
+@pytest.mark.parametrize("confirmed", [False, True])
+def test_run_keeps_original_tick_interval_and_pulse_but_requires_actual_stop_confirmation(prepared, monkeypatch, confirmed):
+    from scripts import production_admission_watchdog as watchdog
+    p = prepared
+    plan, root, _authority, _value = _live_tick_and_operator_marker(p, monkeypatch)
+    monkeypatch.setattr(supervisor, "verify_child_environment", lambda _plan: None)
+    directory = p.root / "watchdog"
+    directory.mkdir(mode=0o700)
+    gate._write(directory / "plan.json", {"synthetic": True})
+    monkeypatch.setattr(watchdog, "load", lambda path: ({"synthetic": True}, directory))
+    pulses, sleeps, steps = [], [], []
+    monkeypatch.setattr(watchdog, "pulse", lambda _plan, _root, phase: pulses.append(phase))
+    monkeypatch.setattr(supervisor.time, "sleep", lambda seconds: sleeps.append(seconds))
+    values = iter([{"result": {"status": "operator_stop_in_progress"}}, {"result": {
+        "status": "producers_stopped_drain_pending" if confirmed else "stop_unconfirmed"}}])
+    monkeypatch.setattr(supervisor, "tick", lambda path: steps.append(path) or next(values))
+    assert supervisor.run(p.plan_path) == (0 if confirmed else 1)
+    assert pulses == ["supervising", "supervising"] and sleeps == [plan["interval_seconds"]] == [15]
+    assert steps == [p.plan_path, p.plan_path] and root == p.root / "continuation"

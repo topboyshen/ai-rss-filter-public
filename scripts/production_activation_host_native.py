@@ -67,7 +67,9 @@ ACTIVATION_STAGES = {"actual_finite_admission_lease", "actual_go_to_real_worker_
     "actual_fixed_network_namespace_transport", "never_opened_receiver_disk", "actual_go_schema135_first_closed",
     "retain_old_stopped_containers_and_seal", "build_exact_application_image", "probe_exact_application_image",
     "bind_exact_migration_permit", "actual_locked_migration_create_grant_start", "actual_compose_parser_metadata",
-    "bounded_internal_network_and_real_redis"}
+    "bounded_internal_network_and_real_redis", "custody_never_opened_synthetic_storage_not_actual125",
+    "custody_actual_sender_first_closed", "custody_same_project_zero_mount_originals_and_seal",
+    "custody_actual_source_bound_application_image"}
 
 
 def phase(root, name):
@@ -446,8 +448,47 @@ def prepare_mounts(commands, root):
     commands.run([str(host.TOOLS["ip"]), "link", "set", "lo", "up"])
 
 
+def _private_run_identity(root, plan, *, final=False):
+    """The fixed PID path is permitted only inside the actual owned /run bind."""
+    frozen, _ = original(root.parent / "PLAN.json")
+    current = host.proc_identity(os.getpid())
+    gate._require(frozen == plan and plan.get("gateway_custody") is True
+                  and os.geteuid() == 0 and current["netns"] != plan["parent"]["netns"]
+                  and current["mntns"] != plan["parent"]["mntns"]
+                  and current["cgroup"] == plan["cgroup"] + "/supervisor"
+                  and host.proc_identity(plan["parent"]["pid"]) == plan["parent"]
+                  and host.file_proof(Path(__file__)) == plan["wrapper_source"],
+                  "fixed archive PID requires the frozen live private host")
+    remaining(plan["deadline"] if final else plan["active_deadline"])
+    actual, owned = os.lstat("/run"), os.lstat(root / "run")
+    gate._require(all(stat.S_ISDIR(info.st_mode) and info.st_uid == info.st_gid == 0
+                      and stat.S_IMODE(info.st_mode) == 0o700 for info in (actual, owned))
+                  and (actual.st_dev, actual.st_ino) == (owned.st_dev, owned.st_ino)
+                  and Path("/var/run").resolve() == Path("/run"),
+                  "fixed archive PID requires the actual private run bind")
+    return actual.st_dev, actual.st_ino, actual.st_mode, actual.st_uid, actual.st_gid
+
+
+def _private_daemon_pidfile(root, plan, run_identity, pid, expected=None, *, final=False):
+    # Reuse the unchanged production authority's bounded NOFOLLOW reader;
+    # publishing an observation never substitutes for its own live checks.
+    from scripts import retained_gateway_configuration as configuration
+    gate._require(_private_run_identity(root, plan, final=final) == run_identity,
+                  "private run bind changed after daemon launch")
+    raw, metadata = configuration._small(configuration.PIDFILE, 32)
+    gate._require(raw in {str(pid).encode(), (str(pid) + "\n").encode()} and metadata[4] == 0
+                  and (expected is None or (raw, metadata) == expected),
+                  "actual private daemon PID file differs")
+    return raw, metadata
+
+
 def start_daemon(commands, root, plan, mirror):
     config = {**host.daemon_config(root, plan), "registry-mirrors": [mirror]}
+    run_identity, pidfile = None, None
+    if plan.get("gateway_custody") is True:
+        run_identity = _private_run_identity(root, plan)
+        gate._require(not os.path.lexists("/run/docker.pid"), "private archive PID file already exists")
+        config["pidfile"] = "/run/docker.pid"
     record(root / "daemon.json", config)
     process, logs = host.launch_daemon(commands, root, plan)
     host.retain_daemons(deadline=commands.deadline)
@@ -464,11 +505,18 @@ def start_daemon(commands, root, plan, mirror):
         return True
 
     host.wait_until(ready, min(commands.deadline, time.monotonic() + 10))
+    if run_identity is not None:
+        pidfile = _private_daemon_pidfile(root, plan, run_identity, process.pid)
 
     def peer():
         logs.check()
         gate._require(host.retainer_confirmed(process), "live daemon FD retainer absent")
         host.check_peer(process.pid, actual)
+        if run_identity is not None:
+            gate._require(commands.deadline in {plan["active_deadline"], plan["deadline"]},
+                          "private daemon authority cannot replace the shared deadline")
+            _private_daemon_pidfile(root, plan, run_identity, process.pid, pidfile,
+                                    final=commands.deadline == plan["deadline"])
 
     commands.peer = peer
     record(root / "DAEMON_INFO.json", json.loads(commands.docker(["info", "--format", "{{json .}}"])))
@@ -495,8 +543,10 @@ def stop_daemon(context, process, logs):
     context.check(final=True)
     context.commands.deadline = context.plan["deadline"]
     ids = context.commands.docker(["ps", "--quiet", "--no-trunc"]).splitlines()
-    record(context.root / "DRAIN_OBSERVATION.json", {"schema": 1, "running_count": len(ids),
-        "uncertain_mutation": context.commands.uncertain_mutation})
+    observation = {"schema": 1, "running_count": len(ids),
+                   "uncertain_mutation": context.commands.uncertain_mutation}
+    record(context.root / "DRAIN_OBSERVATION.json", observation)
+    context.drain_observation = observation  # Diagnostic only, after original persistence.
     gate._require(ids == [] and not context.commands.uncertain_mutation, "running or uncertain containers: retain private daemon")
     host.check_peer(process.pid, context.daemon)
     process.send_signal(signal.SIGTERM)
@@ -515,6 +565,7 @@ def stop_daemon(context, process, logs):
 def inner_execute(root, plan):
     from scripts import production_offline_registry as registry
     from scripts import verify_production_activation_native as activation
+    gate._require(type(plan.get("gateway_custody")) is bool, "frozen native gateway custody mode required")
     os.setsid()
     holder = host.proc_identity(os.getpid())
     commands = FullCommands(root, plan["active_deadline"])
@@ -535,8 +586,11 @@ def inner_execute(root, plan):
             phase(root, "full_activation")
             with native_deadline.scope(plan["active_deadline"], plan["deadline"]):
                 activation_result = activation.execute(Path(plan["repo"]), Path(plan["source"]), plan["sender"]["Id"],
-                                                       Path(plan["binary"]), root / "activation", private_host_context=context)
-            gate._require(activation_result["status"] == "passed", "original complete activation did not pass")
+                                                       Path(plan["binary"]), root / "activation", private_host_context=context,
+                                                       gateway_custody=plan["gateway_custody"])
+            gate._require(activation_result["status"] == "passed"
+                          and activation_result.get("gateway_custody") is plan["gateway_custody"],
+                          "original complete activation did not pass or mode differs")
             context.check()
     except BaseException as error:
         failure, failed_phase = error, PHASE
@@ -583,6 +637,7 @@ def references():
 def outer_plan(args, root, started):
     from scripts import production_offline_registry as registry
     from scripts.verify_miniflux_pause_native import image_checks, source_binding
+    gate._require(type(args.gateway_custody) is bool, "explicit native gateway custody mode required")
     deadline = started + MAX_SECONDS
     active_deadline = deadline - FINAL_SECONDS
     cgroup = cgroup_setup(uuid.uuid4().hex)
@@ -608,6 +663,7 @@ def outer_plan(args, root, started):
     phase(root, "offline_bundle")
     bundle = registry.prepare_bundle(root / "bundle", references(), active_deadline)
     plan = {"schema": CONTEXT_SCHEMA, "started": started, "deadline": deadline, "active_deadline": active_deadline,
+            "gateway_custody": args.gateway_custody,
             "repo": str(args.repo), "source": str(args.source), "binary": str(args.binary), "source_identity": source,
             "source_binding": binding, "wrapper_source": host.file_proof(Path(__file__)),
             "cgroup": cgroup, "parent": host.proc_identity(os.getpid()), "outer_peer": outer_peer,
@@ -717,6 +773,8 @@ def outer_execute(args, root, started):
     args_inner = [str(host.TOOLS["unshare"]), "--mount", "--net", "--fork", sys.executable, "-I", "-B", str(Path(__file__).resolve()),
                   "--repo", str(args.repo), "--source", str(args.source), "--binary", str(args.binary),
                   "--image-id", args.image_id, "--output", str(root / "inner"), "--inside"]
+    if plan["gateway_custody"]:
+        args_inner.append("--gateway-custody")
     (root / "inner").mkdir(mode=0o700)
     process, streams = None, []
     try:
@@ -796,12 +854,32 @@ def safe_harness_failure(value):
         return None
 
 
+def safe_failure_locations(value):
+    """Reviewed source basenames and line numbers only; never locals or text."""
+    if type(value) is not list or len(value) > 32:
+        return None
+    result = []
+    for item in value:
+        if type(item) is not dict or set(item) != {"file", "function", "line"}:
+            return None
+        name, line = item["file"], item["line"]
+        if (type(name) is not str or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,95}\.py", name)
+                or type(line) is not int or not 1 <= line <= 20000
+                or not any((ROOT / folder / name).is_file() for folder in ("scripts", "services"))):
+            return None
+        # The function name is deliberately omitted: unlike a reviewed source
+        # basename, caller-provided text must not enter the public diagnostic.
+        result.append({"file": name, "line": line})
+    return result
+
+
 def safe_activation(value):
     """Project report is still untrusted input to the public summary."""
     result = {"schema": "production-activation-native-v1", "status": value.get("status") if isinstance(value.get("status"), str) and value.get("status") in {
         "passed", "failed_or_evidence_insufficient"} else "unrecognized",
         "last_stage_sha256": hashlib.sha256(host.encoded(value.get("last_stage"))).hexdigest()}
     result["last_stage"] = value.get("last_stage") if isinstance(value.get("last_stage"), str) and value.get("last_stage") in ACTIVATION_STAGES else None
+    result["gateway_custody"] = value.get("gateway_custody") if type(value.get("gateway_custody")) is bool else None
     for key in ("source_sha",):
         result[key] = value.get(key) if re.fullmatch(r"[0-9a-f]{40}", str(value.get(key))) else None
     for key in ("elapsed_seconds", "app_memory_bytes", "app_pids", "pg_memory_bytes", "pg_pids", "real_models"):
@@ -809,18 +887,26 @@ def safe_activation(value):
         result[key] = item if type(item) in {int, float} and math.isfinite(item) and item >= 0 else None
     failure = value.get("failure")
     if isinstance(failure, dict):
+        result["failure_locations"] = safe_failure_locations(failure.get("locations"))
+        nested = startup.safe_nested_diagnostic(failure.get("native_command"))
+        if nested is not None:
+            result["failure_native_command"] = nested
         result["failure_message_sha256"] = (failure.get("message_sha256") if
             re.fullmatch(r"[0-9a-f]{64}", str(failure.get("message_sha256"))) else None)
         result["failure_type_sha256"] = hashlib.sha256(host.encoded(failure.get("type"))).hexdigest()
         kind = failure.get("type")
         result["failure_type"] = kind if isinstance(kind, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]{0,80}", kind) else None
+        from scripts import retained_gateway_diagnostics as socket_diagnostics
+        socket_summary = socket_diagnostics.safe_summary(failure.get("socket_listener"))
+        if socket_summary is not None:
+            result["failure_socket_listener"] = socket_summary
         for key, limit in (("message_literal", 200), ("namespace_helper", 800), ("guardian_handoff", 1600)):
             item = failure.get(key)
             result["failure_" + key] = (item if isinstance(item, str) and 0 < len(item) <= limit
                                         and re.fullmatch(r"[ -~]+", item) and not re.search(r"[0-9a-fA-F]{32,}", item) else None)
     from scripts import private_release_diagnostics as command_diagnostics
     result["private_commands"] = command_diagnostics.safe_summary(value.get("private_commands"))
-    for key in ("pg_readiness", "sender_readiness"):
+    for key in ("pg_readiness", "sender_readiness", "fixture_readiness"):
         readiness = value.get(key)
         result[key] = (dict(readiness) if type(readiness) is dict and set(readiness) == {"ready", "not_ready"}
             and all(type(item) is int and 0 <= item <= 10000 for item in readiness.values()) else None)
@@ -910,8 +996,262 @@ def gateway_command_exports(items, deadline):
     return exports
 
 
-def safe_inventory(root, deadline):
+def custody_completion_profile(root, records, deadline):
+    name = "inner/activation/receiver/ACTUAL_CUSTODY_PROOF.json"
+    expected = hashlib.sha256(name.encode()).hexdigest()
+    recorded = [row for row in records if row["path_sha256"] == expected]
+    if len(recorded) != 1:
+        return None
+    remaining(deadline)
+    before = host.file_proof(root / name, limit=host.OUTPUT_BYTES)
+    value = host.read_original_json(root / name)
+    gate._require(before == host.file_proof(root / name, limit=host.OUTPUT_BYTES)
+                  and before["sha256"] == recorded[0]["sha256"], "custody completion original changed")
+    return {"status": "passed" if type(value) is dict and value.get("status") == "passed"
+            and type(value.get("schema")) is int and value["schema"] == 1
+            and type(value.get("old_project_roles")) is int and value["old_project_roles"] == 3
+            and type(value.get("old_gateway_mounts")) is int and value["old_gateway_mounts"] == 0
+            and value.get("actual_gateway_and_live_legacy") is True
+            and value.get("actual_125_compatibility_proven") is False else "unconfirmed",
+            "sha256": before["sha256"], "actual_125_compatibility_proven": False}
+
+
+FAILURE_COMMAND_BYTES, FAILURE_STDERR_BYTES, FAILURE_DAEMON_BYTES = 128 * 1024, 4096, 8192
+FAILURE_TEXT_BYTES = 16 * 1024
+RESOURCE_SCOPE = "supervisor_and_private_daemon_only_not_all_application_containers"
+RESOURCE_EVENTS = {"low", "high", "max", "oom", "oom_kill", "oom_group_kill", "sock_throttled"}
+
+
+def _failure_original(root, relative, records, deadline, *, limit, tail=None):
+    """Read one exact hashed original, never a replacement or a link target."""
+    remaining(deadline)
+    path = root / relative
+    path_hash = hashlib.sha256(relative.encode()).hexdigest()
+    matches = [row for row in records if row.get("path_sha256") == path_hash]
+    gate._require(len(matches) == 1 and set(matches[0]) == {"path_sha256", "sha256", "bytes"},
+                  "failure diagnostic original commitment missing")
+    expected = matches[0]
+    gate._require(type(expected["bytes"]) is int and 0 <= expected["bytes"] <= limit
+                  and type(expected["sha256"]) is str and re.fullmatch(r"[0-9a-f]{64}", expected["sha256"])
+                  and path == path.resolve(), "failure diagnostic original commitment invalid")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        proof = host.file_proof(path, limit=limit, fd=fd)
+        gate._require(proof["size"] == expected["bytes"] and proof["sha256"] == expected["sha256"],
+                      "failure diagnostic original hash changed")
+        offset = max(0, proof["size"] - tail) if tail is not None else 0
+        os.lseek(fd, offset, os.SEEK_SET)
+        data = os.read(fd, min(proof["size"], tail) if tail is not None else limit + 1)
+        gate._require(len(data) == proof["size"] - offset
+                      and host.file_proof(path, limit=limit, fd=fd) == proof and path == path.resolve(),
+                      "failure diagnostic original changed during read")
+    finally:
+        os.close(fd)
+    remaining(deadline)
+    return data, dict(expected), bool(offset)
+
+
+def _failure_text(raw, limit, *, partial=False):
+    """Unstructured sensitive lines remain hashes, never public text."""
+    from scripts.capture_release_diagnostics import SENSITIVE_KEY_RE, URL_USERINFO_RE, redact_text
+    original_bytes = len(raw)
+    partial = partial or original_bytes > limit
+    raw = raw[-limit:]
+    if partial:
+        boundary = raw.find(b"\n")
+        raw = raw[boundary + 1:] if boundary >= 0 else b""
+    source_lines = raw.decode("utf-8", errors="replace").split("\n")
+    private_key = partial and any(re.search(r"(?i)-----END .*PRIVATE KEY-----", line) for line in source_lines)
+    lines = []
+    for line in source_lines:
+        private_key = private_key or bool(re.search(r"(?i)-----BEGIN .*PRIVATE KEY-----", line))
+        if (private_key or SENSITIVE_KEY_RE.search(line) or URL_USERINFO_RE.search(line)
+                or partial and re.fullmatch(r"[A-Za-z0-9+/_-]+={0,2}", line.strip())
+                or re.search(r"(?i)private[ _-]*key|-----[A-Z ]*KEY-----|[A-Za-z0-9+/=_-]{32,}", line)):
+            lines.append("<sensitive-line-sha256:" + hashlib.sha256(line.encode()).hexdigest() + ">")
+            if re.search(r"(?i)-----END .*PRIVATE KEY-----", line):
+                private_key = False
+        else:
+            text = re.sub(r"[0-9a-fA-F]{32,}", "<hex>", redact_text(line))
+            lines.append(re.sub(r"(?<![A-Za-z0-9])/[^\s\"\'<>]+", "<path>", text))
+    rendered = "\n".join(lines).encode()
+    return {"text": rendered[:limit].decode("utf-8", errors="ignore"),
+            "truncated": partial or len(rendered) > limit, "redacted": True}
+
+
+def _failure_resource_payload(raw, value, proof):
+    """Optional exact resource bytes; this never validates execution or counters."""
+    def unique_pairs(pairs):
+        result = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError("duplicate resource diagnostic key")
+            result[key] = item
+        return result
+
+    try:
+        if (type(raw) is not bytes or not 0 < len(raw) <= 4096 or type(proof) is not dict
+                or set(proof) != {"path_sha256", "sha256", "bytes"}
+                or proof["path_sha256"] != hashlib.sha256(b"inner/RESOURCES_FINAL.json").hexdigest()
+                or type(proof["bytes"]) is not int or proof["bytes"] != len(raw)
+                or proof["sha256"] != hashlib.sha256(raw).hexdigest()):
+            return None
+        text = raw.decode("ascii")
+        parsed = json.loads(text, object_pairs_hook=unique_pairs)
+        if (parsed != value or type(parsed) is not dict
+                or set(parsed) != set(SUPERVISOR) | {"memory.peak", "memory.events", "scope"}
+                or any(parsed.get(key) != expected for key, expected in SUPERVISOR.items())
+                or parsed.get("scope") != RESOURCE_SCOPE):
+            return None
+        peak, events = parsed["memory.peak"], parsed["memory.events"]
+        if (type(peak) is not str or not re.fullmatch(r"0|[1-9][0-9]{0,19}", peak)
+                or type(events) is not dict or not {"oom", "oom_kill"} <= set(events)
+                or len(events) > 16):
+            return None
+        for name, count in events.items():
+            if (type(name) is not str or not re.fullmatch(r"[a-z_]{1,32}", name)
+                    or re.search(r"authorization|bearer|cookie|password|passwd|pwd|secret|token|key|credential|session", name)
+                    or type(count) is not str or not re.fullmatch(r"0|[1-9][0-9]{0,19}", count)):
+                return None
+        payload = {"schema": 1, "scope": "resource_original_only_not_counter_validation",
+                   "encoding": "ascii", "bytes": len(raw), "sha256": proof["sha256"], "content": text}
+        return payload if len(host.encoded(payload)) <= 4096 else None
+    except (UnicodeError, ValueError, TypeError, KeyError):
+        return None
+
+
+def _failure_resources(value):
+    gate._require(type(value) is dict and set(value) == set(SUPERVISOR) | {"memory.peak", "memory.events", "scope"}
+                  and all(value.get(key) == expected for key, expected in SUPERVISOR.items())
+                  and value.get("scope") == RESOURCE_SCOPE, "failure diagnostic resource scope invalid")
+    peak, events = value["memory.peak"], value["memory.events"]
+    gate._require(type(peak) is str and re.fullmatch(r"0|[1-9][0-9]{0,19}", peak)
+                  and type(events) is dict and {"oom", "oom_kill"} <= set(events) <= RESOURCE_EVENTS
+                  and all(type(count) is str and re.fullmatch(r"0|[1-9][0-9]{0,19}", count)
+                          for count in events.values()), "failure diagnostic resource counters invalid")
+    return {**SUPERVISOR, "memory.peak": int(peak), "memory.events": {key: int(count) for key, count in events.items()},
+            "scope": RESOURCE_SCOPE}
+
+
+def _daemon_error_counts(raw, *, partial=False):
+    """Count matching complete lines, at most once per category per line."""
+    if type(raw) is not bytes or len(raw) > FAILURE_DAEMON_BYTES or type(partial) is not bool:
+        raise ValueError("fixed bounded daemon literal input required")
+    literals = {
+        "timeout_literal": (b"context deadline exceeded", b"i/o timeout", b"operation timed out",
+                            b"connection timed out", b"timeout awaiting response headers"),
+        "capacity_literal": (b"no space left on device", b"disk quota exceeded"),
+        "permission_literal": (b"permission denied", b"operation not permitted"),
+        "runtime_failure_literal": (b"failed to create shim task", b"failed to start shim",
+                                    b"oci runtime create failed", b"oci runtime exec failed",
+                                    b"runc create failed", b"runc exec failed"),
+        "memory_failure_literal": (b"cannot allocate memory", b"out of memory", b"memory allocation failed"),
+        "other_error_marker": (b"level=error", b'level="error"', b"level=fatal", b'level="fatal"',
+                               b"panic:", b"fatal error:"),
+    }
+    if partial:
+        boundary = raw.find(b"\n")
+        raw = raw[boundary + 1:] if boundary >= 0 else b""
+    counts = dict.fromkeys(literals, 0)
+    scanned = unmatched = 0
+    for line in raw.split(b"\n"):
+        if not line.strip():
+            continue
+        scanned += 1
+        lowered, matched = line.lower(), False
+        for category, choices in literals.items():
+            if any(choice in lowered for choice in choices):
+                counts[category] += 1
+                matched = True
+        unmatched += not matched
+    return {"schema": 1, "scope": "bounded_daemon_tail_literals_not_root_cause", "counts": counts,
+            "scanned_nonempty_lines": scanned, "unclassified_nonempty_lines": unmatched,
+            "window_partial": partial, "error_absence_not_proven": True}
+
+
+def failure_originals(root, records, profiles, deadline):
+    """Only same-failure local originals; missing evidence never proves success."""
+    name = "inner/activation/HARNESS_COMMAND_FAILURE.json"
+    if name not in profiles:
+        return {"status": "not_observed"}
+    observation = safe_harness_failure(profiles[name])
+    if observation is None:
+        return {"status": "evidence_insufficient"}
+    try:
+        data, proof, _ = _failure_original(root, "inner/activation/HARNESS_COMMAND_FAILURE.json", records, deadline,
+                                           limit=FAILURE_COMMAND_BYTES)
+        gate._require(safe_harness_failure(json.loads(data)) == observation, "failure diagnostic observation changed")
+    except (OSError, ValueError, TypeError, KeyError, gate.AdmissionError, host.ProofError) as error:
+        return {"status": "evidence_insufficient", "error_type": error_type(error)}
+    result = {"status": "diagnostic_only_not_execution_proof", "observation": observation, "observation_original": proof}
+    for kind, relative, limit, tail in (
+            ("command", "inner/activation/command-%04d.json" % observation["sequence"], FAILURE_COMMAND_BYTES, None),
+            ("daemon", "inner/daemon.stderr", 8 * 1024**2, FAILURE_DAEMON_BYTES),
+            ("resources", "inner/RESOURCES_FINAL.json", FAILURE_COMMAND_BYTES, None)):
+        stage, item = "read_original", {"status": "evidence_insufficient"}
+        try:
+            data, proof, partial = _failure_original(root, relative, records, deadline, limit=limit, tail=tail)
+            item = {"status": "available", "original": proof}
+            if kind == "command":
+                stage = "parse_json"
+                value = json.loads(data)
+                stage = "validate_command"
+                gate._require(type(value) is dict and set(value) == {
+                    "argv", "rc", "stdin_sha256", "elapsed_seconds", "utc", "stdout", "stderr"}
+                    and type(value["argv"]) is list and len(value["argv"]) >= 4
+                    and value["argv"][:3] == ["docker", "--host", "unix:///var/run/docker.sock"]
+                    and value["argv"][3] in {"create", "start", "exec", "inspect", "logs"}
+                    and "docker_" + value["argv"][3] == observation["operation"]
+                    and type(value["rc"]) is type(observation["returncode"]) and value["rc"] == observation["returncode"]
+                    and type(value["elapsed_seconds"]) in {int, float} and math.isfinite(value["elapsed_seconds"])
+                    and 0 <= value["elapsed_seconds"] <= MAX_SECONDS
+                    and type(value["stdin_sha256"]) is str and re.fullmatch(r"[0-9a-f]{64}", value["stdin_sha256"])
+                    and type(value["stdout"]) is str and type(value["utc"]) is str and len(value["utc"]) <= 64
+                    and type(value["stderr"]) is str, "failure diagnostic command differs from observation")
+                raw = value["stderr"].encode()
+                stage = "render_text"
+                item.update(stderr_bytes=len(raw), stderr_sha256=hashlib.sha256(raw).hexdigest(),
+                            **_failure_text(raw, FAILURE_STDERR_BYTES))
+            elif kind == "daemon":
+                stage = "render_text"
+                item.update(source_window="tail", **_failure_text(data, FAILURE_DAEMON_BYTES, partial=partial),
+                            error_literals=_daemon_error_counts(data, partial=partial))
+            else:
+                stage = "parse_json"
+                value = json.loads(data)
+                payload = _failure_resource_payload(data, value, proof)
+                if payload is not None:
+                    item["original_payload"] = payload
+                stage = "validate_resources"
+                item["profile"] = _failure_resources(value)
+                item.pop("original_payload", None)  # Successful projections retain their original shape.
+            result[kind] = item
+        except (OSError, ValueError, TypeError, KeyError, gate.AdmissionError, host.ProofError) as error:
+            message = str(error)
+            reason = {
+                "failure diagnostic original commitment missing": "original_commitment_missing",
+                "failure diagnostic original commitment invalid": "original_commitment_invalid",
+                "failure diagnostic original hash changed": "original_hash_changed",
+                "failure diagnostic original changed during read": "original_changed_during_read",
+                "full-host shared deadline expired or replaced": "shared_deadline_rejected",
+                "failure diagnostic command differs from observation": "command_observation_mismatch",
+                "failure diagnostic resource scope invalid": "resource_scope_invalid",
+                "failure diagnostic resource counters invalid": "resource_counters_invalid",
+            }.get(message, "stage_failure")
+            item.update(status="evidence_insufficient", error_type=error_type(error), stage=stage,
+                        reason_code="invalid_json" if isinstance(error, json.JSONDecodeError) else reason,
+                        error_sha256=hashlib.sha256(message.encode("utf-8", errors="backslashreplace")).hexdigest())
+            result[kind] = item
+    if len(host.encoded(result)) > FAILURE_TEXT_BYTES:
+        result.get("resources", {}).pop("original_payload", None)
+        if len(host.encoded(result)) > FAILURE_TEXT_BYTES:
+            return {"status": "export_budget_exhausted"}
+    return result
+
+
+def safe_inventory(root, deadline, *, gateway_custody=False):
     """Hash bounded originals; explicitly exclude storage trees and raw payloads."""
+    gate._require(type(gateway_custody) is bool, "exact inventory custody mode required")
     records, omissions, total, gateway_texts, outer_build_texts = [], [], 0, [], []
     excluded = {root / "inner/data", root / "inner/exec", root / "inner/run", root / "bundle/objects",
                 root / "outer-build/context"}
@@ -951,6 +1291,10 @@ def safe_inventory(root, deadline):
     expected = {hashlib.sha256(name.encode()).hexdigest() for name in required}
     complete = expected <= {row["path_sha256"] for row in records}
     profiles = {}
+    if gateway_custody:
+        profile = custody_completion_profile(root, records, deadline)
+        profiles["ACTUAL_CUSTODY_PROOF.json"] = profile
+        complete = complete and profile is not None and profile["status"] == "passed"
     for name in ("inner/activation/HARNESS_COMMAND_FAILURE.json", "inner/activation/FAILURE.json", "inner/activation/RESULT.json", "inner/INNER_RESULT.json", "inner/DRAIN_OBSERVATION.json", "inner/DAEMON_STOP.json", "inner/RESOURCES_FINAL.json"):
         remaining(deadline)
         path = root / name
@@ -988,6 +1332,19 @@ def safe_inventory(root, deadline):
               "profiles": profiles, "full_raw_archive_verified": False, "raw_originals_preserved_privately": True,
               "gateway_command_stderr": gateway_command_exports(gateway_texts, deadline),
               "outer_build_command_stderr": outer_build_command_exports(outer_build_texts, deadline)}
+    packet["failure_originals"] = failure_originals(root, records, profiles, deadline)
+    if len(host.encoded(packet)) > 384 * 1024:
+        for profile in profiles.values():
+            if type(profile) is dict:
+                profile.pop("failure_native_command", None)
+    if len(host.encoded(packet)) > 384 * 1024:
+        for profile in profiles.values():
+            if type(profile) is dict:
+                profile.pop("failure_socket_listener", None)
+    if len(host.encoded(packet)) > 384 * 1024:
+        packet["failure_originals"] = {"status": "export_budget_exhausted"}
+        if len(host.encoded(packet)) > 384 * 1024:
+            del packet["failure_originals"]  # Optional diagnostics never displace the existing packet.
     gate._require(len(host.encoded(packet)) <= 384 * 1024, "selected full-host evidence encoding bound")
     remaining(deadline)
     return packet
@@ -998,6 +1355,7 @@ def _arguments(argv):
     for name in ("repo", "source", "binary", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--image-id", required=True)
+    parser.add_argument("--gateway-custody", action="store_true", help="Exercise the actual dedicated legacy gateway custody topology")
     parser.add_argument("--inside", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     gate._require(sys.platform == "linux" and os.uname().machine == "x86_64" and os.geteuid() == 0
@@ -1013,11 +1371,12 @@ def _arguments(argv):
 
 def _main(argv=None, *, _cli_started=None):
     started = time.monotonic() if _cli_started is None else cli_start(_cli_started)
-    result, failure, root, failed_phase = None, None, None, None
+    result, failure, root, failed_phase, gateway_custody = None, None, None, None, False
     try:
         if _cli_started is not None:
             cli_progress("arguments_before")
         args = _arguments(argv)
+        gateway_custody = getattr(args, "gateway_custody", False)
         if _cli_started is not None:
             cli_progress("arguments_verified")
         os.umask(0o077)
@@ -1027,6 +1386,7 @@ def _main(argv=None, *, _cli_started=None):
             plan, _ = original(root.parent / "PLAN.json")
             gate._require(root.name == "inner" and args.repo == Path(plan["repo"]) and args.source == Path(plan["source"])
                           and args.binary == Path(plan["binary"]) and args.image_id == plan["sender"]["Id"]
+                          and type(plan.get("gateway_custody")) is bool and args.gateway_custody is plan["gateway_custody"]
                           and host.file_proof(Path(__file__)) == plan["wrapper_source"], "inner frozen invocation differs")
             from scripts.production_gateway_switch import _hard_deadline
             with _hard_deadline(remaining(plan["deadline"])):
@@ -1046,7 +1406,8 @@ def _main(argv=None, *, _cli_started=None):
             from scripts.production_gateway_switch import _hard_deadline
             with _hard_deadline(remaining(started + MAX_SECONDS)):
                 phase(root, "evidence_export")
-                packet = safe_inventory(root, started + MAX_SECONDS)
+                packet = (safe_inventory(root, started + MAX_SECONDS, gateway_custody=True) if gateway_custody
+                          else safe_inventory(root, started + MAX_SECONDS))
                 record(root / "SAFE_INVENTORY.json", packet)
         except BaseException as error:
             if failure:
@@ -1063,6 +1424,10 @@ def _main(argv=None, *, _cli_started=None):
                "error_type": error_type(failure) if failure else inner_profile and inner_profile["error_type"],
                "error_sha256": hashlib.sha256(str(failure).encode()).hexdigest() if failure else inner_profile and inner_profile["error_sha256"],
                "elapsed_seconds": time.monotonic() - started, "production_access": False, "real_models": 0, "existing_126_modified": False}
+    if len(host.encoded(summary)) > 512 * 1024 and type(summary.get("activation")) is dict:
+        summary["activation"].pop("failure_native_command", None)
+    if len(host.encoded(summary)) > 512 * 1024 and type(summary.get("activation")) is dict:
+        summary["activation"].pop("failure_socket_listener", None)
     gate._require(len(host.encoded(summary)) <= 512 * 1024, "full-host summary encoding bound")
     if root is not None and root.is_dir():
         try:

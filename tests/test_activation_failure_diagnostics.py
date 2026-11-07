@@ -106,3 +106,36 @@ def test_namespace_helper_report_literal_only(monkeypatch):
     monkeypatch.setattr(namespace_native, "execute_owned", raises(RuntimeError("runtime " + "9" * 64)))
     result = namespace_native.run_report({}, "9" * 64)
     assert result["error_type"] == "RuntimeError" and result["error_message_literal"] is None
+
+
+def test_namespace_report_has_real_public_coordinates_without_text(monkeypatch):
+    monkeypatch.setattr(namespace_native, "safe_export", lambda *a: {"complete": True})
+    monkeypatch.setattr(namespace_native, "execute_owned", lambda *a: namespace_native._receipt({}, {}, "", "", set()))
+    result = namespace_native.run_report({}, "a" * 64)
+    assert result["diagnostic_schema"] == "namespace-helper-v1"
+    assert result["locations"][-1]["file"] == "admission_fence.py"
+    assert "actual sender receipt required" not in json.dumps(result["locations"])
+
+
+def test_namespace_locator_failure_keeps_primary_rejection(monkeypatch):
+    from scripts import verify_production_startup_native as startup
+    monkeypatch.setattr(namespace_native, "safe_export", lambda *a: {"complete": True})
+    monkeypatch.setattr(namespace_native, "execute_owned", lambda *a: namespace_native._receipt({}, {}, "", "", set()))
+    monkeypatch.setattr(startup, "public_exception_locations", lambda *a: (_ for _ in ()).throw(OSError("SECRET")))
+    result = namespace_native.run_report({}, "a" * 64)
+    assert result["error_type"] == "AdmissionError" and result["locations"] == []
+    assert "SECRET" not in json.dumps(result)
+
+
+def test_namespace_optional_locations_never_displace_original_safe_packet(monkeypatch):
+    evidence = {"complete": True, "padding": ""}
+    monkeypatch.setattr(namespace_native, "safe_export", lambda *a: dict(evidence))
+    monkeypatch.setattr(namespace_native, "execute_owned", lambda *a: namespace_native._receipt({}, {}, "", "", set()))
+    first = namespace_native.run_report({}, "a" * 64)
+    assert first.pop("locations")
+    first.pop("diagnostic_schema")
+    evidence["padding"] = "x" * (namespace_native.EXPORT_BYTES - 1 - len(namespace_native.namespace._encoded(first)))
+    value = namespace_native.run_report({}, "a" * 64)
+    assert len(namespace_native.namespace._encoded(value)) + 1 == namespace_native.EXPORT_BYTES
+    assert value["error_type"] == "AdmissionError" and value["error_sha256"] == first["error_sha256"]
+    assert value["safe_evidence"] == evidence and "locations" not in value and "diagnostic_schema" not in value

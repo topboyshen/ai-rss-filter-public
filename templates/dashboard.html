@@ -77,7 +77,7 @@
             <div class="subtitle">最后更新：{{ now }} | 版本：{{ release_version }}</div>
         </div>
         <nav class="top-actions" aria-label="后台导航">
-            <a class="top-link" href="https://example.invalid/" rel="noreferrer">返回新闻首页</a>
+            {% if news_home_origin %}<a class="top-link" href="{{ news_home_origin }}/" rel="noreferrer">返回新闻首页</a>{% else %}<span>新闻首页入口未配置</span>{% endif %}
             <a class="top-link" href="/dashboard/events">事件雷达</a>
             <a class="top-link" href="/briefing?format=html">今日情报</a>
             {% if dashboard_auth_kind == 'session' %}
@@ -111,7 +111,7 @@
         {% endif %}
         <div class="ops-links" aria-label="处理说明入口">
             <a class="top-link" href="/ops-feeds">零输出原因</a>
-            <a class="top-link" href="https://example.invalid/quality">模型质量</a>
+            {% if news_home_origin %}<a class="top-link" href="{{ news_home_origin }}/quality">模型质量</a>{% else %}<span>模型质量入口未配置</span>{% endif %}
             <a class="top-link" href="/dashboard/neutral-records">保守处理记录</a>
         </div>
     </section>

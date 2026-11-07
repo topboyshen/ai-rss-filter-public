@@ -7,12 +7,16 @@ All attempts, including failures, keep their original logs and inspect data.
 from __future__ import annotations
 
 import argparse
+import ast
 from datetime import datetime, timezone
 import hashlib
 import json
 import os
 from pathlib import Path
 import platform
+import re
+import stat
+import sys
 import subprocess
 import uuid
 
@@ -59,6 +63,7 @@ FILES = (
 )
 CONTAINER_TEST = """
 import json, pathlib, platform, sys, unittest
+from scripts.verify_handoff_operations_native import test_failure_coordinates
 assert platform.system() == 'Linux' and platform.machine() == 'x86_64'
 suite = unittest.TestSuite()
 for pattern in ('test_webhook_receipt_trial_plan.py', 'test_durable_handoff_cutover.py',
@@ -72,9 +77,99 @@ print(json.dumps({'status': 'passed' if result.wasSuccessful() else 'failed',
       'tests_run': result.testsRun, 'failures': len(result.failures),
       'errors': len(result.errors), 'skipped': len(result.skipped),
       'memory_peak_bytes': int(peak.read_text()) if peak.exists() else None,
-      'machine': platform.machine(), 'production_access': False, 'model_calls': 0}))
+      'machine': platform.machine(), 'production_access': False, 'model_calls': 0,
+      'failure_coordinates': test_failure_coordinates(result)}))
 sys.exit(0 if result.wasSuccessful() and not result.skipped else 1)
 """
+
+
+def test_failure_coordinates(result):
+    """Coordinates only; exception messages and subtest parameters stay private."""
+    rows = []
+    for _test, trace in (result.failures[:8] + result.errors[:8]):
+        if type(trace) is not str or len(trace) > 65536:
+            continue
+        for match in re.finditer(r'  File "/work/((?:scripts|services|tests)/[A-Za-z_][A-Za-z0-9_]{0,100}\.py)", line ([1-9][0-9]{0,5}), in ', trace):
+            rows.append({"file": match[1], "line": int(match[2])})
+    return rows[-8:]
+
+
+def _test_location(row, repo, files):
+    if type(row) is not dict or set(row) != {"file", "line"}:
+        return None
+    name, line = row["file"], row["line"]
+    if (type(name) is not str or name not in files or not re.fullmatch(
+            r"(?:scripts|services|tests)/[A-Za-z_][A-Za-z0-9_]{0,100}\.py", name)
+            or type(line) is not int or not 1 <= line <= 100000):
+        return None
+    path = repo / name
+    if path.resolve() != path:
+        return None
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= 256 * 1024:
+            return None
+        raw = os.read(fd, 256 * 1024 + 1)
+        after = os.fstat(fd)
+        fields = ("st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if len(raw) != before.st_size or any(getattr(after, k) != getattr(before, k) for k in fields):
+            return None
+        nodes = list(ast.walk(ast.parse(raw)))
+    finally:
+        os.close(fd)
+    if line > max((getattr(node, "end_lineno", 0) or 0 for node in nodes), default=0):
+        return None
+    scopes = [n for n in nodes if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+              and n.lineno <= line <= n.end_lineno]
+    scope = min(scopes, key=lambda n: n.end_lineno - n.lineno).name if scopes else "<module>"
+    return {"file": name, "line": line, "function": scope}
+
+
+def _test_summary(stdout, repo, files):
+    if type(stdout) is not str or len(stdout) > 512 * 1024:
+        return None
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate summary key")
+            result[key] = value
+        return result
+    value = json.loads(stdout.strip().splitlines()[-1], object_pairs_hook=unique)
+    if type(value) is not dict or value.get("status") not in {"passed", "failed"}:
+        return None
+    counts = {key: value.get(key) for key in ("tests_run", "failures", "errors", "skipped")}
+    if any(type(v) is not int or not 0 <= v <= 100000 for v in counts.values()):
+        return None
+    rows = value.get("failure_coordinates", [])
+    if type(rows) is not list or len(rows) > 8:
+        return None
+    locations = [_test_location(row, repo, files) for row in rows]
+    return {"status": value["status"], **counts, "locations": [r for r in locations if r is not None]}
+
+
+def emit_failure_diagnostic(stdout, state, rc, repo, files):
+    """Optional bounded job-log projection; never makes a test or gate pass."""
+    try:
+        runtime = state.get("State", {}) if type(state) is dict else {}
+        code = runtime.get("ExitCode")
+        value = {"schema": "native-test-failure-v1", "execution_proof": False,
+                 "full_raw_archive_verified": False,
+                 "client_returncode": rc if type(rc) is int and -255 <= rc <= 255 else None,
+                 "exit_code": code if type(code) is int and -255 <= code <= 255 else None,
+                 "running": runtime.get("Running") if type(runtime.get("Running")) is bool else None,
+                 "oom_killed": runtime.get("OOMKilled") if type(runtime.get("OOMKilled")) is bool else None}
+        try:
+            value["tests"] = _test_summary(stdout, repo, files)
+        except BaseException:
+            value["tests"] = None
+        raw = json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+        if len(raw.encode()) <= 4096:
+            sys.stderr.write(raw)
+            sys.stderr.flush()
+    except BaseException:
+        pass  # Keep the primary error even if diagnostics cannot be produced.
 
 
 def save(path, value):
@@ -204,6 +299,7 @@ def run(repo, output, *, files=FILES, container_test=CONTAINER_TEST, prepared_im
          "models": 0, "existing_126_modified": False, "image": IMAGE})
     name = "handoff-operations-" + uuid.uuid4().hex[:16]
     created = False
+    rc, stdout, state = None, None, None
     try:
         info = json.loads(checked(DOCKER + ["info", "--format", "{{json .}}"], output / "docker-info"))
         native_host(info)
@@ -245,6 +341,7 @@ def run(repo, output, *, files=FILES, container_test=CONTAINER_TEST, prepared_im
              "container": name, "production_adapter_verified": False,
              "model_calls": 0, "production_access": False, "existing_126_modified": False})
     except Exception as error:
+        emit_failure_diagnostic(stdout, state, rc, repo, files)
         save(output / "FAILURE.json", {"type": type(error).__name__, "message": str(error), "container": name})
         if created:
             preserve_failed_container(name, output)

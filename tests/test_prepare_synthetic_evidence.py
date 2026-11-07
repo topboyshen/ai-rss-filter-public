@@ -1049,6 +1049,157 @@ def test_actual_compact_inventory_roundtrips_all_fields_without_retaining_row_di
     assert inventory.path_bytes == sum(len(os.fsencode(name)) for name in expected)
 
 
+def test_legacy_inventory_remains_byte_exact_and_distinct_from_prefix_encoding():
+    rows = {'files/synthetic/one': inventory_file(), 'files/synthetic/two': inventory_file(123456790)}
+    original = (evidence.encoded(evidence.LEGACY_INVENTORY_HEADER) + b'\n'
+                + b''.join(evidence.encoded(evidence.inventory_record(name, row)) + b'\n'
+                           for name, row in rows.items()))
+    retained = evidence.CompactInventory.from_bytes(original, hashlib.sha256(original).hexdigest())
+    current = evidence.CompactInventory()
+    budget = {**inventory_budget(), 'metadata': len(current.to_bytes())}
+    for name, row in rows.items():
+        current.add(name, row, budget)
+    assert retained.to_bytes() == original and retained.proof()['schema'] == 1
+    assert retained == current == rows and current.proof()['schema'] == 2
+    assert retained.to_bytes() != current.to_bytes()
+
+
+@pytest.mark.parametrize('schema', [1, 2])
+@pytest.mark.parametrize('with_row', [False, True])
+def test_import_requires_original_line_endings_and_exact_consumption(schema, with_row):
+    header = evidence.LEGACY_INVENTORY_HEADER if schema == 1 else evidence.INVENTORY_HEADER
+    raw = evidence.encoded(header) + b'\n'
+    if with_row:
+        raw += evidence.encoded_inventory_record('retained', inventory_file(), schema=schema)
+    imported = evidence.CompactInventory.from_bytes(raw, hashlib.sha256(raw).hexdigest())
+    assert imported.to_bytes() == raw and imported.proof()['schema'] == schema
+    assert len(imported) == int(with_row)
+    truncated = raw[:-1]
+    with pytest.raises(evidence.EvidenceError, match='inventory_truncated'):
+        evidence.CompactInventory.from_bytes(truncated, hashlib.sha256(truncated).hexdigest())
+    for trailing in (b'\n', b'garbage', b' '):
+        changed = raw + trailing
+        with pytest.raises(evidence.EvidenceError):
+            evidence.CompactInventory.from_bytes(changed, hashlib.sha256(changed).hexdigest())
+
+
+@pytest.mark.parametrize('schema', [1, 2])
+def test_import_final_comparison_refuses_synthesized_bytes(schema, monkeypatch):
+    inventory = evidence.CompactInventory(schema=schema)
+    inventory.add('retained', inventory_file(), inventory_budget())
+    raw = inventory.to_bytes()
+    original_add = evidence.CompactInventory.add
+
+    def injected(self, *args):
+        original_add(self, *args)
+        self._raw.extend(b'\n')
+
+    monkeypatch.setattr(evidence.CompactInventory, 'add', injected)
+    with pytest.raises(evidence.EvidenceError, match='inventory_noncanonical'):
+        evidence.CompactInventory.from_bytes(raw, hashlib.sha256(raw).hexdigest())
+
+
+def test_prefix_encoding_keeps_all_paths_identities_and_link_targets_exact(tmp_path):
+    root, _output = fixture(tmp_path)
+    branch = root / ('long-repeated-fixture-prefix-' * 4)
+    branch.mkdir()
+    (branch / '中文').write_bytes(b'payload')
+    (branch / 'quoted"name').write_bytes(b'other')
+    (branch / 'alias').symlink_to('中文')
+    os.mkfifo(branch / 'pipe')
+    budget = inventory_budget()
+    with evidence.directory(root) as fd:
+        actual = evidence.scan(fd, budget, float('inf'))
+    raw = actual.to_bytes()
+    retained = evidence.CompactInventory.from_bytes(raw, actual.proof()['sha256'])
+    expanded = (evidence.encoded(evidence.LEGACY_INVENTORY_HEADER) + b'\n'
+                + b''.join(evidence.encoded(evidence.inventory_record(name, row)) + b'\n'
+                           for name, row in actual.items()))
+    assert len(raw) < len(expanded) and retained == actual
+    assert budget['metadata'] == len(raw) and budget['entries'] == len(actual)
+    assert all(retained[name] == actual[name] for name in reversed(list(actual)))
+    assert retained[str((branch / 'alias').relative_to(root))]['target'] == '中文'
+    assert actual.path_bytes == sum(len(os.fsencode(name)) for name in actual)
+
+
+@pytest.mark.parametrize('path', [[True, 'b'], [-1, 'b'], [999, 'b'], [1.0, 'b'],
+                                [2, None], [2], [2, 'b', 'extra'], [0, '../outside'],
+                                [0, 'unnecessarily-long-full-path'], [2, '']])
+def test_prefix_corruption_invalid_or_noncanonical_records_fail_closed(path):
+    first = 'shared/full-path/a'
+    row = inventory_file()
+    invalid = evidence.inventory_record('ignored', row)
+    invalid[0] = path
+    raw = (evidence.encoded(evidence.INVENTORY_HEADER) + b'\n'
+           + evidence.encoded_inventory_record(first, row) + evidence.encoded(invalid) + b'\n')
+    with pytest.raises(evidence.EvidenceError):
+        evidence.CompactInventory.from_bytes(raw)
+
+
+def test_prefix_reconstruction_cannot_bypass_duplicate_path_or_full_path_limit():
+    name = 'shared/' + 'x' * 4088
+    row = inventory_file()
+    first = evidence.encoded_inventory_record(name, row)
+    header = evidence.encoded(evidence.INVENTORY_HEADER) + b'\n'
+    duplicate = evidence.encoded_inventory_record(name, row, name)
+    with pytest.raises(evidence.EvidenceError, match='inventory_duplicate_path'):
+        evidence.CompactInventory.from_bytes(header + first + duplicate)
+    oversized = [[len(name), 'xx'], *evidence.inventory_record('ignored', row)[1:]]
+    with pytest.raises(evidence.EvidenceError, match='inventory_record_invalid'):
+        evidence.CompactInventory.from_bytes(header + first + evidence.encoded(oversized) + b'\n')
+
+
+def test_prefix_lengths_count_unicode_characters_and_digest_rejects_a_lost_whole_row():
+    inventory = evidence.CompactInventory()
+    budget = {**inventory_budget(), 'metadata': len(inventory.to_bytes())}
+    names = ['名录/企业甲/原文', '名录/企业乙/原文', 'different-last-path']
+    for index, name in enumerate(names):
+        inventory.add(name, inventory_file(index + 1), budget)
+    raw = inventory.to_bytes()
+    second = json.loads(raw.splitlines()[2])
+    assert second[0] == [5, '乙/原文']
+    restored = evidence.CompactInventory.from_bytes(raw, inventory.proof()['sha256'])
+    assert list(restored) == names and restored == inventory
+    with pytest.raises(evidence.EvidenceError, match='inventory_digest_mismatch'):
+        evidence.CompactInventory.from_bytes(b'\n'.join(raw.splitlines()[:-1]) + b'\n',
+                                              inventory.proof()['sha256'])
+
+
+def test_legacy_header_cannot_silently_accept_prefix_records():
+    row = inventory_file()
+    raw = (evidence.encoded(evidence.LEGACY_INVENTORY_HEADER) + b'\n'
+           + evidence.encoded_inventory_record('shared/first', row)
+           + evidence.encoded_inventory_record('shared/second', row, 'shared/first'))
+    with pytest.raises(evidence.EvidenceError, match='inventory_record_invalid'):
+        evidence.CompactInventory.from_bytes(raw)
+
+
+def test_complete_output_scale_fits_losslessly_without_truncating_the_stop_point():
+    # The retained failure copied 28,968 files and created 16,333 non-root
+    # directories, plus two metadata files: 44,366 was only the stopped scan.
+    inventory = evidence.CompactInventory()
+    budget = {**inventory_budget(), 'metadata': len(inventory.to_bytes())}
+    legacy_bytes = len(evidence.encoded(evidence.LEGACY_INVENTORY_HEADER)) + 1
+    expected = {}
+    for index in range(45303):
+        kind = 'file' if index < 28970 else 'directory'
+        row = inventory_file(index + 1)
+        if kind == 'directory':
+            row['kind'] = kind
+            row['identity'].update(mode=stat.S_IFDIR | 0o700, nlink=2, size=4096)
+        name = ('files/cutover-completion/native-activation/fixtures/disk-fixtures/s/'
+                f'preserved-synthetic-case-{index // 100:05d}/{index:05d}')
+        inventory.add(name, row, budget)
+        expected[name] = row
+        legacy_bytes += len(evidence.encoded(evidence.inventory_record(name, row))) + 1
+    assert legacy_bytes > evidence.MAX_METADATA == 8 * 1024**2
+    assert budget['metadata'] == len(inventory.to_bytes()) < evidence.MAX_METADATA
+    assert len(inventory) == budget['entries'] == 45303
+    assert inventory.path_bytes == sum(len(os.fsencode(name)) for name in expected)
+    restored = evidence.CompactInventory.from_bytes(inventory.to_bytes(), inventory.proof()['sha256'])
+    assert restored == expected and inventory == expected
+
+
 def test_21054_complete_entries_use_real_compact_layout_instead_of_expanded_output_overflow():
     source, output = evidence.CompactInventory(), evidence.CompactInventory()
     source_budget = {**inventory_budget(), 'metadata': len(source.to_bytes())}
@@ -1074,10 +1225,12 @@ def test_actual_compact_metadata_exact_eight_mib_boundary_and_next_row_stops():
     budget = inventory_budget()
     inventory = evidence.CompactInventory(budget)
     row = inventory_file()
-    chunk = len(evidence.encoded(evidence.inventory_record('n00000' + 'x' * 4000, row))) + 1
+    chunk = len(evidence.encoded(evidence.inventory_record('A00000' + 'x' * 4000, row))) + 1
     index = 0
     while evidence.MAX_METADATA - budget['metadata'] >= chunk * 2:
-        inventory.add(f'n{index:05d}' + 'x' * 4000, row, budget)
+        # Adjacent paths have no shared prefix: the hard limit must also hold
+        # for incompressible names, not only the common fixture layout.
+        inventory.add(('A' if index % 2 == 0 else 'B') + f'{index:05d}' + 'x' * 4000, row, budget)
         index += 1
     minimum = sum(len(evidence.encoded(evidence.inventory_record(name, row))) + 1 for name in ('last1', 'last2'))
     remaining = evidence.MAX_METADATA - budget['metadata'] - minimum
@@ -1109,7 +1262,7 @@ def test_compact_inventory_corruption_and_truncation_fail_closed(change):
     elif change == 'duplicate':
         raw += evidence.encoded(record) + b'\n'
     elif change == 'wrong_header':
-        raw = raw.replace(b'"schema":1', b'"schema":2', 1)
+        raw = raw.replace(b'"schema":2', b'"schema":999', 1)
     elif change == 'noncanonical':
         raw = header + json.dumps(record, indent=1).encode() + b'\n'
     elif change == 'bad_json':

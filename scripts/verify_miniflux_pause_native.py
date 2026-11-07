@@ -373,6 +373,9 @@ class Harness:
     def sender_ready(self):
         return self.http("sender", "/healthcheck")
 
+    def fixture_ready(self):
+        return self.http("fixture", "/health")
+
     def prepare(self):
         info = json.loads(self.command(["info", "--format", "{{json .}}"]))
         native_host(info)
@@ -398,7 +401,7 @@ class Harness:
                     "--mount", "type=bind,src=" + str(evidence) + ",dst=/evidence",
                     "--mount", "type=bind,src=" + str(self.repo / "scripts/miniflux_pause_fixture.py") + ",dst=/fixture.py,readonly",
                     "-e", "MINIFLUX_PAUSE_FIXTURE_TOKEN=" + self.token], ["python", "-B", "/fixture.py"])
-        self.wait(lambda: self.http("fixture", "/health"), readiness=True)
+        self.wait(self.fixture_ready, readiness=True)
 
     def prepare_network(self):
         self.command(["network", "create", "--internal", "--label", LABEL + "=" + self.owner, self.network])

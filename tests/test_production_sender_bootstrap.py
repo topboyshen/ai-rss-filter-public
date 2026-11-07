@@ -92,7 +92,7 @@ def test_all_candidate_harness_calls_inherit_defaults_and_seed_is_a_separate_ima
         assert [node.id for node in cls.bases] == ["Harness"]
         assert not any(isinstance(node, ast.FunctionDef) and node.name == "launch_sender" for node in cls.body)
     tree = ast.parse((bootstrap.ROOT / "scripts/production_sender_bootstrap_native.py").read_text())
-    seed = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "seed132")
+    seed = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "seed131")
     launch, = [node for node in ast.walk(seed) if isinstance(node, ast.Call)
                and isinstance(node.func, ast.Attribute) and node.func.attr == "launch"]
     assert ast.literal_eval(launch.args[0]) == "seed131" and isinstance(launch.args[1], ast.Subscript)
@@ -357,7 +357,8 @@ def initialized(request,monkeypatch):
             clients.append(client)
         return clients[0]
     class Reader(PostgresReader):
-        def __init__(self,path,expected):
+        def __init__(self,path,expected,*,transport_binding=None):
+            assert transport_binding is None  # This fixture is the original external-PG path.
             self.expected=expected
         def initial_snapshot(self):
             t=clients[0]
@@ -427,7 +428,7 @@ def test_bounded_actual_pg_metadata_reader_refuses_unsafe_initialization(request
             if sql==module.PG_SQL:
                 return Result(tuple(base[k] for k in module.PG_KEYS))
             if sql.startswith("SELECT version"):
-                return Result([("131" if kind=="old_schema" else "0135" if kind=="noncanonical_schema" else "134",)])
+                return Result([("130" if kind=="old_schema" else "0135" if kind=="noncanonical_schema" else "134",)])
             if sql.startswith("SELECT to_regclass"):
                 return Result(("handoff_state" if kind=="existing_gate" else None,))
             if sql.startswith("SELECT 1 FROM"):

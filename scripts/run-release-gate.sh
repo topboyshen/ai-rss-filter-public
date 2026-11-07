@@ -117,6 +117,262 @@ validate_python_file() {
   (( (mode_value & 0022) == 0 )) || die "resolved Python must not be group- or world-writable"
 }
 
+# Only the release controller's separately reviewed executable/SHA pair enables
+# this mode. Ambient AI_FILTER_TEST_NODE, NODE_OPTIONS and caller PATH do not.
+gate_node_guard() {
+  "${PYTHON_PATH}" -I - "$1" "${GATE_NODE_INPUT}" "${GATE_NODE_EXPECTED}" "${WORK_ROOT}" "${ROOT}" <<'AI_FILTER_RELEASE_GATE_NODE_GUARD'
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import stat
+import sys
+import time
+
+MAX_NODE = 128 * 1024**2
+MAX_PROOF = 32768
+GUARD_SECONDS = 5
+IDENTITY = ('dev', 'ino', 'uid', 'gid', 'mode', 'nlink', 'size', 'mtime_ns', 'ctime_ns')
+
+
+class NodeGuardError(ValueError):
+    pass
+
+
+def need(value, reason):
+    if not value:
+        raise NodeGuardError(reason)
+
+
+def identity(info):
+    return {name: getattr(info, 'st_' + name) for name in IDENTITY}
+
+
+def encoded(value):
+    return (json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False) + '\n').encode()
+
+
+def plain_path(raw):
+    need(type(raw) is str and 1 < len(raw) <= 1024 and raw.isascii()
+         and not any(ord(c) < 32 or ord(c) == 127 or c == ':' for c in raw), 'invalid_path')
+    path = Path(raw)
+    need(path.is_absolute() and str(path) == raw and '..' not in path.parts, 'invalid_path')
+    return path
+
+
+def chain(path, *, temporary=False):
+    records = []
+    for item in [*reversed(path.parents), path]:
+        info = os.lstat(item)
+        need(not stat.S_ISLNK(info.st_mode) and info.st_uid == 0, 'unsafe_path_owner_or_link')
+        sticky_root = temporary and stat.S_ISDIR(info.st_mode) and info.st_mode & stat.S_ISVTX
+        need(not info.st_mode & 0o022 or sticky_root, 'writable_path_component')
+        need(item == path or stat.S_ISDIR(info.st_mode), 'non_directory_parent')
+        records.append({'path': str(item), 'identity': identity(info)})
+    need(os.path.realpath(path, strict=True) == str(path), 'noncanonical_path')
+    return records
+
+
+def source_snapshot(raw, expected, source_root, work_root):
+    path = plain_path(raw)
+    need(path.name == 'node' and len(expected) == 64 and all(c in '0123456789abcdef' for c in expected),
+         'invalid_node_or_sha256')
+    need(not path.is_relative_to(source_root) and not path.is_relative_to(work_root), 'node_inside_source_or_work')
+    rows = chain(path)
+    info = os.lstat(path)
+    need(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_mode & 0o111
+         and 0 < info.st_size <= MAX_NODE, 'invalid_node_file')
+    return path, rows, identity(info)
+
+
+def private_root(raw):
+    path = plain_path(raw)
+    chain(path, temporary=True)
+    info = os.lstat(path)
+    need(stat.S_ISDIR(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o700, 'unsafe_private_root')
+    return path, {name: getattr(info, 'st_' + name) for name in ('dev', 'ino', 'uid', 'gid', 'mode')}
+
+
+def checked_open(path, expected_identity, flags=os.O_RDONLY):
+    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        need(identity(os.fstat(fd)) == expected_identity, 'opened_identity_changed')
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def digest_fd(fd, *, destination=None):
+    result, count = hashlib.sha256(), 0
+    while True:
+        block = os.read(fd, min(65536, MAX_NODE + 1 - count))
+        if not block:
+            break
+        count += len(block)
+        need(count <= MAX_NODE, 'node_size_limit')
+        result.update(block)
+        if destination is not None:
+            view = memoryview(block)
+            while view:
+                written = os.write(destination, view)
+                need(written > 0, 'short_private_write')
+                view = view[written:]
+    return result.hexdigest(), count
+
+
+def validate_copy(path, expected):
+    rows = chain(path, temporary=True)
+    info = os.lstat(path)
+    need(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and stat.S_IMODE(info.st_mode) == 0o500
+         and 0 < info.st_size <= MAX_NODE, 'unsafe_private_node')
+    fd = checked_open(path, identity(info))
+    try:
+        actual, size = digest_fd(fd)
+        need(actual == expected and size == info.st_size and identity(os.fstat(fd)) == identity(info),
+             'private_node_hash_or_identity_changed')
+    finally:
+        os.close(fd)
+    need(chain(path, temporary=True) == rows, 'private_node_path_changed')
+    return identity(info)
+
+
+def stage(raw, expected, root_raw, source_raw):
+    need(os.geteuid() == 0, 'root_required_for_explicit_node')
+    work, work_identity = private_root(root_raw)
+    source_root = plain_path(source_raw)
+    path, before, source_identity = source_snapshot(raw, expected, source_root, work)
+    fd = checked_open(path, source_identity)
+    try:
+        private_bin = work / 'node-bin'
+        os.mkdir(private_bin, 0o700)
+        private = private_bin / 'node'
+        output = os.open(private, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o500)
+        try:
+            actual, size = digest_fd(fd, destination=output)
+            need(actual == expected and size == source_identity['size'], 'node_sha256_mismatch')
+            os.fsync(output)
+        finally:
+            os.close(output)
+        need(identity(os.fstat(fd)) == source_identity and chain(path) == before, 'source_changed_during_copy')
+    finally:
+        os.close(fd)
+    need(private_root(root_raw)[1] == work_identity, 'private_root_changed')
+    copy_identity = validate_copy(private, expected)
+    bin_identity = identity(os.lstat(private_bin))
+    need(stat.S_IMODE(bin_identity['mode']) == 0o700, 'unsafe_private_bin')
+    proof = {'schema': 1, 'source': raw, 'expected_sha256': expected, 'source_root': source_raw,
+             'source_chain': before, 'source_identity': source_identity, 'work_identity': work_identity,
+             'copy_identity': copy_identity, 'bin_identity': bin_identity}
+    payload = encoded(proof)
+    need(len(payload) <= MAX_PROOF, 'proof_size_limit')
+    proof_fd = os.open(work / 'node-proof.json', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        view = memoryview(payload)
+        while view:
+            count = os.write(proof_fd, view)
+            need(count > 0, 'short_proof_write')
+            view = view[count:]
+        os.fsync(proof_fd)
+    finally:
+        os.close(proof_fd)
+    return public_proof(payload, expected)
+
+
+def read_proof(work):
+    path = work / 'node-proof.json'
+    info = os.lstat(path)
+    need(info.st_uid == 0 and stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+         and stat.S_IMODE(info.st_mode) == 0o600 and 0 < info.st_size <= MAX_PROOF, 'unsafe_private_proof')
+    fd = checked_open(path, identity(info))
+    try:
+        data = bytearray()
+        while len(data) <= MAX_PROOF:
+            block = os.read(fd, min(4096, MAX_PROOF + 1 - len(data)))
+            if not block:
+                break
+            data.extend(block)
+        need(len(data) == info.st_size and identity(os.fstat(fd)) == identity(info)
+             and identity(os.lstat(path)) == identity(info), 'private_proof_changed')
+    finally:
+        os.close(fd)
+    return bytes(data)
+
+
+def public_proof(payload, expected):
+    result = {'node_sha256': expected, 'private_proof_sha256': hashlib.sha256(payload).hexdigest(),
+              'metadata_proof': json.loads(payload)}
+    need(len(encoded(result)) <= MAX_PROOF, 'audit_proof_size_limit')
+    return result
+
+
+def verify(raw, expected, root_raw, source_raw):
+    need(os.geteuid() == 0, 'root_required_for_explicit_node')
+    work, work_identity = private_root(root_raw)
+    payload = read_proof(work)
+    proof = json.loads(payload)
+    keys = {'schema', 'source', 'expected_sha256', 'source_root', 'source_chain', 'source_identity',
+            'work_identity', 'copy_identity', 'bin_identity'}
+    need(type(proof) is dict and set(proof) == keys and proof['schema'] == 1
+         and type(proof['schema']) is int and encoded(proof) == payload, 'invalid_private_proof')
+    need(proof['source'] == raw and proof['expected_sha256'] == expected and proof['source_root'] == source_raw
+         and proof['work_identity'] == work_identity, 'private_binding_changed')
+    path, rows, info = source_snapshot(raw, expected, plain_path(source_raw), work)
+    need(rows == proof['source_chain'] and info == proof['source_identity'], 'source_identity_changed')
+    fd = checked_open(path, info)
+    try:
+        actual, size = digest_fd(fd)
+        need(actual == expected and size == info['size'] and identity(os.fstat(fd)) == info,
+             'source_hash_or_fd_changed')
+    finally:
+        os.close(fd)
+    private_bin = work / 'node-bin'
+    need(identity(os.lstat(private_bin)) == proof['bin_identity'], 'private_bin_changed')
+    with os.scandir(private_bin) as entries:
+        names = []
+        for entry in entries:
+            names.append(entry.name)
+            need(len(names) <= 1, 'extra_private_executable')
+    need(names == ['node'], 'private_node_missing')
+    need(validate_copy(private_bin / 'node', expected) == proof['copy_identity'], 'private_copy_identity_changed')
+    need(chain(path) == rows and private_root(root_raw)[1] == work_identity, 'final_path_changed')
+    return public_proof(payload, expected)
+
+
+def main(argv):
+    # This child never extends an enclosing controller budget. The alarm covers
+    # metadata, hashing, fsync and both outputs; kernel-uninterruptible I/O is not
+    # claimed to have stopped merely because a parent reports a timeout.
+    need(signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0), 'existing_guard_timer')
+    previous = signal.getsignal(signal.SIGALRM)
+    started = time.monotonic()
+
+    def expired(_signum, _frame):
+        os._exit(124)
+
+    signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, GUARD_SECONDS)
+    try:
+        need(len(argv) == 5 and argv[0] in {'stage', 'verify'}, 'fixed_guard_operation_required')
+        result = (stage if argv[0] == 'stage' else verify)(*argv[1:])
+        need(time.monotonic() - started < GUARD_SECONDS, 'node_guard_deadline')
+        print(json.dumps(result, sort_keys=True, separators=(',', ':')), flush=True)
+        return 0
+    except Exception as error:
+        reason = str(error) if type(error) is NodeGuardError else 'node_guard_io_or_input_failure'
+        print('Release gate Node guard: ' + reason, file=sys.stderr, flush=True)
+        return 2
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+if __name__ == '__main__':
+    raise SystemExit(main(sys.argv[1:]))
+AI_FILTER_RELEASE_GATE_NODE_GUARD
+}
+
 read_python_identity() {
   local path="$1"
   "${path}" -I -c 'import platform, sys; print(f"{platform.python_implementation()}|{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")'
@@ -159,6 +415,17 @@ PYTHON_IDENTITY="$(read_python_identity "${PYTHON_PATH}")" || die "could not ide
 [[ "${PYTHON_IDENTITY}" =~ ^CPython\|3\.11\.[0-9]+$ ]] || die "release gate requires CPython 3.11.x"
 PYTHON_IDENTITY_SHA256="$(sha256_text "${PYTHON_IDENTITY}")" || die "could not hash Python identity"
 [[ "${PYTHON_IDENTITY_SHA256}" =~ ^[0-9a-f]{64}$ ]] || die "invalid Python identity SHA-256"
+
+GATE_NODE_INPUT=""
+GATE_NODE_EXPECTED=""
+GATE_NODE_ENABLED=0
+if [[ -n "${AI_FILTER_RELEASE_GATE_NODE+x}${AI_FILTER_RELEASE_GATE_NODE_SHA256+x}" ]]; then
+  [[ -n "${AI_FILTER_RELEASE_GATE_NODE:-}" && -n "${AI_FILTER_RELEASE_GATE_NODE_SHA256:-}" ]] || \
+    die "explicit release-gate Node requires both executable and reviewed SHA-256"
+  GATE_NODE_INPUT="${AI_FILTER_RELEASE_GATE_NODE}"
+  GATE_NODE_EXPECTED="${AI_FILTER_RELEASE_GATE_NODE_SHA256}"
+  GATE_NODE_ENABLED=1
+fi
 
 ATTESTATION_DIR="${RELEASE_TEST_ATTESTATION_DIR:-/run/ai-filter-release-gate/attestations}"
 [[ "${ATTESTATION_DIR}" == /* && "${ATTESTATION_DIR}" != "/" && "${ATTESTATION_DIR}" != *$'\n'* && "${ATTESTATION_DIR}" != *$'\r'* ]] || die "RELEASE_TEST_ATTESTATION_DIR must be a safe absolute path"
@@ -240,6 +507,11 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+GATE_NODE_LOG_PROOF=""
+if [[ "${GATE_NODE_ENABLED}" == "1" ]]; then
+  GATE_NODE_LOG_PROOF="$(gate_node_guard stage)" || die "explicit release-gate Node staging failed"
+fi
+
 git -C "${ROOT}" -c core.hooksPath=/dev/null worktree add --detach "${WORKTREE}" "${HEAD_OID}"
 
 DETACHED_HEAD="$(git -C "${WORKTREE}" rev-parse --verify 'HEAD^{commit}')"
@@ -248,12 +520,18 @@ DETACHED_STATUS="$(git -C "${WORKTREE}" status --porcelain=v1 --untracked-files=
 [[ -z "${DETACHED_STATUS}" ]] || die "detached worktree was not initially clean"
 
 SAFE_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+if [[ "${GATE_NODE_ENABLED}" == "1" ]]; then
+  SAFE_PATH="${WORK_ROOT}/node-bin:${SAFE_PATH}"
+fi
 STARTED_EPOCH="$(date +%s)"
 [[ "${STARTED_EPOCH}" =~ ^[0-9]+$ ]] || die "could not record start time"
 
 set +e
 (
   cd -- "${WORKTREE}"
+  if [[ "${GATE_NODE_ENABLED}" == "1" ]]; then
+    printf 'Release gate reviewed Node: %s\n' "${GATE_NODE_LOG_PROOF}"
+  fi
   env -i \
     HOME="${TEST_HOME}" \
     TMPDIR="${TEST_TMP}" \
@@ -318,6 +596,11 @@ validate_python_file "${PYTHON_TARGET_AFTER}"
 PYTHON_IDENTITY_AFTER="$(read_python_identity "${PYTHON_PATH_AFTER}")" || die "could not re-identify Python"
 [[ "${PYTHON_IDENTITY_AFTER}" == "${PYTHON_IDENTITY}" ]] || die "Python identity changed during the release gate"
 [[ "$(sha256_text "${PYTHON_IDENTITY_AFTER}")" == "${PYTHON_IDENTITY_SHA256}" ]] || die "Python identity hash changed during the release gate"
+
+if [[ "${GATE_NODE_ENABLED}" == "1" ]]; then
+  GATE_NODE_FINAL_PROOF="$(gate_node_guard verify)" || die "explicit release-gate Node changed during tests"
+  [[ "${GATE_NODE_FINAL_PROOF}" == "${GATE_NODE_LOG_PROOF}" ]] || die "release-gate Node proof changed"
+fi
 
 LOG_SHA256="$(sha256_file "${RUN_LOG}")" || die "could not hash release-gate log"
 [[ "${LOG_SHA256}" =~ ^[0-9a-f]{64}$ ]] || die "invalid log SHA-256"

@@ -136,7 +136,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt', 'requirements-prod.txt') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt', 'requirements-prod.txt', 'requirements-ops.txt') }}
           restore-keys: |
             ${{ runner.os }}-pip-
 
@@ -144,6 +144,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install --only-binary=:all: -r requirements-ops.txt
 
       - name: Validate shell and release contracts
         run: |
@@ -205,6 +206,7 @@ jobs:
           mapping_generation="event-mapping-store-v5-provider-attribution-v1"
           IMAGE_REF="${image_ref}" docker compose config --quiet
           docker build --tag "${image_ref}" \
+            --build-arg PIP_INDEX_URL=https://pypi.org/simple \
             --build-arg AI_FILTER_BUILD_VERSION="${build_version}" \
             --build-arg AI_FILTER_BUILD_GIT_SHA="${GITHUB_SHA}" \
             --build-arg AI_FILTER_BUILD_MANIFEST_SHA="${manifest_sha}" \

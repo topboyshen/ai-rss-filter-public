@@ -31,6 +31,7 @@ from scripts import verify_production_startup_native as startup_native  # noqa: 
 from scripts import production_gateway_native as gateway_native  # noqa: E402
 from scripts import production_native_deadline as native_deadline  # noqa: E402
 from scripts import private_release_diagnostics as command_diagnostics  # noqa: E402
+from scripts import retained_gateway_diagnostics as socket_diagnostics  # noqa: E402
 from scripts.verify_miniflux_pause_native import Harness, CLIENT, image_checks, source_binding, sha, read_command_result, resource_checks  # noqa: E402
 from scripts.miniflux_host_joint_native import component  # noqa: E402
 from scripts.miniflux_handoff_adapter import source_sha256 as bridge_source, CutoverError  # noqa: E402
@@ -111,6 +112,39 @@ except Exception:
  # The parent rejects this unknown completion and preserves sticky uncertainty.
  pass
 print(json.dumps({'schema':1,'probe':'sender_healthcheck','nonce':p['nonce'],
+ 'status':status,'reason':reason},separators=(',',':')))
+'''
+
+FIXTURE_READINESS_PROBE = r'''import errno,ipaddress,json,re,sys,urllib.error,urllib.request
+p=json.load(sys.stdin)
+if (type(p) is not dict or set(p)!={'nonce','fixture_ip'}
+    or type(p['nonce']) is not str or re.fullmatch(r'[0-9a-f]{64}',p['nonce']) is None
+    or type(p['fixture_ip']) is not str):
+ raise ValueError('fixed fixture readiness input required')
+address=ipaddress.IPv4Address(p['fixture_ip'])
+if str(address)!=p['fixture_ip'] or address.is_loopback or address.is_unspecified or address.is_multicast:
+ raise ValueError('owned fixture IPv4 required')
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+ def redirect_request(self,req,fp,code,msg,headers,newurl): return None
+opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),NoRedirect())
+request=urllib.request.Request('http://'+str(address)+':8080/health',method='GET')
+status,reason='unknown','unknown'
+try:
+ with opener.open(request,timeout=12) as response:
+  body=response.read(513)
+  if response.status==200 and body==b'{"status":"synthetic_fixture_ready"}':
+   status,reason='ready','http200'
+  elif response.status==503: status,reason='not_ready','http503'
+except urllib.error.HTTPError as error:
+ if error.code==503: status,reason='not_ready','http503'
+ error.close()
+except urllib.error.URLError as error:
+ if isinstance(error.reason,OSError) and type(error.reason.errno) is int and error.reason.errno==errno.ECONNREFUSED:
+  status,reason='not_ready','econnrefused'
+except Exception:
+ # A timeout, protocol mismatch or other unknown result must remain blocking.
+ pass
+print(json.dumps({'schema':1,'probe':'fixture_healthcheck','nonce':p['nonce'],
  'status':status,'reason':reason},separators=(',',':')))
 '''
 
@@ -345,6 +379,60 @@ class ActivationHarness(Harness):
                 error.add_note("command failure diagnostic unavailable: " + type(diagnostic_error).__name__)
             raise
 
+    def fixture_ready(self):
+        context = getattr(self, "private_host_context", None)
+        if context is None:
+            return super().fixture_ready()
+        expected, observation = {}, {}
+        try:
+            from scripts import production_host_ingress_native as host
+            from scripts.production_activation_host_native import remaining
+            context.check()
+            bound = self.sender_readiness_launch_identities["fixture"]
+            before = self._sender_readiness_identity(json.loads(self.command(["inspect", bound["Id"]]))[0], "fixture")
+            gate._require(all(before[key] == bound[key] for key in ("Id", "Name", "Image", "Created", "NetworkID")),
+                          "fixture readiness target changed after launch")
+            nonce = os.urandom(32).hex()
+            raw = Harness.command(self, ["exec", "-i", bound["Id"], "python", "-B", "-c", FIXTURE_READINESS_PROBE],
+                                  stdin=json.dumps({"nonce": nonce, "fixture_ip": before["IPAddress"]}),
+                                  timeout=min(15, remaining(context.plan["active_deadline"])), allowed_failure=True,
+                                  command_result=expected, command_observation=observation)
+            sequence = self.sequence
+            saved = read_command_result(self.output / f"command-{sequence:04d}.json", sequence, expected)
+            gate._require(saved["returncode"] == 0 and type(raw) is str and len(raw.encode()) <= 512,
+                          "fixture readiness transport unconfirmed")
+            result = json.loads(raw)
+            gate._require(type(result) is dict and set(result) == {"schema", "probe", "nonce", "status", "reason"}
+                          and type(result["schema"]) is int and result["schema"] == 1
+                          and result["probe"] == "fixture_healthcheck" and result["nonce"] == nonce
+                          and (result["status"], result["reason"]) in {
+                              ("ready", "http200"), ("not_ready", "http503"), ("not_ready", "econnrefused")},
+                          "fixture readiness completion unconfirmed")
+            gate._require(raw == json.dumps({"schema": 1, "probe": "fixture_healthcheck", "nonce": nonce,
+                                            "status": result["status"], "reason": result["reason"]},
+                                           separators=(",", ":")) + "\n",
+                          "fixture readiness completion encoding changed")
+            after = self._sender_readiness_identity(json.loads(self.command(["inspect", bound["Id"]]))[0], "fixture")
+            context.check()
+            gate._require(after == before, "fixture readiness identity changed during probe")
+            record = {"schema": 1, "probe": "fixture_healthcheck", "sequence": sequence,
+                      "status": result["status"], "reason": result["reason"], "transport_returncode": 0,
+                      "nonce_sha256": hashlib.sha256(nonce.encode()).hexdigest(),
+                      "container_sha256": hashlib.sha256(private.encoded(before)).hexdigest(),
+                      "command_original_sha256": saved["original"]["sha256"]}
+            host.durable(self.output / f"FIXTURE_READINESS_{sequence:04d}.json", record)
+            counts = getattr(self, "fixture_readiness_counts", {"ready": 0, "not_ready": 0})
+            counts[record["status"]] += 1
+            self.fixture_readiness_counts = counts
+            return result["status"] == "ready"
+        except BaseException as error:
+            context.commands.uncertain_mutation = True
+            try:
+                self._preserve_command_failure(observation)
+            except BaseException as diagnostic_error:
+                error.add_note("command failure diagnostic unavailable: " + type(diagnostic_error).__name__)
+            raise
+
     def prepare_network(self):
         if self.private_host_context is None:
             return super().prepare_network()
@@ -542,12 +630,15 @@ def closed_initialization(harness, p):
     return driver
 
 
-def create_and_start(session, p):
+def create_and_start(session, p, *, legacy=None):
     from services import production_container_lifecycle as lifecycle
     paths = {"database": "/app/data/fixture.db", "config": "/app/config.yaml",
              "freeze": "/app/data/admission_fence", "state": "/app/data/startup_slots"}
     args = (session, p["paths"]["grants"], p["paths"]["slots"], p["paths"]["lifecycle"])
-    created = lifecycle.create(*args, operation_id=p["operation"], paths=paths, web_workers=2, threads=4)
+    capabilities = {} if legacy is None else {"legacy": legacy}
+    created = lifecycle.create(*args, operation_id=p["operation"], paths=paths, web_workers=2, threads=4, **capabilities)
+    if legacy is not None:
+        p["custody_new_containers"] = dict(created["containers"])
     original = private.run
     calls = []
     def dropped_start(command):
@@ -559,7 +650,7 @@ def create_and_start(session, p):
     try:
         private.run = dropped_start
         try:
-            lifecycle.start(*args, operation_id=p["operation"])
+            lifecycle.start(*args, operation_id=p["operation"], **capabilities)
         except LostAck:
             pass
         else:
@@ -568,10 +659,10 @@ def create_and_start(session, p):
         private.run = original
     deadline = time.monotonic() + 40
     while time.monotonic() < deadline:
-        result = lifecycle.query(*args, operation_id=p["operation"])
+        result = lifecycle.query(*args, operation_id=p["operation"], **capabilities)
         if result["status"] == "closed_initialized":
             gate._require(len(calls) == 1, "Docker start repeated")
-            require_rejected(lambda: lifecycle.start(*args, operation_id=p["operation"]))
+            require_rejected(lambda: lifecycle.start(*args, operation_id=p["operation"], **capabilities))
             return created, result
         time.sleep(0.1)
     raise TimeoutError("actual candidate startup did not confirm")
@@ -679,7 +770,7 @@ def _watchdog_window(p, harness, receiver, native_driver):
 
 
 
-def activate(harness, p, driver, migration_root, native_driver, *, release_lock=None):
+def activate(harness, p, driver, migration_root, native_driver, *, release_lock=None, legacy=None):
     from services.production_activation_control import locked_activation
     from services.production_container_lifecycle import verify_active
     with locked_activation(migration_root, p["paths"]["grants"], p["paths"]["slots"],
@@ -718,7 +809,8 @@ def activate(harness, p, driver, migration_root, native_driver, *, release_lock=
                      "actual_process": True, "transport_scope": "synthetic_loopback_to_owned_go"})
         harness.stage("receiver_resume_and_independent_runtime_verification")
         resumed = receiver.resume()
-        verified = verify_active(receiver, p["paths"]["lifecycle"], operation_id=p["operation"])
+        capabilities = {} if legacy is None else {"legacy": legacy, "gateway": gateway}
+        verified = verify_active(receiver, p["paths"]["lifecycle"], operation_id=p["operation"], **capabilities)
         harness.stage("sender_resume_lost_ack_exact_query")
         transport = p["sender_transport"]
         transport.drop.add("/production-resume")
@@ -794,7 +886,7 @@ def complete_native_supervision(harness, p, active, native_driver, migration_roo
     actual_namespace_transport(harness, p, stopped)
 
 
-def retained_native_phases(harness, p, driver, native_driver, permit, migration_root):
+def retained_native_phases(harness, p, driver, native_driver, permit, migration_root, *, legacy=None):
     from services import production_migration as migration
     from services.production_activation_control import arm
     from services.production_release_lock import retained_release_lock
@@ -802,7 +894,8 @@ def retained_native_phases(harness, p, driver, native_driver, permit, migration_
         with migration.locked_session(migration_root, permit, release_lock=release_lock) as session:
             session.authorize()
             completed = session.migrate()
-            created, started = create_and_start(session, p)
+            capabilities = {} if legacy is None else {"legacy": legacy}
+            created, started = create_and_start(session, p, **capabilities)
             web = created["containers"]["web"]
             gate._require(harness.receiver_http(web, "/refresh")["status"] == 503, "closed receiver performed business")
             from services.production_admission_lifecycle import source_sha256
@@ -817,7 +910,7 @@ def retained_native_phases(harness, p, driver, native_driver, permit, migration_
             fixture.save(p["directory"] / "CLOSED_LIFECYCLE.json", {"migration": completed, "created": created,
                 "started": started, "armed": armed, "old_container_ids": sorted(p["previous_containers"]),
                 "old_binary_execution_proven": False})
-        return activate(harness, p, driver, migration_root, native_driver, release_lock=release_lock)
+        return activate(harness, p, driver, migration_root, native_driver, release_lock=release_lock, **capabilities)
 
 
 def abort_native_guardian(p):
@@ -1046,12 +1139,20 @@ def record_failure(error, repo, output, stage, *, private_commands=None):
     commands = command_diagnostics.safe_summary(private_commands)
     if commands is not None:
         failure["private_commands"] = summary["private_commands"] = commands
+    nested = startup_native.safe_nested_diagnostic(getattr(error, "native_command_diagnostic", None))
+    if nested is not None:
+        failure["native_command"] = summary["native_command"] = nested
+    socket_summary = socket_diagnostics.error_summary(error)
+    if socket_summary is not None:
+        failure["socket_listener"] = summary["socket_listener"] = socket_summary
     print("activation_native_failure=" + json.dumps(summary, sort_keys=True), flush=True)
     fixture.save(output / "FAILURE.json", failure)
     return failure
 
 
-def execute(repo, source, image_id, binary, output, *, private_host_context=None):
+def execute(repo, source, image_id, binary, output, *, private_host_context=None, gateway_custody=False):
+    gate._require(type(gateway_custody) is bool and (not gateway_custody or private_host_context is not None),
+                  "custody opt-in requires the actual private host context")
     binding = source_binding(repo, source, binary)
     harness = ActivationHarness(repo, source, image_id, binary, output, private_host_context=private_host_context)
     fixture.save(output / "SOURCE.json", binding)
@@ -1059,14 +1160,18 @@ def execute(repo, source, image_id, binary, output, *, private_host_context=None
     # Only the attested isolated host scenario opts in; default/production calls
     # do not create a collector or a file/environment-based diagnostic switch.
     context = command_diagnostics.scope() if private_host_context is not None else nullcontext(None)
-    with context as observation:
+    with context as observation, socket_diagnostics.scope(enabled=private_host_context is not None):
         try:
             harness.stage("actual_compose_parser_metadata")
             harness.compose_parser_evidence()
             harness.stage("bounded_internal_network_and_real_redis")
             harness.prepare()
             harness.redis()
-            scenario(harness, output)
+            if gateway_custody:
+                from scripts.production_gateway_custody_native import scenario as custody_scenario
+                custody_scenario(harness, output)
+            else:
+                scenario(harness, output)
         except BaseException as error:
             failure = record_failure(error, repo, output, harness.current_stage,
                                      private_commands=observation.summary() if observation else None)
@@ -1085,9 +1190,11 @@ def execute(repo, source, image_id, binary, output, *, private_host_context=None
         "failure": failure, "private_commands": commands,
         "pg_readiness": getattr(harness, "pg_readiness_counts", None),
         "sender_readiness": getattr(harness, "sender_readiness_counts", None),
+        "fixture_readiness": getattr(harness, "fixture_readiness_counts", None),
         "evidence_errors": evidence_errors, "elapsed_seconds": time.monotonic() - harness.started,
         "last_stage": harness.current_stage,
         "synthetic_only": True, "production_access": False, "existing_126_modified": False, "real_models": 0,
+        "gateway_custody": gateway_custody, "actual_125_compatibility_proven": False,
         "limits": ["unknown_before_T0_no_replay", "old_binary_not_executed", "no_power_loss_proof", "no_model_quality_proof"],
         "app_memory_bytes": 768 * 1024**2, "app_pids": 256, "pg_memory_bytes": 384 * 1024**2, "pg_pids": 64}
     fixture.save(output / "RESULT.json", report)
