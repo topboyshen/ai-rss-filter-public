@@ -1613,6 +1613,17 @@ seal_legacy_config_manifest() {
   printf '%s\n' "$sealed"
 }
 
+# Archived manifests are either the historical YAML documents or the compact
+# JSON emitted by private_release_contract.encoded() (sorted keys, ',' and ':'
+# separators, one trailing newline). Match the versioned gateway *config key*
+# in either serialization; the quoted form only occurs for a mapping key, so a
+# service reference ("source":"ai-filter-gateway-nginx") does not match.
+manifest_declares_gateway_config() {
+  local file="$1"
+  grep -Fq 'ai-filter-gateway-nginx:' "$file" ||
+    grep -Fq '"ai-filter-gateway-nginx":' "$file"
+}
+
 compose_validate() {
   local ref="$1" manifest="$2" file
   file="$(manifest_path "$manifest")"
@@ -1621,10 +1632,10 @@ compose_validate() {
 
   # Compose may return success after warning about an interpolated Nginx
   # variable and silently render it as an empty string.  For manifests that
-  # contain the versioned gateway, validate the *mounted* config with the
+  # declare the versioned gateway, validate the *mounted* config with the
   # pinned Nginx image.  Older archived manifests do not have this config and
   # remain valid rollback targets.
-  if grep -Fq 'ai-filter-gateway-nginx:' "$file"; then
+  if manifest_declares_gateway_config "$file"; then
     IMAGE_REF="$ref" release_compose -f "$file" \
       run --rm --no-deps ai-filter-web nginx -t || return $?
   fi
@@ -1696,7 +1707,7 @@ compose_up() {
   # health check turn unhealthy, which causes Compose to abandon the worker.
   # Each command has an explicit return because this function is called from
   # an `if ! compose_up` condition, where Bash suppresses errexit semantics.
-  if grep -Fq 'ai-filter-gateway-nginx:' "$file"; then
+  if manifest_declares_gateway_config "$file"; then
     IMAGE_REF="$ref" release_compose -f "$file" \
       up -d --no-build --pull never redis rsshub || return $?
     wait_healthy "$ref" "$manifest" "redis rsshub" "infra" || return $?

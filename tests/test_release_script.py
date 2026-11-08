@@ -2077,6 +2077,88 @@ def test_old_archived_manifest_skips_gateway_specific_preflight(release_env):
     assert " run --rm --no-deps " not in log.read_text()
 
 
+def _write_compact_json_manifest(path, *, gateway):
+    """Mirror private_release_contract.encoded() for an archived manifest."""
+    services = {
+        "ai-filter-api": {
+            "image": "${IMAGE_REF:?}",
+            "depends_on": {"redis": {"condition": "service_healthy"}},
+        },
+        "ai-filter-worker": {"image": "${IMAGE_REF:?}"},
+        "ai-filter-web": {
+            "image": "nginx:stable-alpine@sha256:" + "c" * 64,
+            "depends_on": {"ai-filter-api": {"condition": "service_healthy"}},
+        },
+        "redis": {"image": "redis:7-alpine"},
+        "rsshub": {"image": "rsshub:1"},
+    }
+    payload = {"services": services}
+    if gateway:
+        payload["configs"] = {
+            "ai-filter-gateway-nginx": {
+                "content": (
+                    "server {\n"
+                    "  listen 5000;\n"
+                    "  location /health { proxy_pass http://ai-filter-api:5000; }\n"
+                    "}\n"
+                )
+            }
+        }
+        services["ai-filter-web"]["configs"] = [
+            {
+                "source": "ai-filter-gateway-nginx",
+                "target": "/etc/nginx/nginx.conf",
+                "mode": "0444",
+            }
+        ]
+    path.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_compact_json_manifest_runs_gateway_preflight_and_ordered_convergence(
+    release_env, tmp_path
+):
+    env, log, _registry, _old_manifest = release_env
+    manifest = _write_compact_json_manifest(
+        tmp_path / "private-compose.json", gateway=True
+    )
+    env["RELEASE_COMPOSE_FILE"] = str(manifest)
+
+    result = _run_release(env, "deploy", "my-ai-filter:2026.11.08.130")
+
+    assert result.returncode == 0, result.stderr
+    calls = log.read_text()
+    assert "run --rm --no-deps ai-filter-web nginx -t" in calls
+    ordered = [
+        "up -d --no-build --pull never redis rsshub",
+        "up -d --no-build --pull never --no-deps --force-recreate ai-filter-api",
+        "up -d --no-build --pull never --no-deps --force-recreate ai-filter-web",
+        "up -d --no-build --pull never --no-deps --force-recreate ai-filter-worker",
+    ]
+    positions = [calls.index(fragment) for fragment in ordered]
+    assert positions == sorted(positions)
+
+
+def test_compact_json_manifest_without_gateway_config_skips_gateway_steps(
+    release_env, tmp_path
+):
+    env, log, _registry, _old_manifest = release_env
+    manifest = _write_compact_json_manifest(
+        tmp_path / "private-compose.json", gateway=False
+    )
+    env["RELEASE_COMPOSE_FILE"] = str(manifest)
+
+    result = _run_release(env, "deploy", "my-ai-filter:2026.11.08.130")
+
+    assert result.returncode == 0, result.stderr
+    calls = log.read_text()
+    assert " run --rm --no-deps " not in calls
+    assert "--force-recreate" not in calls
+
+
 def test_gateway_preflight_failure_blocks_build_before_image_build(release_env):
     env, log, _registry, _old_manifest = release_env
     env["FAKE_MISSING_UNTIL_BUILD"] = "1"
