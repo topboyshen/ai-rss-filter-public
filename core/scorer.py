@@ -1547,8 +1547,9 @@ class LLMBackend:
     def is_healthy(self) -> bool:
         if self.client is None:
             return False
-        # 失败计数衰减：超过衰减间隔后自动减 1，允许后端恢复
-        now = time.time()
+        # 失败计数衰减：超过衰减间隔后自动减 1，允许后端恢复。
+        # 这是进程内的间隔，必须用单调时钟：墙钟回拨会让差值永远为负。
+        now = time.monotonic()
         with self.lock:
             if (
                 self.fail_count > 0
@@ -1572,7 +1573,10 @@ class LLMBackend:
                 f"{self.name} rate-limit lock wait exceeded {lock_timeout:.1f}s"
             )
         try:
-            now = time.time()
+            # ``next_available_at`` is an in-process deadline compared against
+            # the monotonic wait budget below; a wall clock that steps backwards
+            # would otherwise make every call look hours late.
+            now = time.monotonic()
             scheduled_at = max(now, self.next_available_at)
             wait = max(0.0, scheduled_at - now)
             if wait > max(0.0, stop_at - time.monotonic()):
@@ -1598,7 +1602,7 @@ class LLMBackend:
     def record_fail(self):
         with self.lock:
             self.fail_count += 1
-            self.last_fail_time = time.time()
+            self.last_fail_time = time.monotonic()
 
     @staticmethod
     def is_rate_limit_error(exc: Exception) -> bool:
@@ -1736,7 +1740,9 @@ class Scorer:
                 del self._score_cache[key]
                 return None
             result, ts = entry
-            if time.time() - ts > self._score_cache_ttl:
+            # In-process TTL: monotonic so a wall-clock step cannot freeze or
+            # mass-expire the cache.
+            if time.monotonic() - ts > self._score_cache_ttl:
                 del self._score_cache[key]
                 return None
             # LRU: 移动到末尾（最近使用）
@@ -1748,7 +1754,7 @@ class Scorer:
         if not isinstance(result, ScoringResult) or not result.model_name.strip():
             raise ValueError("score cache entries require a bound model identity")
         with self._score_cache_lock:
-            self._score_cache[key] = (result, time.time())
+            self._score_cache[key] = (result, time.monotonic())
             self._score_cache.move_to_end(key)
             # LRU 淘汰：超过上限时移除最旧的条目（O(1)）
             while len(self._score_cache) > self._score_cache_max:
