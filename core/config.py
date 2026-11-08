@@ -89,6 +89,141 @@ DEFAULTS = {
 }
 
 
+class ConfigError(ValueError):
+    """配置结构非法：启动或热重载时立即失败，而不是在业务路径深处崩溃。"""
+
+
+# DEFAULTS 是形状的唯一定义来源；下列键在既有用法里接受多个形状。
+_SHAPE_EXCEPTIONS = {
+    ("security", "cors_allowed_origins"): (str, list),
+}
+
+# 列表项必须是字符串的段；feeds / prompt_matchers 的项另按 mapping 校验。
+_STRING_LIST_KEYS = ("blacklist", "highlight_keywords")
+
+
+def _shape_name(value) -> str:
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "int"
+    if isinstance(value, float):
+        return "float"
+    if isinstance(value, str):
+        return "str"
+    if isinstance(value, dict):
+        return "mapping"
+    if isinstance(value, list):
+        return "list"
+    if value is None:
+        return "null"
+    return type(value).__name__
+
+
+def _type_shape_name(value: type) -> str:
+    return {
+        bool: "bool",
+        int: "int",
+        float: "float",
+        str: "str",
+        dict: "mapping",
+        list: "list",
+    }.get(value, value.__name__)
+
+
+def _matches_shape(expected, actual, allowed=None) -> bool:
+    for wanted in allowed or (expected,):
+        if isinstance(wanted, type):
+            if wanted is bool:
+                if isinstance(actual, bool):
+                    return True
+            elif wanted in (int, float):
+                if isinstance(actual, (int, float)) and not isinstance(actual, bool):
+                    return True
+            elif isinstance(actual, wanted):
+                return True
+        elif isinstance(wanted, bool):
+            if isinstance(actual, bool):
+                return True
+        elif isinstance(wanted, (int, float)):
+            # int 与 float 在阈值/间隔类配置里可互换，bool 不算数值。
+            if isinstance(actual, (int, float)) and not isinstance(actual, bool):
+                return True
+        elif isinstance(wanted, (dict, list, str)):
+            if isinstance(actual, type(wanted)):
+                return True
+        elif actual is wanted:
+            return True
+    return False
+
+
+def _shape_label(expected, allowed=None) -> str:
+    def label(value) -> str:
+        if isinstance(value, type):
+            return _type_shape_name(value)
+        return _shape_name(value)
+
+    if not allowed:
+        return label(expected)
+    return " 或 ".join(label(item) for item in allowed)
+
+
+def _collect_shape_errors(expected, actual, segments, errors, allowed=None) -> None:
+    path = ".".join(segments) or "<root>"
+    if not _matches_shape(expected, actual, allowed):
+        errors.append(
+            f"{path} 期望 {_shape_label(expected, allowed)}，实际 {_shape_name(actual)}"
+        )
+        return
+    if not isinstance(actual, dict):
+        return
+    for key, default_value in expected.items():
+        if key not in actual:
+            continue
+        child_segments = segments + (key,)
+        _collect_shape_errors(
+            default_value,
+            actual[key],
+            child_segments,
+            errors,
+            _SHAPE_EXCEPTIONS.get(child_segments),
+        )
+
+
+def _list_section(cfg: dict, key: str) -> list:
+    value = cfg.get(key)
+    return value if isinstance(value, list) else []
+
+
+def _collect_item_errors(cfg: dict, errors: list) -> None:
+    for key in _STRING_LIST_KEYS:
+        for index, item in enumerate(_list_section(cfg, key)):
+            if not isinstance(item, str):
+                errors.append(f"{key}[{index}] 期望 str，实际 {_shape_name(item)}")
+    for index, matcher in enumerate(_list_section(cfg, "prompt_matchers")):
+        if not isinstance(matcher, dict):
+            errors.append(
+                f"prompt_matchers[{index}] 期望 mapping，实际 {_shape_name(matcher)}"
+            )
+    for index, feed in enumerate(_list_section(cfg, "feeds")):
+        if not isinstance(feed, dict):
+            errors.append(f"feeds[{index}] 期望 mapping，实际 {_shape_name(feed)}")
+            continue
+        if "url" in feed and not isinstance(feed["url"], str):
+            errors.append(
+                f"feeds[{index}].url 期望 str，实际 {_shape_name(feed['url'])}"
+            )
+
+
+def _validate_config_shape(cfg: dict) -> None:
+    """一次性列出所有形状错误，避免修一个报一个。"""
+    errors: list = []
+    _collect_shape_errors(DEFAULTS, cfg, (), errors)
+    _collect_item_errors(cfg, errors)
+    if errors:
+        raise ConfigError("配置结构非法：" + "；".join(errors))
+
+
 def _merge(base, override):
     for k, v in override.items():
         if isinstance(v, dict) and k in base and isinstance(base[k], dict):
@@ -166,6 +301,8 @@ def load_config():
         if not isinstance(user_cfg, dict):
             raise TypeError("配置文件顶层必须是 YAML mapping")
         _merge(cfg, user_cfg)
+    # 先校验 YAML 形状，再让环境变量覆盖；env 派生值由本模块自己保证类型。
+    _validate_config_shape(cfg)
     _apply_secrets_from_env(cfg)
     manual_version = str(cfg.get("scoring_strategy_version") or "").strip()
     # Runtime-only host rewrites must not change the strategy identity. Compute
