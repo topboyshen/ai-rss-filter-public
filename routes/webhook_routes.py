@@ -564,6 +564,35 @@ def _delivery_strategy() -> str:
     return str(resolve_scoring_contract(_cfg()).get("scoring_strategy_version") or "unknown")
 
 
+def undrained_delivery_count(strategy: str) -> int | None:
+    """Count accepted deliveries the given contract could no longer claim.
+
+    A delivery whose ``receipt_context.strategy`` differs from the live one is
+    skipped forever by the claim loop, so publishing a new contract while it is
+    queued would strand it.  ``None`` means the spool could not be inspected and
+    the caller must fail closed.  Internal commands carry no receipt context and
+    are not bound to a scoring contract.
+    """
+    expected = str(strategy or "")
+    try:
+        with _locked_spool() as directory:
+            paths = _pending_paths_unlocked(directory) + _inflight_paths_unlocked(directory)
+            count = 0
+            for path in paths:
+                envelope = _load_spooled_task(path)
+                if envelope is None:
+                    continue
+                context = envelope.get("receipt_context")
+                if not isinstance(context, dict):
+                    continue
+                if str(context.get("strategy") or "") != expected:
+                    count += 1
+            return count
+    except Exception:
+        logger.exception("[Webhook] could not inspect undrained deliveries")
+        return None
+
+
 def _confirm_spool_file(path: Path) -> None:
     with path.open("rb") as source:
         os.fsync(source.fileno())
