@@ -289,8 +289,10 @@ def _model_name(scorer: Optional[Scorer]) -> str:
     try:
         if scorer and getattr(scorer, "backends", None):
             return getattr(scorer, "last_backend_name", "") or scorer.backends[0].model or scorer.backends[0].name
-    except Exception:
-        pass
+    except (AttributeError, IndexError, TypeError):
+        # 只容忍「后端对象形状不符合预期」；其余异常说明 scorer 本身有问题，
+        # 不应被一个展示字段静默掩盖。
+        logger.debug("Could not read model identity from scorer", exc_info=True)
     return ""
 
 
@@ -382,8 +384,12 @@ def _set_scoring_meta(entry, **meta) -> None:
     explanation = meta.pop("score_explanation", {}) or {}
     try:
         entry.scoring_meta = {**meta, **{key: explanation.get(key) for key in EXPLANATION_FIELDS}}
-    except Exception:
-        pass
+    except (AttributeError, TypeError):
+        # 不可变/无该属性的条目类型属于预期内形状，降级为 debug；
+        # 其它异常是编程错误，必须继续向上暴露。
+        logger.debug(
+            "Entry of type %s does not accept scoring_meta", type(entry).__name__
+        )
 
 
 def _stable_event_id(value: Any) -> str:
@@ -438,21 +444,34 @@ def _assign_event_identity(entry: Any, event_id: str, event_version: int) -> Non
     """Attach persisted identity without assuming a mutable feed-entry class."""
     if not event_id:
         return
+    version = int(event_version or 0)
+    attached = False
     try:
         entry.event_id = event_id
-        entry.event_version = int(event_version or 0)
-    except Exception:
+        entry.event_version = version
+        attached = True
+    except (AttributeError, TypeError):
         try:
             entry["event_id"] = event_id
-            entry["event_version"] = int(event_version or 0)
-        except Exception:
+            entry["event_version"] = version
+            attached = True
+        except (AttributeError, KeyError, TypeError):
             pass
     meta = dict(getattr(entry, "scoring_meta", {}) or {})
-    meta.update({"event_id": event_id, "event_version": int(event_version or 0)})
+    meta.update({"event_id": event_id, "event_version": version})
     try:
         entry.scoring_meta = meta
-    except Exception:
+        attached = True
+    except (AttributeError, TypeError):
         pass
+    if not attached:
+        # ``FeedEntry`` 等带 __slots__ 的类型没有 event_id 槽位，身份本来就
+        # 存在 scoring_meta 里，不算失败；只有三条路都不通才需要留痕。
+        logger.debug(
+            "Entry of type %s accepts neither attributes, items, nor scoring_meta; "
+            "persisted event identity was not attached",
+            type(entry).__name__,
+        )
 
 
 def _persisted_event_identity(entry: Any, write_result: Any = None) -> Tuple[str, int]:

@@ -980,8 +980,10 @@ def cached_feed():
                 cfg,
             )
             return Response(xml, mimetype="application/rss+xml")
-    except Exception:
-        pass
+    except Exception as e:
+        # 与 preview/fallback 两条路径保持一致：数据库或渲染故障必须留痕，
+        # 否则日志里与「该源确实没有高分条目」无法区分。
+        logger.warning("[cached_feed] primary query failed for %s: %s", target_url, str(e)[:160])
 
     # 通用观察流兜底：不按高分阈值过滤，避免新增源或低频源完全不可读。
     try:
