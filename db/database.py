@@ -120,6 +120,51 @@ def _require_event_mapping_write_authorized(
     require_event_mapping_connection_write_authorized(conn, mapping_version)
 
 
+# Presentation-only query parameters: transports append them, but they never
+# identify a different article.  Item identity parameters (for example
+# ``ai_filter_item``) are deliberately absent from this set.
+_TRACKING_QUERY_KEYS = frozenset(
+    {
+        "from",
+        "spm",
+        "ref",
+        "ref_src",
+        "fbclid",
+        "gclid",
+        "yclid",
+        "msclkid",
+        "igshid",
+        "mc_cid",
+        "mc_eid",
+        "share_source",
+        "share_token",
+    }
+)
+
+
+def _strip_tracking_query(query: str) -> str:
+    """Drop known tracking parameters, preserving order and every other key."""
+    if not query:
+        return ""
+    kept = []
+    for part in query.split("&"):
+        if not part:
+            continue
+        key = part.split("=", 1)[0].strip().lower()
+        if key.startswith("utm_") or key in _TRACKING_QUERY_KEYS:
+            continue
+        kept.append(part)
+    return "&".join(kept)
+
+
+def _canonical_article_path(path: str) -> str:
+    """Fold presentation-only path parts: letter case and trailing slashes."""
+    normalized = (path or "/").lower()
+    if normalized != "/":
+        normalized = normalized.rstrip("/") or "/"
+    return normalized
+
+
 def _normalized_article_identity(link: str) -> tuple[str, str]:
     """Return a durable observation key without exposing the source URL.
 
@@ -143,8 +188,8 @@ def _normalized_article_identity(link: str) -> tuple[str, str]:
                 (
                     parsed.scheme.lower(),
                     netloc,
-                    parsed.path or "/",
-                    parsed.query,
+                    _canonical_article_path(parsed.path),
+                    _strip_tracking_query(parsed.query),
                     "",
                 )
             )
