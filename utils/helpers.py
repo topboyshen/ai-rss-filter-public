@@ -1,3 +1,4 @@
+import random
 import re
 import time
 import threading
@@ -7,7 +8,11 @@ import urllib.parse
 import urllib.request
 from difflib import SequenceMatcher
 from typing import Optional, Dict, Any
+from urllib.error import HTTPError
 from urllib.request import Request, ProxyHandler, build_opener
+
+# 4xx 是永久失败，重试不会改变结果；只有超时与限流值得再试。
+_RETRYABLE_HTTP_STATUS = frozenset({408, 429})
 
 
 # 预编译正则（避免重复编译）
@@ -571,11 +576,17 @@ def fetch_feed(
         except PermissionError:
             # Policy failures cannot become valid through retry/backoff.
             raise
+        except HTTPError as e:
+            if e.code not in _RETRYABLE_HTTP_STATUS and not 500 <= e.code < 600:
+                # A 404/403 will answer the same way next time.
+                raise
+            last_err = e
         except Exception as e:
             last_err = e
-            if attempt == max_attempts - 1:
-                break
-            _time.sleep(backoff_base * (attempt + 1))
+        if attempt == max_attempts - 1:
+            break
+        # 抖动把同时失败的多个源错开，避免同一秒集体重试。
+        _time.sleep(backoff_base * (attempt + 1) * random.uniform(0.5, 1.0))
     if last_err:
         raise last_err
     raise RuntimeError("fetch_feed: no attempts")
