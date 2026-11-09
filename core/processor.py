@@ -1158,10 +1158,10 @@ def _persist_similar_entry(ctx, similar_info, notify_threshold):
                 "independence_key": event_id,
             }
         )
-    effective_notify = (
-        notify_threshold
-        if notify_threshold is not None
-        else DB.get_feed_thresholds(cfg, feed_url)["notify"]
+    # A reused score still produces a fresh alert, so quiet hours must raise its
+    # bar exactly like the main scoring path.
+    effective_notify = _effective_notify_threshold(
+        cfg, feed_url, notify_threshold, raw_title
     )
     if score >= effective_notify:
         send_telegram_notification(
