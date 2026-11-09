@@ -8,8 +8,12 @@ from utils.helpers import escape_html, safe_http_url
 # parsing instead of losing an oversized alert inside the failure branch.
 _MAX_MESSAGE_CHARS = 3900
 _FALLBACK_TITLE_CHARS = 300
+_FALLBACK_TAG_CHARS = 120
+_FALLBACK_LOGIC_CHARS = 300
 _LAST_RESORT_TITLE_CHARS = 120
+_LAST_RESORT_TAG_CHARS = 60
 _LAST_RESORT_LOGIC_CHARS = 200
+_LINK_OMITTED = "\n\U0001f517 原文链接超过单条消息上限，已省略"
 
 
 def _telegram_message(title, link, score, tag, logic):
@@ -25,25 +29,48 @@ def _telegram_message(title, link, score, tag, logic):
     return msg
 
 
+def _clip(value, limit):
+    return str(value or "")[:limit]
+
+
 def _bounded_telegram_message(title, link, score, tag, logic):
-    """Degrade an oversized alert instead of letting the provider reject it whole."""
+    """Degrade an oversized alert instead of letting the provider reject it whole.
+
+    The source link is the only way back to the article, so it survives the
+    first two degradations: title, tag and explanation are shortened before the
+    link is considered.  A link that still cannot fit the smallest message is
+    omitted explicitly; it is never truncated, which would forge a different
+    address.  tag/logic are contract-bounded upstream; shortening them only
+    protects callers outside that contract.
+    """
     msg = _telegram_message(title, link, score, tag, logic)
     if len(msg) <= _MAX_MESSAGE_CHARS:
         return msg
     msg = _telegram_message(
-        str(title or "")[:_FALLBACK_TITLE_CHARS], "", score, tag, logic
+        _clip(title, _FALLBACK_TITLE_CHARS),
+        link,
+        score,
+        _clip(tag, _FALLBACK_TAG_CHARS),
+        _clip(logic, _FALLBACK_LOGIC_CHARS),
     )
     if len(msg) <= _MAX_MESSAGE_CHARS:
         return msg
-    # tag/logic are contract-bounded upstream; this last resort only protects
-    # callers outside that contract.
+    msg = _telegram_message(
+        _clip(title, _LAST_RESORT_TITLE_CHARS),
+        link,
+        score,
+        _clip(tag, _LAST_RESORT_TAG_CHARS),
+        _clip(logic, _LAST_RESORT_LOGIC_CHARS),
+    )
+    if len(msg) <= _MAX_MESSAGE_CHARS:
+        return msg
     return _telegram_message(
-        str(title or "")[:_LAST_RESORT_TITLE_CHARS],
+        _clip(title, _LAST_RESORT_TITLE_CHARS),
         "",
         score,
-        tag,
-        str(logic or "")[:_LAST_RESORT_LOGIC_CHARS],
-    )
+        _clip(tag, _LAST_RESORT_TAG_CHARS),
+        _clip(logic, _LAST_RESORT_LOGIC_CHARS),
+    ) + _LINK_OMITTED
 
 
 def send_telegram_notification(title, link, score, tag, logic, cfg, notify_threshold=None):
