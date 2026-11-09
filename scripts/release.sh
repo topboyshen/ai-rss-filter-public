@@ -1653,7 +1653,12 @@ validate_runtime_secrets_for_manifest() {
     ai_filter_integration_token \
     quant_market_context_token
   do
-    if ! grep -Fq "${secret_name}:" "$file"; then
+    # The archived manifest may be YAML (`name:`) or JSON (`"name":`), and
+    # YAML keys may be single- or double-quoted. Match the key with an
+    # optional quote and optional whitespace before the colon. This pattern
+    # is a strict superset of the previous fixed-string check, so a manifest
+    # that mentions the name at all is still validated (fail closed).
+    if ! grep -Eq "${secret_name}[\"']?[[:space:]]*:" "$file"; then
       continue
     fi
     secret_file="${ROOT}/secrets/${secret_name}"

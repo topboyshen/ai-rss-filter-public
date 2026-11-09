@@ -1509,6 +1509,83 @@ def test_deploy_accepts_graphic_secret_without_trailing_lf(release_env):
     assert result.returncode == 0, result.stderr
 
 
+def _write_compact_json_compose_manifest(path):
+    secret_names = (
+        "dashboard_session_secret",
+        "ai_filter_integration_token",
+        "quant_market_context_token",
+    )
+    manifest = {
+        "services": {
+            "ai-filter-api": {
+                "image": "${IMAGE_REF}",
+                "secrets": list(secret_names),
+            },
+            "ai-filter-worker": {"image": "${IMAGE_REF}"},
+            "ai-filter-web": {"image": "${IMAGE_REF}"},
+            "redis": {"image": "redis:7"},
+            "rsshub": {"image": "rsshub:1"},
+        },
+        "secrets": {
+            name: {"file": f"./secrets/{name}"} for name in secret_names
+        },
+    }
+    # Compact JSON with no space after the colon: the exact key form the
+    # previous fixed-string YAML check ("name:") silently skipped.
+    path.write_text(
+        json.dumps(manifest, separators=(",", ":")), encoding="utf-8"
+    )
+
+
+def test_deploy_rejects_json_manifest_with_missing_runtime_secret(
+    release_env, tmp_path
+):
+    env, log, registry, _old_manifest = release_env
+    manifest = tmp_path / "json-compose.json"
+    _write_compact_json_compose_manifest(manifest)
+    env["RELEASE_COMPOSE_FILE"] = str(manifest)
+    (PROJECT_ROOT / "secrets" / "dashboard_session_secret").unlink()
+
+    result = _run_release(env, "deploy", "my-ai-filter:2026.07.12.13")
+
+    assert result.returncode != 0
+    assert "Runtime secret" in result.stderr
+    assert "dashboard_session_secret" in result.stderr
+    assert " up -d " not in log.read_text()
+    assert "preflight_failed" in (registry / "history.tsv").read_text()
+
+
+def test_deploy_rejects_json_manifest_with_insecure_runtime_secret_mode(
+    release_env, tmp_path
+):
+    env, log, _registry, _old_manifest = release_env
+    manifest = tmp_path / "json-compose.json"
+    _write_compact_json_compose_manifest(manifest)
+    env["RELEASE_COMPOSE_FILE"] = str(manifest)
+    secret = PROJECT_ROOT / "secrets" / "ai_filter_integration_token"
+    secret.chmod(0o644)
+
+    result = _run_release(env, "deploy", "my-ai-filter:2026.07.12.14")
+
+    assert result.returncode != 0
+    assert "mode 0400 or 0600" in result.stderr
+    assert "ai_filter_integration_token" in result.stderr
+    assert " up -d " not in log.read_text()
+
+
+def test_deploy_accepts_json_manifest_with_valid_runtime_secrets(
+    release_env, tmp_path
+):
+    env, _log, _registry, _old_manifest = release_env
+    manifest = tmp_path / "json-compose.json"
+    _write_compact_json_compose_manifest(manifest)
+    env["RELEASE_COMPOSE_FILE"] = str(manifest)
+
+    result = _run_release(env, "deploy", "my-ai-filter:2026.07.12.15")
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_digest_ref_must_resolve_to_requested_digest(release_env):
     env, _log, _registry, _old_manifest = release_env
     wrong = "b" * 64
