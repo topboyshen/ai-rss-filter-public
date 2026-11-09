@@ -68,7 +68,8 @@
 **Priority**: P3（长期重构）
 
 ### Dashboard 巡检快照缺少 `trading_calendar`（2026-11-10）
-**Status**: Open  
+**Status**: Fixed（2026-11-10，`fix/dashboard-trading-calendar-20261110` 按方案 A 落地：producer 与
+consumer 两侧白名单同步加入 `trading_calendar`，两侧各补测试；2026-12 前的续期仍需补 2027 年休市安排）  
 **Impact**: `ops/ai_filter_ops_check.py` 的 `CHECKS` 会执行交易日历覆盖检查，但写 dashboard 快照时
 `_DASHBOARD_CHECK_NAMES` 不含 `trading_calendar`，dashboard 读取端 `_HOST_CHECKS` 也没有这一项；
 日历缺年份的告警不会出现在页面与 attention 列表，只能从巡检日志/退出码看到。`_CHINA_HOLIDAYS_BY_YEAR`
@@ -80,7 +81,8 @@
 - 方案 A: 同一提交内同时给 producer `_DASHBOARD_CHECK_NAMES` 与 consumer `_HOST_CHECKS` 加
   `trading_calendar`（标题「交易日历」），并补两侧测试
 - 方案 B: 抽一份共享检查清单，producer 与 consumer 都从它派生，避免再次漂移
-**Priority**: P1（2026-12-02 起巡检会持续失败，修复窗口约三周）
+**Priority**: P1（本条「告警可见性」已修；**日历数据本身仍缺 2027 年休市安排**，`check_trading_calendar`
+会从 2026-12-02 起失败，需在这之前补 `_CHINA_HOLIDAYS_BY_YEAR[2027]`）
 
 ---
 

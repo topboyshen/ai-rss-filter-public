@@ -32,6 +32,7 @@ _HOST_CHECKS = {
     "event_enrichment": "事件丰富化",
     "market_timer": "收盘任务",
     "market_history": "历史行情任务",
+    "trading_calendar": "交易日历",
     "root_disk": "根分区空间",
     "backup": "备份",
     "restore_drill": "恢复演练",

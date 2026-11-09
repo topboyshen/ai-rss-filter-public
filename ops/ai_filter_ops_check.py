@@ -1656,7 +1656,7 @@ def _write_state(path: Path, payload: dict[str, object]) -> None:
 _DASHBOARD_CHECK_NAMES = frozenset({
     "metrics", "notification_transport", "backup", "restore_drill",
     "offsite_upload", "event_enrichment", "market_timer", "market_history",
-    "root_disk", "release_containers",
+    "trading_calendar", "root_disk", "release_containers",
 })
 _DASHBOARD_CHECK_ALIASES = {
     "check_offsite": "offsite_upload",
