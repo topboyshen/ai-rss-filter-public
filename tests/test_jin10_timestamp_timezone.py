@@ -49,3 +49,13 @@ def test_naive_minute_precision_is_read_as_beijing_wall_clock(utc_process):
 def test_aware_input_still_uses_its_own_offset(utc_process):
     assert calendar.timegm(_parse_timestamp("2026-07-13T20:03:53+08:00")) == EXPECTED
     assert calendar.timegm(_parse_timestamp("2026-07-13T12:03:53Z")) == EXPECTED
+
+
+def test_rfc2822_unknown_offset_is_utc_not_beijing(utc_process):
+    """``-0000`` means "UTC with unknown local zone", not a naive Beijing value.
+
+    RFC 5322 defines ``-0000`` as UTC with an unknown local zone; Python's
+    ``email.utils.parsedate_to_datetime`` returns a *naive* datetime for it, so
+    the naive branch would otherwise reinterpret a UTC instant as Beijing time.
+    """
+    assert calendar.timegm(_parse_timestamp("Mon, 13 Jul 2026 12:03:53 -0000")) == EXPECTED
