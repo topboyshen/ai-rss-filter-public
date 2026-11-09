@@ -1968,18 +1968,29 @@ record_current() {
 }
 
 restore_previous() {
-  local ref="$1" digest="$2" manifest="$3" services="$4" actual
+  local action="$1" ref="$2" digest="$3" manifest="$4" services="$5" actual
   if [[ -z "$ref" ]]; then
     echo "No previous release state is recorded" >&2
     return 1
   fi
-  echo "Restoring previous release $ref with manifest $manifest" >&2
+  # During a rollback "previous" is the release being rolled away from, so the
+  # same sentence would read as a successful rollback while the rejected
+  # release is actually being put back.
+  if [[ "$action" == "rollback" ]]; then
+    echo "Rollback target failed; restoring recorded current release $ref with manifest $manifest" >&2
+  else
+    echo "Restoring previous release $ref with manifest $manifest" >&2
+  fi
   validate_recorded_state "$ref" "$digest" "$manifest" "$services"
   validate_event_mapping_release_target \
     "auto-rollback" "$ref" "$digest" "$manifest" "" "" "" || return $?
   compose_up "$digest" "$manifest"
   if ! wait_healthy "$digest" "$manifest" "$services" "rollback-final"; then
-    echo "Automatic rollback also failed health checks" >&2
+    if [[ "$action" == "rollback" ]]; then
+      echo "The recorded current release also failed health checks" >&2
+    else
+      echo "Automatic rollback also failed health checks" >&2
+    fi
     return 1
   fi
   actual="$(resolved_image_id "$ref")"
@@ -2050,7 +2061,7 @@ deploy_ref() {
     if [[ -n "$previous_ref" ]] && \
        [[ "$previous_ref|$previous_manifest" != "$ref|$manifest" ]]; then
       if [[ "$AUTO_ROLLBACK" == "1" ]]; then
-        restore_previous "$previous_ref" "$previous_digest" "$previous_manifest" "$previous_services" || return 5
+        restore_previous "$action" "$previous_ref" "$previous_digest" "$previous_manifest" "$previous_services" || return 5
       else
         echo "Automatic image rollback is disabled; leaving recovery to the maintenance caller" >&2
       fi
@@ -2070,7 +2081,7 @@ deploy_ref() {
   if [[ -n "$previous_ref" ]] && \
      [[ "$previous_ref|$previous_manifest" != "$ref|$manifest" ]]; then
     if [[ "$AUTO_ROLLBACK" == "1" ]]; then
-      restore_previous "$previous_ref" "$previous_digest" "$previous_manifest" "$previous_services" || return 5
+      restore_previous "$action" "$previous_ref" "$previous_digest" "$previous_manifest" "$previous_services" || return 5
     else
       echo "Automatic image rollback is disabled; leaving recovery to the maintenance caller" >&2
     fi
