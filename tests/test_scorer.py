@@ -807,6 +807,36 @@ def test_compact_score_contract_loads_from_backend_config(monkeypatch):
     assert scorer.backends[0].compact_score_contract is True
 
 
+def test_legacy_single_backend_dict_config_still_initializes(monkeypatch):
+    """旧配置（``llm`` 为单个字典）必须继续可用；这是向后兼容分支。"""
+    import core.scorer as scorer_module
+    from core.config import config
+
+    monkeypatch.setattr(scorer_module, "OpenAI", lambda **kwargs: object())
+    monkeypatch.setattr(
+        config,
+        "_cfg",
+        {
+            "llm": {
+                "api_key": "test-key",
+                "base_url": "https://legacy.example.test/v1",
+                "model": "legacy-model",
+            }
+        },
+    )
+    scorer = object.__new__(Scorer)
+    scorer.backends = []
+    scorer._init_backends()
+
+    assert len(scorer.backends) == 1
+    backend = scorer.backends[0]
+    assert backend.name == "legacy"
+    assert backend.model == "legacy-model"
+    assert backend.priority == 1
+    assert backend.rate_limit == 3.0
+    assert backend.timeout == 25
+
+
 def test_score_cache_key_includes_compact_score_contract():
     scorer = Scorer()
     compact = LLMBackend(
