@@ -215,6 +215,18 @@ def _normalized_item_link(item: dict[str, Any], item_id: str) -> str:
     return ""
 
 
+def _pin_unknown_offset_to_utc(text: str) -> str:
+    """Pin RFC 5322 ``-0000`` to UTC before parsing.
+
+    ``-0000`` means "UTC with an unknown local zone".  ``email.utils`` returns a
+    naive datetime for it, which the caller would otherwise read as Beijing
+    wall-clock time and shift by eight hours.
+    """
+    if text.endswith("-0000"):
+        return text[:-5] + "+0000"
+    return text
+
+
 def _parse_timestamp(value: Any) -> time.struct_time | None:
     if value is None or value == "":
         return None
@@ -232,7 +244,7 @@ def _parse_timestamp(value: Any) -> time.struct_time | None:
 
     for parser in (
         lambda v: datetime.fromisoformat(v.replace("Z", "+00:00")),
-        parsedate_to_datetime,
+        lambda v: parsedate_to_datetime(_pin_unknown_offset_to_utc(v)),
     ):
         try:
             parsed = parser(text)
