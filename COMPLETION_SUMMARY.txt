@@ -2,6 +2,12 @@
 ai-rss-filter 改进任务 100% 完成
 ========================================
 
+[2026-11-09 更正] 本文件是历史快照。按当前代码与编排核对：
+- 中期/长期 6 项并未进入默认部署：无 PostgreSQL 服务、Prometheus 抓取为空、
+  Grafana 仪表板不加载、ML 训练脚本是打印占位符、feedback 蓝图未注册。
+- 指标端点已是需要 X-API-Key 的 /metrics；/prometheus-metrics 返回 404。
+- 可用的部署/验证命令以 DEPLOYMENT.md 为准。
+
 ✅ 短期改进 (3/3 - 100%)
   ✅ Prometheus Metrics 监控系统
   ✅ LLM API 配置优化  
@@ -28,13 +34,16 @@ Git 提交: 6 个功能提交
 状态: ✅ 所有改进已完成并提交
 
 ========================================
-部署命令:
-1. docker-compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
-2. docker exec ai-rss-filter-ai-filter-worker-1 python3 /app/scripts/migrate_to_postgres.py
-3. cd ml && python3 train_classifier.py
+部署命令（历史，均不适用于默认部署）:
+1. ~~docker-compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d~~
+   （栈可启动，但 Prometheus 无抓取任务、Grafana 无数据）
+2. ~~docker exec ai-rss-filter-ai-filter-worker-1 python3 /app/scripts/migrate_to_postgres.py~~
+   （镜像不含该脚本，编排也没有 postgres 服务）
+3. ~~cd ml && python3 train_classifier.py~~
+   （占位脚本，只打印一行信息）
 
 验证:
-- curl http://127.0.0.1:5000/prometheus-metrics
-- http://127.0.0.1:3000 (Grafana)
-- http://127.0.0.1:9090 (Prometheus)
+- curl -H "X-API-Key: $AI_FILTER_API_KEY" http://127.0.0.1:5000/metrics
+- http://127.0.0.1:3000 (Grafana，界面可开，无指标数据)
+- http://127.0.0.1:9090 (Prometheus，无活动抓取任务)
 ========================================
