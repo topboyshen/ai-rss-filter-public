@@ -442,8 +442,6 @@ networks:
     driver: bridge
 
 volumes:
-  postgres-data:
-    driver: local
   redis-data:
   # Application containers never need the host release registry. This empty,
   # read-only nested mount prevents a compromised process from rewriting

@@ -76,10 +76,9 @@ _MAX_TITLE_CHARS = 512
 _MAX_URL_CHARS = 2048
 _MAX_CONTENT_BYTES = 20 * 1024
 
-_webhook_replay_ttl = _bounded_env_int("WEBHOOK_REPLAY_TTL_SECONDS", 600, 30, 86400)
+# Receipt pruning bound.  Replay suppression itself is owned by the durable
+# spool receipt check, so there is no second in-memory replay cache.
 _webhook_replay_max = _bounded_env_int("WEBHOOK_REPLAY_MAX_ENTRIES", 2048, 128, 8192)
-_webhook_replay_lock = threading.Lock()
-_webhook_replay_seen: OrderedDict[str, float] = OrderedDict()
 
 # Durable outbox.  The default lives under the bind-mounted data directory so
 # accepted webhooks survive both Gunicorn worker and container restarts.
@@ -183,30 +182,6 @@ def _clip_utf8(value: Any, max_bytes: int) -> str:
     if len(raw) <= max_bytes:
         return raw.decode("utf-8")
     return raw[:max_bytes].decode("utf-8", errors="ignore")
-
-
-def _reserve_webhook_digest(body: bytes) -> tuple[str, bool]:
-    """Reserve an authenticated payload digest to suppress exact replays."""
-    digest = hashlib.sha256(body).hexdigest()
-    now = time.time()
-    with _webhook_replay_lock:
-        while _webhook_replay_seen:
-            _key, seen_at = next(iter(_webhook_replay_seen.items()))
-            if now - seen_at < _webhook_replay_ttl:
-                break
-            _webhook_replay_seen.popitem(last=False)
-        if digest in _webhook_replay_seen:
-            _webhook_replay_seen.move_to_end(digest)
-            return digest, False
-        _webhook_replay_seen[digest] = now
-        while len(_webhook_replay_seen) > _webhook_replay_max:
-            _webhook_replay_seen.popitem(last=False)
-    return digest, True
-
-
-def _forget_webhook_digest(digest: str) -> None:
-    with _webhook_replay_lock:
-        _webhook_replay_seen.pop(digest, None)
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -404,10 +379,6 @@ def _spool_task_meta(path: Path) -> tuple[str, float | None]:
 
 def _spool_task_type(path: Path) -> str:
     return _spool_task_meta(path)[0]
-
-
-def _spool_task_priority(path: Path) -> int:
-    return _task_type_priority(_spool_task_type(path))
 
 
 def _task_type_priority(task_type: str) -> int:

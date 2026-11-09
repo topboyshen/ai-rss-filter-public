@@ -28,7 +28,6 @@ from services.news_reading import (
     restore_reading_titles,
     score_contract_label,
 )
-from db.event_core import canonical_event_id
 from utils.helpers import (
     escape_html,
     normalize_direction,
@@ -210,14 +209,6 @@ _SOURCE_BRAND_MARKERS = (
 
 def _cutoff_ts(hours: int = REALTIME_FEED_HOURS) -> int:
     return int(time.time()) - max(1, int(hours)) * 3600
-
-
-def _is_recent_entry(entry: dict, hours: int = REALTIME_FEED_HOURS) -> bool:
-    ts = entry.get("time", 0) or entry.get("created_at", 0)
-    try:
-        return int(ts) >= _cutoff_ts(hours)
-    except (TypeError, ValueError):
-        return False
 
 
 def _entry_timestamp(entry: dict) -> int:
@@ -734,20 +725,6 @@ def _row_safe_neutral_reason(row) -> str:
         return str(row["safe_neutral_reason"] or "")
     except (KeyError, IndexError):
         return ""
-
-
-def _resolve_event_version(conn, event_id: str):
-    """Resolve canonical event id and current version; fail closed."""
-    try:
-        event_id = canonical_event_id(conn, event_id)
-        version_row = conn.execute(
-            "SELECT version FROM events WHERE event_id = ?",
-            (event_id,),
-        ).fetchone()
-        return event_id, max(1, int(version_row[0])) if version_row else 0
-    except Exception:
-        return "", 0
-
 
 
 def _cache_score_source_projection(columns, event_columns) -> str:
