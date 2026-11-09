@@ -9,10 +9,7 @@ import yaml
 from core.prompts import get_prompt_for_url
 from core.scorer import (
     _SCORE_COMPACT_JSON_OUTPUT_INSTRUCTION,
-    _SCORE_COMPACT_REPAIR_INSTRUCTION,
     _SCORE_JSON_OUTPUT_INSTRUCTION,
-    _SCORE_GROUNDING_REPAIR_INSTRUCTION,
-    _SCORE_REPAIR_INSTRUCTION,
     _SCORE_SAFE_NEUTRAL_JSON,
     _SUMMARY_REPAIR_INSTRUCTION,
     _SUMMARY_SYSTEM_PROMPT,
@@ -63,29 +60,12 @@ def test_compact_score_contract_is_short_and_copyable():
     )
     assert _SCORE_SAFE_NEUTRAL_JSON in _SCORE_COMPACT_JSON_OUTPUT_INSTRUCTION
     assert "宏观放水" not in _SCORE_COMPACT_JSON_OUTPUT_INSTRUCTION
-    assert "只输出下面这一行 JSON，不要其它文字：" in (
-        _SCORE_COMPACT_REPAIR_INSTRUCTION
-    )
-    assert _SCORE_COMPACT_REPAIR_INSTRUCTION == (
-        "只输出下面这一行 JSON，不要其它文字：" + _SCORE_SAFE_NEUTRAL_JSON
-    )
     assert len(_SCORE_COMPACT_JSON_OUTPUT_INSTRUCTION) < len(
         _SCORE_JSON_OUTPUT_INSTRUCTION
     )
 
 
-def test_repair_prompts_are_fixed_and_summary_prompts_have_no_concrete_numerals():
-    assert "tag 最多十个字符" in _SCORE_REPAIR_INSTRUCTION
-    assert "logic 最多八十个字符" in _SCORE_REPAIR_INSTRUCTION
-    assert "无法从当前新闻来源核对" in _SCORE_GROUNDING_REPAIR_INSTRUCTION
-    assert "不要重新评分" in _SCORE_GROUNDING_REPAIR_INSTRUCTION
-    assert (
-        '{"score":4,"tag":"其他","logic":"来源未显示明确投资催化",'
-        '"sentiment":"中性"}' in _SCORE_GROUNDING_REPAIR_INSTRUCTION
-    )
-    assert "不要引用、复述或解释先前答复" in (
-        _SCORE_GROUNDING_REPAIR_INSTRUCTION
-    )
+def test_summary_prompts_have_no_concrete_numerals():
     forbidden = set("0123456789一二三四五六七八九十百千万亿")
     assert not (forbidden & set(_SUMMARY_SYSTEM_PROMPT))
     assert not (forbidden & set(_SUMMARY_REPAIR_INSTRUCTION))

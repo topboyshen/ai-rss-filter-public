@@ -24,10 +24,10 @@
    - db/database.py - 数据库锁定监控
 
 ### 中期改进（3/3）✅
-1. **PostgreSQL 迁移** - 100%
-   - 迁移脚本：scripts/migrate_to_postgres.py
-   - docker-compose.yml 已添加 postgres 服务
-   - 健康检查和自动重启已配置
+1. **PostgreSQL 迁移** - 未进入默认部署（更正）
+   - 迁移脚本：scripts/migrate_to_postgres.py，仅作历史参考保留
+   - 镜像不 COPY 该脚本，docker-compose.yml 也没有 postgres 服务
+   - 脚本依赖未声明的 psycopg2（v2），与 requirements-ops.txt 的 psycopg 3.x 不兼容
 
 2. **Grafana 监控仪表板** - 100%
    - docker-compose.monitoring.yml 已创建
@@ -72,7 +72,7 @@
 
 ### 基础设施
 - docker-compose.monitoring.yml (59 行) - 监控栈
-- scripts/migrate_to_postgres.py (88 行) - 数据库迁移
+- scripts/migrate_to_postgres.py (88 行) - 数据库迁移（历史参考；不进镜像，依赖 psycopg2 未声明）
 - monitoring/prometheus.yml (12 行) - Prometheus 配置
 - monitoring/grafana/datasources/prometheus.yml (8 行)
 - monitoring/grafana/dashboards/ai-rss-filter.json (24 行)
@@ -186,11 +186,7 @@ Web (nginx) → API (Flask) → Worker (Python)
    docker-compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
    ```
 
-2. 执行 PostgreSQL 迁移
-   ```bash
-   docker-compose up -d postgres
-   docker exec ai-rss-filter-ai-filter-worker-1 python3 /app/scripts/migrate_to_postgres.py
-   ```
+2. ~~执行 PostgreSQL 迁移~~（更正：默认部署使用 SQLite，镜像和编排都不提供 PostgreSQL；确需迁移须自备实例、安装 psycopg2 并单独拷入脚本）
 
 3. 训练 ML 模型
    ```bash
