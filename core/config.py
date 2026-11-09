@@ -95,7 +95,13 @@ class ConfigError(ValueError):
 
 # DEFAULTS 是形状的唯一定义来源；下列键在既有用法里接受多个形状。
 _SHAPE_EXCEPTIONS = {
-    ("security", "cors_allowed_origins"): (str, list),
+    # null 表示"不启用 CORS"，routes/shared.py 按 falsy 处理。
+    ("security", "cors_allowed_origins"): (str, list, type(None)),
+    # Telegram Bot API 的 chat_id 既接受字符串也接受整数。
+    ("telegram", "chat_id"): (str, int),
+    # 这两个列表只被 `if value:` 消费，null 等价于空列表。
+    ("blacklist",): (list, type(None)),
+    ("highlight_keywords",): (list, type(None)),
 }
 
 # 列表项必须是字符串的段；feeds / prompt_matchers 的项另按 mapping 校验。
@@ -301,9 +307,10 @@ def load_config():
         if not isinstance(user_cfg, dict):
             raise TypeError("配置文件顶层必须是 YAML mapping")
         _merge(cfg, user_cfg)
-    # 先校验 YAML 形状，再让环境变量覆盖；env 派生值由本模块自己保证类型。
-    _validate_config_shape(cfg)
+    # 环境变量先行：YAML 里的空占位（如 ``api_key:``）由 env 补上后才是最终
+    # 生效值，先校验会把这种一直合法的部署判死。env 派生值由本模块保证类型。
     _apply_secrets_from_env(cfg)
+    _validate_config_shape(cfg)
     manual_version = str(cfg.get("scoring_strategy_version") or "").strip()
     # Runtime-only host rewrites must not change the strategy identity. Compute
     # from the canonical YAML URLs first, then expose container-reachable URLs.
@@ -359,7 +366,11 @@ def _apply_rsshub_base_url_from_env(cfg: dict) -> None:
 
 def _apply_secrets_from_env(cfg: dict) -> None:
     """环境变量覆盖敏感项（不写入文件，优先于 config.yaml）。"""
-    se = cfg.setdefault("security", {})
+    # env 在校验之前应用，形状错误的整段不能被这里当成 mapping 使用；
+    # 直接跳过，交给 _validate_config_shape 报出准确路径。
+    se = cfg.get("security")
+    if not isinstance(se, dict):
+        se = {}
     for env_name in ("AI_FILTER_API_KEY", "API_KEY"):
         v = (os.environ.get(env_name) or "").strip()
         if v:
@@ -374,7 +385,9 @@ def _apply_secrets_from_env(cfg: dict) -> None:
     v = (os.environ.get("AI_FILTER_CORS_ALLOWED_ORIGINS") or "").strip()
     if v:
         se["cors_allowed_origins"] = "*" if v == "*" else [x.strip() for x in v.split(",") if x.strip()]
-    tg = cfg.setdefault("telegram", {})
+    tg = cfg.get("telegram")
+    if not isinstance(tg, dict):
+        tg = {}
     if (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip():
         tg["bot_token"] = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if (os.environ.get("TELEGRAM_CHAT_ID") or "").strip():
