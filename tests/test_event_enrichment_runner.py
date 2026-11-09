@@ -133,13 +133,33 @@ def _run(env):
     )
 
 
-def _wait_for_path(path: Path, timeout: float = 3.0) -> None:
+def _wait_for_path(path: Path, timeout: float = 15.0, proc=None) -> None:
+    """Wait for a marker written by a freshly spawned shell/python child.
+
+    Three seconds was not enough on loaded hosts: the child has to start bash,
+    run the release checks and reach the fake docker before touching the marker,
+    and one run in ten timed out at 3s while the same code passed at 15s.  The
+    deadline is therefore load-tolerant, and the failure message records what
+    the child was doing so a real hang stays diagnosable.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if path.exists():
             return
-        time.sleep(0.01)
-    raise AssertionError(f"timed out waiting for {path}")
+        time.sleep(0.02)
+    details = []
+    if proc is not None:
+        code = proc.poll()
+        details.append(
+            f"process exit={code}" if code is not None else "process still running"
+        )
+        if code is not None:
+            _stdout, stderr = proc.communicate()
+            if stderr:
+                details.append(f"stderr={stderr[-800:]!r}")
+    if path.parent.is_dir():
+        details.append(f"dir={sorted(item.name for item in path.parent.iterdir())}")
+    raise AssertionError(f"timed out waiting for {path} ({'; '.join(details)})")
 
 
 def _start_lock_holder(lock_path: Path, ready: Path, release: Path):
@@ -163,7 +183,7 @@ with lock_path.open("a+", encoding="utf-8") as handle:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    _wait_for_path(ready)
+    _wait_for_path(ready, proc=process)
     return process
 
 
@@ -387,7 +407,7 @@ def test_enrichment_owner_makes_refresh_busy_then_releases_for_retry(runner_env)
         stderr=subprocess.PIPE,
     )
     try:
-        _wait_for_path(started)
+        _wait_for_path(started, proc=enrichment)
 
         blocked = _run_refresh_probe(pipeline_lock)
         assert blocked.returncode == 0, blocked.stderr
