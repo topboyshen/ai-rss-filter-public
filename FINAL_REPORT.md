@@ -209,7 +209,7 @@ Web (nginx) → API (Flask) → Worker (Python)
 
 ## 💡 技术亮点
 
-1. **无重新构建部署** - 通过 docker cp 快速迭代
+1. **不可变镜像发布** - 变更必须构建新版本镜像并经发布/回滚流程上线；不再用 `docker cp` 修改运行中的容器（见 `docs/deployment-and-recovery.md`）
 2. **分层监控设计** - Metrics 端点 + 主机侧主动检查（Prometheus/Grafana 栈未启用）
 3. **渐进式 ML 替代** - 设计设想，尚未接线
 4. **用户反馈闭环** - 由 dashboard 的 `POST /feedback` 提供，`routes/feedback_routes.py` 未注册
