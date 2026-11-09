@@ -307,8 +307,11 @@ def load_config():
         if not isinstance(user_cfg, dict):
             raise TypeError("配置文件顶层必须是 YAML mapping")
         _merge(cfg, user_cfg)
-    # 环境变量先行：YAML 里的空占位（如 ``api_key:``）由 env 补上后才是最终
-    # 生效值，先校验会把这种一直合法的部署判死。env 派生值由本模块保证类型。
+    # 留空的字符串占位（如 ``api_key:``）先归一为空值：它们的空态就是 DEFAULTS
+    # 里的空字符串，直接交给校验会把一直合法的部署判死。
+    _normalize_null_placeholders(cfg)
+    # 环境变量先行：YAML 里的空占位由 env 补上后才是最终生效值。env 派生值由
+    # 本模块保证类型。
     _apply_secrets_from_env(cfg)
     _validate_config_shape(cfg)
     manual_version = str(cfg.get("scoring_strategy_version") or "").strip()
@@ -362,6 +365,30 @@ def _apply_rsshub_base_url_from_env(cfg: dict) -> None:
         "AI_FILTER_WEB_BASE_URL",
         ("http://127.0.0.1:5000", "http://localhost:5000"),
     )
+
+
+# YAML 里留空的字符串占位等同于"未配置"，DEFAULTS 中的空字符串就是它们的合法
+# 空值：消费方只在真值分支使用这些字段，``scoring_strategy_version`` 本身也按
+# ``or ""`` 归一。数字/布尔字段不在此列——写 null 从来不是有效配置。
+_NULL_AS_EMPTY = (
+    ("security", "api_key"),
+    ("telegram", "bot_token"),
+    ("telegram", "chat_id"),
+    ("scoring_strategy_version",),
+)
+
+
+def _normalize_null_placeholders(cfg: dict) -> None:
+    """把留空的字符串占位归一为空串，避免形状校验把它们判成非法形状。"""
+    for path in _NULL_AS_EMPTY:
+        section = cfg
+        for key in path[:-1]:
+            section = section.get(key)
+            if not isinstance(section, dict):
+                section = None
+                break
+        if isinstance(section, dict) and section.get(path[-1]) is None:
+            section[path[-1]] = ""
 
 
 def _apply_secrets_from_env(cfg: dict) -> None:
