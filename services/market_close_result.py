@@ -69,6 +69,15 @@ def new_run_id() -> str:
     return uuid.uuid4().hex
 
 
+def _fsync_directory(directory: Path) -> None:
+    """Persist the rename; a receipt that can vanish after a crash is not durable."""
+    dir_fd = os.open(str(directory), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
 def write_result(directory: Path, **fields: Any) -> Path:
     kind = str(fields.get("kind") or "")
     status = str(fields.get("status") or "")
@@ -92,9 +101,13 @@ def write_result(directory: Path, **fields: Any) -> Path:
     path.parent.mkdir(mode=0o700, exist_ok=True)
     encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(encoded + "\n", encoding="utf-8")
+    with tmp.open("w", encoding="utf-8") as handle:
+        handle.write(encoded + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
     tmp.chmod(0o600)
     tmp.replace(path)
+    _fsync_directory(path.parent)
     return path
 
 
