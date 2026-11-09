@@ -153,8 +153,14 @@ def _strip_tracking_query(query: str) -> str:
 
 
 def _canonical_article_path(path: str) -> str:
-    """Fold presentation-only path parts: letter case and trailing slashes."""
-    normalized = (path or "/").lower()
+    """Fold trailing slashes only: HTTP path letter case is identity-bearing.
+
+    Short links and base64-style ids can differ only in case, so lowercasing
+    the path would merge two distinct articles into one event.  That merge is
+    irreversible and overwrites the first article's title and priority, so a
+    missed merge is preferred here.
+    """
+    normalized = path or "/"
     if normalized != "/":
         normalized = normalized.rstrip("/") or "/"
     return normalized
