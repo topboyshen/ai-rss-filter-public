@@ -38,15 +38,21 @@ and networks with `external: true` and exact existing `name`. Application images
 use exactly `${IMAGE_REF:?}`; other images require immutable repository digests.
 Every app role, including optional cron/maintenance roles, must mount source
 `@RUNTIME_CONFIG@` at `/app/config.yaml` with `read_only: true` and set
-`AI_FILTER_CONFIG_PATH=/app/config.yaml`. Sealing substitutes only that source.
-No build context, include/extends, env_file, source-code mount, privileged mode,
-container name, or indirect namespace reuse is accepted. Volume/bind targets
-are restricted to explicit data directories and the frozen runtime YAML;
-interpreter/site-packages mounts are rejected. Inline configs are allowed only
-for a pinned official Nginx gateway at `/etc/nginx/nginx.conf` or
-`/etc/nginx/conf.d/default.conf`; application roles cannot mount inline configs.
-Secret names must be safe basenames. Volume, config and secret targets cannot
-overlap or repeat within a service.
+`AI_FILTER_CONFIG_PATH=/app/config.yaml`. Sealing substitutes that source and,
+for every embedded gateway config, writes a mode-0400 `<name>.conf` sealed file,
+adds it to the frozen contract inventory, and points the service config at it.
+Compose mounts a file-backed config read-only; embedded `content` is
+copy-injected into the container writable layer without a mount, so a sealed
+manifest is always file-backed. The input manifest still embeds the reviewed
+`content`; a `file` reference in the input (or one outside the seal inventory)
+is refused. No build context, include/extends, env_file, source-code mount,
+privileged mode, container name, or indirect namespace reuse is accepted.
+Volume/bind targets are restricted to explicit data directories and the frozen
+runtime YAML; interpreter/site-packages mounts are rejected. Configs are allowed
+only for a pinned official Nginx gateway at `/etc/nginx/nginx.conf` or
+`/etc/nginx/conf.d/default.conf`; application roles cannot mount configs.
+Secret and config names must be safe basenames. Volume, config and secret
+targets cannot overlap or repeat within a service.
 
 Runtime YAML must be distinct from the public example; example.invalid and
 inline credentials in recognized sensitive fields are rejected. Credentials
@@ -109,9 +115,12 @@ Replace the illustrative tag with a supported unused numeric version; never
 reuse `.126`. Build/deploy require the review to remain fresh. Historical verify
 retains integrity checks after expiry. Changing private inputs, strategy,
 topology, source or credentials requires a new review, seal and image identity.
-The local build contract records the private contract hash; omitting the private
-option later cannot turn that image into a public-mode deployment. Additional
-image labels bind the private contract hash and mounted runtime-config hash.
+Keep the sealed directory: the sealed manifest references its runtime YAML and
+gateway config files by absolute path, so historical verification and rollback
+require those frozen files to remain in place. The local build contract records
+the private contract hash; omitting the private option later cannot turn that
+image into a public-mode deployment. Additional image labels bind the private
+contract hash and mounted runtime-config hash.
 
 Compose uses the **existing project name and working directory**, regardless of
 where the clean checkout or frozen manifest lives. Before mutation, actual old
@@ -147,7 +156,8 @@ prevents a writable data directory from supplying the loader's Python imports.
 After startup, verification checks actual app container image IDs, config mount
 source/read-only status, effective environment, config bytes, and the strategy
 computed by the loader inside each running role. It also checks each service's
-mounts, networks, ports, replicas and embedded gateway-config bytes. Every
+mounts, networks, ports, replicas and gateway-config bytes, including the
+read-only config bind mount and a byte hash of the sealed config file. Every
 running service, including infrastructure, must use its exact immutable image,
 reviewed Cmd/Entrypoint, image-plus-manifest environment (including role),
 configured WorkingDir, Healthcheck, User/GroupAdd, and memory/swap/PID/CPU limits.

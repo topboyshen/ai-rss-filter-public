@@ -409,7 +409,25 @@ def expected_healthcheck(service, defaults):
     return {key: supplied[key] or value for key, value in base.items()}
 
 
-def validate_manifest(manifest, review, env_values, runtime_path):
+def validate_config_definitions(manifest, config_directory):
+    for name, definition in manifest.get("configs", {}).items():
+        require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", name), "invalid config reference name")
+        require(isinstance(definition, dict) and set(definition) in ({"content"}, {"file"}),
+                "manifest config must be embedded or a sealed file")
+        if "file" not in definition:
+            continue
+        # Compose copies embedded content into the container writable layer
+        # without creating a mount; only a file-backed config becomes the
+        # read-only bind mount the runtime verifier requires. The file must
+        # be one frozen member of the sealed contract inventory.
+        require(config_directory is not None, "file-backed config outside a sealed contract")
+        path = safe_path(definition["file"])
+        require(path.parent == Path(config_directory) and path.name == name + ".conf",
+                "file-backed config outside the sealed inventory")
+        private_file(path, sealed=True)
+
+
+def validate_manifest(manifest, review, env_values, runtime_path, config_directory=None):
     require(isinstance(manifest, dict) and set(manifest) <= {
         "name", "services", "volumes", "networks", "secrets", "configs"}, "unsupported manifest field")
     require(manifest.get("name") == review["project"]
@@ -438,9 +456,7 @@ def validate_manifest(manifest, review, env_values, runtime_path):
         # to reject replacement or rotation until a fresh review is sealed.
         record.pop("sha256")
         secret_refs.append(record)
-    for definition in manifest.get("configs", {}).values():
-        require(isinstance(definition, dict) and set(definition) == {"content"},
-                "manifest config must be embedded and frozen")
+    validate_config_definitions(manifest, config_directory)
     topology = {}
     apps = []
     used_env = set()
@@ -517,7 +533,8 @@ def validate_manifest(manifest, review, env_values, runtime_path):
         other = {k: v for k, v in service.items() if k not in {"image", "environment"}}
         require("$" not in json.dumps(other), "interpolation outside approved environment")
     for definition in manifest.get("configs", {}).values():
-        require("$" not in definition["content"].replace("$$", ""), "unescaped embedded config interpolation")
+        if "content" in definition:
+            require("$" not in definition["content"].replace("$$", ""), "unescaped embedded config interpolation")
     return sorted(apps), sorted(secret_refs, key=lambda item: item["path"])
 
 
@@ -579,11 +596,21 @@ def seal(root, config, manifest, environment, review, output):
         _helper, held = custody
         data.update(held["files"])
         inputs.update(held["inputs"])
-    # Freeze the complete manifest, with one controlled substitution only.
+    # Freeze the complete manifest with controlled substitutions only. Compose
+    # copies embedded config content into the container writable layer instead
+    # of mounting it, so emit every reviewed config as a sealed file; Compose
+    # then creates the read-only bind mount the runtime verifier requires. A
+    # config file is mounted verbatim (Compose does not interpolate it), so it
+    # holds the reviewed content with Compose's dollar escaping resolved.
     for service in deployment["services"].values():
         for mount in service.get("volumes", []):
             if mount.get("source") == RUNTIME:
                 mount["source"] = str(output / "runtime.yaml")
+    for name, definition in deployment.get("configs", {}).items():
+        data[name + ".conf"] = definition["content"].replace("$$", "$").encode()
+        deployment["configs"][name] = {"file": str(output / (name + ".conf"))}
+    require(all(set(definition) == {"file"} for definition in deployment.get("configs", {}).values()),
+            "sealed configs must be file-backed")
     data["compose.json"] = encoded(deployment)
     directory_paths = {str(project_dir)}
     directory_paths.update(mount["source"] for service in deployment["services"].values()
@@ -596,6 +623,11 @@ def seal(root, config, manifest, environment, review, output):
     output.mkdir(mode=0o700)
     for name, value in data.items():
         write_sealed(output / name, value)
+    # Re-validate the exact bytes that were frozen, now that sealed config files
+    # exist, so a substitution bug cannot emit a contract the loader would
+    # reject (or would accept only after the review has expired).
+    validate_manifest(deployment, policy, environment_values(data["environment"]),
+                      str(output / "runtime.yaml"), config_directory=output)
     write_sealed(output / "contract.json", encoded(contract))
     output.chmod(0o500)
     for directory in (output, output.parent):
@@ -613,11 +645,23 @@ def load(path, root, *, require_fresh=False):
     data, _record = private_file(path, sealed=True)
     contract = json.loads(data)
     require(contract.get("schema") == SCHEMA, "unsupported private release contract")
+    base_files = {"runtime.yaml", "input-compose.json", "environment", "review.json", "compose.json"}
     custody_files = {"custody-gateway-plan.json", "custody-configuration-proof.json"} if "retained_gateway_custody" in contract["review"] else set()
-    require(set(contract["files"]) == {"runtime.yaml", "input-compose.json", "environment", "review.json", "compose.json"} | custody_files,
+    frozen = contract.get("files")
+    require(isinstance(frozen, dict) and base_files | custody_files <= set(frozen),
             "invalid frozen file inventory")
+    # Derive the exact inventory from the frozen manifest before reading any
+    # other file, so an unexpected member is refused instead of read.
+    compose_bytes, _metadata = private_file(directory / "compose.json", sealed=True)
+    require(sha(compose_bytes) == frozen["compose.json"], "frozen private input drift")
+    definitions = json.loads(compose_bytes).get("configs", {})
+    require(isinstance(definitions, dict) and all(isinstance(definition, dict) for definition in definitions.values()),
+            "invalid config inventory")
+    config_files = {name + ".conf" for name, definition in definitions.items() if "file" in definition}
+    require(set(frozen) == base_files | custody_files | config_files, "invalid frozen file inventory")
     files = {}
-    for name, digest in contract["files"].items():
+    for name, digest in frozen.items():
+        require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}", name), "invalid frozen file name")
         files[name], _metadata = private_file(directory / name, sealed=True)
         require(sha(files[name]) == digest, "frozen private input drift")
     require(json.loads(files["review.json"]) == contract["review"], "private review drift")
@@ -640,7 +684,8 @@ def load(path, root, *, require_fresh=False):
         fresh(policy)
     require(safe_path(policy["project_directory"]).is_dir(), "project path drift")
     manifest = json.loads(files["compose.json"])
-    apps, refs = validate_manifest(manifest, policy, environment_values(files["environment"]), str(directory / "runtime.yaml"))
+    apps, refs = validate_manifest(manifest, policy, environment_values(files["environment"]),
+                                   str(directory / "runtime.yaml"), config_directory=directory)
     expected_directories = {policy["project_directory"]}
     expected_directories.update(mount["source"] for service in manifest["services"].values()
                                 for mount in service.get("volumes", [])
@@ -972,14 +1017,18 @@ def _verify_runtime_records(contract, manifest, directory, digest, containers):
         require(type(replicas) is int and 1 <= replicas <= 16 and len(actual_topology[name]) == replicas,
                 "runtime service replica mismatch")
         for actual in actual_topology[name]:
-            # Inline Compose configs use engine-selected host sources. Bind the
+            # Compose configs use engine-selected host sources. Bind the
             # target/read-only status and hash the actual bytes inside its role.
             observed = list(actual["mounts"])
             for config in service.get("configs", []):
                 matches = [mount for mount in observed if mount["target"] == config["target"]]
                 require(len(matches) == 1 and matches[0]["read_only"], "runtime inline config mount mismatch")
                 observed.remove(matches[0])
-                content = manifest["configs"][config["source"]]["content"].replace("$$", "$").encode()
+                definition = manifest["configs"][config["source"]]
+                if "content" in definition:
+                    content = definition["content"].replace("$$", "$").encode()
+                else:
+                    content = private_file(Path(definition["file"]), sealed=True)[0]
                 value = run(["docker", "exec", actual["id"], "sha256sum", config["target"]]).decode().split()[0]
                 require(value == sha(content), "runtime inline config bytes mismatch")
             require(sorted(observed, key=lambda item: item["target"]) == sorted(expected_mounts, key=lambda item: item["target"])

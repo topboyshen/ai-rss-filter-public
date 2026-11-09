@@ -1,6 +1,7 @@
 """Synthetic private files and inspect records; no Docker or production access."""
 
 from copy import deepcopy
+import json
 import os
 from pathlib import Path
 import stat
@@ -116,6 +117,11 @@ def inspect_records(fixture, directory, *, image=DIGEST):
             mounts.append({"Type": mount["type"], "Source": source,
                            "Name": "existing-project_redis-data" if mount["type"] == "volume" else "",
                            "Destination": mount["target"], "RW": not mount.get("read_only", False)})
+        for config in service.get("configs", []):
+            definition = fixture["manifest_data"]["configs"][config["source"]]
+            source = definition.get("file") or str(directory / (config["source"] + ".conf"))
+            mounts.append({"Type": "bind", "Source": source, "Name": "",
+                           "Destination": config["target"], "RW": False})
         records.append({"Id": str(index) * 64, "Image": image, "State": {"Running": True},
                         "Config": {"Labels": {"com.docker.compose.project": "existing-project",
                                               "com.docker.compose.project.working_dir": fixture["review_data"]["project_directory"],
@@ -132,7 +138,7 @@ def inspect_records(fixture, directory, *, image=DIGEST):
     return records
 
 
-def fake_docker(monkeypatch, contract, records, *, probe=None, image_defaults=None):
+def fake_docker(monkeypatch, contract, records, *, probe=None, image_defaults=None, sha256sums=None):
     calls = []
 
     def run(args, **kwargs):
@@ -146,6 +152,8 @@ def fake_docker(monkeypatch, contract, records, *, probe=None, image_defaults=No
             return private.encoded([{"Id": DIGEST, "Config": {**defaults, **(image_defaults or {})}}])
         if args[:2] in (["docker", "volume"], ["docker", "network"]):
             return private.encoded([{"Name": args[-1]}])
+        if args[:2] == ["docker", "exec"] and args[3:4] == ["sha256sum"]:
+            return ((sha256sums or {})[args[4]] + "  " + args[4] + "\n").encode()
         if args[:2] in (["docker", "exec"], ["docker", "run"]):
             return private.encoded(probe or {"config_sha256": contract["files"]["runtime.yaml"],
                                            "strategy": contract["review"]["strategy"]})
@@ -199,7 +207,7 @@ def test_input_permissions_ownership_links_rejected(fixture, monkeypatch, mutati
         seal(fixture)
 
 
-@pytest.mark.parametrize("file", ["runtime.yaml", "compose.json", "environment", "review.json", "input-compose.json"])
+@pytest.mark.parametrize("file", ["runtime.yaml", "compose.json", "environment", "review.json", "input-compose.json", "gateway.conf"])
 def test_frozen_contents_and_permissions_cannot_drift(fixture, file):
     path = seal(fixture)
     frozen = path.parent / file
@@ -539,6 +547,79 @@ def test_application_cannot_mount_inline_configs(fixture):
     reseal_inputs(fixture)
     with pytest.raises(private.ContractError, match="application inline config"):
         seal(fixture)
+
+
+def attach_gateway_config(fixture):
+    service = fixture["manifest_data"]["services"]["redis"]
+    service["image"] = "nginx:stable-alpine@" + DIGEST
+    service["configs"] = [{"source": "gateway", "target": "/etc/nginx/nginx.conf"}]
+    reseal_inputs(fixture)
+
+
+def test_input_manifest_cannot_reference_host_config_files(fixture, tmp_path):
+    host = save(tmp_path / "host.conf", b"server {}\n")
+    fixture["manifest_data"]["configs"]["gateway"] = {"file": str(host)}
+    reseal_inputs(fixture)
+    with pytest.raises(private.ContractError, match="outside a sealed contract"):
+        seal(fixture)
+
+
+def test_embedded_config_is_sealed_as_a_read_only_file(fixture, monkeypatch):
+    attach_gateway_config(fixture)
+    path = seal(fixture)
+    contract, manifest, _ = private.load(path, fixture["root"])
+    sealed = path.parent / "gateway.conf"
+    assert manifest["configs"]["gateway"] == {"file": str(sealed)}
+    assert sealed.read_bytes() == b"proxy_set_header Host $host;"
+    assert contract["files"]["gateway.conf"] == private.sha(sealed.read_bytes())
+    assert stat.S_IMODE(sealed.stat().st_mode) == 0o400
+    records = inspect_records(fixture, path.parent)
+    fake_docker(monkeypatch, contract, records,
+                sha256sums={"/etc/nginx/nginx.conf": contract["files"]["gateway.conf"]})
+    private.verify_runtime(contract, manifest, path.parent, DIGEST)
+
+
+@pytest.mark.parametrize("mutation", ["missing", "writable", "bytes"])
+def test_runtime_gateway_config_must_be_the_frozen_read_only_file(fixture, monkeypatch, mutation):
+    attach_gateway_config(fixture)
+    path = seal(fixture)
+    contract, manifest, _ = private.load(path, fixture["root"])
+    records = inspect_records(fixture, path.parent)
+    sums = {"/etc/nginx/nginx.conf": contract["files"]["gateway.conf"]}
+    for record in records:
+        for index, mount in enumerate(record["Mounts"]):
+            if mount["Destination"] != "/etc/nginx/nginx.conf":
+                continue
+            if mutation == "missing":
+                record["Mounts"].pop(index)
+            elif mutation == "writable":
+                mount["RW"] = True
+    if mutation == "bytes":
+        sums["/etc/nginx/nginx.conf"] = "0" * 64
+    fake_docker(monkeypatch, contract, records, sha256sums=sums)
+    expected = "bytes mismatch" if mutation == "bytes" else "mount mismatch"
+    with pytest.raises(private.ContractError, match=expected):
+        private.verify_runtime(contract, manifest, path.parent, DIGEST)
+
+
+def test_sealed_manifest_cannot_point_at_a_config_outside_the_seal(fixture, tmp_path):
+    attach_gateway_config(fixture)
+    path = seal(fixture)
+    directory = path.parent
+    directory.chmod(0o700)
+    manifest = json.loads((directory / "compose.json").read_bytes())
+    manifest["configs"]["gateway"] = {"file": str(tmp_path / "gateway.conf")}
+    (directory / "compose.json").chmod(0o600)
+    (directory / "compose.json").write_bytes(private.encoded(manifest))
+    (directory / "compose.json").chmod(0o400)
+    contract = json.loads(path.read_bytes())
+    contract["files"]["compose.json"] = private.sha((directory / "compose.json").read_bytes())
+    path.chmod(0o600)
+    path.write_bytes(private.encoded(contract))
+    path.chmod(0o400)
+    directory.chmod(0o500)
+    with pytest.raises(private.ContractError, match="outside the sealed inventory"):
+        private.load(path, fixture["root"])
 
 
 @pytest.mark.parametrize("name", ["../../escape", "/absolute", "with space", "../file"])
