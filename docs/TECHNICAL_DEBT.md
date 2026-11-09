@@ -1,6 +1,6 @@
 # Technical Debt & Known Issues
 
-**Last Updated**: 2026-08-19
+**Last Updated**: 2026-11-10
 
 ---
 
@@ -66,6 +66,21 @@
 **Long-term Solution**: 引入依赖注入 / 重构为分层架构
 
 **Priority**: P3（长期重构）
+
+### Dashboard 巡检快照缺少 `trading_calendar`（2026-11-10）
+**Status**: Open  
+**Impact**: `ops/ai_filter_ops_check.py` 的 `CHECKS` 会执行交易日历覆盖检查，但写 dashboard 快照时
+`_DASHBOARD_CHECK_NAMES` 不含 `trading_calendar`，dashboard 读取端 `_HOST_CHECKS` 也没有这一项；
+日历缺年份的告警不会出现在页面与 attention 列表，只能从巡检日志/退出码看到。`_CHINA_HOLIDAYS_BY_YEAR`
+目前只有 2026，`check_trading_calendar` 会从 2026-12-02 起失败（horizon=+30 天进入 2027），
+而 2027-01-01 起收盘采集、事件结果与回测会因无法判断交易日而报错。  
+**Root Cause**: producer 与 consumer 两份白名单在 `check_trading_calendar` 加入 `CHECKS` 之前维护，
+之后没有同步；且 consumer 遇到未知检查名会把整块服务状态降为 `unknown`，所以只改一侧不够。  
+**Possible Solutions**:
+- 方案 A: 同一提交内同时给 producer `_DASHBOARD_CHECK_NAMES` 与 consumer `_HOST_CHECKS` 加
+  `trading_calendar`（标题「交易日历」），并补两侧测试
+- 方案 B: 抽一份共享检查清单，producer 与 consumer 都从它派生，避免再次漂移
+**Priority**: P1（2026-12-02 起巡检会持续失败，修复窗口约三周）
 
 ---
 
