@@ -143,7 +143,7 @@ def test_repository_configuration_passes_validation(monkeypatch):
     assert isinstance(cfg["feeds"], list)
 
 
-def test_environment_overrides_are_applied_after_shape_validation(
+def test_environment_overrides_are_applied(
     tmp_path, monkeypatch
 ):
     path = tmp_path / "config.yaml"
@@ -170,7 +170,7 @@ def test_every_offending_path_is_reported_together(tmp_path, monkeypatch):
     assert "blacklist[0]" in message
 
 
-def test_null_security_section_fails_before_env_overrides(tmp_path, monkeypatch):
+def test_null_security_section_still_fails_with_env_overrides(tmp_path, monkeypatch):
     path = tmp_path / "config.yaml"
     path.write_text("security:\n", encoding="utf-8")
     monkeypatch.setattr(config_module, "CONFIG_PATH", str(path))
@@ -209,3 +209,45 @@ def test_reload_keeps_previous_configuration_when_new_one_is_invalid(
     with pytest.raises(config_module.ConfigError):
         holder.reload()
     assert holder.cfg["threshold"]["pass"] == 6
+
+
+def test_null_secret_placeholders_are_filled_from_env(tmp_path, monkeypatch):
+    """Empty YAML placeholders must not shadow the env-provided secrets."""
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "security:\n  api_key:\ntelegram:\n  bot_token:\n  chat_id:\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config_module, "CONFIG_PATH", str(path))
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("AI_FILTER_API_KEY", "from_env_key")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "from_env_token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "from_env_chat")
+
+    cfg = config_module.load_config()
+
+    assert cfg["security"]["api_key"] == "from_env_key"
+    assert cfg["telegram"]["bot_token"] == "from_env_token"
+    assert cfg["telegram"]["chat_id"] == "from_env_chat"
+
+
+def test_numeric_telegram_chat_id_is_accepted(tmp_path, monkeypatch):
+    """Telegram accepts an integer chat id, so an unquoted YAML number is valid."""
+    cfg = _load(tmp_path, monkeypatch, "telegram:\n  chat_id: 123456789\n")
+
+    assert cfg["telegram"]["chat_id"] == 123456789
+
+
+def test_null_cors_origins_means_cors_disabled(tmp_path, monkeypatch):
+    """``cors_allowed_origins:`` is the documented way to disable CORS."""
+    cfg = _load(tmp_path, monkeypatch, "security:\n  cors_allowed_origins:\n")
+
+    assert cfg["security"]["cors_allowed_origins"] is None
+
+
+def test_null_blacklist_and_highlight_keywords_mean_empty(tmp_path, monkeypatch):
+    """Both lists are consumed with ``if value:``, so null is an empty list."""
+    cfg = _load(tmp_path, monkeypatch, "blacklist:\nhighlight_keywords:\n")
+
+    assert cfg["blacklist"] is None
+    assert cfg["highlight_keywords"] is None
