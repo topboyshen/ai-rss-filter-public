@@ -183,6 +183,28 @@ def resumed(root, descriptor):
     return read_confirmed(Path(descriptor["freeze"]["root"]) / "operations" / (arm["operation_id"] + ".json"))
 
 
+def observed_state(root, descriptor):
+    """Classify retained activation state without writing or waiting on anything.
+
+    ``readiness`` is the exact check admission applies.  When it fails but the
+    fence still reports a confirmed open generation the result must stay
+    unknown: business is closed and the reason is not one of the reviewed
+    phases, so claiming open would be worse than saying nothing.
+    """
+    if not gate._present(Path(root) / "activation.arm.json"):
+        # No activation was ever attempted; the retained initial-closed fence
+        # is the reason business stays closed.
+        return "closed-by-intent", "pre-activation"
+    try:
+        readiness(root, descriptor)
+    except Exception:
+        phase = resume_phase(root, descriptor)
+        if phase == "open":
+            raise
+        return ("resuming" if phase == "resuming" else "closing"), phase
+    return "open", "open"
+
+
 def require_business_ready():
     """Additional admission condition for production-startup processes only."""
     if not startup.enabled():
