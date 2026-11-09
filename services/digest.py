@@ -71,7 +71,15 @@ def _send_telegram_html_blocks(
                     return False
         return True
     except Exception as exc:
-        logger.warning("[Digest] Telegram push failed: %s", exc)
+        # 异常原文常带完整请求 URL（内含 bot token）或响应内容，日志只留安全分类：
+        # 异常类名与 HTTP 状态码，绝不记录 URL、请求正文或响应正文。
+        status = getattr(exc, "code", None)
+        status = status if isinstance(status, int) else None
+        logger.warning(
+            "[Digest] Telegram push failed: %s%s",
+            type(exc).__name__,
+            f" (HTTP {status})" if status is not None else "",
+        )
         return False
 
 
