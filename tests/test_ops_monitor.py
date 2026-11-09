@@ -395,6 +395,26 @@ def _write_market_result(tmp_path: Path, kind: str, **fields) -> None:
     path.chmod(0o600)
 
 
+def test_trading_calendar_check_warns_before_the_calendar_runs_out(tmp_path):
+    """The calendar must be added before 1 January, not discovered that morning."""
+    zone = ZoneInfo("Asia/Shanghai")
+    settings = _settings(tmp_path)
+    covered = int(datetime(2026, 12, 1, 9, 0, tzinfo=zone).timestamp())
+    expiring = int(datetime(2026, 12, 2, 9, 0, tzinfo=zone).timestamp())
+
+    fresh = monitor.check_trading_calendar(settings, covered)
+    stale = monitor.check_trading_calendar(settings, expiring)
+
+    assert fresh.ok is True
+    assert stale.ok is False
+    assert "2027" in stale.detail
+
+
+def test_trading_calendar_check_is_registered(tmp_path):
+    """A check nobody runs cannot alert; the tuple is the whole schedule."""
+    assert monitor.check_trading_calendar in monitor.CHECKS
+
+
 def test_market_timer_checks_service_result_and_expected_database_date(
     monkeypatch, tmp_path
 ):

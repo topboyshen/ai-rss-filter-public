@@ -78,6 +78,8 @@ _CHINA_HOLIDAYS_BY_YEAR = {
         "2026-10-06", "2026-10-07",
     }
 }
+# 提前量：官方次年休市安排通常在年前公布，留一个月处理窗口。
+_CALENDAR_HORIZON_DAYS = 30
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1068,6 +1070,32 @@ def _market_timer_from_results(
     )
 
 
+def check_trading_calendar(_settings: Settings, now: int) -> CheckResult:
+    """Fail while the A-share calendar can still be extended.
+
+    ``_is_trading_day_local`` refuses to guess for an unconfigured year, so the
+    first trading day of that year turns close collection, event outcomes and
+    backtests into errors.  The official schedule is published late in the
+    preceding year, so a check that only fails on 1 January leaves no window to
+    act.  This looks one horizon ahead instead: it starts failing while the
+    missing year is still a month away.
+    """
+    horizon = (
+        datetime.fromtimestamp(now, _MARKET_TZ).date()
+        + timedelta(days=_CALENDAR_HORIZON_DAYS)
+    )
+    if horizon.year in _CHINA_HOLIDAYS_BY_YEAR:
+        return CheckResult(
+            "trading_calendar", True, f"covers through {horizon.isoformat()}"
+        )
+    return CheckResult(
+        "trading_calendar",
+        False,
+        f"calendar missing for {horizon.year}; "
+        f"trading-day decisions fail from {horizon.year}-01-01",
+    )
+
+
 def check_market_timer(settings: Settings, now: int) -> CheckResult:
     service_unit = settings.market_service_unit or settings.timer_unit.removesuffix(".timer") + ".service"
     if not _SAFE_NAME_RE.fullmatch(settings.timer_unit) or not _SAFE_NAME_RE.fullmatch(service_unit):
@@ -1426,6 +1454,7 @@ CHECKS: tuple[Callable[[Settings, int], CheckResult], ...] = (
     check_restore_drill,
     check_offsite,
     check_event_enrichment,
+    check_trading_calendar,
     check_market_timer,
     check_market_history,
     check_root_disk,
