@@ -97,6 +97,19 @@ CURRENT_REF="$(cat data/releases/current.ref)"
 在任何新版本 preflight/容器变更之前持久化 current state；但它只能捕获 deploy 当时已经可见
 的配置，不能证明这是 checkout/pull 之前的旧发布配置，不能代替上述显式步骤。
 
+### 热重载的边界
+
+`POST /config/reload` 只重载处理该请求的进程，不会通知其它角色。生产镜像里的
+`config.yaml` 随镜像构建写入，容器不挂载它，环境变量也在创建时固定，因此生产运行中这条
+命令读到的总是与原启动相同的字节：响应里的 `changed` 为 `false`，没有任何新配置生效，
+配置变更必须走新的不可变发布。
+
+拆分布署（`AI_FILTER_ROLE=web`）下 worker 没有重载入口，响应会如实带上
+`scope: api-process` 和 `worker_reloaded: false`。若候选配置改变了评分契约，接口直接返回
+409（`reason: split_deployment`）而不是假装成功——API 单独切换契约会让之后接收的投递带
+新策略，而 worker 仍按旧契约 claim，永远无法认领。本地单进程（`role=all`，例如在
+worktree 里直接改 `config.yaml`）是该接口唯一切实可用的场景。
+
 ## 3. 应用回滚不等于数据回滚
 
 镜像回滚只处理应用与 Compose manifest，不恢复 SQLite。若某次变更包含数据库迁移，

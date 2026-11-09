@@ -156,6 +156,7 @@ def reload_config():
         return json.dumps({"error": "Unauthorized"}), 401
     from core.config import config, load_config
     from routes.shared import scorer
+    from services.shared_cache import process_role
     with cfg_lock:
         # A new scoring contract cannot claim deliveries accepted under the
         # previous one; publishing it while they are queued strands them
@@ -170,6 +171,24 @@ def reload_config():
                 "status": "unavailable",
                 "message": "无法确认评分契约是否变化，已拒绝热重载",
             }, ensure_ascii=False), status=503, mimetype="application/json")
+        changed = candidate != config.cfg
+        # 该接口只能重载发出请求的进程。拆分布署（role=web/worker）里 worker 没有
+        # 任何重载入口，API 单独切换契约会让此后接收的投递带新策略，而 worker 仍
+        # 按旧契约 claim——永远认领不上。如实拒绝，让人走发布重启。
+        scope = "all-processes" if process_role() == "all" else "api-process"
+        worker_reloaded = scope == "all-processes"
+        if candidate_version != current_version and not worker_reloaded:
+            return Response(json.dumps({
+                "status": "conflict",
+                "reason": "split_deployment",
+                "changed": True,
+                "scope": scope,
+                "worker_reloaded": False,
+                "message": (
+                    "评分契约发生变更，但热重载只作用于当前 API 进程，worker 仍使用旧契约；"
+                    "继续会让新接收的投递永远无法被认领。请走发布重启"
+                ),
+            }, ensure_ascii=False), status=409, mimetype="application/json")
         if candidate_version != current_version:
             from routes.webhook_routes import undrained_delivery_count
 
@@ -190,7 +209,19 @@ def reload_config():
                 }, ensure_ascii=False), status=409, mimetype="application/json")
         config.reload(candidate)
         scorer.reload_backends()
-    return json.dumps({"status": "ok", "message": "配置已重新加载，LLM后端与运行态缓存已刷新"}, ensure_ascii=False)
+    if not changed:
+        message = "配置值与当前进程一致，未变化；LLM后端与运行态缓存已按当前配置刷新"
+    elif worker_reloaded:
+        message = "配置已重新加载，LLM后端与运行态缓存已刷新"
+    else:
+        message = "配置已重新加载到 API 进程；worker 不会重载，仍使用启动时的配置"
+    return Response(json.dumps({
+        "status": "ok",
+        "changed": changed,
+        "scope": scope,
+        "worker_reloaded": worker_reloaded,
+        "message": message,
+    }, ensure_ascii=False), mimetype="application/json")
 
 
 @admin_bp.route("/stats")
