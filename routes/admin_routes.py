@@ -150,6 +150,39 @@ def health():
     return "OK", 200
 
 
+@admin_bp.route("/activation/state")
+def activation_state():
+    """Report retained production activation state; never changes it.
+
+    ``/health`` stays a liveness probe and ``/readiness`` only reports feed
+    staleness (and takes an admission lease, so it is unavailable while
+    business is closed).  This read-only probe is the audited exemption that
+    lets the host tell "closed by intent" apart from "state unreadable".
+    """
+    if not check_api_key():
+        return json.dumps({"error": "Unauthorized"}), 401
+    from services import production_activation, production_startup
+
+    try:
+        if not production_startup.enabled():
+            payload, status = {"state": "not_applicable"}, 200
+        else:
+            root, descriptor = production_startup.load(
+                active=False, verify_database=False, allow_activated=True
+            )
+            state, phase = production_activation.observed_state(root, descriptor)
+            payload, status = {"state": state, "phase": phase}, 200
+    except Exception as exc:
+        # Class name only: descriptors and paths must not leak into logs.
+        logger.warning("activation state unavailable: %s", type(exc).__name__)
+        payload, status = {"state": "unknown", "reason": type(exc).__name__}, 503
+    return Response(
+        json.dumps(payload, ensure_ascii=False),
+        status=status,
+        mimetype="application/json",
+    )
+
+
 @admin_bp.route("/config/reload", methods=["POST"])
 def reload_config():
     if not check_api_key():
