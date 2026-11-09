@@ -154,10 +154,41 @@ def health():
 def reload_config():
     if not check_api_key():
         return json.dumps({"error": "Unauthorized"}), 401
-    from core.config import config
+    from core.config import config, load_config
     from routes.shared import scorer
     with cfg_lock:
-        config.reload()
+        # A new scoring contract cannot claim deliveries accepted under the
+        # previous one; publishing it while they are queued strands them
+        # silently (the sender already holds a 202).  Gate the publish first.
+        candidate = load_config()
+        try:
+            current_version = _quality_strategy_version(config.cfg)
+            candidate_version = _quality_strategy_version(candidate)
+        except Exception:
+            logger.exception("Could not resolve scoring contract for reload gate")
+            return Response(json.dumps({
+                "status": "unavailable",
+                "message": "无法确认评分契约是否变化，已拒绝热重载",
+            }, ensure_ascii=False), status=503, mimetype="application/json")
+        if candidate_version != current_version:
+            from routes.webhook_routes import undrained_delivery_count
+
+            undrained = undrained_delivery_count(candidate_version)
+            if undrained is None:
+                return Response(json.dumps({
+                    "status": "unavailable",
+                    "message": "无法确认在途投递状态，已拒绝热重载以免遗留未执行的工作",
+                }, ensure_ascii=False), status=503, mimetype="application/json")
+            if undrained:
+                return Response(json.dumps({
+                    "status": "conflict",
+                    "message": (
+                        f"评分契约将变更，但队列中仍有 {undrained} 个已接收未执行的投递；"
+                        "请先排空队列再重载，否则它们会永久滞留"
+                    ),
+                    "undrained_deliveries": undrained,
+                }, ensure_ascii=False), status=409, mimetype="application/json")
+        config.reload(candidate)
         scorer.reload_backends()
     return json.dumps({"status": "ok", "message": "配置已重新加载，LLM后端与运行态缓存已刷新"}, ensure_ascii=False)
 

@@ -395,10 +395,12 @@ class ConfigHolder:
     def blacklist_re(self):
         return self._blacklist_re
 
-    def reload(self):
+    def reload(self, new_cfg=None):
         # Publish the configuration and its derived regex as one validated pair.
-        # An exception leaves the previous runtime state untouched.
-        new_cfg = load_config()
+        # An exception leaves the previous runtime state untouched.  Callers may
+        # pass an already validated candidate so the published config is exactly
+        # the one that was gated (e.g. against undrained scoring work).
+        new_cfg = load_config() if new_cfg is None else new_cfg
         new_regex = re.compile("|".join(new_cfg["blacklist"])) if new_cfg["blacklist"] else re.compile("$^")
         self._cfg, self._blacklist_re = new_cfg, new_regex
         return new_cfg
