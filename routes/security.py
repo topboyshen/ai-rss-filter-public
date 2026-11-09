@@ -156,15 +156,6 @@ def _is_approved_configured_internal_endpoint(endpoint: _Endpoint) -> bool:
     )
 
 
-def _is_internal_redirect_target(endpoint: _Endpoint) -> bool:
-    if _is_declared_internal_endpoint(endpoint):
-        return True
-    try:
-        return any(not address.is_global for address in _resolve_addresses(endpoint))
-    except (OSError, ValueError):
-        return True
-
-
 # 简易请求限速器（内存存储，单实例有效）
 _rate_limit_store: dict[str, tuple[float, int]] = {}
 _rate_limit_lock = threading.Lock()
@@ -538,20 +529,6 @@ def check_refresh_rate_limit() -> tuple[bool, str]:
             return False, f"\u8bf7\u6c42\u8fc7\u4e8e\u9891\u7e41\uff0c\u8bf7 {int(60 - (now - last))} \u79d2\u540e\u91cd\u8bd5"
         _refresh_rate_limit_store[client_ip] = now
     return True, ""
-
-
-def refresh_rate_limit(f):
-    """Flask 装饰器：限制 /refresh 端点 1 次/分钟（装饰器版本）。"""
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        ok, msg = check_refresh_rate_limit()
-        if not ok:
-            return Response(
-                json.dumps({"error": msg}, ensure_ascii=False),
-                status=429, mimetype="application/json"
-            )
-        return f(*args, **kwargs)
-    return wrapper
 
 
 def verify_miniflux_signature() -> bool:

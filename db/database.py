@@ -46,7 +46,6 @@ from db.score_explanation import (
 )
 from db.event_mapping_gate import (
     EventMappingMigrationGateError as EventMappingMigrationGateError,
-    event_mapping_migration_gate_path,
     require_event_mapping_connection_write_authorized,
     require_event_mapping_write_authorized,
 )
@@ -104,10 +103,6 @@ db_lock = threading.Lock()
 # remaining ``database is locked`` as a bounded transient deferral instead.
 SQLITE_BUSY_TIMEOUT_SECONDS = 5.0
 _SQLITE_BUSY_TIMEOUT_PRAGMA = f"PRAGMA busy_timeout={int(SQLITE_BUSY_TIMEOUT_SECONDS * 1000)}"
-
-
-def _event_mapping_migration_gate_path() -> str:
-    return event_mapping_migration_gate_path(DB_PATH)
 
 
 def _require_event_mapping_write_authorized(

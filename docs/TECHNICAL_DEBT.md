@@ -90,7 +90,6 @@
 **Target**: 85%+
 
 **Low Coverage Areas**:
-- `routes/feedback_routes.py`: 0%
 - `core/metrics.py`: 25.53%
 - `db/event_migration.py`: 56.34%
 - `services/jin10_feed.py`: 63.64%

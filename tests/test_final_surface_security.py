@@ -580,8 +580,6 @@ def test_webhook_exact_replay_is_not_resubmitted(monkeypatch, tmp_path):
     import routes.webhook_routes as webhook_routes
 
     monkeypatch.setattr(webhook_routes, "_webhook_spool_dir", tmp_path / "spool")
-    with webhook_routes._webhook_replay_lock:
-        webhook_routes._webhook_replay_seen.clear()
     payload = {"entries": [{"title": "a", "url": "https://example.com"}]}
     context, receiver = _webhook_context(payload)
     with context:
@@ -600,8 +598,6 @@ def test_webhook_queue_rejection_releases_replay_reservation(monkeypatch):
     import routes.webhook_routes as webhook_routes
 
     outcomes = iter([("full", None), ("stored", {"state": "accepted"})])
-    with webhook_routes._webhook_replay_lock:
-        webhook_routes._webhook_replay_seen.clear()
     monkeypatch.setattr(
         webhook_routes, "_submit_webhook_delivery", lambda *_args: next(outcomes)
     )
