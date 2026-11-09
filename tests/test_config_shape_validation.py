@@ -231,6 +231,44 @@ def test_null_secret_placeholders_are_filled_from_env(tmp_path, monkeypatch):
     assert cfg["telegram"]["chat_id"] == "from_env_chat"
 
 
+def test_null_string_placeholders_mean_unset_without_env(tmp_path, monkeypatch):
+    """Bare ``key:`` placeholders are a valid way to leave secrets unset.
+
+    ``api_key``/``bot_token``/``chat_id`` default to ``""`` and are only read in
+    truthy branches; ``load_config`` itself normalises a null
+    ``scoring_strategy_version`` with ``or ""``.  Rejecting null here turned a
+    deployment that booted before shape validation into a boot failure.
+    """
+    cfg = _load(
+        tmp_path,
+        monkeypatch,
+        "scoring_strategy_version:\n"
+        "security:\n"
+        "  api_key:\n"
+        "telegram:\n"
+        "  bot_token:\n"
+        "  chat_id:\n",
+    )
+
+    assert cfg["security"]["api_key"] == ""
+    assert cfg["telegram"]["bot_token"] == ""
+    assert cfg["telegram"]["chat_id"] == ""
+    assert cfg["scoring_strategy_version"] == cfg["scoring_strategy_fingerprint"]
+
+
+def test_null_numeric_setting_still_fails_fast(tmp_path, monkeypatch):
+    """Null is tolerated only where the empty value is the documented default."""
+    path = tmp_path / "config.yaml"
+    path.write_text("max_entries:\n", encoding="utf-8")
+    monkeypatch.setattr(config_module, "CONFIG_PATH", str(path))
+    _clear_env(monkeypatch)
+
+    with pytest.raises(config_module.ConfigError) as excinfo:
+        config_module.load_config()
+
+    assert "max_entries" in str(excinfo.value)
+
+
 def test_numeric_telegram_chat_id_is_accepted(tmp_path, monkeypatch):
     """Telegram accepts an integer chat id, so an unquoted YAML number is valid."""
     cfg = _load(tmp_path, monkeypatch, "telegram:\n  chat_id: 123456789\n")
