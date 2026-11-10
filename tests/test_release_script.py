@@ -298,8 +298,7 @@ if [ "$1" = "inspect" ]; then
   # Real docker gets one newline-joined argument and answers object-not-found.
   case "$container_id" in *"
 "*) echo "Error: No such object" >&2; exit 1 ;; esac
-  unhealthy=0
-  stopped=0
+  unhealthy=0 stopped=0
   if [ -n "${FAKE_FAIL_REF:-}" ] && [ "${IMAGE_REF:-}" = "$FAKE_FAIL_REF" ]; then unhealthy=1
   elif [ -n "${FAKE_FAIL_SERVICE:-}" ] && [ "$container_id" = "cid-$FAKE_FAIL_SERVICE" ]; then unhealthy=1
   elif [ -n "${FAKE_STOPPED_SERVICE:-}" ] && [ "$container_id" = "cid-$FAKE_STOPPED_SERVICE" ]; then stopped=1
@@ -324,8 +323,9 @@ if [ "$1" = "inspect" ]; then
         health="healthy"
         exit_code=0
       fi
-      printf '{"Id":"%s","Name":"/%s","RestartCount":0,"State":{"Status":"%s","Running":true,"ExitCode":%s,"OOMKilled":false,"Error":"","Health":{"Status":"%s","FailingStreak":3,"Log":[{"Start":"2026-09-02T01:00:00Z","End":"2026-09-02T01:00:01Z","ExitCode":1,"Output":"{\\"token\\":\\"json-health-secret\\"}"}]}}}\n' \
-        "$container_id" "$service" "$status" "$exit_code" "$health"
+      # printf rewrites \\" in its format string, so the inner JSON goes via %s.
+      printf '{"Id":"%s","Name":"/%s","RestartCount":0,"State":{"Status":"%s","Running":true,"ExitCode":%s,"OOMKilled":false,"Error":"","Health":{"Status":"%s","FailingStreak":3,"Log":[{"Start":"2026-09-02T01:00:00Z","End":"2026-09-02T01:00:01Z","ExitCode":1,"Output":"%s"}]}}}\n' \
+        "$container_id" "$service" "$status" "$exit_code" "$health" '{\\"token\\":\\"json-health-secret\\"}'
       ;;
   esac
   exit 0
