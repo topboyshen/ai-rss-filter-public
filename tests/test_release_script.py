@@ -296,19 +296,16 @@ if [ "$1" = "inspect" ]; then
     case "$argument" in cid-*) container_id="$argument" ;; esac
   done
   unhealthy=0
-  if [ -n "${FAKE_FAIL_REF:-}" ] && [ "${IMAGE_REF:-}" = "$FAKE_FAIL_REF" ]; then
-    unhealthy=1
-  elif [ -n "${FAKE_FAIL_SERVICE:-}" ] && \
-       [ "$container_id" = "cid-$FAKE_FAIL_SERVICE" ]; then
-    unhealthy=1
+  stopped=0
+  if [ -n "${FAKE_FAIL_REF:-}" ] && [ "${IMAGE_REF:-}" = "$FAKE_FAIL_REF" ]; then unhealthy=1
+  elif [ -n "${FAKE_FAIL_SERVICE:-}" ] && [ "$container_id" = "cid-$FAKE_FAIL_SERVICE" ]; then unhealthy=1
+  elif [ -n "${FAKE_STOPPED_SERVICE:-}" ] && [ "$container_id" = "cid-$FAKE_STOPPED_SERVICE" ]; then stopped=1
   fi
   case "$*" in
     *"{{if .State.Health}}"*)
-      if [ "$unhealthy" = "1" ]; then
-        printf 'unhealthy\n'
-      else
-        printf 'healthy\n'
-      fi
+      if [ "$stopped" = "1" ]; then printf 'exited|healthy\n'
+      elif [ "$unhealthy" = "1" ]; then printf 'running|unhealthy\n'
+      else printf 'running|healthy\n'; fi
       ;;
     *)
       if [ "${FAKE_DIAGNOSTIC_INSPECT_FAIL:-0}" = "1" ]; then
@@ -1368,6 +1365,17 @@ def test_deploy_archives_manifest_and_records_complete_state(release_env):
         for line in compose_calls
     )
     assert ":latest" not in calls
+
+
+def test_deploy_rejects_a_stopped_service_with_stale_healthy_health(release_env):
+    env, _log, _registry, _old_manifest = release_env
+    env["FAKE_STOPPED_SERVICE"] = "ai-filter-api"
+
+    result = _run_release(env, "deploy", "my-ai-filter:2026.07.12.1")
+
+    assert result.returncode != 0
+    assert "Health timeout" in result.stderr
+    assert "exited|healthy" in result.stderr
 
 
 @pytest.mark.parametrize("preflight_failure", [False, True])

@@ -1726,8 +1726,11 @@ service_state() {
     printf '%s\n' "missing"
     return
   fi
+  # Docker keeps the last health result after a container exits, so the health
+  # value alone can call a stopped service "healthy". Report both fields and
+  # require State.Status=running before accepting a service.
   IMAGE_REF="$ref" docker inspect "$container_id" \
-    --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}'
+    --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}'
 }
 
 capture_health_timeout_diagnostics() {
@@ -1775,7 +1778,7 @@ wait_healthy() {
     all_healthy=1
     for service in $services; do
       state="$(service_state "$ref" "$manifest" "$service" 2>/dev/null || true)"
-      if [[ "$state" != "healthy" && "$state" != "running" ]]; then
+      if [[ "$state" != "running|healthy" && "$state" != "running|none" ]]; then
         all_healthy=0
         break
       fi
