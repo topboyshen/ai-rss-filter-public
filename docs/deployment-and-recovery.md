@@ -57,6 +57,10 @@ python3.11 -m venv .venv-release-gate
 存在不同且完整的 previous/current 状态时，失败才有可用的自动回滚目标。首次发布或没有
 distinct previous 时不能假定脚本可以自动恢复。
 
+健康检查要求每个服务**恰好一个**容器：`docker compose ps -q` 返回多个容器时（例如同一服务
+残留了第二个容器），部署会立即失败并进入原有的回滚路径，而不是等到健康超时；这与宿主巡检
+「服务必须唯一匹配」的口径一致。
+
 `run-release-gate.sh` 先在隔离的 clean-HEAD worktree 中固定执行 shell 语法检查、完整 pytest
 和 75% 覆盖率门槛。成功后才会在 `/run/ai-filter-release-gate/attestations` 原子写入权限
 `0600`、最长有效 6 小时且绑定 HEAD、runner、Python 与测试日志的本机收据。新一轮测试开始

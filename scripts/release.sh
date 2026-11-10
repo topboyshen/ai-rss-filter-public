@@ -1718,14 +1718,22 @@ compose_up() {
 }
 
 service_state() {
-  local ref="$1" manifest="$2" service="$3" file container_id
+  local ref="$1" manifest="$2" service="$3" file container_ids container_id count
   validate_runtime_digest "$ref"
   file="$(manifest_path "$manifest")"
-  container_id="$(IMAGE_REF="$ref" release_compose -f "$file" ps --all -q "$service")"
-  if [[ -z "$container_id" ]]; then
+  container_ids="$(IMAGE_REF="$ref" release_compose -f "$file" ps --all -q "$service")"
+  if [[ -z "$container_ids" ]]; then
     printf '%s\n' "missing"
     return
   fi
+  count="$(grep -c . <<<"$container_ids")"
+  if (( count != 1 )); then
+    # Inspecting a newline-joined argument fails, so the health gate would only
+    # time out without saying why. The host check refuses to guess as well.
+    printf 'ambiguous|%s\n' "$count"
+    return
+  fi
+  container_id="$container_ids"
   # Docker keeps the last health result after a container exits, so the health
   # value alone can call a stopped service "healthy". Report both fields and
   # require State.Status=running before accepting a service.
@@ -1778,6 +1786,10 @@ wait_healthy() {
     all_healthy=1
     for service in $services; do
       state="$(service_state "$ref" "$manifest" "$service" 2>/dev/null || true)"
+      if [[ "$state" == ambiguous\|* ]]; then
+        echo "Health check cannot identify a single container for $service in $ref (found ${state#ambiguous|}); refusing to guess" >&2
+        return 1
+      fi
       if [[ "$state" != "running|healthy" && "$state" != "running|none" ]]; then
         all_healthy=0
         break
