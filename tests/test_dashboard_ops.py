@@ -17,13 +17,16 @@ def _text(value):
     return json.dumps(value, ensure_ascii=False)
 
 
-def _feed(*, error="", empty=0, passed=0, checked=NOW - 60, last_nonempty=NOW - 60):
+def _feed(
+    *, error="", empty=0, passed=0, checked=NOW - 60, last_nonempty=NOW - 60,
+    response_ms=15,
+):
     # success/fail are lifetime counters; neither represents the latest refresh.
     return (
         "https://example.test/feed",
         "测试订阅源",
         checked,
-        15,
+        response_ms,
         999,
         777,
         20,
@@ -422,7 +425,7 @@ def test_authenticated_real_dashboard_renders_unknowns_and_escapes_errors(
     integration_client, monkeypatch, tmp_path
 ):
     error = '<script>alert("unsafe")</script>'
-    _prepare_dashboard(monkeypatch, tmp_path, rows=[_feed(error=error)])
+    _prepare_dashboard(monkeypatch, tmp_path, rows=[_feed(error=error, response_ms=0)])
 
     response = integration_client.get("/dashboard")
     body = response.get_data(as_text=True)
@@ -433,6 +436,11 @@ def test_authenticated_real_dashboard_renders_unknowns_and_escapes_errors(
     assert "未接入" in body and "未知" in body
     assert 'href="/ops-feeds"' in body
     assert 'href="/dashboard/neutral-records"' in body
+    assert "未测" in body and "0ms" not in body
+    assert "仅记录" in body
+    assert "不是误拒率" in body
+    assert "实际评分模型：Qwen / Kimi" in body
+    assert "开发辅助：GPT-5.5" in body
     assert error not in body
     assert "&lt;script&gt;" in body
     assert response.headers["Cache-Control"].startswith("no-store")

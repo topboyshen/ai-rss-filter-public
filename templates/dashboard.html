@@ -291,6 +291,7 @@
 
     <details class="section secondary-section">
         <summary><h2>🎯 质量指标（近24小时）</h2></summary>
+        <p style="color:#888;font-size:12px;line-height:1.7;margin:6px 0 10px;">评分路径计数是处理路径分布，不是误拒率；保守中性表示该条未形成正式信号，不等于新闻无效，也不等于校验失败。没有人工反馈样本时 Precision 显示“-”，不能按 0 处理。</p>
         <div class="grid">
             <div class="card"><div class="card-label">Precision@7</div><div class="card-value">{{ quality_metrics.precision_at_7 if quality_metrics.precision_at_7 is not none else '-' }}{% if quality_metrics.precision_at_7 is not none %}%{% endif %}</div><div class="card-sub">人工反馈样本 {{ quality_metrics.precision_good_at_7 }}/{{ quality_metrics.precision_n_at_7 }}</div></div>
             <div class="card"><div class="card-label">Precision@8</div><div class="card-value">{{ quality_metrics.precision_at_8 if quality_metrics.precision_at_8 is not none else '-' }}{% if quality_metrics.precision_at_8 is not none %}%{% endif %}</div><div class="card-sub">强信号样本 {{ quality_metrics.precision_good_at_8 }}/{{ quality_metrics.precision_n_at_8 }}</div></div>
@@ -356,49 +357,53 @@
 
     <div class="section" id="source-health">
         <h2>📡 源健康状态</h2>
-        <p style="color:#888;font-size:12px;line-height:1.7;">近24h新闻时间、主来源统计，阈值按源配置。新增有效信号率＝正式达标 / 全部样本，不是抓取成功率；重复稿不计为新增。中性处理区分格式/字段校验与来源依据校验，不等于新闻没有价值。多源同链接仅计主来源。模型链路失败与条目处理异常单独计数，不算正式达标；仅其他评分契约的样本不计入，无法归因时写“原因未完整记录”。</p>
+        <p style="color:#888;font-size:12px;line-height:1.7;">近24h新闻时间、主来源统计，阈值按源配置。新增有效信号率＝正式达标 / 全部样本，不是抓取成功率；重复稿不计为新增。中性处理区分格式/字段校验与来源依据校验，不等于新闻没有价值。多源同链接仅计主来源。模型链路失败与条目处理异常单独计数，不算正式达标；仅其他评分契约的样本不计入，无法归因时写“原因未完整记录”。最后检查＝最近一次拉源检查时间；最新文章＝近24h缓存中该源文章的发布时间（RSS 发布时间，不是抓取时间）。响应时间 0 或缺失表示该次检查未记录耗时，显示“未测”，不代表零延迟。</p>
         <div class="table-scroll"><table>
-            <tr><th>源名称</th><th>累计抓取成功率</th><th>数据状态</th><th>24h样本</th><th>新增有效信号率</th><th>响应时间</th><th>最后检查</th><th>上次非空</th><th>错误</th></tr>
+            <tr><th>源名称</th><th>累计抓取成功率</th><th>数据状态</th><th>24h样本</th><th>新增有效信号率</th><th>响应时间</th><th>最后检查</th><th>最新文章</th><th>上次非空</th><th>错误</th></tr>
             {% if health_rows %}
                 {% for r in health_rows %}
                     {% set total_checks = r[4] + r[5] %}
                     {% set success_rate = (r[4] / total_checks * 100) | round(1) if total_checks > 0 else 0 %}
                     {% set metric = feed_metric_details[r[0]] %}
                     {% set status_color = '#27ae60' if success_rate >= 90 else '#f39c12' if success_rate >= 50 else '#e74c3c' %}
-                    {% set last_check = datetime.fromtimestamp(r[2]).strftime('%m-%d %H:%M') if r[2] else 'N/A' %}
+                    {% set last_check = beijing_fromtimestamp(r[2]).strftime('%m-%d %H:%M') if r[2] else '未记录' %}
+                    {% set latest_article_ts = metric.latest_article_at %}
+                    {% set latest_article = beijing_fromtimestamp(latest_article_ts).strftime('%m-%d %H:%M') if latest_article_ts else '近24h无记录' %}
                     {% set data_health = feed_data_health(r, cfg) %}
                     {% set empty_checks = data_health.consecutive_empty_checks %}
                     {% set last_nonempty_ts = data_health.last_nonempty_at %}
                     {% set data_label = data_health.data_state_label ~ (' ×' ~ empty_checks if empty_checks > 0 else '') %}
                     {% set data_color = '#e74c3c' if data_health.data_degraded else '#f39c12' if empty_checks > 0 or data_health.data_state == 'unknown' else '#27ae60' %}
-                    {% set last_nonempty = datetime.fromtimestamp(last_nonempty_ts).strftime('%m-%d %H:%M') if last_nonempty_ts else 'N/A' %}
+                    {% set last_nonempty = beijing_fromtimestamp(last_nonempty_ts).strftime('%m-%d %H:%M') if last_nonempty_ts else '未记录' %}
                     <tr>
                         <td>{{ r[1] or r[0] }}</td>
                         <td><span style="color:{{ status_color }}">{{ success_rate }}%</span></td>
                         <td><span style="color:{{ data_color }}">{{ data_label }}</span></td>
                         <td>{{ r[6] }}</td>
                         <td>{{ metric.rate_text }}</td>
-                        <td>{{ r[3] }}ms</td>
+                        <td>{% if r[3] %}{{ r[3] }}ms{% else %}<span title="该次检查未记录耗时，不代表零延迟" style="color:#888;">未测</span>{% endif %}</td>
                         <td>{{ last_check }}</td>
+                        <td>{{ latest_article }}</td>
                         <td>{{ last_nonempty }}</td>
                         <td style="color:#e74c3c;font-size:12px;">{{ r[9] or '' }}</td>
                     </tr>
-                    <tr><td colspan="9" style="font-size:12px;color:#888;">达标阈值 {{ '%g' | format(metric.threshold) }} 分 · {{ metric.breakdown_text }}{% if metric.other_contract_total and not metric.zero_output_reason %} · 其他评分契约 {{ metric.other_contract_total }} 条未计入{% endif %}</td></tr>
-                    {% if metric.zero_output_reason %}<tr><td colspan="9" style="font-size:12px;color:#c98a00;">零输出原因：{{ metric.zero_output_reason }}</td></tr>{% endif %}
+                    <tr><td colspan="10" style="font-size:12px;color:#888;">达标阈值 {{ '%g' | format(metric.threshold) }} 分 · {{ metric.breakdown_text }}{% if metric.other_contract_total and not metric.zero_output_reason %} · 其他评分契约 {{ metric.other_contract_total }} 条未计入{% endif %}</td></tr>
+                    {% if metric.zero_output_reason %}<tr><td colspan="10" style="font-size:12px;color:#c98a00;">零输出原因：{{ metric.zero_output_reason }}</td></tr>{% endif %}
                 {% endfor %}
             {% else %}
-                <tr><td colspan="9" style="color:#888;text-align:center;">暂无数据</td></tr>
+                <tr><td colspan="10" style="color:#888;text-align:center;">暂无数据</td></tr>
             {% endif %}
         </table></div>
     </div>
 
     <details class="section secondary-section">
         <summary><h2>📝 最近20条请求日志</h2></summary>
+        <p style="color:#888;font-size:12px;line-height:1.7;margin:6px 0 10px;">本表仅记录 <code>/filter</code> 冷路径的实时处理请求（内存缓存与数据库降级都未命中、且取得冷路径槽位时），按时间倒序取最近 20 条，不设日期下限。最新一条停在较早日期只表示该路径近期没有新请求，不代表采集、刷新或评分停止；源抓取的实际检查时间以上方“最后检查”为准。耗时列是该请求的实测耗时。</p>
         <div class="table-scroll"><table>
             <tr><th>时间</th><th>URL</th><th>总数</th><th>通过</th><th>API调用</th><th>耗时</th><th>错误</th></tr>
             {% if log_rows %}
                 {% for r in log_rows %}
-                    {% set ts = datetime.fromtimestamp(r[0]).strftime('%m-%d %H:%M:%S') %}
+                    {% set ts = beijing_fromtimestamp(r[0]).strftime('%m-%d %H:%M:%S') %}
                     {% set error_style = 'color:#e74c3c;' if r[10] else '' %}
                     <tr style="{{ error_style }}">
                         <td>{{ ts }}</td>
@@ -417,6 +422,6 @@
     </details>
 
     <div style="text-align:center;color:#666;font-size:12px;margin-top:20px;">
-        AI-Filter {{ release_version }} | A-Share Macro Intelligence Filter | Powered by GPT5.5
+        AI-Filter {{ release_version }} | A-Share Macro Intelligence Filter | 实际评分模型：Qwen / Kimi（以调用统计为准） | 开发辅助：GPT-5.5
     </div>
     </body></html>
