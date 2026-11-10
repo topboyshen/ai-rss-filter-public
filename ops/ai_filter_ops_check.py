@@ -65,6 +65,12 @@ _POLICY_DISABLED_CHECKS = {
     "check_offsite": "offsite_upload",
 }
 _MARKET_TZ = ZoneInfo("Asia/Shanghai")
+_DB_MAINTENANCE_LOG_PATH = Path("/var/log/ai-filter-db-maintenance.log")
+_DB_MAINTENANCE_TASK = "db_maintenance"
+_DB_MAINTENANCE_PHASES = ("integrity_check", "vacuum", "close")
+_DB_MAINTENANCE_MAX_AGE_SECONDS = 8 * 86400
+_DB_MAINTENANCE_RUNNING_GRACE_SECONDS = 70 * 60
+_DB_MAINTENANCE_LOG_TAIL_BYTES = 256 * 1024
 _MARKET_REQUIRED_SYMBOLS = {"sh000001", "sh000300", "sz399001", "sz399006"}
 _CHINA_HOLIDAYS_BY_YEAR = {
     2026: {
@@ -129,6 +135,7 @@ class Settings:
     restore_drill_max_age_seconds: int = 691200
     restore_drill_running_grace_seconds: int = 3000
     enrichment_state_file: Path | None = None
+    db_maintenance_log: Path = _DB_MAINTENANCE_LOG_PATH
     enrichment_max_age_seconds: int = 4500
     enrichment_running_grace_seconds: int = 900
     database_path: Path | None = None
@@ -915,6 +922,116 @@ def check_event_enrichment(settings: Settings, now: int) -> CheckResult:
         return CheckResult("event_enrichment", False, _safe_detail(detail))
 
 
+def _db_maintenance_records(path: Path) -> list[dict[str, object]]:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - _DB_MAINTENANCE_LOG_TAIL_BYTES))
+            payload = handle.read()
+    except OSError:
+        return []
+    records = []
+    for line in payload.decode("utf-8", errors="replace").splitlines():
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict) and record.get("task") == _DB_MAINTENANCE_TASK:
+            records.append(record)
+    return records
+
+
+def _db_maintenance_evidence(
+    path: Path,
+) -> tuple[dict[str, object], dict[str, object] | None] | None:
+    """Newest host start/finish, plus the first failure that run recorded."""
+    records = _db_maintenance_records(path)
+    for index in range(len(records) - 1, -1, -1):
+        record = records[index]
+        if record.get("scope") != "host":
+            continue
+        if record.get("event") not in {"start", "finish"}:
+            continue
+        failure = None
+        if record.get("event") == "finish":
+            for prior in reversed(records[:index]):
+                if prior.get("run_id") != record.get("run_id"):
+                    continue
+                if prior.get("scope") == "host" and prior.get("event") == "start":
+                    break
+                if prior.get("event") == "error" or (
+                    prior.get("event") == "phase_end"
+                    and prior.get("status") == "failed"
+                ):
+                    failure = prior
+                    break
+        return record, failure
+    return None
+
+
+def _db_maintenance_recorded_at(record: dict[str, object], now: int) -> int:
+    value = record.get("utc")
+    if not isinstance(value, str):
+        raise ValueError("maintenance timestamp is missing")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError("maintenance timestamp is invalid") from exc
+    if parsed.tzinfo is None:
+        raise ValueError("maintenance timestamp has no timezone")
+    if int(parsed.timestamp()) > now + 300:
+        raise ValueError("maintenance timestamp is in the future")
+    return int(parsed.timestamp())
+
+
+def check_db_maintenance(settings: Settings, now: int) -> CheckResult:
+    """The weekly VACUUM only writes a host log; nothing else reads that log."""
+    evidence = _db_maintenance_evidence(settings.db_maintenance_log)
+    if evidence is None:
+        return CheckResult(
+            "db_maintenance", True, "no maintenance result recorded yet", warning=True
+        )
+    record, failure = evidence
+    try:
+        recorded_at = _db_maintenance_recorded_at(record, now)
+    except ValueError as exc:
+        return CheckResult("db_maintenance", False, str(exc))
+    age = now - recorded_at
+    if record.get("event") == "start":
+        if age <= _DB_MAINTENANCE_RUNNING_GRACE_SECONDS:
+            return CheckResult(
+                "db_maintenance",
+                True,
+                f"in progress age_seconds={max(0, age)}",
+                warning=True,
+            )
+        return CheckResult(
+            "db_maintenance", False, f"run did not finish age_seconds={age}"
+        )
+    rc = record.get("rc")
+    phases = {phase: record.get(phase) for phase in _DB_MAINTENANCE_PHASES}
+    if (
+        type(rc) is not int
+        or rc != 0
+        or record.get("outcome") != "success"
+        or set(phases.values()) != {"success"}
+    ):
+        detail = (
+            f"rc={rc} outcome={record.get('outcome') or 'unknown'} "
+            + " ".join(f"{phase}={status}" for phase, status in phases.items())
+        )
+        if failure is not None:
+            detail += f" phase={failure.get('phase') or 'unknown'}"
+            if failure.get("error"):
+                detail += f" error={failure['error']}"
+        return CheckResult("db_maintenance", False, _safe_detail(detail))
+    if age > _DB_MAINTENANCE_MAX_AGE_SECONDS:
+        return CheckResult("db_maintenance", False, f"stale age_seconds={age}")
+    return CheckResult(
+        "db_maintenance", True, f"vacuum complete age_seconds={max(0, age)}"
+    )
+
+
 def _expected_market_trade_date(
     now: int, *, ready_at: datetime_time = datetime_time(16, 0)
 ) -> str:
@@ -1454,6 +1571,7 @@ CHECKS: tuple[Callable[[Settings, int], CheckResult], ...] = (
     check_restore_drill,
     check_offsite,
     check_event_enrichment,
+    check_db_maintenance,
     check_trading_calendar,
     check_market_timer,
     check_market_history,
@@ -1655,8 +1773,8 @@ def _write_state(path: Path, payload: dict[str, object]) -> None:
 
 _DASHBOARD_CHECK_NAMES = frozenset({
     "metrics", "notification_transport", "backup", "restore_drill",
-    "offsite_upload", "event_enrichment", "market_timer", "market_history",
-    "trading_calendar", "root_disk", "release_containers",
+    "offsite_upload", "event_enrichment", "db_maintenance", "market_timer",
+    "market_history", "trading_calendar", "root_disk", "release_containers",
 })
 _DASHBOARD_CHECK_ALIASES = {
     "check_offsite": "offsite_upload",

@@ -30,6 +30,7 @@ _HOST_CHECKS = {
     "metrics": "应用指标",
     "notification_transport": "通知通道",
     "event_enrichment": "事件丰富化",
+    "db_maintenance": "数据库维护",
     "market_timer": "收盘任务",
     "market_history": "历史行情任务",
     "trading_calendar": "交易日历",

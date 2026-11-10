@@ -7,7 +7,7 @@ import os
 import sqlite3
 import subprocess
 import tarfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -39,6 +39,7 @@ def _healthy_metrics(**updates: float) -> bytes:
 
 def _settings(tmp_path: Path, **updates) -> monitor.Settings:
     base = monitor.Settings(
+        db_maintenance_log=tmp_path / "db-maintenance.log",
         root=tmp_path / "app",
         backup_dir=tmp_path / "backups",
         backup_max_age_seconds=108000,
@@ -352,6 +353,128 @@ def test_event_enrichment_check_accepts_explicit_successful_noop(tmp_path):
 
     assert result.ok is True
     assert "completed" in result.detail
+
+
+def _utc(at: int) -> str:
+    return datetime.fromtimestamp(at, timezone.utc).isoformat(timespec="seconds")
+
+
+def _write_db_maintenance_log(path: Path, *records: dict) -> None:
+    path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+    )
+
+
+def _maintenance_start(at: int, **fields) -> dict:
+    record = {
+        "utc": _utc(at),
+        "task": "db_maintenance",
+        "run_id": "a" * 32,
+        "scope": "host",
+        "event": "start",
+        "timeout_seconds": 3600,
+        "kill_after_seconds": 60,
+    }
+    record.update(fields)
+    return record
+
+
+def _maintenance_finish(at: int, **fields) -> dict:
+    record = {
+        "utc": _utc(at),
+        "task": "db_maintenance",
+        "run_id": "a" * 32,
+        "scope": "host",
+        "event": "finish",
+        "rc": 0,
+        "outcome": "success",
+        "integrity_check": "success",
+        "vacuum": "success",
+        "close": "success",
+    }
+    record.update(fields)
+    return record
+
+
+def test_db_maintenance_check_surfaces_a_locked_vacuum(tmp_path):
+    """The weekly VACUUM fails after 5s of write lock and nothing else reads it."""
+    now = 2_000_000_000
+    log = tmp_path / "db-maintenance.log"
+    _write_db_maintenance_log(
+        log,
+        _maintenance_start(now - 30),
+        {
+            "utc": _utc(now - 28),
+            "task": "db_maintenance",
+            "run_id": "a" * 32,
+            "scope": "database",
+            "event": "phase_end",
+            "phase": "vacuum",
+            "status": "failed",
+            "error_type": "OperationalError",
+            "error": "database is locked",
+        },
+        _maintenance_finish(now - 27, rc=1, outcome="failed", vacuum="failed"),
+    )
+
+    result = monitor.check_db_maintenance(
+        _settings(tmp_path, db_maintenance_log=log), now
+    )
+
+    assert result.ok is False
+    assert "vacuum=failed" in result.detail
+    assert "error=database is locked" in result.detail
+
+
+def test_db_maintenance_check_tracks_weekly_freshness(tmp_path):
+    now = 2_000_000_000
+    log = tmp_path / "db-maintenance.log"
+    settings = _settings(tmp_path, db_maintenance_log=log)
+
+    # Only the newest run counts: an older failure must not mask a later success.
+    _write_db_maintenance_log(
+        log,
+        _maintenance_finish(now - 7200, rc=1, outcome="failed", vacuum="failed"),
+        _maintenance_finish(now - 3600),
+    )
+    fresh = monitor.check_db_maintenance(settings, now)
+    assert fresh.ok is True
+    assert "vacuum complete" in fresh.detail
+
+    stale_at = now - monitor._DB_MAINTENANCE_MAX_AGE_SECONDS - 1
+    _write_db_maintenance_log(log, _maintenance_finish(stale_at))
+    stale = monitor.check_db_maintenance(settings, now)
+    assert stale.ok is False
+    assert "stale" in stale.detail
+
+
+def test_db_maintenance_check_waits_for_an_unfinished_run_then_fails(tmp_path):
+    now = 2_000_000_000
+    log = tmp_path / "db-maintenance.log"
+    settings = _settings(tmp_path, db_maintenance_log=log)
+
+    _write_db_maintenance_log(log, _maintenance_start(now - 60))
+    running = monitor.check_db_maintenance(settings, now)
+    assert running.ok is True and running.warning is True
+    assert "in progress" in running.detail
+
+    wedged_at = now - monitor._DB_MAINTENANCE_RUNNING_GRACE_SECONDS - 60
+    _write_db_maintenance_log(log, _maintenance_start(wedged_at))
+    wedged = monitor.check_db_maintenance(settings, now)
+    assert wedged.ok is False
+    assert "did not finish" in wedged.detail
+
+
+def test_db_maintenance_check_is_pending_before_the_first_weekly_run(tmp_path):
+    result = monitor.check_db_maintenance(
+        _settings(tmp_path, db_maintenance_log=tmp_path / "absent.log"), 2_000_000_000
+    )
+    assert result.ok is True and result.warning is True
+    assert "no maintenance result" in result.detail
+
+
+def test_db_maintenance_check_is_registered():
+    assert monitor.check_db_maintenance in monitor.CHECKS
 
 
 def _market_database(path: Path, trade_date: str, source_ts: int) -> None:

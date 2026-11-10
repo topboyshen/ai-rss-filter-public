@@ -84,6 +84,28 @@ consumer 两侧白名单同步加入 `trading_calendar`，两侧各补测试；2
 **Priority**: P1（本条「告警可见性」已修；**日历数据本身仍缺 2027 年休市安排**，`check_trading_calendar`
 会从 2026-12-02 起失败，需在这之前补 `_CHINA_HOLIDAYS_BY_YEAR[2027]`）
 
+### 每周 VACUUM 失败只写主机日志，巡检与 dashboard 都看不到（2026-11-10）
+**Status**: Fixed（2026-11-10，`fix/db-maintenance-visibility-20261110`：巡检新增 `db_maintenance`
+检查，读取 `/var/log/ai-filter-db-maintenance.log` 中最后一次运行的结果，producer 与 consumer
+两份白名单同步加入；维护脚本、调度与 VACUUM 参数均未改动）  
+**Impact**: `scripts/run_db_maintenance.py --host` 的失败只写
+`/var/log/ai-filter-db-maintenance.log`，此前没有任何巡检项读它，dashboard 也没有对应卡片；
+VACUUM 在写锁下等满 SQLite 默认 5 秒超时即失败（本机复现
+`vacuum failed after 5.2 s: database is locked`），周维护可以连续失败而无人知晓。  
+**Root Cause**: 维护结果只有日志、没有巡检读入口；enrichment 每 30 分钟跑一次（`:15`、`:45`），
+外层上限 18 分钟，02:45 那次最晚可跑到 03:03，与周日 03:00 的维护直接重叠。  
+**Possible Solutions**:
+- 方案 A（已落地）: 巡检新增 `db_maintenance`，取日志中最后一次 host 运行的 `finish` 记录；
+  `rc`、`outcome` 与三个阶段任一不成功即 FAIL，并把同一次运行里第一条失败的 phase 与 error
+  （例如 `vacuum` + `database is locked`）写进 detail；成功结果超过 8 天视为 stale；只有 `start`
+  且未超过 70 分钟预算时按「进行中」WARN，日志还没有任何结果时按「尚未运行」WARN（WARN 不会触发
+  Telegram，只有 FAIL 才通知）
+- 方案 B（未实施）: 把维护挪到不冲突的窗口。enrichment 每半小时一次、单次上限 18 分钟，任何
+  半小时窗口的尾部都可能与 VACUUM 重叠，移动只能收窄冲突概率，不能消除；且
+  `ops/README.md` 已明确记录「不引入调度/并发变更」，因此本次只做可见性
+**Priority**: P1（失败可见性已修；**02:45 enrichment 最晚 03:03 与周日 03:00 VACUUM 的重叠仍在**，
+届时巡检会以 `vacuum=failed ... error=database is locked` 报 FAIL）
+
 ---
 
 ## 🔴 Security Issues

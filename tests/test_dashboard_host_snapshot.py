@@ -19,6 +19,7 @@ CHECK_NAMES = (
     "metrics",
     "notification_transport",
     "event_enrichment",
+    "db_maintenance",
     "market_timer",
     "market_history",
     "trading_calendar",
@@ -160,7 +161,7 @@ def test_unknown_or_secret_top_level_fields_reject_entire_snapshot(tmp_path, key
         [{"name": "release_containers", "status": True}],
         [{"name": ["release_containers"], "status": "PASS"}],
         [{"name": "metrics", "status": "PASS"}] * 2,
-        [{"name": "metrics", "status": "PASS"}] * 12,
+        [{"name": "metrics", "status": "PASS"}] * 13,
     ],
 )
 def test_invalid_or_ambiguous_check_rows_reject_entire_snapshot(tmp_path, checks):
@@ -233,6 +234,24 @@ def test_trading_calendar_gap_is_shown_and_enters_attention(tmp_path, monkeypatc
     built = _build(tmp_path, monkeypatch, payload)
     assert any(
         item["title"] == "宿主巡检 · 交易日历：检查失败"
+        for item in built["attention"]
+    )
+
+
+def test_db_maintenance_failure_is_shown_and_enters_attention(tmp_path, monkeypatch):
+    payload = _change_check(_payload(), "db_maintenance", "FAIL")
+
+    result = _read(tmp_path, payload)
+
+    assert _check(result, "db_maintenance") == {
+        "name": "db_maintenance",
+        "title": "数据库维护",
+        "status": "warn",
+        "label": "检查失败",
+    }
+    built = _build(tmp_path, monkeypatch, payload)
+    assert any(
+        item["title"] == "宿主巡检 · 数据库维护：检查失败"
         for item in built["attention"]
     )
 

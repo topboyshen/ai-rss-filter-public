@@ -105,6 +105,18 @@ def test_trading_calendar_result_reaches_the_allowlisted_rows():
     ]
 
 
+def test_db_maintenance_result_reaches_the_allowlisted_rows():
+    result = monitor.CheckResult(
+        "db_maintenance",
+        False,
+        "rc=1 outcome=failed vacuum=failed error=database is locked",
+    )
+
+    assert monitor._dashboard_check_rows([result]) == [
+        {"name": "db_maintenance", "status": "FAIL"}
+    ]
+
+
 def test_duplicate_check_names_do_not_produce_healthy_snapshot():
     results = [
         monitor.CheckResult("metrics", True, "first"),
