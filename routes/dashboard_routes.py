@@ -2525,6 +2525,14 @@ def score_backtest_widget():
     return rsp
 
 
+def _render_briefing_content(result, format_type, hours):
+    """Render a briefing and add the browser return link outside the route."""
+    content, mimetype = render_digest(result, format_type, hours)
+    if format_type == "html":
+        content = _dashboard_back_link_html() + content
+    return content, mimetype
+
+
 @dash_bp.route("/briefing", methods=["GET", "POST"])
 def briefing():
     """跨文章主题聚合情报简报
@@ -2563,9 +2571,7 @@ def briefing():
             "generated_at": beijing_now().isoformat()
         }
         empty_result = attach_quant_market_context(empty_result)
-        content, mimetype = render_digest(empty_result, format_type, hours)
-        if format_type == "html":
-            content = _dashboard_back_link_html() + content
+        content, mimetype = _render_briefing_content(empty_result, format_type, hours)
         return Response(content, mimetype=mimetype)
 
     articles_info = []
@@ -2639,9 +2645,7 @@ def briefing():
         response.headers["Retry-After"] = "30" if status == 503 else "10"
         return response
 
-    content, mimetype = render_digest(aggregation, format_type, hours)
-    if format_type == "html":
-        content = _dashboard_back_link_html() + content
+    content, mimetype = _render_briefing_content(aggregation, format_type, hours)
 
     if push_requested:
         if not _push_digest_to_telegram(aggregation, _cfg()):
