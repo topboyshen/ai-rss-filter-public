@@ -1350,6 +1350,26 @@ def check_market_history(settings: Settings, now: int) -> CheckResult:
     except (ValueError, TypeError, OverflowError, OSError) as exc:
         return CheckResult("market_history", False, _safe_detail(exc), evidence_present=True)
     remaining = payload.get("remaining_total", payload.get("due_total"))
+    # The history scope reports remaining backlog as incomplete with exit 0 and
+    # a failed run as incomplete with exit 1, so status alone cannot tell a
+    # healthy backlog from a repair that could not write prices or outcomes.
+    exit_code = payload.get("exit_code", 0)
+    if type(exit_code) is not int:
+        return CheckResult(
+            "market_history",
+            False,
+            "history result exit_code is not an integer",
+            evidence_present=True,
+        )
+    if exit_code != 0:
+        return CheckResult(
+            "market_history",
+            False,
+            f"history repair exited nonzero exit_code={exit_code} "
+            f"trade_date={payload.get('trade_date')} "
+            f"total={remaining} unresolved={payload.get('unresolved')}",
+            evidence_present=True,
+        )
     if status == "complete":
         return CheckResult(
             "market_history",

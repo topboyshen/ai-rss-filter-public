@@ -714,6 +714,45 @@ def test_market_history_reports_backlog_without_failing_same_day(tmp_path):
     assert failed.ok is False
 
 
+def test_failed_history_run_fails_despite_remaining_backlog(tmp_path):
+    now = int(datetime(2026, 8, 4, 17, 0, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp())
+    _write_market_result(
+        tmp_path,
+        "history",
+        status="incomplete",
+        trade_date="2026-08-03",
+        remaining_total=3,
+        truncated=False,
+        unresolved=2,
+        exit_code=1,
+        started_at=now - 1800,
+        completed_at=now - 1740,
+    )
+
+    result = monitor.check_market_history(_settings(tmp_path), now)
+
+    assert result.ok is False
+    assert result.warning is False
+    assert "exit_code=1" in result.detail
+
+
+def test_history_receipt_with_a_non_integer_exit_code_fails(tmp_path):
+    now = int(datetime(2026, 8, 4, 17, 0, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp())
+    _write_market_result(
+        tmp_path,
+        "history",
+        status="complete",
+        exit_code="0",
+        started_at=now - 1800,
+        completed_at=now - 1740,
+    )
+
+    result = monitor.check_market_history(_settings(tmp_path), now)
+
+    assert result.ok is False
+    assert "exit_code" in result.detail
+
+
 def test_missing_history_receipt_fails_after_a_recorded_baseline(tmp_path):
     state = tmp_path / "state" / "state.json"
     state.parent.mkdir(parents=True)
