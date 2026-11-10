@@ -82,6 +82,32 @@ VACUUM 在写锁下等满 SQLite 默认 5 秒超时即失败（本机复现
 **Priority**: P1（失败可见性已修；**02:45 enrichment 最晚 03:03 与周日 03:00 VACUUM 的重叠仍在**，
 届时巡检会以 `vacuum=failed ... error=database is locked` 报 FAIL）
 
+### 收盘回执目录在巡检与生产者之间按不同规则推导（2026-11-10）
+**Status**: Documented / 未修（潜在耦合；在仓库当前交付配置下没有可触发场景）  
+**Impact**: `ops/ai_filter_ops_check.py` 的 `_load_market_result` 固定读
+`settings.root/data/market_close/<kind>_last.json`，不读 `MARKET_CLOSE_RESULT_DIR`，也不看数据库路径；
+生产者三处却是「环境变量优先，否则按数据库目录」。只有当有人**只给生产者**设置覆盖、或巡检的
+`--root`/`OPS_DATABASE_PATH` 与数据库实际位置不一致时，两侧才会指向不同目录：巡检读不到回执，
+`market_timer` 以 `collector result missing` FAIL，`market_history` 在已有基线后 FAIL。分叉会以
+FAIL 暴露，不会静默假通过；`market_timer` 的缺失分支也不会把「无回执」误当成健康。  
+**Root Cause**: 巡检的 `Settings` 只有 `root`，结果目录直接从 root 推导；生产者各自解析：
+`scripts/run_market_close.sh` 用 `MARKET_CLOSE_RESULT_DIR` 或 `$ROOT/data/market_close`，
+`scripts/repair_market_close.py` 用 `MARKET_CLOSE_RESULT_DIR` 或 `DB.parent/market_close`
+（`DB = ROOT/data/cache.db`），`services/market_close_result.py::result_dir_from_env` 用
+`MARKET_CLOSE_RESULT_DIR` 或 `db_path.parent/market_close`。交付面没有任何入口设置该变量：
+三个收盘相关 systemd 单元都没有 `EnvironmentFile`/`Environment`，cron 只有
+`ai-filter-ops-check --quiet`（默认 root `/root/ai-rss-filter`），compose 固定
+`AI_FILTER_DB_PATH=/app/data/cache.db` 且 `./data:/app/data`，所以当前部署两侧落在同一目录。  
+**Possible Solutions**:
+- 方案 A（已选）: 只在此文档记录，不改代码。现状没有触发条件，人为制造分叉也会以 FAIL 暴露，
+  改路径语义的收益低于风险
+- 方案 B（未实施）: 巡检改为优先读 `MARKET_CLOSE_RESULT_DIR`（必须绝对路径，相对路径报
+  `ValueError`），否则按 `database_path.parent/market_close` 推导，与
+  `services.market_close_result.result_dir_from_env` 完全对齐；需要新分支、覆盖「覆盖变量 /
+  相对路径拒绝 / 数据库路径推导 / 默认目录不变」四类测试，并确认 `--dry-run` 与 dashboard
+  快照的路径语义不变
+**Priority**: P3（潜在耦合；当前无触发条件，且分叉会报 FAIL 而非静默误报）
+
 ---
 
 ## 🔴 Security Issues
