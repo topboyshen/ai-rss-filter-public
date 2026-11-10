@@ -4,50 +4,26 @@
 
 ---
 
-## 🟡 Skipped Tests (3 total)
+## 🟡 Skipped Tests
 
-### 1. `test_refresh_rate_limit` (test_integration.py)
-**Status**: Skipped  
-**Reason**: Dynamic import bypasses monkeypatch  
-**Impact**: Rate limiting功能已通过其他测试验证，功能正常  
-**Root Cause**: 测试在动态导入模块后尝试 monkeypatch，此时模块已加载，patch 不生效  
+An earlier revision of this section listed three tests as skipped and
+prescribed repair plans for them. None of the three carries a skip marker, and
+all of them run in the standard suite; under the release-gate environment they
+passed on 2026-11-10:
 
-**Possible Solutions**:
-- 方案 A: 使用 `unittest.mock.patch` 替代 `pytest.monkeypatch`
-- 方案 B: 重构为集成测试，使用真实的 Redis/时间
-- 方案 C: 在模块导入前 patch（需要重构测试结构）
+- `test_refresh_rate_limit` (test_integration.py)
+- `test_ops_feeds_widget_uses_recent_feed_health_without_cache_rows` (test_ops_health.py)
+- `test_consecutive_empty_feed_is_visible_even_with_recent_cache_rows` (test_ops_health.py)
 
-**Priority**: P2（功能已覆盖，测试改进）
+There is no outstanding test-repair debt for them.
 
----
-
-### 2. `test_ops_feeds_widget_uses_recent_feed_health_without_cache_rows` (test_ops_health.py)
-**Status**: Skipped  
-**Reason**: UI output contract changed after ops widget refactor  
-**Impact**: Ops 健康面板功能正常，输出格式变化  
-**Root Cause**: Ops widget 重构后，HTML 输出格式变化，测试期望过时  
-
-**Possible Solutions**:
-- 方案 A: 更新测试期望以匹配新的 HTML 输出格式
-- 方案 B: 改为测试结构化数据（JSON）而非 HTML 字符串
-- 方案 C: 使用 CSS selector 而非字符串匹配
-
-**Priority**: P2（UI 测试，功能正常）
-
----
-
-### 3. `test_consecutive_empty_feed_is_visible_even_with_recent_cache_rows` (test_ops_health.py)
-**Status**: Skipped  
-**Reason**: Empty feed visibility logic changed  
-**Impact**: Empty feed 显示逻辑已更新，测试假设不再成立  
-**Root Cause**: Feed 可见性逻辑演进，现在空 feed 的显示条件不同  
-
-**Possible Solutions**:
-- 方案 A: 阅读新的可见性逻辑，更新测试场景
-- 方案 B: 删除测试（如果新逻辑不再需要此场景）
-- 方案 C: 改为测试新的可见性规则
-
-**Priority**: P2（逻辑已变更，需要重新设计）
+The remaining skips are environment gates, not debt: real Linux `flock`
+(`test_release_script.py`, `test_health_check_release_state.py`), Linux process
+identity and `AF_UNIX`/`procfs` lifecycle checks, an isolated PostgreSQL DSN or
+an explicit native Miniflux/PostgreSQL report, a checkout without
+`config.yaml`, and Windows exclusions for POSIX permission and `SIGALRM`
+contracts. They execute on the Linux gate host; the local macOS run without a
+PostgreSQL DSN reports 26 skips, which says nothing about those paths.
 
 ---
 
