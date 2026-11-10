@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from ops import ai_filter_ops_check as monitor
 from services import dashboard_ops as ops
 from tests import test_dashboard_browser_auth as browser_tests
 from tests import test_dashboard_ops as dashboard_tests
@@ -355,3 +356,23 @@ def test_authenticated_dashboard_renders_real_snapshot_and_private_headers(
     assert 'href="#host-checks"' in body
     assert response.headers["Cache-Control"].startswith("no-store")
     assert response.headers["X-Content-Type-Options"] == "nosniff"
+
+
+def test_every_host_check_reaches_the_dashboard_and_the_consumer():
+    produced = {
+        monitor._DASHBOARD_CHECK_ALIASES.get(check.__name__, check.__name__)
+        for check in monitor.CHECKS
+    }
+    # An unexported check is silently dropped by the producer, and a name the
+    # consumer does not know turns its whole card into "unknown". Both sides
+    # must therefore change together; this pins them to the check list.
+    assert len(produced) == len(monitor.CHECKS)
+    assert produced == set(monitor._DASHBOARD_CHECK_NAMES)
+    assert produced == set(ops._HOST_CHECKS)
+    # The consumer rejects SKIPPED_BY_POLICY outside this allowlist, again
+    # degrading the whole card, so a policy-disabled check must live inside it.
+    assert set(monitor._POLICY_DISABLED_CHECKS.values()) <= {
+        "backup",
+        "restore_drill",
+        "offsite_upload",
+    }
