@@ -599,6 +599,50 @@ def test_market_timer_checks_service_result_and_expected_database_date(
     assert missing_after_failure.ok is False
     assert "missing required benchmark" in missing_after_failure.detail
 
+
+def test_next_trading_morning_after_a_holiday_skip_is_not_a_failure(
+    monkeypatch, tmp_path
+):
+    """Full check: the holiday receipt stays on disk until the next 15:10 run."""
+    zone = ZoneInfo("Asia/Shanghai")
+    close_ts = int(datetime(2026, 9, 30, 15, 0, tzinfo=zone).timestamp())
+    database_path = tmp_path / "cache.db"
+    _market_database(database_path, "2026-09-30", close_ts)
+    settings = _settings(tmp_path, database_path=database_path)
+    holiday_run = int(datetime(2026, 10, 7, 15, 10, 30, tzinfo=zone).timestamp())
+    _write_market_result(
+        tmp_path,
+        "collector",
+        status="skipped_nontrading",
+        trade_date="",
+        started_at=holiday_run - 30,
+        completed_at=holiday_run,
+    )
+
+    def systemctl(command, timeout):
+        del timeout
+        if command[1] in {"is-enabled", "is-active"}:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if "--value" in command:
+            return subprocess.CompletedProcess(
+                command, 0, "Thu 2026-10-08 15:10:00 CST\n", ""
+            )
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            "ActiveState=inactive\nResult=success\nExecMainStatus=0\n"
+            "ExecMainExitTimestamp=Wed 2026-10-07 15:10:30 CST\n",
+            "",
+        )
+
+    monkeypatch.setattr(monitor, "_run", systemctl)
+    now = int(datetime(2026, 10, 8, 9, 0, tzinfo=zone).timestamp())
+    morning = monitor.check_market_timer(settings, now)
+
+    assert morning.ok is True
+    assert morning.warning is False
+    assert "no close due yet" in morning.detail
+
     monkeypatch.setattr(monitor, "_run", systemctl)
     connection = sqlite3.connect(database_path)
     connection.execute(
@@ -670,7 +714,14 @@ def test_holiday_skip_without_previous_receipt_is_not_a_failure(tmp_path):
 
 def test_skip_on_a_trading_day_is_still_a_failure(tmp_path):
     now = int(datetime(2026, 9, 30, 16, 5, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp())
-    _write_market_result(tmp_path, "collector", status="skipped_nontrading", trade_date="")
+    _write_market_result(
+        tmp_path,
+        "collector",
+        status="skipped_nontrading",
+        trade_date="",
+        started_at=now - 30,
+        completed_at=now,
+    )
 
     result = monitor._market_timer_from_results(
         _settings(tmp_path), "2026-09-30", 4, now=now
@@ -678,6 +729,71 @@ def test_skip_on_a_trading_day_is_still_a_failure(tmp_path):
 
     assert result.ok is False
     assert "trading day" in result.detail
+
+
+def test_holiday_skip_receipt_does_not_fail_the_next_trading_morning(tmp_path):
+    """The last close run may be a holiday skip; the new trading day has no run yet."""
+    zone = ZoneInfo("Asia/Shanghai")
+    holiday_run = int(datetime(2026, 10, 7, 15, 10, 30, tzinfo=zone).timestamp())
+    _write_market_result(
+        tmp_path,
+        "collector",
+        status="skipped_nontrading",
+        trade_date="",
+        started_at=holiday_run - 30,
+        completed_at=holiday_run,
+    )
+    now = int(datetime(2026, 10, 8, 9, 0, tzinfo=zone).timestamp())
+
+    result = monitor._market_timer_from_results(
+        _settings(tmp_path), "2026-09-30", 4, now=now
+    )
+
+    assert result.ok is True
+    assert result.warning is False
+    assert "non-trading" in result.detail
+    assert "no close due yet" in result.detail
+    assert "2026-10-07" in result.detail
+
+
+def test_stale_holiday_skip_receipt_fails_once_todays_close_is_due(tmp_path):
+    zone = ZoneInfo("Asia/Shanghai")
+    holiday_run = int(datetime(2026, 10, 7, 15, 10, 30, tzinfo=zone).timestamp())
+    _write_market_result(
+        tmp_path,
+        "collector",
+        status="skipped_nontrading",
+        trade_date="",
+        started_at=holiday_run - 30,
+        completed_at=holiday_run,
+    )
+    now = int(datetime(2026, 10, 8, 16, 5, tzinfo=zone).timestamp())
+
+    result = monitor._market_timer_from_results(
+        _settings(tmp_path), "2026-10-08", 4, now=now
+    )
+
+    assert result.ok is False
+    assert "no receipt for 2026-10-08" in result.detail
+
+
+def test_skip_receipt_without_timestamps_is_malformed(tmp_path):
+    zone = ZoneInfo("Asia/Shanghai")
+    now = int(datetime(2026, 10, 8, 9, 0, tzinfo=zone).timestamp())
+    _write_market_result(
+        tmp_path, "collector", status="skipped_nontrading", trade_date=""
+    )
+    path = tmp_path / "app" / "data" / "market_close" / "collector_last.json"
+    payload = json.loads(path.read_text(encoding="ascii"))
+    payload.pop("completed_at")
+    path.write_text(json.dumps(payload) + "\n", encoding="ascii")
+
+    result = monitor._market_timer_from_results(
+        _settings(tmp_path), "2026-09-30", 4, now=now
+    )
+
+    assert result.ok is False
+    assert "timestamps invalid" in result.detail
 
 
 def test_market_history_reports_backlog_without_failing_same_day(tmp_path):

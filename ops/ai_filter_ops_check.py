@@ -1133,20 +1133,45 @@ def _market_timer_from_results(
     status = str(collector.get("status") or "")
     if status == "skipped_nontrading":
         # persist_host_fallback writes this status without a trade_date when the
-        # host has no previous collector receipt, so it is only evidence of a
-        # healthy holiday when the calendar agrees that today is not a trading
-        # day. On a trading day the skip is a calendar disagreement.
-        if _is_trading_day(datetime.fromtimestamp(now, _MARKET_TZ).date()):
+        # host has no previous collector receipt, and every later holiday run
+        # rewrites the same receipt. Judge the receipt's own day, not today's:
+        # the receipt stays on disk until the next 15:10 run, so asking whether
+        # *today* is a trading day fails every trading morning after a holiday.
+        try:
+            _skip_started, skip_completed = _market_result_times(collector)
+        except ValueError as exc:
+            return CheckResult("market_timer", False, _safe_detail(exc))
+        receipt_day = datetime.fromtimestamp(skip_completed, _MARKET_TZ).date()
+        today = datetime.fromtimestamp(now, _MARKET_TZ).date()
+        if receipt_day == today:
+            if _is_trading_day(today):
+                return CheckResult(
+                    "market_timer",
+                    False,
+                    "collector skipped a trading day; calendar disagrees; "
+                    f"database_trade_date={expected_date} benchmark_rows={row_count}",
+                )
+            return CheckResult(
+                "market_timer",
+                True,
+                f"collector skipped non-trading day on {receipt_day.isoformat()}; "
+                f"database_trade_date={expected_date} benchmark_rows={row_count}",
+            )
+        # An older skip says nothing about today. A close is only due once the
+        # expected trade date has reached today, and that path is also covered by
+        # the benchmark database check that runs before this one.
+        if expected_date == today.isoformat():
             return CheckResult(
                 "market_timer",
                 False,
-                "collector skipped a trading day; calendar disagrees; "
-                f"database_trade_date={expected_date} benchmark_rows={row_count}",
+                f"collector receipt is from {receipt_day.isoformat()}; "
+                f"no receipt for {expected_date}; benchmark_rows={row_count}",
             )
         return CheckResult(
             "market_timer",
             True,
-            "collector skipped non-trading day; "
+            f"collector skipped non-trading day on {receipt_day.isoformat()}; "
+            "no close due yet; "
             f"database_trade_date={expected_date} benchmark_rows={row_count}",
         )
     if status == "skipped_maintenance":
