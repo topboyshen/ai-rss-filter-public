@@ -1,3 +1,5 @@
+import os
+import stat
 import time
 
 import pytest
@@ -28,6 +30,25 @@ def test_write_result_is_atomic_and_private(tmp_path):
     assert payload["trade_date"] == "2026-09-11"
     assert path.stat().st_mode & 0o777 == 0o600
     assert not path.with_name(path.name + ".tmp").exists()
+
+
+def test_write_result_fsyncs_payload_and_directory(tmp_path, monkeypatch):
+    synced = []
+    real_fsync = os.fsync
+
+    def spy(fd):
+        synced.append(stat.S_IFMT(os.fstat(fd).st_mode))
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", spy)
+    path = write_result(
+        tmp_path, kind="collector", status="success", run_id="b" * 32
+    )
+    monkeypatch.undo()
+
+    assert synced[0] == stat.S_IFREG
+    assert stat.S_IFDIR in synced
+    assert read_result(path)["run_id"] == "b" * 32
 
 
 def test_result_dir_from_env_requires_absolute_path(monkeypatch, tmp_path):

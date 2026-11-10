@@ -16,6 +16,7 @@ from services import admission_fence
 logger = logging.getLogger(__name__)
 _REQUEST_LEASE = "_admission_http_lease"
 _READ_ENDPOINTS = {
+    ("admin.activation_state", "/activation/state"),
     ("admin.health", "/health"),
     ("event_radar.event_radar_page", "/dashboard/events"),
     ("event_radar.event_daily_report_page", "/dashboard/events/daily"),

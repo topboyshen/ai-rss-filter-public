@@ -295,20 +295,19 @@ if [ "$1" = "inspect" ]; then
   for argument in "$@"; do
     case "$argument" in cid-*) container_id="$argument" ;; esac
   done
-  unhealthy=0
-  if [ -n "${FAKE_FAIL_REF:-}" ] && [ "${IMAGE_REF:-}" = "$FAKE_FAIL_REF" ]; then
-    unhealthy=1
-  elif [ -n "${FAKE_FAIL_SERVICE:-}" ] && \
-       [ "$container_id" = "cid-$FAKE_FAIL_SERVICE" ]; then
-    unhealthy=1
+  # Real docker gets one newline-joined argument and answers object-not-found.
+  case "$container_id" in *"
+"*) echo "Error: No such object" >&2; exit 1 ;; esac
+  unhealthy=0 stopped=0
+  if [ -n "${FAKE_FAIL_REF:-}" ] && [ "${IMAGE_REF:-}" = "$FAKE_FAIL_REF" ]; then unhealthy=1
+  elif [ -n "${FAKE_FAIL_SERVICE:-}" ] && [ "$container_id" = "cid-$FAKE_FAIL_SERVICE" ]; then unhealthy=1
+  elif [ -n "${FAKE_STOPPED_SERVICE:-}" ] && [ "$container_id" = "cid-$FAKE_STOPPED_SERVICE" ]; then stopped=1
   fi
   case "$*" in
     *"{{if .State.Health}}"*)
-      if [ "$unhealthy" = "1" ]; then
-        printf 'unhealthy\n'
-      else
-        printf 'healthy\n'
-      fi
+      if [ "$stopped" = "1" ]; then printf 'exited|healthy\n'
+      elif [ "$unhealthy" = "1" ]; then printf 'running|unhealthy\n'
+      else printf 'running|healthy\n'; fi
       ;;
     *)
       if [ "${FAKE_DIAGNOSTIC_INSPECT_FAIL:-0}" = "1" ]; then
@@ -324,8 +323,9 @@ if [ "$1" = "inspect" ]; then
         health="healthy"
         exit_code=0
       fi
-      printf '{"Id":"%s","Name":"/%s","RestartCount":0,"State":{"Status":"%s","Running":true,"ExitCode":%s,"OOMKilled":false,"Error":"","Health":{"Status":"%s","FailingStreak":3,"Log":[{"Start":"2026-09-02T01:00:00Z","End":"2026-09-02T01:00:01Z","ExitCode":1,"Output":"{\\"token\\":\\"json-health-secret\\"}"}]}}}\n' \
-        "$container_id" "$service" "$status" "$exit_code" "$health"
+      # printf rewrites \\" in its format string, so the inner JSON goes via %s.
+      printf '{"Id":"%s","Name":"/%s","RestartCount":0,"State":{"Status":"%s","Running":true,"ExitCode":%s,"OOMKilled":false,"Error":"","Health":{"Status":"%s","FailingStreak":3,"Log":[{"Start":"2026-09-02T01:00:00Z","End":"2026-09-02T01:00:01Z","ExitCode":1,"Output":"%s"}]}}}\n' \
+        "$container_id" "$service" "$status" "$exit_code" "$health" '{\\"token\\":\\"json-health-secret\\"}'
       ;;
   esac
   exit 0
@@ -387,15 +387,12 @@ if [ "$1" = "compose" ]; then
       exit 0
       ;;
     ps)
-      if [ "${1:-}" = "--all" ]; then
-        shift
-      fi
+      [ "${1:-}" = "--all" ] && shift
       [ "${1:-}" = "-q" ] || exit 93
       service="$2"
-      if [ -n "${FAKE_MISSING_SERVICE:-}" ] && [ "$service" = "$FAKE_MISSING_SERVICE" ]; then
-        exit 0
-      fi
+      [ "${FAKE_MISSING_SERVICE:-}" = "$service" ] && exit 0
       printf 'cid-%s\n' "$service"
+      [ "${FAKE_DUPLICATE_SERVICE:-}" = "$service" ] && printf 'cid-%s-2\n' "$service"
       exit 0
       ;;
     build)
@@ -1418,6 +1415,29 @@ def test_deploy_archives_manifest_and_records_complete_state(release_env):
         for line in compose_calls
     )
     assert ":latest" not in calls
+
+
+def test_deploy_refuses_to_guess_between_two_service_containers(release_env):
+    env, _log, _registry, _old_manifest = release_env
+    env["FAKE_DUPLICATE_SERVICE"] = "ai-filter-api"
+
+    result = _run_release(env, "deploy", "my-ai-filter:2026.07.12.1")
+
+    assert result.returncode != 0
+    assert "cannot identify a single container for ai-filter-api" in result.stderr
+    assert "found 2" in result.stderr
+    assert "Health timeout" not in result.stderr
+
+
+def test_deploy_rejects_a_stopped_service_with_stale_healthy_health(release_env):
+    env, _log, _registry, _old_manifest = release_env
+    env["FAKE_STOPPED_SERVICE"] = "ai-filter-api"
+
+    result = _run_release(env, "deploy", "my-ai-filter:2026.07.12.1")
+
+    assert result.returncode != 0
+    assert "Health timeout" in result.stderr
+    assert "exited|healthy" in result.stderr
 
 
 @pytest.mark.parametrize("preflight_failure", [False, True])

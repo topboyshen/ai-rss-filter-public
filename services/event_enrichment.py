@@ -192,11 +192,6 @@ def _mapping_generation_prefix() -> str:
     )
 
 
-def _mapping_generation_like_pattern() -> str:
-    """LIKE pattern matching any current generation (rules/master suffixes)."""
-    return f"{_mapping_generation_prefix()}:%"
-
-
 def _mapping_rules_fingerprint() -> str:
     """Backtest-aligned asset-mapping source fingerprint without asset-map:."""
     version = str(get_mapping_version() or "")

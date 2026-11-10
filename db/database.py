@@ -46,7 +46,6 @@ from db.score_explanation import (
 )
 from db.event_mapping_gate import (
     EventMappingMigrationGateError as EventMappingMigrationGateError,
-    event_mapping_migration_gate_path,
     require_event_mapping_connection_write_authorized,
     require_event_mapping_write_authorized,
 )
@@ -106,10 +105,6 @@ SQLITE_BUSY_TIMEOUT_SECONDS = 5.0
 _SQLITE_BUSY_TIMEOUT_PRAGMA = f"PRAGMA busy_timeout={int(SQLITE_BUSY_TIMEOUT_SECONDS * 1000)}"
 
 
-def _event_mapping_migration_gate_path() -> str:
-    return event_mapping_migration_gate_path(DB_PATH)
-
-
 def _require_event_mapping_write_authorized(
     mapping_version: str,
     conn: Optional[sqlite3.Connection] = None,
@@ -118,6 +113,57 @@ def _require_event_mapping_write_authorized(
         require_event_mapping_write_authorized(mapping_version, db_path=DB_PATH)
         return
     require_event_mapping_connection_write_authorized(conn, mapping_version)
+
+
+# Presentation-only query parameters: transports append them, but they never
+# identify a different article.  Item identity parameters (for example
+# ``ai_filter_item``) are deliberately absent from this set.
+_TRACKING_QUERY_KEYS = frozenset(
+    {
+        "from",
+        "spm",
+        "ref",
+        "ref_src",
+        "fbclid",
+        "gclid",
+        "yclid",
+        "msclkid",
+        "igshid",
+        "mc_cid",
+        "mc_eid",
+        "share_source",
+        "share_token",
+    }
+)
+
+
+def _strip_tracking_query(query: str) -> str:
+    """Drop known tracking parameters, preserving order and every other key."""
+    if not query:
+        return ""
+    kept = []
+    for part in query.split("&"):
+        if not part:
+            continue
+        key = part.split("=", 1)[0].strip().lower()
+        if key.startswith("utm_") or key in _TRACKING_QUERY_KEYS:
+            continue
+        kept.append(part)
+    return "&".join(kept)
+
+
+def _canonical_article_path(path: str) -> str:
+    """Fold trailing slashes only: HTTP path letter case is identity-bearing.
+
+    Short links and base64-style ids can differ only in case, so lowercasing
+    the path would merge two distinct articles into one event.  That merge is
+    irreversible and overwrites the first article's title and priority, so a
+    missed merge is preferred here.
+    """
+    normalized = path or "/"
+    if normalized != "/":
+        normalized = normalized.rstrip("/") or "/"
+    return normalized
 
 
 def _normalized_article_identity(link: str) -> tuple[str, str]:
@@ -143,8 +189,8 @@ def _normalized_article_identity(link: str) -> tuple[str, str]:
                 (
                     parsed.scheme.lower(),
                     netloc,
-                    parsed.path or "/",
-                    parsed.query,
+                    _canonical_article_path(parsed.path),
+                    _strip_tracking_query(parsed.query),
                     "",
                 )
             )

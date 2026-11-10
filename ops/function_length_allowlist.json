@@ -68,7 +68,7 @@
   "tests/test_event_core_migration.py:test_true_legacy_price_and_outbox_schema_is_upgraded_inside_migration": 121,
   "tests/test_event_mapping_migration.py:coordinator_env": 152,
   "tests/test_event_outcomes.py:test_distinct_link_reactivation_materializes_current_mapping_and_keeps_history": 139,
-  "tests/test_release_script.py:release_env": 460,
+  "tests/test_release_script.py:release_env": 457,
   "tests/test_security_master_runner.py:runner_env": 141,
   "scripts/repair_market_close.py:main": 141,
   "workers/market_close_collector.py:run": 153

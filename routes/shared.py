@@ -140,7 +140,12 @@ def is_refresh_job_running() -> bool:
 
         shared = get_shared_json("refresh-status")
         return bool(shared and shared.get("running") is True)
-    except Exception:
+    except Exception as e:
+        # 读不到共享状态时按「未运行」处理（保守、只影响展示与监控），
+        # 但必须留痕，否则缓存故障会伪装成正常的空闲状态。
+        logger.warning(
+            "[refresh] shared refresh status unreadable: %s", str(e)[:160]
+        )
         return False
 
 
