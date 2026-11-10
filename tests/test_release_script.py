@@ -520,6 +520,56 @@ def _run_release(env, *args, pass_fds=()):
     )
 
 
+def _release_shell_function(name):
+    source = RELEASE_SCRIPT.read_text(encoding="utf-8")
+    marker = f"{name}() {{"
+    start = source.index(marker)
+    end = source.index("\n}\n", start) + len("\n}\n")
+    return source[start:end]
+
+
+def _run_read_build_contract(
+    tmp_path, *, ref, contract_private_sha, active_private_sha, mode
+):
+    contracts = tmp_path / "build-contracts"
+    contracts.mkdir(exist_ok=True)
+    key = hashlib.sha256(ref.encode()).hexdigest()
+    lines = [
+        ref,
+        IMAGE_ID,
+        "a" * 64,
+        "b" * 64,
+        "c" * 40 + ":clean",
+        "event-mapping-store-v5-provider-attribution-v1",
+    ]
+    if contract_private_sha is not None:
+        lines.append(contract_private_sha)
+    (contracts / f"{key}.state").write_text(
+        "\n".join(lines) + "\n", encoding="utf-8"
+    )
+    harness = "\n".join([
+        "set -u",
+        f"BUILD_CONTRACT_DIR={shlex.quote(str(contracts))}",
+        f"PRIVATE_CONTRACT_SHA={shlex.quote(active_private_sha)}",
+        "EVENT_MAPPING_MIGRATION_GENERATION="
+        "event-mapping-store-v5-provider-attribution-v1",
+        _release_shell_function("build_contract_path"),
+        _release_shell_function("read_build_contract"),
+        f"if read_build_contract {shlex.quote(ref)} {shlex.quote(mode)}; then",
+        '  printf "OK %s\\n" "$CONTRACT_PRIVATE_SHA"',
+        "else",
+        "  exit $?",
+        "fi",
+    ])
+    return subprocess.run(
+        ["bash", "-c", harness],
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+
 def test_release_entrypoint_defaults_to_fixed_event_mapping_operational_paths():
     source = RELEASE_SCRIPT.read_text(encoding="utf-8")
 
@@ -2797,6 +2847,89 @@ def test_private_build_contract_cannot_be_verified_as_public_release(release_env
     assert result.returncode == 3
     assert "Private build contract is missing or mismatched" in result.stderr
     assert " up " not in log.read_text()
+
+
+def test_recorded_private_build_contract_survives_contract_rotation(tmp_path):
+    old_private_sha = "d" * 64
+    active_private_sha = "e" * 64
+
+    result = _run_read_build_contract(
+        tmp_path,
+        ref="my-ai-filter:2026.11.09.133",
+        contract_private_sha=old_private_sha,
+        active_private_sha=active_private_sha,
+        mode="recorded",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"OK {old_private_sha}" in result.stdout
+
+
+def test_recorded_private_build_contract_requires_a_private_release(tmp_path):
+    result = _run_read_build_contract(
+        tmp_path,
+        ref="my-ai-filter:2026.11.09.133",
+        contract_private_sha="d" * 64,
+        active_private_sha="",
+        mode="recorded",
+    )
+
+    assert result.returncode == 3
+    assert "Private build contract is missing or mismatched" in result.stderr
+
+
+def test_new_private_build_contract_requires_exact_active_contract(tmp_path):
+    result = _run_read_build_contract(
+        tmp_path,
+        ref="my-ai-filter:2026.11.10.134",
+        contract_private_sha="d" * 64,
+        active_private_sha="e" * 64,
+        mode="strict",
+    )
+
+    assert result.returncode == 3
+    assert "Private build contract is missing or mismatched" in result.stderr
+
+
+def test_new_private_build_contract_accepts_matching_active_contract(tmp_path):
+    private_sha = "e" * 64
+
+    result = _run_read_build_contract(
+        tmp_path,
+        ref="my-ai-filter:2026.11.10.134",
+        contract_private_sha=private_sha,
+        active_private_sha=private_sha,
+        mode="strict",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"OK {private_sha}" in result.stdout
+
+
+def test_recorded_private_build_contract_rejects_malformed_private_sha(tmp_path):
+    result = _run_read_build_contract(
+        tmp_path,
+        ref="my-ai-filter:2026.11.09.133",
+        contract_private_sha="not-a-sha",
+        active_private_sha="e" * 64,
+        mode="recorded",
+    )
+
+    assert result.returncode == 3
+    assert "Private build contract is missing or mismatched" in result.stderr
+
+
+def test_invalid_build_contract_read_mode_is_rejected(tmp_path):
+    result = _run_read_build_contract(
+        tmp_path,
+        ref="my-ai-filter:2026.11.09.133",
+        contract_private_sha="d" * 64,
+        active_private_sha="e" * 64,
+        mode="relaxed",
+    )
+
+    assert result.returncode == 2
+    assert "Invalid build contract read mode" in result.stderr
 
 
 def test_compose_and_ci_forbid_latest_and_target_master():

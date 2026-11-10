@@ -909,9 +909,21 @@ write_build_contract() {
   chmod 0600 "$target"
 }
 
+# MODE is "strict" for the release being deployed or explicitly verified, and
+# "recorded" for an already-registered release state. A recorded private build
+# may have been produced under an earlier sealed contract; rotation is allowed
+# there because its immutable digest and contract stay recorded, while the
+# newly deployed ref remains strictly matched below.
 read_build_contract() {
-  local ref="$1" target value
+  local ref="$1" mode="${2:-strict}" target value
   local -a values=()
+  case "$mode" in
+    strict|recorded) ;;
+    *)
+      echo "Invalid build contract read mode" >&2
+      return 2
+      ;;
+  esac
   target="$(build_contract_path "$ref")"
   if [[ ! -f "$target" || ! -r "$target" || -L "$target" ]]; then
     echo "No trusted build contract is recorded for $ref; run release.sh build first" >&2
@@ -936,10 +948,19 @@ read_build_contract() {
   CONTRACT_SOURCE_ID="${values[4]}"
   CONTRACT_MAPPING_GENERATION="${values[5]:-}"
   CONTRACT_PRIVATE_SHA="${values[6]:-}"
-  if [[ -n "$CONTRACT_PRIVATE_SHA" &&
-        ( ! "$CONTRACT_PRIVATE_SHA" =~ ^[0-9a-f]{64}$ || "$CONTRACT_PRIVATE_SHA" != "$PRIVATE_CONTRACT_SHA" ) ]]; then
-    echo "Private build contract is missing or mismatched" >&2
-    return 3
+  if [[ -n "$CONTRACT_PRIVATE_SHA" ]]; then
+    if [[ ! "$CONTRACT_PRIVATE_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+      echo "Private build contract is missing or mismatched" >&2
+      return 3
+    fi
+    if [[ "$mode" == "strict" && "$CONTRACT_PRIVATE_SHA" != "$PRIVATE_CONTRACT_SHA" ]]; then
+      echo "Private build contract is missing or mismatched" >&2
+      return 3
+    fi
+    if [[ "$mode" == "recorded" && -z "$PRIVATE_CONTRACT_SHA" ]]; then
+      echo "Private build contract is missing or mismatched" >&2
+      return 3
+    fi
   fi
   if [[ -n "$CONTRACT_MAPPING_GENERATION" && \
         "$CONTRACT_MAPPING_GENERATION" != "$EVENT_MAPPING_MIGRATION_GENERATION" ]]; then
@@ -1330,7 +1351,7 @@ validate_recorded_image_contract_if_present() {
   local ref="$1" digest="$2" manifest="${3:-}" target
   target="$(build_contract_path "$ref")"
   [[ -e "$target" || -L "$target" ]] || return 0
-  read_build_contract "$ref"
+  read_build_contract "$ref" recorded
   if [[ "$CONTRACT_DIGEST" != "$digest" ]] || \
      [[ -n "$manifest" && "$CONTRACT_MANIFEST" != "$manifest" ]]; then
     echo "Recorded release does not match its build contract: $ref" >&2
