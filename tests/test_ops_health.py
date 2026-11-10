@@ -478,6 +478,31 @@ def test_ops_feeds_is_short_cached_and_redacts_internal_details(monkeypatch):
     assert internal_error not in body
 
 
+def test_ops_feeds_browser_html_links_back_to_dashboard(monkeypatch):
+    import routes.dashboard_routes as dashboard_routes
+    from flask import Flask
+
+    monkeypatch.setattr(
+        dashboard_routes,
+        "_cfg",
+        lambda: {"threshold": {}, "feeds": []},
+    )
+    monkeypatch.setattr(
+        dashboard_routes,
+        "_get_feed_health_snapshot",
+        lambda: ([], {}),
+    )
+
+    test_app = Flask(__name__)
+    with test_app.test_request_context(
+        "/ops-feeds", headers={"Accept": "text/html"}
+    ):
+        body = dashboard_routes.ops_feeds_widget().get_data(as_text=True)
+
+    assert 'href="/dashboard"' in body
+    assert "返回后台" in body
+
+
 def test_feed_widget_and_dashboard_share_no_sample_and_zero_rate_labels(
     tmp_path, monkeypatch
 ):
@@ -509,6 +534,7 @@ def test_feed_widget_and_dashboard_share_no_sample_and_zero_rate_labels(
         dashboard = render_template_string(
             section, health_rows=rows, feed_metric_details=details, cfg=cfg,
             datetime=datetime, feed_data_health=routes.feed_data_health,
+            beijing_fromtimestamp=routes.beijing_fromtimestamp,
         )
     for body in (widget, dashboard):
         assert "新增有效信号率" in body
