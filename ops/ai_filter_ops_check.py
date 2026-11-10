@@ -29,7 +29,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, time as datetime_time, timedelta
+from datetime import date, datetime, time as datetime_time, timedelta
 from pathlib import Path
 from typing import Callable, Iterable
 from zoneinfo import ZoneInfo
@@ -1032,6 +1032,13 @@ def check_db_maintenance(settings: Settings, now: int) -> CheckResult:
     )
 
 
+def _is_trading_day(day: date) -> bool:
+    holidays = _CHINA_HOLIDAYS_BY_YEAR.get(day.year)
+    if holidays is None:
+        raise ValueError("A-share trading calendar is not configured")
+    return day.weekday() < 5 and day.isoformat() not in holidays
+
+
 def _expected_market_trade_date(
     now: int, *, ready_at: datetime_time = datetime_time(16, 0)
 ) -> str:
@@ -1042,10 +1049,7 @@ def _expected_market_trade_date(
     if current.time() < ready_at:
         candidate -= timedelta(days=1)
     for _ in range(15):
-        holidays = _CHINA_HOLIDAYS_BY_YEAR.get(candidate.year)
-        if holidays is None:
-            raise ValueError("A-share trading calendar is not configured")
-        if candidate.weekday() < 5 and candidate.isoformat() not in holidays:
+        if _is_trading_day(candidate):
             return candidate.isoformat()
         candidate -= timedelta(days=1)
     raise ValueError("A-share trading date cannot be determined")
@@ -1119,10 +1123,28 @@ def _collector_is_coverage_replay(payload: dict[str, object]) -> bool:
 
 
 def _market_timer_from_results(
-    settings: Settings, expected_date: str, row_count: int
+    settings: Settings, expected_date: str, row_count: int, *, now: int
 ) -> CheckResult:
     collector = _load_market_result(settings, "collector")
     status = str(collector.get("status") or "")
+    if status == "skipped_nontrading":
+        # persist_host_fallback writes this status without a trade_date when the
+        # host has no previous collector receipt, so it is only evidence of a
+        # healthy holiday when the calendar agrees that today is not a trading
+        # day. On a trading day the skip is a calendar disagreement.
+        if _is_trading_day(datetime.fromtimestamp(now, _MARKET_TZ).date()):
+            return CheckResult(
+                "market_timer",
+                False,
+                "collector skipped a trading day; calendar disagrees; "
+                f"database_trade_date={expected_date} benchmark_rows={row_count}",
+            )
+        return CheckResult(
+            "market_timer",
+            True,
+            "collector skipped non-trading day; "
+            f"database_trade_date={expected_date} benchmark_rows={row_count}",
+        )
     if status == "skipped_maintenance":
         return CheckResult(
             "market_timer",
@@ -1271,7 +1293,7 @@ def check_market_timer(settings: Settings, now: int) -> CheckResult:
         if not last_exit or last_exit == "n/a":
             return CheckResult("market_timer", False, "market service has no last completion")
         expected_date, row_count = _check_market_database(settings, now)
-        return _market_timer_from_results(settings, expected_date, row_count)
+        return _market_timer_from_results(settings, expected_date, row_count, now=now)
     except (
         OSError,
         sqlite3.Error,

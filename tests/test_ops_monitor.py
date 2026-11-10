@@ -632,15 +632,52 @@ def test_market_timer_rejects_coverage_replay_success(tmp_path):
             "benchmark_rows=4 pending=0"
         ),
     )
-    replayed = monitor._market_timer_from_results(_settings(tmp_path), "2026-08-04", 4)
+    replayed = monitor._market_timer_from_results(
+        _settings(tmp_path),
+        "2026-08-04",
+        4,
+        now=int(datetime(2026, 8, 4, 16, 5, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp()),
+    )
     assert replayed.ok is False
     assert "coverage replay" in replayed.detail
     assert "not natural close" in replayed.detail
 
     _write_market_result(tmp_path, "collector", status="success")
-    natural = monitor._market_timer_from_results(_settings(tmp_path), "2026-08-04", 4)
+    natural = monitor._market_timer_from_results(
+        _settings(tmp_path),
+        "2026-08-04",
+        4,
+        now=int(datetime(2026, 8, 4, 16, 5, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp()),
+    )
     assert natural.ok is True
     assert "coverage replay" not in natural.detail
+
+
+def test_holiday_skip_without_previous_receipt_is_not_a_failure(tmp_path):
+    now = int(datetime(2026, 10, 1, 16, 5, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp())
+    # persist_host_fallback writes this payload when the host has no previous
+    # collector receipt, so it carries no trade_date at all.
+    _write_market_result(tmp_path, "collector", status="skipped_nontrading", trade_date="")
+
+    result = monitor._market_timer_from_results(
+        _settings(tmp_path), "2026-09-30", 4, now=now
+    )
+
+    assert result.ok is True
+    assert result.warning is False
+    assert "non-trading" in result.detail
+
+
+def test_skip_on_a_trading_day_is_still_a_failure(tmp_path):
+    now = int(datetime(2026, 9, 30, 16, 5, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp())
+    _write_market_result(tmp_path, "collector", status="skipped_nontrading", trade_date="")
+
+    result = monitor._market_timer_from_results(
+        _settings(tmp_path), "2026-09-30", 4, now=now
+    )
+
+    assert result.ok is False
+    assert "trading day" in result.detail
 
 
 def test_market_history_reports_backlog_without_failing_same_day(tmp_path):
@@ -708,7 +745,12 @@ def test_same_day_repair_must_follow_collector_completion(tmp_path, started, com
     _write_market_result(tmp_path, "collector", status="incomplete", completed_at=2)
     _write_market_result(tmp_path, "repair", status="complete",
                          started_at=started, completed_at=completed)
-    result = monitor._market_timer_from_results(_settings(tmp_path), "2026-08-04", 4)
+    result = monitor._market_timer_from_results(
+        _settings(tmp_path),
+        "2026-08-04",
+        4,
+        now=int(datetime(2026, 8, 4, 16, 5, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp()),
+    )
     assert result.ok is accepted
 
 
