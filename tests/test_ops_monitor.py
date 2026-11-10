@@ -714,6 +714,109 @@ def test_market_history_reports_backlog_without_failing_same_day(tmp_path):
     assert failed.ok is False
 
 
+def test_missing_history_receipt_fails_after_a_recorded_baseline(tmp_path):
+    state = tmp_path / "state" / "state.json"
+    state.parent.mkdir(parents=True)
+    state.write_text(
+        json.dumps({"version": 2, "market_history_seen": True}), encoding="utf-8"
+    )
+    now = int(datetime(2026, 8, 4, 17, 0, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp())
+
+    result = monitor.check_market_history(_settings(tmp_path, state_file=state), now)
+
+    assert result.ok is False
+    assert "after a previous run" in result.detail
+    assert "cause not determined" in result.detail
+
+
+def test_seen_history_receipt_is_exported_to_state(monkeypatch, tmp_path):
+    state = tmp_path / "state" / "state.json"
+    arguments = [
+        "--config",
+        str(tmp_path / "missing-monitor.env"),
+        "--backup-config",
+        str(tmp_path / "missing-backup.env"),
+        "--root",
+        str(tmp_path / "app"),
+        "--backup-dir",
+        str(tmp_path / "backups"),
+        "--state-file",
+        str(state),
+    ]
+
+    def run_with(result):
+        monkeypatch.setattr(monitor, "CHECKS", (lambda _settings, _now: result,))
+        assert monitor.main(arguments) == 0
+
+    run_with(
+        monitor.CheckResult(
+            "market_history", True, "historical pending complete", evidence_present=True
+        )
+    )
+    assert json.loads(state.read_text(encoding="utf-8"))["market_history_seen"] is True
+
+    run_with(monitor.CheckResult("market_history", True, "historical pending complete"))
+    assert json.loads(state.read_text(encoding="utf-8"))["market_history_seen"] is True
+
+
+def _monitor_arguments(tmp_path: Path, state: Path, now: int) -> list[str]:
+    return [
+        "--config", str(tmp_path / "missing-monitor.env"),
+        "--backup-config", str(tmp_path / "missing-backup.env"),
+        "--root", str(tmp_path / "app"),
+        "--backup-dir", str(tmp_path / "backups"),
+        "--state-file", str(state),
+        "--now", str(now),
+    ]
+
+
+def _valid_history_receipt(tmp_path: Path, now: int) -> Path:
+    _write_market_result(
+        tmp_path,
+        "history",
+        status="complete",
+        started_at=now - 1800,
+        completed_at=now - 60,
+    )
+    return tmp_path / "app" / "data" / "market_close" / "history_last.json"
+
+
+def test_history_receipt_lost_after_a_successful_run_fails(monkeypatch, tmp_path):
+    state = tmp_path / "state" / "state.json"
+    now = int(datetime(2026, 8, 4, 17, 0, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp())
+    arguments = _monitor_arguments(tmp_path, state, now)
+    monkeypatch.setattr(monitor, "CHECKS", (monitor.check_market_history,))
+    receipt = _valid_history_receipt(tmp_path, now)
+
+    assert monitor.main(arguments) == 0
+    observed = json.loads(state.read_text(encoding="utf-8"))
+    assert observed["status"] == "healthy"
+    assert observed["market_history_seen"] is True
+
+    receipt.unlink()
+    assert monitor.main(arguments) == 1
+    missing = json.loads(state.read_text(encoding="utf-8"))
+    assert missing["status"] == "failing"
+    assert missing["market_history_seen"] is True
+
+
+def test_dry_run_does_not_establish_the_history_baseline(monkeypatch, tmp_path):
+    state = tmp_path / "state" / "state.json"
+    now = int(datetime(2026, 8, 4, 17, 0, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp())
+    arguments = _monitor_arguments(tmp_path, state, now)
+    monkeypatch.setattr(monitor, "CHECKS", (monitor.check_market_history,))
+    receipt = _valid_history_receipt(tmp_path, now)
+
+    assert monitor.main([*arguments, "--dry-run"]) == 0
+    assert not state.exists()
+
+    receipt.unlink()
+    assert monitor.main(arguments) == 0
+    first_missing = json.loads(state.read_text(encoding="utf-8"))
+    assert first_missing["status"] == "healthy"
+    assert first_missing["market_history_seen"] is False
+
+
 def test_root_disk_warns_before_it_fails(monkeypatch, tmp_path):
     class _Usage:
         def __init__(self, used, total, free):

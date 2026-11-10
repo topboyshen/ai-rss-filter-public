@@ -95,6 +95,10 @@ class CheckResult:
     detail: str
     warning: bool = False
     skipped: bool = False
+    # Set by checks whose result proves a durable receipt exists. The run state
+    # keeps the first such sighting so a later disappearance is a failure, not
+    # "not yet reported".
+    evidence_present: bool | None = None
 
     def public(self) -> dict[str, object]:
         return {
@@ -1311,6 +1315,13 @@ def check_market_history(settings: Settings, now: int) -> CheckResult:
         payload = _load_market_result(settings, "history")
     except ValueError as exc:
         if "missing" in str(exc):
+            if _read_state(settings.state_file).get("market_history_seen") is True:
+                return CheckResult(
+                    "market_history",
+                    False,
+                    "history result missing after a previous run reported one; "
+                    "cause not determined (removed, moved, or not written)",
+                )
             return CheckResult(
                 "market_history",
                 True,
@@ -1324,6 +1335,7 @@ def check_market_history(settings: Settings, now: int) -> CheckResult:
             "market_history",
             False,
             f"history repair error detail={payload.get('detail') or 'unknown'}",
+            evidence_present=True,
         )
     try:
         started, completed = _market_result_times(payload)
@@ -1336,13 +1348,14 @@ def check_market_history(settings: Settings, now: int) -> CheckResult:
         if started < scheduled or completed > now:
             raise ValueError(f"history result stale or future; expected_run_date={expected}")
     except (ValueError, TypeError, OverflowError, OSError) as exc:
-        return CheckResult("market_history", False, _safe_detail(exc))
+        return CheckResult("market_history", False, _safe_detail(exc), evidence_present=True)
     remaining = payload.get("remaining_total", payload.get("due_total"))
     if status == "complete":
         return CheckResult(
             "market_history",
             True,
             f"historical pending complete trade_date={payload.get('trade_date')}",
+            evidence_present=True,
         )
     return CheckResult(
         "market_history",
@@ -1352,6 +1365,7 @@ def check_market_history(settings: Settings, now: int) -> CheckResult:
         f"unresolved={payload.get('unresolved')} "
         f"trade_date={payload.get('trade_date')}",
         warning=True,
+        evidence_present=True,
     )
 
 
@@ -1639,6 +1653,7 @@ def evaluate(settings: Settings, now: int) -> list[CheckResult]:
                 _safe_detail(result.detail),
                 bool(result.warning),
                 bool(result.skipped),
+                result.evidence_present,
             )
         )
     return results
@@ -1998,6 +2013,13 @@ def main(argv: list[str] | None = None) -> int:
             if notice_attempted and not notice_sent
             else "",
             "warnings": sorted(item.name for item in results if item.warning),
+            # Sticky: once a history receipt exists, its absence is a failure rather
+            # than "not yet reported", so the sighting has to survive later runs.
+            "market_history_seen": previous.get("market_history_seen") is True
+            or any(
+                item.name == "market_history" and item.evidence_present is True
+                for item in results
+            ),
         }
         _write_state(settings.state_file, state)
         _render(results, as_json=args.json, quiet=args.quiet)
