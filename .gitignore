@@ -35,6 +35,8 @@ data/webhook_spool/.completed-digests
 data/webhook_spool/.lock
 data/webhook_spool/inflight/
 data/webhook_spool/dead-letter/
+# Strict webhook receipt records, task index and alias intents are runtime state.
+/data/webhook_spool/receipts/
 data/dashboard_snapshots/
 # Collector/repair receipts are persistent host runtime state, not source.
 data/market_close/
