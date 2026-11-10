@@ -72,6 +72,9 @@ _DB_MAINTENANCE_MAX_AGE_SECONDS = 8 * 86400
 _DB_MAINTENANCE_RUNNING_GRACE_SECONDS = 70 * 60
 _DB_MAINTENANCE_LOG_TAIL_BYTES = 256 * 1024
 _MARKET_REQUIRED_SYMBOLS = {"sh000001", "sh000300", "sz399001", "sz399006"}
+# This host script is installed separately from the image and cannot import
+# db/database.py, so the holiday table is a hand-kept copy of that module's
+# CHINA_HOLIDAYS_BY_YEAR. Edit both, or tests/test_ops_monitor.py fails.
 _CHINA_HOLIDAYS_BY_YEAR = {
     2026: {
         "2026-01-01", "2026-01-02", "2026-01-03",

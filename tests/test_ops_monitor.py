@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from db import database
 from ops import ai_filter_ops_check as monitor
 
 
@@ -536,6 +537,28 @@ def test_trading_calendar_check_warns_before_the_calendar_runs_out(tmp_path):
 def test_trading_calendar_check_is_registered(tmp_path):
     """A check nobody runs cannot alert; the tuple is the whole schedule."""
     assert monitor.check_trading_calendar in monitor.CHECKS
+
+
+def test_host_calendar_copy_matches_the_database_calendar():
+    """The host monitor runs standalone, so its calendar is a hand-kept copy.
+
+    `ops/ai_filter_ops_check.py` is installed on the host independently of the
+    image, so the two holiday sets cannot share an import. A silent divergence
+    makes the collector and the monitor disagree about whether a day is a
+    trading day, which the monitor reports as "collector skipped a trading day".
+    """
+    host = monitor._CHINA_HOLIDAYS_BY_YEAR
+    image = database.CHINA_HOLIDAYS_BY_YEAR
+    differences = [
+        f"{year}: host_only={sorted(host.get(year, set()) - image.get(year, set()))} "
+        f"image_only={sorted(image.get(year, set()) - host.get(year, set()))}"
+        for year in sorted(set(host) | set(image))
+        if host.get(year) != image.get(year)
+    ]
+
+    assert differences == [], (
+        "host and image holiday calendars diverged: " + "; ".join(differences)
+    )
 
 
 def test_market_timer_checks_service_result_and_expected_database_date(
