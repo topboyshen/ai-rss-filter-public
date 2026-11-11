@@ -9,6 +9,7 @@ import time
 import logging
 import re as _re
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
@@ -940,9 +941,19 @@ def _load_from_db(
     conn = None
     try:
         import sqlite3
-        from db.database import DB_PATH, get_feed_thresholds
+        from db.database import (
+            DB_PATH,
+            SQLITE_BUSY_TIMEOUT_SECONDS,
+            get_feed_thresholds,
+        )
         cfg = load_config() if cfg is None else cfg
-        conn = sqlite3.connect(DB_PATH)
+        # Read-only URI: a missing/renamed DB must fail loudly instead of
+        # creating an empty file, and the connection itself cannot write.
+        conn = sqlite3.connect(
+            Path(DB_PATH).resolve().as_uri() + "?mode=ro",
+            uri=True,
+            timeout=SQLITE_BUSY_TIMEOUT_SECONDS,
+        )
         conn.row_factory = sqlite3.Row
         cutoff = _cutoff_ts(hours)
 
@@ -1077,9 +1088,12 @@ def _load_from_db(
                 feed_url=row_feed_url, source=source,
             ))
         return attach_score_contract_labels(clean, cfg)
-    except Exception:
+    except Exception as exc:
         if strict:
             raise
+        # Keep the historical fail-neutral return, but make the failure
+        # observable without titles/URLs (exception type only).
+        logger.warning("Realtime DB load failed: %s", type(exc).__name__)
         return []
     finally:
         if conn is not None:
