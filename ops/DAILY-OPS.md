@@ -73,6 +73,10 @@ sed -n '1,2p' data/releases/previous.state     # 再只读：可回退的目标
 - **先确认是否已自动回滚**：脚本默认支持自动回滚。失败后先只读查看
   `data/releases/current.state` 与 `data/releases/history.tsv` 最新记录，确认实际运行版本，
   再决定是否需要手动回退，避免重复操作。
+- 部署最终校验失败时，`history.tsv` 的 status 记为 `health_failed:<stage>`：
+  `wait_healthy`（健康超时/服务异常）、`source_immutable`（运行中源码或 `config.yaml`
+  漂移）、`private_runtime`（私有契约运行时校验拒绝）。前缀仍是 `health_failed`，
+  按子串匹配的旧告警仍有效；先按阶段定位，再决定回退或复现。
 - 保留信息：失败命令与输出、`history.tsv` 对应行、`data/releases/` 下的 build contract 与
   manifest、相关 systemd 日志、当时的健康与源健康输出。不要删除失败证据。
 - 明确不做：不手改 `complete` 标记、不伪造 attestation、不为“补通过”放宽校验或阈值、
