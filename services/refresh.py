@@ -15,7 +15,7 @@ from core.prompts import resolve_prompt
 from core.metrics import get_metrics
 from core.scorer import capture_llm_calls
 from core.processor import process_feed, process_entry, build_rss_xml
-from services.natural_scoring import resume_continuations
+from services.natural_scoring import remaining_overview, resume_continuations
 from services.news_processing_trace import processing_origin
 from services.admission_fence import guarded
 from db.database import (
@@ -86,6 +86,17 @@ def _incomplete_feed_reason(stats):
         return (f"采集或评分未完整完成: source_unrecognized={missing}, "
                 f"score_deferred={deferred}, score_terminal_unscored={terminal}, entry_errors={errors}")
     return None
+
+
+def _record_remaining(cfg, continuations):
+    """Replace the pre-feed snapshot with the journal this attempt leaves behind."""
+    remaining = remaining_overview(cfg)
+    if remaining is not None:
+        continuations["remaining"] = remaining
+    elif "remaining" in continuations:
+        # The batch started with a readable journal; never reuse its stale counts.
+        continuations["remaining"] = None
+        continuations["errors"] = continuations.get("errors", 0) + 1
 
 
 def _refresh_one_feed(feed, cfg, name):
@@ -164,6 +175,8 @@ def _execute_feed_refresh():
                 )
                 logger.exception("[Refresh] %s failed", name)
 
+        _record_remaining(cfg, continuations)
+
         try:
             flush_stats(DB.update_stats)
         except Exception:
@@ -182,7 +195,7 @@ def _execute_feed_refresh():
         if status == "success" and (
             continuations["deferred"] or continuations["errors"]
             or continuations["terminal_unscored"]
-            or continuations.get("remaining", {}).get("active", 0)
+            or (continuations.get("remaining") or {}).get("active", 0)
         ):
             status = "partial"
         finished_at = int(time.time())
