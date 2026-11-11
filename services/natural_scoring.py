@@ -286,3 +286,22 @@ def resume_continuations(cfg, *, run_entry):
         result["errors"] += 1
         logger.warning("[NaturalContinuation] remaining work could not be counted")
     return result
+
+
+def remaining_overview(cfg):
+    """Journal counts after feed write-backs; ``None`` when they are unknown.
+
+    ``resume_continuations`` snapshots ``remaining`` before the feeds run, so an
+    entry deferred by a feed would still be reported as an empty queue. Refresh
+    calls this again at the end so the recorded attempt describes the journal it
+    actually leaves behind. An unreadable journal stays unknown instead of
+    reusing the stale pre-feed counts.
+    """
+    strategy = str(cfg.get("scoring_strategy_version") or "")
+    if not strategy and not store.journal_directory().exists():
+        return None
+    try:
+        return store.overview(strategy)
+    except OSError:
+        logger.warning("[NaturalContinuation] remaining work could not be counted after feeds")
+        return None
