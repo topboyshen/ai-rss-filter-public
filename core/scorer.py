@@ -1371,7 +1371,7 @@ class LLMBackend:
     """单个 LLM 后端配置"""
 
     name: str
-    api_key: str
+    api_key: str = field(repr=False)
     base_url: str
     model: str
     rate_limit: float = 1.0  # 两次调用最小间隔（秒）
