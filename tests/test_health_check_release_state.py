@@ -103,8 +103,56 @@ printf '%s|%s\n' "${IMAGE_REF:-}" "$*" >> "$FAKE_DOCKER_LOG"
 
 if [ "$1" = "inspect" ]; then
   container=""
-  for argument in "$@"; do container="$argument"; done
+  format=""
+  previous=""
+  for argument in "$@"; do
+    if [ "$previous" = "--format" ]; then format="$argument"; fi
+    previous="$argument"
+    container="$argument"
+  done
   service="${container#cid-}"
+  if [ "${format#*Mounts}" != "$format" ]; then
+    if [ "$service" = "ai-filter-web" ]; then
+      state="${FAKE_WEB_MOUNT_STATE:-ok}"
+      if [ "$state" = "badjson" ]; then
+        printf 'not-json\n'
+        exit 0
+      fi
+      printf '['
+      separator=''
+      if [ -n "${FAKE_WEB_CONFIG_MOUNT:-}" ]; then
+        source="$FAKE_WEB_CONFIG_FILE"
+        read_only=false
+        case "$state" in
+          missing) source="" ;;
+          rw) read_only=true ;;
+          source) source="/tmp/other/nginx.conf" ;;
+        esac
+        if [ -n "$source" ]; then
+          printf '%s{"Type":"bind","Source":"%s","Destination":"/etc/nginx/nginx.conf","RW":%s}' \
+            "$separator" "$source" "$read_only"
+          separator=','
+        fi
+      fi
+      if [ -n "${FAKE_WEB_VOLUMES:-}" ]; then
+        volume_read_only=false
+        bind_source="$FAKE_PROJECT_ROOT/data"
+        case "$state" in
+          volume_rw) volume_read_only=true ;;
+          bind_source) bind_source="/tmp/other/data" ;;
+        esac
+        printf '%s{"Type":"volume","Source":"/var/lib/docker/volumes/fake/_data","Destination":"/app/data/releases","RW":%s}' \
+          "$separator" "$volume_read_only"
+        separator=','
+        printf '%s{"Type":"bind","Source":"%s","Destination":"/app/data","RW":true}' \
+          "$separator" "$bind_source"
+      fi
+      printf ']\n'
+    else
+      printf '[]\n'
+    fi
+    exit 0
+  fi
   unhealthy=0
   case " ${FAKE_UNHEALTHY_SERVICES:-${FAKE_UNHEALTHY_SERVICE:-}} " in
     *" $service "*) unhealthy=1 ;;
@@ -172,10 +220,27 @@ case "$subcommand" in
       printf '{"services":{'
       separator=''
       for service in $FAKE_CONFIGURED_SERVICES; do
-        printf '%s"%s":{"image":"fake:release"}' "$separator" "$service"
+        extra=''
+        if [ "$service" = "ai-filter-web" ]; then
+          if [ -n "${FAKE_WEB_CONFIG_MOUNT:-}" ]; then
+            extra="$extra"',"configs":[{"source":"ai-filter-gateway-nginx","target":"/etc/nginx/nginx.conf","mode":288}]'
+          fi
+          if [ -n "${FAKE_WEB_VOLUMES:-}" ]; then
+            extra="$extra"',"volumes":[{"type":"volume","source":"releases","target":"/app/data/releases","read_only":true},{"type":"bind","source":"data","target":"/app/data"}]'
+          fi
+        fi
+        printf '%s"%s":{"image":"fake:release"%s}' "$separator" "$service" "$extra"
         separator=','
       done
-      printf '}}\n'
+      if [ -n "${FAKE_WEB_CONFIG_MOUNT:-}" ]; then
+        if [ -n "${FAKE_WEB_CONFIG_CONTENT:-}" ]; then
+          printf '},"configs":{"ai-filter-gateway-nginx":{"content":"events {}","name":"ai-filter-gateway-nginx"}}}\n'
+        else
+          printf '},"configs":{"ai-filter-gateway-nginx":{"file":"%s","name":"ai-filter-gateway-nginx"}}}\n' "$FAKE_WEB_CONFIG_FILE"
+        fi
+      else
+        printf '}}\n'
+      fi
     else
       exit 93
     fi
@@ -265,6 +330,9 @@ def test_health_uses_recorded_old_manifest_and_health_service_set(health_env):
     compose_calls = [line for line in calls.splitlines() if "|compose " in line]
     assert compose_calls
     assert all(line.startswith(f"{DIGEST}|") for line in compose_calls)
+    # This archived manifest declares no mounts or configs, so the probe keeps
+    # its old image-plus-health behavior and never asks Docker for mounts.
+    assert "Mounts" not in calls
 
 
 def test_tampered_archived_manifest_fails_closed_without_restart(health_env):
@@ -446,6 +514,98 @@ def test_health_rejects_container_running_wrong_image(health_env):
     assert not restart_marker.exists()
     assert "AI-Filter webhook-worker health probe failed (1/3)" in log.read_text()
     assert "inspect --format" in docker_log.read_text()
+
+
+def _enable_declared_web_config(env):
+    config_file = Path(env["AI_FILTER_ROOT"]) / "deploy" / "nginx.conf"
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    config_file.write_text("events {}\n", encoding="utf-8")
+    env["FAKE_WEB_CONFIG_MOUNT"] = "1"
+    env["FAKE_WEB_CONFIG_FILE"] = str(config_file)
+    return config_file
+
+
+def test_declared_read_only_config_mount_matches_recorded_manifest(health_env):
+    env, _registry, _archived, docker_log, _marker, _log = health_env
+    _enable_declared_web_config(env)
+
+    result = _run_health(env)
+
+    assert result.returncode == 0, result.stderr
+    calls = docker_log.read_text(encoding="utf-8")
+    assert "inspect --format {{json .Mounts}}" in calls
+
+
+def test_content_based_config_requires_target_and_read_only(health_env):
+    env, _registry, _archived, _docker_log, _marker, log = health_env
+    env["FAKE_WEB_CONFIG_MOUNT"] = "1"
+    env["FAKE_WEB_CONFIG_CONTENT"] = "1"
+    env["FAKE_WEB_CONFIG_FILE"] = "/var/lib/docker/tmp/nginx.conf"
+
+    result = _run_health(env)
+
+    assert result.returncode == 0, result.stderr
+
+    env["FAKE_WEB_MOUNT_STATE"] = "rw"
+    result = _run_health(env)
+
+    assert result.returncode == 1
+    assert "mount /etc/nginx/nginx.conf is not read-only" in log.read_text(
+        encoding="utf-8"
+    )
+
+
+@pytest.mark.parametrize(
+    ("state", "reason"),
+    [
+        ("missing", "missing mount /etc/nginx/nginx.conf"),
+        ("rw", "mount /etc/nginx/nginx.conf is not read-only"),
+        ("source", "mount /etc/nginx/nginx.conf source does not match"),
+        ("badjson", "mount evidence is not valid JSON"),
+    ],
+)
+def test_declared_config_mount_mismatch_fails_the_probe(health_env, state, reason):
+    env, _registry, _archived, _docker_log, restart_marker, log = health_env
+    _enable_declared_web_config(env)
+    env["FAKE_WEB_MOUNT_STATE"] = state
+
+    result = _run_health(env)
+
+    assert result.returncode == 1
+    assert not restart_marker.exists()
+    text = log.read_text(encoding="utf-8")
+    assert "AI-Filter ai-filter-web health probe failed (1/3)" in text
+    assert "runtime mount does not match the recorded manifest" in text
+    assert reason in text
+
+
+def test_declared_volume_and_writable_bind_mounts_match(health_env):
+    env, _registry, _archived, _docker_log, _marker, _log = health_env
+    _enable_declared_web_config(env)
+    env["FAKE_WEB_VOLUMES"] = "1"
+
+    result = _run_health(env)
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("state", "reason"),
+    [
+        ("volume_rw", "mount /app/data/releases is not read-only"),
+        ("bind_source", "mount /app/data source does not match"),
+    ],
+)
+def test_declared_volume_and_bind_mismatch_fails_the_probe(health_env, state, reason):
+    env, _registry, _archived, _docker_log, _marker, log = health_env
+    _enable_declared_web_config(env)
+    env["FAKE_WEB_VOLUMES"] = "1"
+    env["FAKE_WEB_MOUNT_STATE"] = state
+
+    result = _run_health(env)
+
+    assert result.returncode == 1
+    assert reason in log.read_text(encoding="utf-8")
 
 
 def test_health_reconciles_drifted_image_to_recorded_manifest(health_env):
