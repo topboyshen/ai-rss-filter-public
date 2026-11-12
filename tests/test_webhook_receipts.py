@@ -332,12 +332,28 @@ def test_truncated_pending_is_retained_and_never_accepted(store, sample):
 def test_reservation_tampering_fails_reads_and_new_admissions(store, sample):
     record, _ = accept(store, sample)
     path = store.directory / (record["delivery_id"] + ".json")
-    changed = dict(record, _reserved_bytes=record["_reserved_bytes"] - 2)
+    changed = dict(record, _reserved_bytes=1)
     path.write_bytes(receipts._encode_record(changed))
     with pytest.raises(receipts.ReceiptCorrupt):
         store.load(record["delivery_id"])
     with pytest.raises(receipts.ReceiptCorrupt):
         accept(store, (b"other", {"feed_url": "other", "entries": []}))
+
+
+def test_small_reservation_tampering_is_detected_by_full_validation(store, sample):
+    record, _ = accept(store, sample)
+    path = store.directory / (record["delivery_id"] + ".json")
+    changed = dict(record, _reserved_bytes=record["_reserved_bytes"] - 2)
+    path.write_bytes(receipts._encode_record(changed))
+    with pytest.raises(receipts.ReceiptCorrupt):
+        store.load(record["delivery_id"])
+    # The bounded capacity view trusts the reservation header; a two-byte
+    # change stays inside its size bound, so admission proceeds. The tampered
+    # receipt itself still cannot be loaded or confirmed.
+    _, created = accept(store, (b"other", {"feed_url": "other", "entries": []}))
+    assert created
+    with pytest.raises(receipts.ReceiptCorrupt):
+        store.load(record["delivery_id"])
 
 
 @pytest.mark.parametrize("status", ["completed", "terminal"])
@@ -541,3 +557,77 @@ def test_admission_reserves_full_completion_inside_per_file_limit(store, sample,
     with pytest.raises(receipts.ReceiptCapacityError):
         accept(other, sample)
     assert not list(other.directory.glob("*.json"))
+
+
+def test_new_primary_accept_reads_headers_not_existing_receipt_bodies(store, monkeypatch):
+    existing = []
+    for index in range(4):
+        record, created = store.accept(
+            json.dumps({"entries": [{"id": index}]}, separators=(",", ":")).encode(),
+            {"feed_url": f"https://example.test/{index}", "entries": []},
+            strategy="strategy-one", revision="revision-one", accepted_at=123.0)
+        assert created
+        existing.append(record)
+    paths = {store.directory / (record["delivery_id"] + ".json") for record in existing}
+    reads, heads = [], []
+    real_read, real_head = receipts._read, receipts._head
+    def tracking_read(path):
+        reads.append(Path(path))
+        return real_read(path)
+    def tracking_head(path):
+        heads.append(Path(path))
+        return real_head(path)
+    monkeypatch.setattr(receipts, "_read", tracking_read)
+    monkeypatch.setattr(receipts, "_head", tracking_head)
+    record, created = store.accept(
+        b'{"entries":[{"id":99}]}', {"feed_url": "https://example.test/new", "entries": []},
+        strategy="strategy-one", revision="revision-one", accepted_at=123.0)
+    assert created
+    assert not paths & set(reads)
+    assert paths <= set(heads)
+
+
+def test_load_and_duplicate_confirmation_still_read_full_receipt(store, sample, monkeypatch):
+    record, _ = accept(store, sample)
+    path = store.directory / (record["delivery_id"] + ".json")
+    reads = []
+    real_read = receipts._read
+    def tracking_read(item):
+        reads.append(Path(item))
+        return real_read(item)
+    monkeypatch.setattr(receipts, "_read", tracking_read)
+    assert store.load(record["delivery_id"]) == record
+    assert path in reads
+    reads.clear()
+    repeated, created = store.accept(*sample, strategy="changed", revision="changed")
+    assert not created and repeated == record
+    assert path in reads
+
+
+def test_header_index_matches_full_headers_across_primary_alias_and_completion(store, sample):
+    primary, _ = accept(store, sample)
+    _, created = store.accept(b'{"entries":[{"id":2}]}', sample[1], strategy="new", revision="new")
+    assert created
+    assert store._header_index() == store._headers()
+    store.update_status(primary["delivery_id"], status="completed", completion={"filtered": 1})
+    assert store._header_index() == store._headers()
+
+
+def test_capacity_counts_header_reservations_for_new_task(store, sample):
+    first, _ = accept(store, sample)
+    store.max_bytes = first["_reserved_bytes"]
+    with pytest.raises(receipts.ReceiptCapacityError):
+        store.accept(b"another", {"feed_url": "https://example.test/other", "entries": []},
+                     strategy="strategy-one", revision="revision-one", accepted_at=123.0)
+
+
+def test_header_index_is_bounded_capacity_view_not_body_validation(store, sample):
+    record, _ = accept(store, sample)
+    path = store.directory / (record["delivery_id"] + ".json")
+    data = path.read_bytes()
+    assert b'"status":"accepted"' in data
+    path.write_bytes(data.replace(b'"status":"accepted"', b'"status":"rejected"', 1))
+    assert store._header_index()[record["delivery_id"]] == {
+        key: record[key] for key in receipts._HEAD_KEYS}
+    with pytest.raises(receipts.ReceiptCorrupt):
+        store.load(record["delivery_id"])
