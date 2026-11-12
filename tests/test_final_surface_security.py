@@ -469,6 +469,31 @@ def test_jin10_does_not_wait_for_inflight_upstream_fetch(monkeypatch):
         jin10_feed._JIN10_FETCH_LOCK.release()
 
 
+def test_public_jin10_route_hides_upstream_errors(monkeypatch, caplog):
+    import app as app_module
+    import routes.jin10_routes as jin10_routes
+    import routes.security as security
+
+    secret = "https://feed.example/private?token=do-not-leak"
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError(secret)
+
+    with security._rate_limit_lock:
+        security._rate_limit_store.clear()
+    monkeypatch.setattr(jin10_routes, "build_jin10_rss", fail)
+    with caplog.at_level("WARNING"):
+        with app_module.app.test_client() as client:
+            response = client.get("/jin10/rss")
+
+    assert response.status_code == 502
+    assert response.get_json() == {"error": "source_unavailable"}
+    body = response.get_data(as_text=True)
+    assert secret not in body
+    assert secret not in caplog.text
+    assert "RuntimeError" in caplog.text
+
+
 def test_public_jin10_route_clamps_limit(monkeypatch):
     import app as app_module
     import routes.jin10_routes as jin10_routes
