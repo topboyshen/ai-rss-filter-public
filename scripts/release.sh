@@ -2052,7 +2052,7 @@ restore_previous() {
 deploy_ref() {
   local action="$1" ref="$2" manifest="$3" services="$4"
   local previous_ref="" previous_digest="" previous_manifest="" previous_services=""
-  local digest sealed_manifest
+  local digest sealed_manifest verification_stage=""
   validate_image_ref "$ref"
   services="$(normalize_health_services "$services")"
   bootstrap_or_validate_registry
@@ -2120,16 +2120,21 @@ deploy_ref() {
     fi
     return 4
   fi
-  if wait_healthy "$digest" "$manifest" "$services" "release-final" && \
-     verify_runtime_source_immutable "$digest" "$manifest" && \
-     verify_private_runtime "$digest"; then
+  if ! wait_healthy "$digest" "$manifest" "$services" "release-final"; then
+    verification_stage="health_failed:wait_healthy"
+  elif ! verify_runtime_source_immutable "$digest" "$manifest"; then
+    verification_stage="health_failed:source_immutable"
+  elif ! verify_private_runtime "$digest"; then
+    verification_stage="health_failed:private_runtime"
+  fi
+  if [[ -z "$verification_stage" ]]; then
     record_current "$action" "$ref" "$digest" "$manifest" "$services" \
       "$previous_ref" "$previous_digest" "$previous_manifest" "$previous_services"
     echo "${action}: ${ref} (${digest}), manifest ${manifest}"
     return 0
   fi
 
-  record_history "$action" "$ref" "$digest" "health_failed" "$manifest" "$services"
+  record_history "$action" "$ref" "$digest" "$verification_stage" "$manifest" "$services"
   if [[ -n "$previous_ref" ]] && \
      [[ "$previous_ref|$previous_manifest" != "$ref|$manifest" ]]; then
     if [[ "$AUTO_ROLLBACK" == "1" ]]; then
