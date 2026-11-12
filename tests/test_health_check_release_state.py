@@ -94,10 +94,7 @@ exit 0
     )
 
 
-def _write_fake_docker(fake_bin):
-    _write_executable(
-        fake_bin / "docker",
-        """#!/bin/sh
+_FAKE_DOCKER_SCRIPT = """#!/bin/sh
 set -eu
 printf '%s|%s\n' "${IMAGE_REF:-}" "$*" >> "$FAKE_DOCKER_LOG"
 
@@ -265,8 +262,12 @@ case "$subcommand" in
     ;;
   *) exit 96 ;;
 esac
-""",
-    )
+"""
+
+
+def _write_fake_docker(fake_bin):
+    _write_executable(fake_bin / "docker", _FAKE_DOCKER_SCRIPT)
+
 
 @pytest.fixture
 def health_env(tmp_path):
