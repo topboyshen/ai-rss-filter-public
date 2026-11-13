@@ -31,7 +31,7 @@ def record_score_validation(*, strategy_version, backend_name, model_name, stage
     """Best-effort telemetry failure must not change the scoring decision.
 
     Store bounded labels only: no source text, raw model response, links or secrets.
-    Format failures have unknown (NULL) grounding, not a fabricated negative.
+    Use NULL when grounding did not run, including invalid and insufficient input.
     """
     if (stage not in {'score', 'stage1', 'stage2'} or attempt not in {'initial', 'repair'}
             or len(str(strategy_version)) > 255):
@@ -45,7 +45,7 @@ def record_score_validation(*, strategy_version, backend_name, model_name, stage
                 "VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (int(time.time()), str(strategy_version), str(backend_name)[:80],
                  str(model_name)[:120], stage, attempt, int(bool(contract_valid)),
-                 int(bool(source_grounded)) if contract_valid else None,
+                 int(bool(source_grounded)) if contract_valid and source_grounded is not None else None,
                  int(bool(accepted)), re.sub(r'[^a-z0-9_:]', '', reason)[:100]),
             )
             conn.commit()

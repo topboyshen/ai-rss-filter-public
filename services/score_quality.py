@@ -6,6 +6,7 @@ import logging
 
 from db.score_quality import read_score_quality
 from scoring_provenance import (
+    INSUFFICIENT_INPUT_SCORE_PATHS,
     NON_SUBSTANTIVE_SCORE_PATHS,
     SAFE_NEUTRAL_CONTRACT_SCORE_PATHS,
     SAFE_NEUTRAL_GROUNDING_SCORE_PATHS,
@@ -28,6 +29,7 @@ def _zero_output_reason(final: dict, paths: dict, transport: list) -> str:
         (SAFE_NEUTRAL_CONTRACT_SCORE_PATHS, '格式/字段校验保守处理'),
         (SAFE_NEUTRAL_GROUNDING_SCORE_PATHS, '来源依据校验保守处理'),
         (SAFE_NEUTRAL_INITIAL_SCORE_PATHS, '初始中性未区分原因'),
+        (INSUFFICIENT_INPUT_SCORE_PATHS, '信息不足 0 分'),
     )
     for group, label in neutral_groups:
         count = sum(paths.get(path, 0) for path in group.values())
@@ -59,24 +61,29 @@ def score_quality_snapshot(strategy_version: str, hours: int = 24) -> dict:
         return {'available': False, 'hours': hours, 'strategy_version': strategy_version}
     paths = result['final_paths']
     usable = sum(paths.get(path, 0) for path in ('llm', 'stage2'))
-    neutral = sum(paths.get(path, 0) for path in NON_SUBSTANTIVE_SCORE_PATHS)
-    eligible = usable + neutral + paths.get('fallback_local', 0) + paths.get('parse_error', 0)
+    insufficient_paths = INSUFFICIENT_INPUT_SCORE_PATHS.values()
+    insufficient = sum(paths.get(path, 0) for path in insufficient_paths)
+    neutral = sum(paths.get(path, 0) for path in NON_SUBSTANTIVE_SCORE_PATHS.difference(insufficient_paths))
+    neutral_denominator = usable + neutral + paths.get('fallback_local', 0) + paths.get('parse_error', 0)
+    processed = neutral_denominator + insufficient
     result['final'] = {
-        'unit': 'base_ledger_scoring_decisions', 'model_processed': eligible,
-        'usable': usable, 'safe_neutral': neutral,
-        'usable_ratio': usable / eligible if eligible else None,
-        'safe_neutral_ratio': neutral / eligible if eligible else None,
-        'zero_output_reason': _zero_output_reason(
-            {'usable': usable, 'model_processed': eligible, 'safe_neutral': neutral},
-            paths,
-            result.get('transport') or [],
-        ),
+        'unit': 'base_ledger_scoring_decisions', 'model_processed': processed,
+        'usable': usable, 'safe_neutral': neutral, 'insufficient_input': insufficient,
+        'usable_ratio': usable / processed if processed else None,
+        'safe_neutral_denominator': neutral_denominator,
+        'safe_neutral_ratio': neutral / neutral_denominator if neutral_denominator else None,
+        'insufficient_input_ratio': insufficient / processed if processed else None,
     }
+    result['final']['zero_output_reason'] = _zero_output_reason(
+        result['final'], paths, result.get('transport') or [],
+    )
     observed = sum(row['observed'] for row in result['validation'])
     result['validation_observed'] = observed
     result['validation_status'] = 'observed' if observed else 'unknown'
     # Observation-only warning: never changes readiness, selection, scores or gates.
-    result['safe_neutral_warning'] = bool(eligible >= 50 and neutral / eligible >= 0.10)
+    result['safe_neutral_warning'] = bool(
+        neutral_denominator >= 50 and neutral / neutral_denominator >= 0.10
+    )
     result['warning_min_samples'] = 50
     result['warning_ratio'] = 0.10
     return result
@@ -104,9 +111,14 @@ def score_quality_prometheus(strategy_version: str) -> list[str]:
         for row in data['validation']:
             labels = _labels({**window, **{key: row[key] for key in ('backend','model','stage','attempt','reason')}})
             for key in ('observed','contract_valid','grounding_observed','source_grounded','accepted'):
-                lines.append(f'ai_filter_score_validation_{key}{{{labels}}} {row[key] or 0}')
+                if row[key] is not None:
+                    lines.append(f'ai_filter_score_validation_{key}{{{labels}}} {row[key]}')
         labels = _labels(window)
-        for key in ('model_processed', 'usable', 'safe_neutral', 'usable_ratio', 'safe_neutral_ratio'):
+        for key in (
+            'model_processed', 'usable', 'usable_ratio', 'safe_neutral',
+            'safe_neutral_denominator', 'safe_neutral_ratio',
+            'insufficient_input', 'insufficient_input_ratio',
+        ):
             value = data['final'][key]
             if value is not None:
                 lines.append(f'ai_filter_score_final_{key}{{{labels}}} {value}')
