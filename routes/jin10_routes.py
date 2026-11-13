@@ -22,9 +22,11 @@ def jin10_rss():
         xml = build_jin10_rss(request.url, cfg, limit=limit)
         return Response(xml, mimetype="application/rss+xml")
     except Exception as exc:
-        logger.exception("[Jin10RSS] 构建 RSS 失败: %s", exc)
+        # Upstream errors can include the configured source URL. Keep that text
+        # out of the anonymous response and the log line.
+        logger.warning("[Jin10RSS] RSS build failed: %s", type(exc).__name__)
         return Response(
-            json.dumps({"error": str(exc)}, ensure_ascii=False),
+            json.dumps({"error": "source_unavailable"}, ensure_ascii=False),
             status=502,
             mimetype="application/json",
         )
