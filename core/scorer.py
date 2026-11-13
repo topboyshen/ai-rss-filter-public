@@ -49,7 +49,7 @@ from scoring_provenance import (
     NEUTRAL_REASON_THEME,
     is_insufficient_input_fields,
 )
-from openai import OpenAI, APIError, APITimeoutError, AuthenticationError
+from openai import OpenAI, APIError, APIStatusError, APITimeoutError, AuthenticationError
 
 logger = logging.getLogger(__name__)
 
@@ -1327,6 +1327,43 @@ def _record_llm_attempt(purpose: str) -> None:
     )
 
 
+def _score_attempt_reference(attempt: dict) -> str:
+    processing_id = attempt.get("processing_id")
+    ordinal = attempt.get("attempt_ordinal")
+    if not isinstance(processing_id, str) or not re.fullmatch(r"[0-9a-f]{32}", processing_id):
+        return ""
+    if type(ordinal) is not int or ordinal < 1:
+        return ""
+    row_id = attempt.get("call_log_id")
+    return (
+        f" processing_id={processing_id} attempt_ordinal={ordinal}"
+        f" call_log_id={row_id if type(row_id) is int and row_id > 0 else 'unknown'}"
+    )
+
+
+def _score_transport_failure(exc: Exception, attempt: dict, metadata: dict) -> None:
+    try:
+        if isinstance(exc, APIStatusError):
+            failure = "http_status"
+            status = getattr(exc, "status_code", None)
+        elif isinstance(exc, APITimeoutError):
+            failure, status = "timeout", None
+        elif isinstance(exc, APIError):
+            failure, status = "api_error", None
+        else:
+            failure, status = "other", None
+        if type(status) is not int or not 100 <= status <= 599:
+            status = "unknown"
+        logger.warning(
+            "[Score] sdk_failure%s attempt_kind=%s format_retry=%d http_status=%s failure=%s",
+            _score_attempt_reference(attempt), metadata.get("attempt_kind", "direct"),
+            bool(metadata.get("format_retry")), status, failure,
+        )
+    except Exception:
+        # Diagnostics cannot replace the original SDK exception.
+        pass
+
+
 @dataclass
 class LLMCallResult:
     content: str
@@ -2026,7 +2063,7 @@ class Scorer:
         success: bool = True,
         error_type: str = "",
         cfg: Optional[dict] = None,
-    ) -> None:
+    ) -> int | None:
         try:
             from db.database import DB
 
@@ -2045,7 +2082,7 @@ class Scorer:
                 article_key = str(news_metadata.get("article_key") or "")
             except Exception:
                 processing_id, article_key = "", ""
-            DB.log_llm_call(
+            return DB.log_llm_call(
                 purpose=purpose,
                 backend_name=backend.name,
                 model_name=(result.model if result else backend.model),
@@ -2066,7 +2103,8 @@ class Scorer:
                 article_key=article_key,
             )
         except Exception:
-            logger.debug("[LLM] call logging failed", exc_info=True)
+            logger.debug("[LLM] call logging failed")
+            return None
 
     def _call_llm_result(
         self,
@@ -2084,6 +2122,8 @@ class Scorer:
         dispatched = False
         metadata = dict(_active_llm_call_metadata.get())
         metadata.setdefault("request_id", uuid.uuid4().hex)
+        score_attempt = metadata.pop("score_attempt", None)
+        dispatch_identity = {}
         result = LLMCallResult(
             content="", usage={}, model=backend.model, latency_ms=0,
             backend_name=backend.name, call_metadata=metadata,
@@ -2120,6 +2160,8 @@ class Scorer:
             # Count SDK attempts only after local request preparation succeeds.
             dispatched = True
             _record_llm_attempt(purpose)
+            if score_attempt is not None:
+                dispatch_identity = get_news_processing_call_metadata()
             resp = create(**request_kwargs)
             _REMOTE_BACKEND_COOLDOWNS.record_success(backend)
             latency_ms = int((time.time() - start) * 1000)
@@ -2146,7 +2188,7 @@ class Scorer:
                         "[LLM] %s shared cooldown established for %.2fs",
                         backend.name, delay,
                     )
-                self._log_llm_call(
+                call_log_id = self._log_llm_call(
                     purpose,
                     backend,
                     result=result,
@@ -2155,19 +2197,15 @@ class Scorer:
                     error_type=type(exc).__name__,
                     cfg=cfg,
                 )
+                if dispatch_identity:
+                    dispatch_identity["call_log_id"] = call_log_id
+                    _score_transport_failure(exc, dispatch_identity, metadata)
             raise
         # Scoring and summary calls are only backend-quality successes after
         # their content passes caller-side validation. Keep API success logging
         # here, but do not erase consecutive transport failures prematurely.
         if purpose not in {"score", "stage1", "stage2", "summary"}:
             backend.record_success()
-        logger.info(
-            "[LLM] response_meta backend=%s purpose=%s finish_reason=%s response=%s",
-            backend.name,
-            purpose,
-            result.finish_reason,
-            _raw_response_diagnostic(result.content),
-        )
         get_metrics().record_llm_call(
             backend_name=backend.name,
             success=True,
@@ -2175,7 +2213,15 @@ class Scorer:
             input_tokens=usage.get("prompt_tokens", 0),
             output_tokens=usage.get("completion_tokens", 0),
         )
-        self._log_llm_call(purpose, backend, result=result, success=True, cfg=cfg)
+        call_log_id = self._log_llm_call(purpose, backend, result=result, success=True, cfg=cfg)
+        if dispatch_identity:
+            dispatch_identity["call_log_id"] = call_log_id
+            score_attempt.update(dispatch_identity, format_retry=bool(metadata.get("format_retry")))
+        logger.info(
+            "[LLM] response_meta backend=%s purpose=%s finish_reason=%s response=%s%s",
+            backend.name, purpose, result.finish_reason,
+            _raw_response_diagnostic(result.content), _score_attempt_reference(dispatch_identity),
+        )
         return result
 
     def _call_llm(
@@ -2433,7 +2479,10 @@ class Scorer:
                 )
                 attempt_kind = "initial" if attempted_backends == 0 else "fallback"
                 attempted_backends += 1
-                with _llm_call_scope(request_id=request_id, attempt_kind=attempt_kind):
+                score_attempt = {"format_retry": False}
+                with _llm_call_scope(
+                    request_id=request_id, attempt_kind=attempt_kind, score_attempt=score_attempt,
+                ):
                     result = self._call_structured_llm(
                         backend,
                         messages,
@@ -2452,19 +2501,16 @@ class Scorer:
                     )
                 logger.warning(
                     "[Score] semantic_reject backend=%s purpose=%s "
-                    "attempt=initial reason=%s contract_detail=%s response=%s",
+                    "attempt=initial reason=%s contract_detail=%s response=%s attempt_kind=%s format_retry=%d%s",
                     backend.name, stage or "score", failure_reason,
-                    contract_detail or "not_applicable", _raw_response_diagnostic(result),
+                    contract_detail or "not_applicable", _raw_response_diagnostic(result), attempt_kind,
+                    score_attempt["format_retry"], _score_attempt_reference(score_attempt),
                 )
                 if _semantic_repair_enabled(cfg):
                     exhausted_semantic = failure_reason
-            except RateLimitTimeoutException as e:
+            except RateLimitTimeoutException:
                 unverdicted += 1
-                logger.warning(
-                    "[Score] %s local rate-limit timeout: %s",
-                    backend.name,
-                    str(e)[:120],
-                )
+                logger.warning("[Score] %s local rate-limit timeout", backend.name)
                 continue
             except APITimeoutError:
                 unverdicted += 1
@@ -2480,11 +2526,11 @@ class Scorer:
                 if backend.is_rate_limit_error(e):
                     backend.rate_limit_backoff()
                     continue
-                logger.warning("[Score] %s API error: %s", backend.name, str(e)[:80])
+                logger.warning("[Score] %s API error", backend.name)
                 backend.record_fail()
             except Exception:
                 unverdicted += 1
-                logger.exception("[Score] %s unexpected error", backend.name)
+                logger.warning("[Score] %s unexpected error", backend.name)
                 backend.record_fail()
 
         if exhausted_semantic is not None and unverdicted:
