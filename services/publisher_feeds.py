@@ -13,9 +13,10 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 from html.parser import HTMLParser
+from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlsplit
 
-from utils.helpers import fetch_feed, plain_text_from_markup
+from utils.helpers import capture_feed_fetch_trace, fetch_feed, plain_text_from_markup
 
 CSRC_INDEX = "https://www.csrc.gov.cn/csrc/xwfb/index.shtml"
 CAIXIN_INDEX = "https://gateway.caixin.com/api/dataplatform/scroll/index"
@@ -69,14 +70,65 @@ def _fetch(url, timeout, attempts):
     return fetch_feed(url, timeout, max_attempts=attempts, cfg={"feeds": [{"url": url}]})
 
 
+class _CsrcHTTPError(HTTPError):
+    def __str__(self):
+        return self.msg
+
+
+class _CsrcURLError(URLError):
+    def __str__(self):
+        return self.reason
+
+
+def _csrc_fetch(url, timeout, attempts, *, stage):
+    with capture_feed_fetch_trace() as trace:
+        try:
+            return _fetch(url, timeout, attempts)
+        except Exception as exc:
+            status = exc.code if isinstance(exc, HTTPError) else trace.http_status
+            os_error = exc.reason if isinstance(exc, URLError) else exc
+            errnum = trace.dns_errno
+            if errnum is None and isinstance(os_error, OSError):
+                errnum = os_error.errno
+            family = {4: "IPv4", 6: "IPv6"}.get(trace.family, "unknown")
+            safe_errno = errnum if type(errnum) is int and -32768 <= errnum <= 32767 else "unknown"
+            safe_status = status if type(status) is int and 100 <= status <= 599 else "unknown"
+            # The processor stores the first 100 characters of this exception.
+            message = (
+                f"CSRC fetch stage={stage} phase={trace.phase} family={family} "
+                f"errno={safe_errno} http_status={safe_status}"
+            )
+            if isinstance(exc, TimeoutError):
+                error = TimeoutError(message)
+            elif isinstance(exc, HTTPError):
+                error = _CsrcHTTPError("", safe_status, message, None, None)
+            elif isinstance(exc, URLError):
+                error = _CsrcURLError(message)
+            elif isinstance(exc, PermissionError):
+                error = PermissionError(message)
+            elif isinstance(exc, ValueError):
+                error = ValueError(message)
+            else:
+                error = OSError(message)
+            raise error from None
+
+
 def _csrc_url(raw):
-    url = urljoin(CSRC_INDEX, raw)
-    p = urlsplit(url)
+    try:
+        url = urljoin(CSRC_INDEX, raw)
+        p = urlsplit(url)
+        port = p.port
+    except ValueError:
+        raise ValueError("CSRC article URL identity invalid") from None
     if (p.scheme not in {"http", "https"} or p.hostname != "www.csrc.gov.cn"
-            or p.port not in {None, 80, 443} or p.username is not None or p.password is not None
+            or port not in {None, 80, 443} or p.username is not None or p.password is not None
             or p.query or p.fragment or not _ARTICLE_PATH.fullmatch(p.path)):
         raise ValueError("CSRC article URL identity invalid")
     return "https://www.csrc.gov.cn" + p.path
+
+
+class _AmbiguousCsrcSection(ValueError):
+    pass
 
 
 class _CsrcPage(HTMLParser):
@@ -118,7 +170,7 @@ class _CsrcPage(HTMLParser):
             if self.lists:
                 if href == "/csrc/c100028/common_xq_list.shtml" and text == "加载更多":
                     if self.news is not None:
-                        raise ValueError("CSRC news section ambiguous")
+                        raise _AmbiguousCsrcSection("CSRC news section ambiguous")
                     self.news = list(self.lists[-1])
                 elif text:
                     self.lists[-1].append((href, text))
@@ -129,27 +181,35 @@ class _CsrcPage(HTMLParser):
             self.body_depth -= 1
 
 
-def _page(payload):
+def _page(payload, *, stage):
     page = _CsrcPage()
-    page.feed(payload.decode("utf-8"))
-    page.close()
+    try:
+        page.feed(payload.decode("utf-8"))
+        page.close()
+    except _AmbiguousCsrcSection:
+        raise
+    except (AssertionError, ValueError, AttributeError, TypeError):
+        raise ValueError(f"CSRC {stage} response could not be parsed") from None
     return page
 
 
 def _csrc_article(url, timeout, attempts):
-    page = _page(_fetch(url, timeout, attempts))
-    title = page.meta.get("articletitle", "").strip()
+    page = _page(_csrc_fetch(url, timeout, attempts, stage="detail"), stage="detail")
+    title = (page.meta.get("articletitle") or "").strip()
     date = page.meta.get("pubdate", "")
     body = " ".join("".join(page.body).split())
     if not title or not body or not date:
         raise ValueError("CSRC article title/date/body missing")
-    published = datetime.strptime(date, "%Y-%m-%d %H:%M:%S").replace(
-        tzinfo=timezone(timedelta(hours=8)))
+    try:
+        published = datetime.strptime(date, "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=timezone(timedelta(hours=8)))
+    except ValueError:
+        raise ValueError("CSRC article publication date invalid") from None
     return {"title": title, "link": url, "description": body, "published": published}
 
 
 def _csrc_items(limit, timeout, attempts):
-    page = _page(_fetch(CSRC_INDEX, timeout, attempts))
+    page = _page(_csrc_fetch(CSRC_INDEX, timeout, attempts, stage="index"), stage="index")
     if not page.news:
         raise ValueError("CSRC current news section missing (not a valid empty feed)")
     links = list(dict.fromkeys(_csrc_url(href) for href, _ in page.news))
