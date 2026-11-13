@@ -74,6 +74,7 @@ def get_news_processing_call_metadata() -> dict:
         return {
             "processing_id": state["processing_id"],
             "article_key": state["article_key"],
+            "attempt_ordinal": state["model_attempts"],
         }
     except Exception:
         return {}
