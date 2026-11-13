@@ -452,6 +452,29 @@ def test_jin10_fetch_is_cached_and_outages_are_negative_cached(monkeypatch):
     assert failures == ["https://example.com/down"]
 
 
+def test_jin10_stale_cache_fallback_does_not_log_upstream_secret(monkeypatch, caplog):
+    import services.jin10_feed as jin10_feed
+
+    secret = "https://feed.example/private?token=do-not-leak"
+    with jin10_feed._JIN10_CACHE_LOCK:
+        jin10_feed._JIN10_CACHE.update(
+            source_url=secret, ts=0.0, items=[{"title": "stale"}]
+        )
+
+    def fail(_url):
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(jin10_feed, "_fetch_jin10_uncached", fail)
+    try:
+        with caplog.at_level("WARNING"):
+            assert jin10_feed.fetch_jin10_latest(secret) == [{"title": "stale"}]
+    finally:
+        with jin10_feed._JIN10_CACHE_LOCK:
+            jin10_feed._JIN10_CACHE.update(source_url="", ts=0.0, items=[])
+    assert secret not in caplog.text
+    assert "RuntimeError" in caplog.text
+
+
 def test_jin10_does_not_wait_for_inflight_upstream_fetch(monkeypatch):
     import services.jin10_feed as jin10_feed
 
