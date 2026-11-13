@@ -51,14 +51,17 @@ from db.event_mapping_gate import (
 )
 from scoring_provenance import (
     FORMAL_SIGNAL_SCORE_PATHS,
+    INSUFFICIENT_INPUT_SCORE_PATHS,
     NON_EXPORTABLE_SCORE_PATHS,
     NON_SUBSTANTIVE_SCORE_PATHS,
     PUBLIC_SCORE_PATHS,
     RECOGNIZED_SCORE_PATHS,
     SAFE_NEUTRAL_CONTRACT_VALUES,
     SAFE_NEUTRAL_SCORE_PATH_METADATA,
+    SEMANTIC_RESOLUTION_INSUFFICIENT_INPUT,
     SEMANTIC_RESOLUTION_SAFE_NEUTRAL_INITIAL,
     is_fixed_safe_neutral_fields,
+    is_insufficient_input_fields,
     is_recognized_score_path,
     normalize_score_path,
 )
@@ -2972,13 +2975,28 @@ def _validate_safe_neutral_fields(
     score_path = normalize_score_path(score_path)
     if score_path not in NON_SUBSTANTIVE_SCORE_PATHS:
         return
-    expected_score, expected_tag, expected_logic, _sentiment = (
-        SAFE_NEUTRAL_CONTRACT_VALUES
-    )
     actual_score = _finite_float(score, f"{field_prefix}.score")
     actual_confidence = _finite_float(
         score_confidence or 0.0,
         f"{field_prefix}.score_confidence",
+    )
+    if score_path in INSUFFICIENT_INPUT_SCORE_PATHS.values():
+        if not is_insufficient_input_fields(
+            actual_score, tag, logic, direction
+        ):
+            raise ValueError(f"{field_prefix} insufficient-input tuple is invalid")
+        if not math.isclose(
+            actual_confidence,
+            0.0,
+            rel_tol=0.0,
+            abs_tol=0.0,
+        ):
+            raise ValueError(
+                f"{field_prefix} insufficient-input confidence must be zero"
+            )
+        return
+    expected_score, expected_tag, expected_logic, _sentiment = (
+        SAFE_NEUTRAL_CONTRACT_VALUES
     )
     if not math.isclose(
         actual_score,
@@ -3807,10 +3825,16 @@ def _validate_cache_signal_score_contract(
     stage1_identity = str(stage1_model or "").strip()
     stage2_identity = str(stage2_model or "").strip()
     stage, _resolution = SAFE_NEUTRAL_SCORE_PATH_METADATA[cache_path]
-    expected_score = SAFE_NEUTRAL_CONTRACT_VALUES[0]
+    expected_score = (
+        0.0
+        if _resolution == SEMANTIC_RESOLUTION_INSUFFICIENT_INPUT
+        else SAFE_NEUTRAL_CONTRACT_VALUES[0]
+    )
     if selected_model == "local_safe_neutral":
         if _resolution == SEMANTIC_RESOLUTION_SAFE_NEUTRAL_INITIAL:
             raise ValueError("local safe-neutral identity cannot be an initial model result")
+        if _resolution == SEMANTIC_RESOLUTION_INSUFFICIENT_INPUT:
+            raise ValueError("local safe-neutral identity cannot be an insufficient-input result")
     elif not _is_real_quality_repair_model(selected_model):
         raise ValueError("safe-neutral cache write requires a real or local neutral identity")
     if stage == "stage1":

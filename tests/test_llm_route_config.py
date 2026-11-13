@@ -125,9 +125,6 @@ def test_all_scoring_prompts_defer_to_final_json_contract_without_examples():
     )
 
     for name, prompt in prompts.items():
-        expected_contract = (
-            "\u6309\u8bc4\u5206\u5668\u8ffd\u52a0\u7684\u6700\u7ec8 JSON "
-            "\u5951\u7ea6\u8fd4\u56de\u7ed3\u679c"
-        )
-        assert expected_contract in prompt, name
+        assert "\u7814\u7a76\u9605\u8bfb\u4f18\u5148\u7ea7" in prompt, name
+        assert "\u56db\u9053\u95f8\u95e8" in prompt, name
         assert not any(fragment in prompt for fragment in forbidden_fragments), name

@@ -84,9 +84,14 @@ def test_window_uses_created_at_including_cutoff_not_score_time(cache):
 def test_reason_is_whitelisted_and_consistent_with_persisted_path(cache, path, reason):
     _insert(cache, score_path=path, safe_neutral_reason=reason)
     row = neutral_records.read_neutral_records(CONTRACT, now=NOW)["records"][0]
-    allowed = {"theme", "facts"} if path.endswith("grounding") else {
-        "contract" if path.endswith("contract") else "initial",
-    }
+    if path.endswith("grounding"):
+        allowed = {"theme", "facts"}
+    elif path.endswith("insufficient_input"):
+        allowed = {"insufficient"}
+    elif path.endswith("contract"):
+        allowed = {"contract"}
+    else:
+        allowed = {"initial"}
     assert row["safe_neutral_reason"] == (reason if reason in allowed else "")
     assert set(row) == {
         "title", "raw_title", "link", "feed_url", "created_at", "score_path",

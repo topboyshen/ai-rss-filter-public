@@ -42,7 +42,9 @@ from scoring_provenance import (
     RECOGNIZED_SCORE_PATHS,
     SAFE_NEUTRAL_CONTRACT_VALUES,
     SAFE_NEUTRAL_SCORE_PATHS_BY_RESOLUTION,
+    SEMANTIC_RESOLUTION_INSUFFICIENT_INPUT,
     is_fixed_safe_neutral_fields,
+    is_insufficient_input_fields,
     normalize_score_path,
 )
 from core.metrics import get_metrics
@@ -318,7 +320,10 @@ def _score_stage_with_identity(
             raise TypeError(f"{bound_name} returned an invalid bound score")
         if semantic_resolution not in ALLOWED_SEMANTIC_RESOLUTIONS:
             raise TypeError(f"{bound_name} returned an invalid semantic resolution")
-        if semantic_resolution and values != SAFE_NEUTRAL_CONTRACT_VALUES:
+        if semantic_resolution == SEMANTIC_RESOLUTION_INSUFFICIENT_INPUT:
+            if not is_insufficient_input_fields(*values):
+                raise TypeError(f"{bound_name} returned an invalid insufficient-input tuple")
+        elif semantic_resolution and values != SAFE_NEUTRAL_CONTRACT_VALUES:
             raise TypeError(f"{bound_name} returned an invalid safe-neutral tuple")
         if neutral_reason and not semantic_resolution:
             raise TypeError(f"{bound_name} returned a reason without a resolution")

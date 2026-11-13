@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 import yaml
-from core.prompts import get_prompt_for_url
+from core.prompts import BUILTIN_PROMPTS, get_prompt_for_url
 from core.scorer import (
     _SCORE_COMPACT_JSON_OUTPUT_INSTRUCTION,
     _SCORE_JSON_OUTPUT_INSTRUCTION,
@@ -58,7 +58,9 @@ def test_compact_score_contract_is_short_and_copyable():
     assert "sentiment 只能是“看多”“看空”“中性”" in (
         _SCORE_COMPACT_JSON_OUTPUT_INSTRUCTION
     )
-    assert _SCORE_SAFE_NEUTRAL_JSON in _SCORE_COMPACT_JSON_OUTPUT_INSTRUCTION
+    assert _SCORE_SAFE_NEUTRAL_JSON not in _SCORE_COMPACT_JSON_OUTPUT_INSTRUCTION
+    assert "信息不足" in _SCORE_COMPACT_JSON_OUTPUT_INSTRUCTION
+    assert "不要给 4 分" in _SCORE_COMPACT_JSON_OUTPUT_INSTRUCTION
     assert "宏观放水" not in _SCORE_COMPACT_JSON_OUTPUT_INSTRUCTION
     assert len(_SCORE_COMPACT_JSON_OUTPUT_INSTRUCTION) < len(
         _SCORE_JSON_OUTPUT_INSTRUCTION
@@ -101,9 +103,9 @@ def test_36kr_uses_cross_industry_prompt_in_feed_and_url_routing():
         if item["key"] == "tech"
     ).lower()
     selected = get_prompt_for_url(feed["url"], cfg)
-    assert selected == cfg["prompts"]["industry"]
-    assert "覆盖科技、创新药与医疗、消费、新能源" in selected
-    assert "来源频道不是行业证据" in selected
+    assert selected == BUILTIN_PROMPTS["industry"]
+    assert "多行业频道" in selected
+    assert "不把非科技新闻强行归入" in selected
 
 
 def test_reported_innovative_drug_prompt_copy_fails_over_and_is_not_cached(
