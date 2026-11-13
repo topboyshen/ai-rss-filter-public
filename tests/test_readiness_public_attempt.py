@@ -83,6 +83,37 @@ def test_projection_rejects_non_attempt_values():
     assert public_refresh_attempt("partial") is None
 
 
+def test_unknown_remaining_stays_null_and_does_not_become_an_empty_queue():
+    attempt = _attempt()
+    attempt["score_continuations"]["remaining"] = None
+    attempt["score_continuations"]["errors"] = 1
+
+    public = public_refresh_attempt(attempt)
+
+    assert public["score_continuations"]["remaining"] is None
+    assert public["score_continuations"]["errors"] == 1
+    assert "active" not in json.dumps(public["score_continuations"])
+
+
+def test_legacy_continuation_without_remaining_stays_omitted():
+    attempt = _attempt()
+    del attempt["score_continuations"]["remaining"]
+
+    public = public_refresh_attempt(attempt)
+
+    assert "remaining" not in public["score_continuations"]
+
+
+def test_malformed_remaining_is_not_rewritten_as_zero_counts():
+    attempt = _attempt()
+    attempt["score_continuations"]["remaining"] = "unreadable"
+
+    public = public_refresh_attempt(attempt)
+
+    assert public["score_continuations"]["remaining"] is None
+    assert "active" not in json.dumps(public["score_continuations"])
+
+
 def test_projection_tolerates_malformed_entries():
     public = public_refresh_attempt({
         "status": "mystery",
@@ -134,6 +165,23 @@ def test_anonymous_readiness_redacts_failure_text(monkeypatch):
     for marker in ("http", "rsshub", "internal-host", "token", "connecterror",
                    "refresh-id-must-not-leak"):
         assert marker not in body
+
+
+def test_anonymous_readiness_keeps_unknown_remaining_null(monkeypatch):
+    from app import app
+
+    attempt = _attempt()
+    attempt["score_continuations"]["remaining"] = None
+    _patch_readiness(monkeypatch, attempt, authorized=False)
+    with app.test_client() as client:
+        response = client.get("/readiness")
+
+    assert response.status_code == 200
+    continuation = response.get_json()["last_attempt"]["score_continuations"]
+    assert continuation["remaining"] is None
+    assert continuation["errors"] == 1
+    assert '"remaining": null' in response.get_data(as_text=True)
+    assert "active" not in response.get_data(as_text=True)
 
 
 def test_anonymous_strict_readiness_stays_redacted(monkeypatch):

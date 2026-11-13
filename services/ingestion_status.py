@@ -57,6 +57,11 @@ def public_refresh_attempt(attempt: object) -> dict | None:
     text: error strings can carry internal hostnames or credential-bearing
     URLs, and a feed without ``name`` falls back to its full URL. The
     authenticated ``/status`` and keyed ``/readiness`` keep the full record.
+
+    An explicit ``remaining: null``, and any non-dict remaining value, stays
+    null. The refresh writer uses null when the post-feed journal cannot be
+    read; dropping the key would make an unknown queue look like the legacy
+    shape with no snapshot.
     """
     if not isinstance(attempt, dict):
         return None
@@ -95,13 +100,18 @@ def public_refresh_attempt(attempt: object) -> dict | None:
             for field in _PUBLIC_CONTINUATION_INTS
             if type(continuation.get(field)) is int
         }
-        remaining = continuation.get("remaining")
-        if isinstance(remaining, dict):
-            projection["remaining"] = {
-                field: remaining[field]
-                for field in _PUBLIC_REMAINING_INTS
-                if type(remaining.get(field)) is int
-            }
+        if "remaining" in continuation:
+            remaining = continuation.get("remaining")
+            # A dict is a real snapshot. Null and every other shape mean the
+            # queue is unknown; omitting the key would look like no snapshot.
+            if isinstance(remaining, dict):
+                projection["remaining"] = {
+                    field: remaining[field]
+                    for field in _PUBLIC_REMAINING_INTS
+                    if type(remaining.get(field)) is int
+                }
+            else:
+                projection["remaining"] = None
         public["score_continuations"] = projection
     return public
 
