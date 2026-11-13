@@ -24,6 +24,9 @@ def test_format_unknown_grounding_and_transport_are_distinct(monkeypatch):
     assert observation['observed'] == 1 and observation['contract_valid'] == 0
     assert observation['grounding_observed'] == 0
     assert observation['source_grounded'] is None
+    text = '\n'.join(score_quality.score_quality_prometheus('quality-test'))
+    assert 'ai_filter_score_validation_grounding_observed' in text
+    assert 'ai_filter_score_validation_source_grounded' not in text
     assert read_score_quality(24, 'other-contract')['validation'] == []
 
 
@@ -38,6 +41,7 @@ def test_legacy_transport_does_not_fabricate_validation_or_final_success():
     text = '\n'.join(score_quality.score_quality_prometheus('legacy'))
     assert 'ai_filter_score_transport_succeeded' in text
     assert 'ai_filter_score_final_usable_ratio' not in text
+    assert 'ai_filter_score_final_insufficient_input_ratio' not in text
 
 
 def test_final_warning_excludes_local_and_copy_paths(monkeypatch):
@@ -55,6 +59,33 @@ def test_final_warning_excludes_local_and_copy_paths(monkeypatch):
     assert data['safe_neutral_warning']
     fixture['final_paths'] = {'llm_safe_neutral_contract': 1}
     assert not score_quality.score_quality_snapshot('fixture')['safe_neutral_warning']
+
+
+def test_insufficient_input_has_own_count_without_inflating_neutral_warning(monkeypatch):
+    fixture = {'available': True, 'transport': [], 'validation': [], 'final_paths': {
+        'llm': 2, 'llm_safe_neutral_contract': 3,
+        'insufficient_input': 45, 'stage2_insufficient_input': 5,
+    }}
+    monkeypatch.setattr(score_quality, 'read_score_quality', lambda *a: dict(fixture))
+    data = score_quality.score_quality_snapshot('fixture')
+    final = data['final']
+    assert final['model_processed'] == 55
+    assert final['usable_ratio'] == 2 / 55
+    assert final['safe_neutral'] == 3
+    assert final['safe_neutral_denominator'] == 5
+    assert final['safe_neutral_ratio'] == 3 / 5
+    assert final['insufficient_input'] == 50
+    assert final['insufficient_input_ratio'] == 50 / 55
+    assert not data['safe_neutral_warning']
+    text = '\n'.join(score_quality.score_quality_prometheus('fixture'))
+    assert 'ai_filter_score_final_insufficient_input{window="24h",strategy_version="fixture"} 50' in text
+    assert 'ai_filter_score_final_safe_neutral{window="24h",strategy_version="fixture"} 3' in text
+
+    fixture['final_paths'] = {'insufficient_input': 60}
+    data = score_quality.score_quality_snapshot('fixture')
+    assert data['final']['safe_neutral_ratio'] is None
+    assert data['final']['zero_output_reason'] == '信息不足 0 分 60'
+    assert not data['safe_neutral_warning']
 
 
 def test_telemetry_failure_does_not_escape_into_scoring(monkeypatch):

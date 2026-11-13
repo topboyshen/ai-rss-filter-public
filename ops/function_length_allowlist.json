@@ -5,7 +5,7 @@
   "core/digest_engine.py:render_themes_html": 180,
   "core/processor.py:_build_backtest_signal_snapshot": 140,
   "core/processor.py:process_feed": 201,
-  "core/scorer.py:_parse_score_result_with_detail": 177,
+  "core/scorer.py:_parse_score_result_with_detail": 174,
   "db/database.py:_event_core_startup_preflight": 125,
   "db/database.py:_init_backtest_signals": 147,
   "db/database.py:_init_future_prices": 211,

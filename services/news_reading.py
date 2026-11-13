@@ -2,7 +2,11 @@
 
 import re
 
-from scoring_provenance import NON_SUBSTANTIVE_SCORE_PATHS, normalize_score_path
+from scoring_provenance import (
+    INSUFFICIENT_INPUT_SCORE_PATHS,
+    NON_SUBSTANTIVE_SCORE_PATHS,
+    normalize_score_path,
+)
 from utils.helpers import escape_html, plain_text_from_markup
 
 
@@ -22,11 +26,12 @@ def render_evidence_context(entry: dict) -> str:
     # nor an empty display value establishes what the scorer originally saw.
     has_title = isinstance(raw_title, str) and bool(plain_text_from_markup(raw_title).strip())
     path = normalize_score_path(entry.get("score_path"))
-    # Keep conservative-neutral distinct from system fallback (do not merge labels).
-    path_label = (
-        "保守中性" if path in NON_SUBSTANTIVE_SCORE_PATHS
-        else _PATH_LABELS.get(path, "未知路径")
-    )
+    if path in INSUFFICIENT_INPUT_SCORE_PATHS.values():
+        path_label = "信息不足（0分）"
+    elif path in NON_SUBSTANTIVE_SCORE_PATHS:
+        path_label = "保守中性"
+    else:
+        path_label = _PATH_LABELS.get(path, "未知路径")
     lines = (
         "本卡片提供原始标题" if has_title else "标题缺失",
         "评分时使用的正文范围：未记录，无法从本卡片确认",

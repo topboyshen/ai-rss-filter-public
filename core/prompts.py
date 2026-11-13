@@ -1,10 +1,11 @@
 import logging
 import re
 from typing import Any, Dict, Tuple
+from scoring_provenance import INSUFFICIENT_INPUT_PROMPT
 
 logger = logging.getLogger(__name__)
 
-RESEARCH_READING_RUBRIC = """
+RESEARCH_READING_RUBRIC = f"""
 你是财经研究阅读助手，不是交易员。分数表示研究阅读优先级，不是买入强度、涨跌预测或可交易性。
 只根据标题和摘要已写明的内容判断，不补外部事实。不要因为文章没有直接可交易催化，就把有具体事实的条目压到 4 分或固定中性。
 
@@ -31,7 +32,7 @@ RESEARCH_READING_RUBRIC = """
 按文章相对事件的增量评分：首发/主要来源 8-10；后续新细节/分析 5-7；纯转载/复述 3-4。不要因为同一事件重要就给所有转载高分。
 
 【输入不足】
-标题+摘要无法识别主体或事件时，不要猜，也不要给 4 分。输出 score=0、tag="信息不足"、logic 说明缺什么、sentiment="中性"。
+{INSUFFICIENT_INPUT_PROMPT}
 4 分只表示“在范围内但低价值”，不表示“不确定”。
 """
 

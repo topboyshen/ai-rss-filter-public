@@ -78,7 +78,7 @@ def test_quality_sections_preserve_original_counters_context_and_auth_explanatio
         "不是页面打开时间，也不是新闻更新时间",
         "调用尝试 8 次 · 成功 5 次 · 失败 3 次",
         "校验尝试 7 次；调用成功不表示输出正确",
-        "已识别路径的基础评分记录 18 条：实质模型结果 5 · 保守中性 6 · 本地兜底 1 · "
+        "已识别路径的基础评分记录 18 条：实质模型结果 5 · 保守中性 6 · 信息不足（0分）0 · 本地兜底 1 · "
         "处理异常 2 · 隔离待处理 1 · 其他已识别路径 3",
         "三种计量单位，不能组成逐条对应的通过率漏斗",
         "基础评分记录按评分时间统计，排除相似副本",
@@ -89,8 +89,8 @@ def test_quality_sections_preserve_original_counters_context_and_auth_explanatio
     assert "解释质量：尚未评估（本页未接入人工核对结果）" in assessment
     assert "这不表示其他地方不存在人工核对" in assessment
     assert "查看记录（需后台登录）" in assessment
-    assert "当前契约近24小时收录的现存缓存，最新50条" in assessment
-    assert "不是上述数字的逐行明细" in assessment
+    assert "按缓存条目时间查看当前契约近24小时的现存记录，最多50条" in assessment
+    assert "两处查询的时间口径不同" in assessment
     assert "研究查询窗口：评分 23 条 · 入选 3 条" in parsed.text("mq-research")
     assert "市场表现仅作事后参考" in parsed.text("mq-research")
     links = [node["attrs"]["href"] for node in parsed.nodes if node["tag"] == "a"]

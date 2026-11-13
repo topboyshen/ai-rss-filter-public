@@ -11,7 +11,7 @@
 | --- | --- | --- |
 | 接口 | 实际评分模型请求 / 传输成功请求 | `ai_filter_score_transport_attempts`、`..._succeeded` |
 | 格式 | 返回内容校验尝试 / 契约通过 | `ai_filter_score_validation_observed`、`..._contract_valid` |
-| 事实 | 格式通过的校验尝试 / 来源锚定通过 | `..._grounding_observed`、`..._source_grounded` |
+| 事实 | 记录了来源校验结果的尝试 / 来源校验通过 | `..._grounding_observed`、`..._source_grounded` |
 | 最终 | 模型处理的 base 账本决策 / 正常 llm、stage2 决策 | `ai_filter_score_final_model_processed`、`..._usable`、`..._usable_ratio` |
 
 前三层按 backend/model/stage 分类；校验额外区分 initial/repair/reason。所有时序指标标明
@@ -19,12 +19,19 @@
 校验尝试包含修复，最终账本还可能复用评分缓存；它们不是同一分母，也不是独立事件数。
 最终层仅计 `signal_stage=base` 且 `is_similarity_copy=0`，排除本地拒收与 FastPass；
 模型异常的 `fallback_local`/`parse_error` 纳入最终不可用分母。事件雷达修订不重复计数。
+0 分信息不足按 `insufficient_input` 和 `stage2_insufficient_input` 单列。它们计入
+`model_processed` 和 `insufficient_input_ratio` 的分母，也参与计算 `usable_ratio`。
+固定安全中性比例沿用可比口径，分子与 `safe_neutral_denominator` 均排除 0 分信息不足。
+认证 `/metrics` 另有按 `news_cache.created_at` 统计的 2h 和 24h 安全中性与信息不足指标。
+RSS 条目优先使用来源发布时间，其次使用更新时间。缺少可用来源时间时使用写入时的本机时间。
+缓存口径排除处理异常。账本口径按评分时间和当前精确评分契约统计。
 
 `score_validation_logs` 为新增观测表；只存有界标签，不存标题、原文或模型原始回复。
-旧请求不补造校验结果；格式失败时事实校验为 NULL，未观测比例不冒充零或成功。
+旧请求保留原始校验结果。格式失败与合法的 0 分信息不足均未执行事实校验，数据库记录 NULL。
+固定 4 分安全中性沿用已有校验计数口径。未观测的来源校验不输出零值。
 记录失败不影响评分决策。诊断随既有清理流程保留七天；GET 只读，不进行评分或后验重算。
 
-`ai_filter_score_safe_neutral_warning=1` 表示窗口内至少 50 次模型处理决策、保守中性比例
+`ai_filter_score_safe_neutral_warning=1` 表示窗口内至少 50 次参与安全中性统计的决策、保守中性比例
 至少 10%。这只是运维观察告警，不影响 health/readiness、入选门槛或模型研究资格。
 Prometheus 的抓取与告警转发仍须在发布后配置；新增 gauge 不是已发出的通知。
 

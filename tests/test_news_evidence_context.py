@@ -99,6 +99,8 @@ def test_all_safe_neutral_paths_keep_recorded_reason_separate(reading, path, rea
     ("fallback_local", "系统兜底"), ("similarity", "相似结果复用"),
     ("radar", "雷达路径"), ("parse_error", "处理异常（解析失败）"),
     ("quality_quarantine", "质量隔离"),
+    ("insufficient_input", "信息不足（0分）"),
+    ("stage2_insufficient_input", "信息不足（0分）"),
     ("unexpected-private-path", "未知路径"), ("", "未知路径"), (None, "未知路径"),
 ])
 def test_cached_path_has_bounded_labels_not_per_field_model_attribution(path, label):
@@ -113,6 +115,7 @@ def test_cached_path_has_bounded_labels_not_per_field_model_attribution(path, la
 @pytest.mark.parametrize("path,label", [
     (" LLM_SAFE_NEUTRAL_INITIAL ", "保守中性"),
     (" STAGE2_SAFE_NEUTRAL_GROUNDING ", "保守中性"),
+    (" STAGE2_INSUFFICIENT_INPUT ", "信息不足（0分）"),
     ("fallback_local", "系统兜底"), ("parse_error", "处理异常（解析失败）"),
     ("radar", "雷达路径"), ("quality_quarantine", "质量隔离"),
     ("llm", "模型评分"), ("stage2", "模型二阶段评分"),

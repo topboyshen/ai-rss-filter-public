@@ -2982,7 +2982,7 @@ def _validate_safe_neutral_fields(
     )
     if score_path in INSUFFICIENT_INPUT_SCORE_PATHS.values():
         if not is_insufficient_input_fields(
-            actual_score, tag, logic, direction
+            score, tag, logic, direction
         ):
             raise ValueError(f"{field_prefix} insufficient-input tuple is invalid")
         if not math.isclose(
@@ -3030,6 +3030,8 @@ def _validate_safe_neutral_signal_payload(
     score_path = normalize_score_path(score_path)
     if score_path not in NON_SUBSTANTIVE_SCORE_PATHS:
         return
+    if score_path in INSUFFICIENT_INPUT_SCORE_PATHS.values():
+        score = signal.get("score")
     _validate_safe_neutral_fields(
         score_path=score_path,
         score=score,
@@ -6103,19 +6105,20 @@ def log_llm_call(
 
 
 def get_score_fallback_stats(hours: int = 24) -> Dict[str, Any]:
-    """Return fallback health plus independent safe-neutral observations.
+    """Return fallback health, fixed neutral and insufficient-input counts.
 
     ``eligible`` and ``fallback_ratio`` deliberately retain their established
-    definition: direct model scores plus ``fallback_local`` only.  Safe-neutral
-    paths are reported separately because they are auditable, non-substantive
-    semantic resolutions rather than backend failures.  Their denominator is
-    direct model scores, local fallbacks, and safe-neutral resolutions; cache,
-    similarity, local rejects, and other non-model paths remain excluded.
+    definition: direct model scores plus ``fallback_local`` only. The fixed
+    neutral denominator adds fixed-neutral outcomes. The insufficient-input
+    share uses all three categories plus insufficient-input outcomes. Cache
+    reuse, similarity, local rejects and other paths remain excluded.
     """
     bounded_hours = max(1, min(168, int(hours or 24)))
     cutoff = int(time.time()) - bounded_hours * 3600
-    safe_neutral_paths = tuple(sorted(NON_SUBSTANTIVE_SCORE_PATHS))
+    insufficient_paths = tuple(INSUFFICIENT_INPUT_SCORE_PATHS.values())
+    safe_neutral_paths = tuple(sorted(NON_SUBSTANTIVE_SCORE_PATHS.difference(insufficient_paths)))
     safe_neutral_placeholders = ",".join("?" for _ in safe_neutral_paths)
+    insufficient_placeholders = ",".join("?" for _ in insufficient_paths)
     with db_lock:
         with get_connection() as conn:
             row = conn.execute(
@@ -6125,15 +6128,19 @@ def get_score_fallback_stats(hours: int = 24) -> Dict[str, Any]:
                 "COALESCE(SUM(CASE WHEN LOWER(TRIM(COALESCE(score_path, ''))) "
                 "IN ('llm', 'stage2') THEN 1 ELSE 0 END), 0), "
                 "COALESCE(SUM(CASE WHEN LOWER(TRIM(COALESCE(score_path, ''))) "
-                f"IN ({safe_neutral_placeholders}) THEN 1 ELSE 0 END), 0) "
+                f"IN ({safe_neutral_placeholders}) THEN 1 ELSE 0 END), 0), "
+                "COALESCE(SUM(CASE WHEN LOWER(TRIM(COALESCE(score_path, ''))) "
+                f"IN ({insufficient_placeholders}) THEN 1 ELSE 0 END), 0) "
                 "FROM news_cache WHERE created_at >= ?",
-                (*safe_neutral_paths, cutoff),
+                (*safe_neutral_paths, *insufficient_paths, cutoff),
             ).fetchone()
     fallback = int(row[0] or 0) if row else 0
     model_scored = int(row[1] or 0) if row else 0
     safe_neutral = int(row[2] or 0) if row else 0
+    insufficient_input = int(row[3] or 0) if row else 0
     eligible = fallback + model_scored
     safe_neutral_denominator = eligible + safe_neutral
+    observed = safe_neutral_denominator + insufficient_input
     return {
         "window_hours": bounded_hours,
         "fallback_local": fallback,
@@ -6147,6 +6154,8 @@ def get_score_fallback_stats(hours: int = 24) -> Dict[str, Any]:
             if safe_neutral_denominator
             else 0.0
         ),
+        "insufficient_input": insufficient_input,
+        "insufficient_input_ratio": insufficient_input / observed if observed else None,
     }
 
 
