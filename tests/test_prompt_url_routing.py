@@ -3,7 +3,12 @@ from copy import deepcopy
 import yaml
 from pathlib import Path
 
-from core.prompts import get_prompt, get_prompt_for_url
+from core.prompts import (
+    BUILTIN_PROMPTS,
+    get_prompt,
+    get_prompt_for_url,
+    resolve_prompt,
+)
 
 
 def _cfg():
@@ -16,7 +21,8 @@ def _cfg():
 
 def _key_for(url: str, cfg: dict) -> str:
     selected = get_prompt_for_url(url, cfg)
-    for key, text in cfg["prompts"].items():
+    named = {**BUILTIN_PROMPTS, **(cfg.get("prompts") or {})}
+    for key, text in named.items():
         if selected == text:
             return key
     return "default"
@@ -67,6 +73,25 @@ def test_explicit_tech_sources_still_select_tech_prompt():
 def test_feed_prompt_lookup_is_unchanged_and_not_inferred_from_yicai_url():
     cfg = _cfg()
     yicai = _feed(cfg, "第一财经·最新")
-    assert get_prompt(yicai["prompt"], cfg) == cfg["prompts"]["industry"]
-    assert get_prompt_for_url(yicai["url"], deepcopy(cfg)) != cfg["prompts"]["industry"]
-    assert get_prompt_for_url(yicai["url"], deepcopy(cfg)) == cfg["prompts"]["default"]
+    assert get_prompt(yicai["prompt"], cfg) == BUILTIN_PROMPTS["industry"]
+    assert get_prompt_for_url(yicai["url"], deepcopy(cfg)) != BUILTIN_PROMPTS["industry"]
+    assert get_prompt_for_url(yicai["url"], deepcopy(cfg)) == BUILTIN_PROMPTS["default"]
+
+
+def test_jin10_uses_its_feed_prompt_not_the_url_matcher():
+    cfg = _cfg()
+    name, body = resolve_prompt("http://ai-filter-web:5000/jin10/rss", cfg)
+    assert name == "industry"
+    assert body == BUILTIN_PROMPTS["industry"]
+    assert get_prompt_for_url("http://ai-filter-web:5000/jin10/rss", cfg) == BUILTIN_PROMPTS["default"]
+
+
+def test_every_configured_feed_prompt_name_resolves_to_a_body():
+    cfg = _cfg()
+    for feed in cfg["feeds"]:
+        key = feed.get("prompt")
+        if not key:
+            continue
+        name, body = resolve_prompt(feed["url"], cfg)
+        assert name == key
+        assert body == BUILTIN_PROMPTS[key]

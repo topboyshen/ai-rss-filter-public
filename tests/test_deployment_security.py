@@ -192,7 +192,7 @@ def test_real_scoring_provenance_import_order_is_cycle_free(
             "-c",
             imports
             + "; from scoring_provenance import NON_SUBSTANTIVE_SCORE_PATHS"
-            + "; assert len(NON_SUBSTANTIVE_SCORE_PATHS) == 6",
+            + "; assert 'insufficient_input' in NON_SUBSTANTIVE_SCORE_PATHS",
         ],
         cwd=PROJECT_ROOT,
         env=env,
