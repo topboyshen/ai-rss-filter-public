@@ -266,7 +266,7 @@ feeds:
   max_entries: 6
   name: 财联社电报
   notify_threshold: 8.0
-  pass_threshold: 6.5
+  pass_threshold: 5.0
   aggregation_threshold: 6.2
   irrelevance_floor: 6.5
   prompt: industry
@@ -276,7 +276,7 @@ feeds:
   max_entries: 5
   name: 同花顺7x24
   notify_threshold: 8.0
-  pass_threshold: 6.2
+  pass_threshold: 4.7
   aggregation_threshold: 6.0
   irrelevance_floor: 6.5
   prompt: industry
@@ -286,7 +286,7 @@ feeds:
   max_entries: 6
   name: 36氪快讯
   notify_threshold: 9.0
-  pass_threshold: 8.0
+  pass_threshold: 6.5
   aggregation_threshold: 7.5
   irrelevance_floor: 4.0
   prompt: industry
@@ -296,7 +296,7 @@ feeds:
   max_entries: 5
   name: 华尔街见闻全球
   notify_threshold: 8.5
-  pass_threshold: 6.5
+  pass_threshold: 5.0
   aggregation_threshold: 6.2
   irrelevance_floor: 6.5
   prompt: industry
@@ -327,7 +327,7 @@ feeds:
   max_entries: 8
   name: 国家发改委·新闻发布
   notify_threshold: 7.8
-  pass_threshold: 6.5
+  pass_threshold: 5.0
   aggregation_threshold: 6.2
   irrelevance_floor: 6.5
   prompt: macro
@@ -337,7 +337,7 @@ feeds:
   max_entries: 5
   name: 国家统计局·最新数据
   notify_threshold: 7.8
-  pass_threshold: 6.5
+  pass_threshold: 5.0
   aggregation_threshold: 6.2
   irrelevance_floor: 6.5
   prompt: macro
@@ -366,7 +366,7 @@ feeds:
   max_entries: 5
   name: 华尔街见闻·实时
   notify_threshold: 8.0
-  pass_threshold: 6.3
+  pass_threshold: 4.8
   aggregation_threshold: 6.0
   irrelevance_floor: 6.5
   prompt: industry
@@ -383,7 +383,7 @@ feeds:
   max_entries: 8
   name: 第一财经·最新
   notify_threshold: 8.2
-  pass_threshold: 6.3
+  pass_threshold: 4.8
   aggregation_threshold: 6.0
   irrelevance_floor: 6.5
   prompt: industry
@@ -399,7 +399,7 @@ feeds:
   max_entries: 6
   name: 华尔街见闻·A股实时
   notify_threshold: 8.0
-  pass_threshold: 6.3
+  pass_threshold: 4.8
   aggregation_threshold: 6.0
   irrelevance_floor: 6.5
   prompt: industry
@@ -423,7 +423,7 @@ feeds:
   max_entries: 6
   name: 上交所科创板项目动态
   notify_threshold: 7.8
-  pass_threshold: 6.8
+  pass_threshold: 5.3
   aggregation_threshold: 6.5
   irrelevance_floor: 6.5
   prompt: industry
@@ -447,7 +447,7 @@ feeds:
   max_entries: 12
   name: 深交所上市公司公告
   notify_threshold: 7.8
-  pass_threshold: 6.8
+  pass_threshold: 5.3
   aggregation_threshold: 6.5
   irrelevance_floor: 6.5
   prompt: industry
@@ -485,7 +485,7 @@ feeds:
   max_entries: 8
   name: 金十数据
   notify_threshold: 8.0
-  pass_threshold: 6.0
+  pass_threshold: 4.5
   aggregation_threshold: 6.0
   irrelevance_floor: 6.5
   prompt: industry
@@ -749,7 +749,7 @@ telegram:
   enabled: false
 threshold:
   notify: 9
-  pass: 7
+  pass: 5.5
   similarity: 0.6
 time_weight:
   enabled: false
