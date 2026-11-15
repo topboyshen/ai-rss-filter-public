@@ -28,6 +28,7 @@ _RSSHUB_HOSTS = {"127.0.0.1", "localhost", "rsshub", "172.17.0.1"}
 _ARTICLE_PATH = re.compile(r"/csrc/c[0-9]+/c[0-9]+/content\.shtml\Z")
 _CAIXIN_ARTICLE_PATH = re.compile(r"/[0-9]{4}-[0-9]{2}-[0-9]{2}/[0-9]+\.html\Z")
 _CAIXIN_TOPIC_PATH = re.compile(r"/topic/[A-Za-z0-9.]+\Z")
+_CAIXIN_DEEPVIEW_TOPIC_PATH = re.compile(r"/topic/[A-Za-z0-9.]+\.html\Z")
 _CAIXIN_COLUMN_PATH = re.compile(r"/(?:column|special)/[A-Za-z0-9._-]+\Z")
 _CAIXIN_AUTHORITY = re.compile(
     r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+caixin\.com(?::443)?\Z",
@@ -37,6 +38,7 @@ _CAIXIN_MEDIA_HOSTS = frozenset({
     "fm.caixin.com", "video.caixin.com", "datanews.caixin.com",
 })
 _CAIXIN_TOPIC_HOST = "key.caixin.com"
+_CAIXIN_DEEPVIEW_HOST = "deepview.caixin.com"
 _COVERAGE_FIELDS = ("source_unrecognized", "source_excluded_ads", "source_excluded_deleted")
 
 
@@ -223,7 +225,7 @@ def _csrc_items(limit, timeout, attempts):
 
 def _caixin_link_class(url: str) -> str:
     """Classify one list URL. Named non-articles skip; conflicts still fail."""
-    if (not isinstance(url, str) or not url or any(char in url for char in "\\?#")
+    if (not isinstance(url, str) or not url or any(char in url for char in "\\#")
             or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in url)):
         raise ValueError("Caixin article URL identity invalid")
     try:
@@ -231,16 +233,23 @@ def _caixin_link_class(url: str) -> str:
     except ValueError:
         raise ValueError("Caixin article URL identity invalid") from None
     host = (parsed.hostname or "").lower()
+    path = parsed.path or ""
+    deepview_topic = (
+        host == _CAIXIN_DEEPVIEW_HOST
+        and _CAIXIN_DEEPVIEW_TOPIC_PATH.fullmatch(path) is not None
+    )
     if (parsed.scheme != "https" or not _CAIXIN_AUTHORITY.fullmatch(parsed.netloc)
             or parsed.username is not None or parsed.password is not None
-            or parsed.fragment or parsed.query):
+            or parsed.fragment
+            or ("?" in url and not (deepview_topic and parsed.query == "cxapp_link=true"))):
         raise ValueError("Caixin article URL identity invalid")
-    path = parsed.path or ""
     if path.rsplit("/", 1)[-1] in {".", ".."}:
         raise ValueError("Caixin article URL identity invalid")
     if host in _CAIXIN_MEDIA_HOSTS and _CAIXIN_ARTICLE_PATH.fullmatch(path):
         return "media"
     if host == _CAIXIN_TOPIC_HOST and _CAIXIN_TOPIC_PATH.fullmatch(path):
+        return "topic"
+    if host == _CAIXIN_DEEPVIEW_HOST and _CAIXIN_DEEPVIEW_TOPIC_PATH.fullmatch(path):
         return "topic"
     if _CAIXIN_COLUMN_PATH.fullmatch(path):
         return "column"
