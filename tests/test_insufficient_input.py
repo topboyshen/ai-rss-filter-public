@@ -260,3 +260,15 @@ def test_processor_persists_insufficient_input_as_filtered_and_unselected(monkey
     assert (
         database.get_entries_for_cached_rss(_cfg(), feed_url=FEED, min_score=1.0) == []
     )
+
+
+def test_builtin_prompts_preserve_title_only_rule_and_insufficient_sentinel():
+    from core.prompts import BUILTIN_PROMPTS
+    from scoring_provenance import INSUFFICIENT_INPUT_PROMPT
+
+    for prompt in BUILTIN_PROMPTS.values():
+        assert INSUFFICIENT_INPUT_PROMPT in prompt
+        assert "只有“标题和摘要都无法识别主体或事件”时才用信息不足" in prompt
+        assert "“摘要为空”不等于信息不足" in prompt
+        assert "这些属于待核查" in prompt
+        assert "不要用“信息不足”" in prompt

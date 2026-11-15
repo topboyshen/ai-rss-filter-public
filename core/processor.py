@@ -753,6 +753,49 @@ def _cap_irrelevant_high_score(score: float, tag: str, logic: str, cfg: Optional
     return score, tag, logic
 
 
+_LOW_VALUE_ANNOUNCEMENT_TITLE = re.compile(
+    r"会议|论坛|年会|现场会|致辞|学术年会|峰会|研讨会|座谈会|拍卖"
+)
+_LOW_VALUE_POLICY_RESEARCH = re.compile(
+    r"(?:深化|提出|加强|推进|开展)[^。；\n]{0,24}研究"
+)
+_LOW_VALUE_CONCRETE_ACTION = re.compile(
+    r"订单|中标|签约|合同|获批|批准|业绩|营收|净利|利润|指引|回购|重组|并购|收购|"
+    r"投资|产能|投产|扩产|涨价|降价|裁员|上市|注册|证书|批文|发布|亮相|"
+    r"超预期|不及预期|同比|环比"
+)
+_LOW_VALUE_COMPANY = re.compile(
+    r"[\u4e00-\u9fffA-Za-z0-9]{2,}(?:公司|集团|银行|证券|基金|科技|医药|半导体|"
+    r"能源|汽车|电子|控股|股份)"
+)
+_LOW_VALUE_TAGS = {"艺术", "拍卖"}
+_LOW_VALUE_CAP = 5.0
+
+
+def _cap_low_value_announcement(score: float, tag: str, logic: str, raw_title: str) -> Tuple[float, str, str]:
+    """Cap routine meetings, speeches, auctions and principle-only research.
+
+    The contract puts these in 3-4, but the model sometimes scores them 6.0 and
+    the aggregation threshold then selects them.  The cap only applies when the
+    title names no company and states no concrete action, so a conference with
+    an order, launch or filing keeps its score.
+    """
+    if score <= _LOW_VALUE_CAP:
+        return score, tag, logic
+    title = re.sub(r"\s+", "", raw_title or "")
+    normalized_tag = re.sub(r"\s+", "", tag or "")
+    low_value = (
+        normalized_tag in _LOW_VALUE_TAGS
+        or _LOW_VALUE_ANNOUNCEMENT_TITLE.search(title) is not None
+        or _LOW_VALUE_POLICY_RESEARCH.search(title) is not None
+    )
+    if not low_value:
+        return score, tag, logic
+    if _LOW_VALUE_CONCRETE_ACTION.search(title) or _LOW_VALUE_COMPANY.search(title):
+        return score, tag, logic
+    return _LOW_VALUE_CAP, tag, logic
+
+
 def _apply_score_adjustments(score, tag, logic, cfg, feed_url, raw_title, non_substantive):
     """Apply the existing cap and time weight without changing their order."""
     if non_substantive:
@@ -763,6 +806,7 @@ def _apply_score_adjustments(score, tag, logic, cfg, feed_url, raw_title, non_su
     if score >= 0 and time_bonus != 0:
         score = min(10.0, max(0.0, score + time_bonus))
         logger.info("[TimeWeight] '%s' %s bonus %+.1f -> %.1f", raw_title[:40], time_label, time_bonus, score)
+    score, tag, logic = _cap_low_value_announcement(score, tag, logic, raw_title)
     return score, tag, logic
 
 
