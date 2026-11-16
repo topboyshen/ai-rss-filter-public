@@ -53,22 +53,14 @@ COMMAND_TIMEOUT_SECONDS = 4.0
 TOTAL_TIMEOUT_SECONDS = 15.0
 RETENTION_DAYS = 30
 LOG_SERVICE_ALLOWLIST = frozenset({"redis"})
-DOCKER_STATES = frozenset(
-    {
-        "created",
-        "dead",
-        "exited",
-        "healthy",
-        "missing",
-        "paused",
-        "removing",
-        "restarting",
-        "running",
-        "starting",
-        "unhealthy",
-        "unknown",
-    }
+# release.sh reports "State.Status|State.Health.Status" so that a stopped
+# container cannot look healthy through its last health result.  A container
+# that is gone (or whose inspect failed) is reported as a single word instead.
+CONTAINER_STATUSES = frozenset(
+    {"created", "dead", "exited", "paused", "removing", "restarting", "running"}
 )
+CONTAINER_HEALTHS = frozenset({"healthy", "none", "starting", "unhealthy"})
+SERVICE_STATES = frozenset({"missing", "unknown"})
 
 SERVICE_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 PHASE_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
@@ -672,6 +664,19 @@ def best_effort_mark_partial(reason_code: str) -> None:
         return
 
 
+def failed_state_is_allowed(value: str) -> bool:
+    """Accept the status/health pair release.sh reports, or one service word."""
+
+    parts = value.split("|")
+    if len(parts) == 1:
+        return parts[0] in SERVICE_STATES
+    return (
+        len(parts) == 2
+        and parts[0] in CONTAINER_STATUSES
+        and parts[1] in CONTAINER_HEALTHS
+    )
+
+
 def verify_manifest(path: Path, expected_hash: str) -> str:
     metadata = path.stat()
     if metadata.st_size > MAX_COMPOSE_BYTES:
@@ -709,7 +714,7 @@ def validate_args(args: argparse.Namespace) -> tuple[Path, Path, Path, list[str]
 
     reject_unsafe_text(args.image_ref, "--image-ref", 512)
     reject_unsafe_text(args.failed_state, "--failed-state", 128)
-    if args.failed_state not in DOCKER_STATES:
+    if not failed_state_is_allowed(args.failed_state):
         raise SafetyError("--failed-state is not an allowlisted Docker state")
     if not HASH_RE.fullmatch(args.manifest_hash):
         raise SafetyError("--manifest-hash must be exactly 64 hexadecimal characters")

@@ -1,0 +1,65 @@
+name: Admission fence isolation
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches: [master, 'codex/**']
+    paths:
+      - 'services/admission_*.py'
+      - 'scripts/control_admission_fence.py'
+      - 'scripts/verify_admission_fence_native.py'
+      - 'scripts/verify_handoff_operations_native.py'
+      - 'tests/test_admission_*.py'
+      - 'app.py'
+      - 'docker-compose.yml'
+      - 'worker_main.py'
+      - 'routes/webhook_routes.py'
+      - 'routes/dashboard_routes.py'
+      - 'services/refresh.py'
+      - 'services/quant_market_context.py'
+      - 'services/dashboard_snapshot_updates.py'
+      - 'services/first_rejection_retention.py'
+      - 'scripts/run_db_maintenance.py'
+      - 'scripts/run_event_enrichment.py'
+      - 'workers/*_collector.py'
+      - '.github/workflows/admission-fence.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'services/admission_*.py'
+      - 'tests/test_admission_*.py'
+      - 'scripts/*admission*.py'
+      - '.github/workflows/admission-fence.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  native-amd64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Native bounded cross-process admission regression
+        run: |
+          python -I -B scripts/verify_admission_fence_native.py \
+            --repo . --output "${RUNNER_TEMP}/admission-fence"
+      - name: Preserve evidence including failed attempts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: admission-fence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/admission-fence/**
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14

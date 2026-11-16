@@ -52,9 +52,9 @@ check_api_key = check_api_key
 _allowed_cors_origin = _allowed_cors_origin
 
 
-def initialize_app() -> None:
+def initialize_app(*, slot=None, attempt=0) -> None:
     """Initialize persistent application state at an explicit startup boundary."""
-    initialize_runtime_database("web", _init_db, "http_database_initialize")
+    initialize_runtime_database("web", _init_db, "http_database_initialize", slot=slot, attempt=attempt)
 
 
 # Backward-compatible helper for callers that already initialize a test or

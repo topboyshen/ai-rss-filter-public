@@ -143,6 +143,7 @@ def test_missing_mismatched_and_partial_summary_stay_unknown(monkeypatch):
 
 
 def test_pure_render_escapes_preserves_input_and_static_authenticated_link(monkeypatch):
+    monkeypatch.setenv("AI_FILTER_PUBLIC_DASHBOARD_ORIGIN", "https://dashboard.example.test")
     data = _collect(monkeypatch, _snapshot())
     data["observed_at"] = '<script>alert("timestamp")</script>'
     data["final_paths"]["<script>private</script>"] = 100
@@ -153,7 +154,7 @@ def test_pure_render_escapes_preserves_input_and_static_authenticated_link(monke
     assert data == saved
     assert "时间未知" in html and "<script" not in html
     assert "private" not in html and "<iframe" not in html
-    assert 'href="https://ai.example.invalid/dashboard/neutral-records"' in html
+    assert 'href="https://dashboard.example.test/dashboard/neutral-records"' in html
     assert "查看记录（需后台登录）" in html and "最新50条" in html
     assert "不是上述数字的逐行明细" in html
     assert "?token=" not in html and "?key=" not in html

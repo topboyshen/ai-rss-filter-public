@@ -28,12 +28,12 @@ def test_webhook_signature_rejects_missing_secret(monkeypatch, tmp_path):
 
 def test_api_key_header_preferred_and_query_can_be_disabled(monkeypatch, tmp_path):
     app_module = load_app(monkeypatch, tmp_path)
-    app_module.config._cfg = {
+    monkeypatch.setattr(app_module.config, "_cfg", {
         "security": {
             "api_key": "secret",
             "allow_query_api_key": False,
         }
-    }
+    })
 
     with app_module.app.test_request_context("/stats?key=secret"):
         assert app_module.check_api_key() is False
@@ -44,11 +44,11 @@ def test_api_key_header_preferred_and_query_can_be_disabled(monkeypatch, tmp_pat
 
 def test_cors_origin_can_be_restricted(monkeypatch, tmp_path):
     app_module = load_app(monkeypatch, tmp_path)
-    app_module.config._cfg = {
+    monkeypatch.setattr(app_module.config, "_cfg", {
         "security": {
             "cors_allowed_origins": ["https://allowed.example"],
         }
-    }
+    })
 
     with app_module.app.test_request_context("/", headers={"Origin": "https://allowed.example"}):
         assert app_module._allowed_cors_origin() == "https://allowed.example"
@@ -497,7 +497,7 @@ def test_malformed_webhook_signature_returns_unauthorized(monkeypatch, tmp_path,
 
 def test_api_key_fails_closed_when_missing(monkeypatch, tmp_path):
     app_module = load_app(monkeypatch, tmp_path)
-    app_module.config._cfg = {"security": {}}
+    monkeypatch.setattr(app_module.config, "_cfg", {"security": {}})
 
     with app_module.app.test_request_context("/stats"):
         assert app_module.check_api_key() is False
@@ -509,7 +509,9 @@ def test_webhook_rejects_oversized_body(monkeypatch, tmp_path):
 
     app_module = load_app(monkeypatch, tmp_path)
     monkeypatch.setenv("MINIFLUX_WEBHOOK_SECRET", "secret")
-    app_module.app.config["MAX_CONTENT_LENGTH"] = 64
+    # 必须走 monkeypatch：直接赋值会把这个全局上限遗留给后续测试，
+    # 让同一次会话里后跑的 dashboard 登录用例全部误报 413。
+    monkeypatch.setitem(app_module.app.config, "MAX_CONTENT_LENGTH", 64)
     body = b"x" * 65
     digest = hmac.new(b"secret", body, hashlib.sha256).hexdigest()
 

@@ -1,53 +1,29 @@
 # Technical Debt & Known Issues
 
-**Last Updated**: 2026-08-19
+**Last Updated**: 2026-11-10
 
 ---
 
-## 🟡 Skipped Tests (3 total)
+## 🟡 Skipped Tests
 
-### 1. `test_refresh_rate_limit` (test_integration.py)
-**Status**: Skipped  
-**Reason**: Dynamic import bypasses monkeypatch  
-**Impact**: Rate limiting功能已通过其他测试验证，功能正常  
-**Root Cause**: 测试在动态导入模块后尝试 monkeypatch，此时模块已加载，patch 不生效  
+An earlier revision of this section listed three tests as skipped and
+prescribed repair plans for them. None of the three carries a skip marker, and
+all of them run in the standard suite; under the release-gate environment they
+passed on 2026-11-10:
 
-**Possible Solutions**:
-- 方案 A: 使用 `unittest.mock.patch` 替代 `pytest.monkeypatch`
-- 方案 B: 重构为集成测试，使用真实的 Redis/时间
-- 方案 C: 在模块导入前 patch（需要重构测试结构）
+- `test_refresh_rate_limit` (test_integration.py)
+- `test_ops_feeds_widget_uses_recent_feed_health_without_cache_rows` (test_ops_health.py)
+- `test_consecutive_empty_feed_is_visible_even_with_recent_cache_rows` (test_ops_health.py)
 
-**Priority**: P2（功能已覆盖，测试改进）
+There is no outstanding test-repair debt for them.
 
----
-
-### 2. `test_ops_feeds_widget_uses_recent_feed_health_without_cache_rows` (test_ops_health.py)
-**Status**: Skipped  
-**Reason**: UI output contract changed after ops widget refactor  
-**Impact**: Ops 健康面板功能正常，输出格式变化  
-**Root Cause**: Ops widget 重构后，HTML 输出格式变化，测试期望过时  
-
-**Possible Solutions**:
-- 方案 A: 更新测试期望以匹配新的 HTML 输出格式
-- 方案 B: 改为测试结构化数据（JSON）而非 HTML 字符串
-- 方案 C: 使用 CSS selector 而非字符串匹配
-
-**Priority**: P2（UI 测试，功能正常）
-
----
-
-### 3. `test_consecutive_empty_feed_is_visible_even_with_recent_cache_rows` (test_ops_health.py)
-**Status**: Skipped  
-**Reason**: Empty feed visibility logic changed  
-**Impact**: Empty feed 显示逻辑已更新，测试假设不再成立  
-**Root Cause**: Feed 可见性逻辑演进，现在空 feed 的显示条件不同  
-
-**Possible Solutions**:
-- 方案 A: 阅读新的可见性逻辑，更新测试场景
-- 方案 B: 删除测试（如果新逻辑不再需要此场景）
-- 方案 C: 改为测试新的可见性规则
-
-**Priority**: P2（逻辑已变更，需要重新设计）
+The remaining skips are environment gates, not debt: real Linux `flock`
+(`test_release_script.py`, `test_health_check_release_state.py`), Linux process
+identity and `AF_UNIX`/`procfs` lifecycle checks, an isolated PostgreSQL DSN or
+an explicit native Miniflux/PostgreSQL report, a checkout without
+`config.yaml`, and Windows exclusions for POSIX permission and `SIGALRM`
+contracts. They execute on the Linux gate host; the local macOS run without a
+PostgreSQL DSN reports 26 skips, which says nothing about those paths.
 
 ---
 
@@ -66,6 +42,71 @@
 **Long-term Solution**: 引入依赖注入 / 重构为分层架构
 
 **Priority**: P3（长期重构）
+
+### Dashboard 巡检快照缺少 `trading_calendar`（2026-11-10）
+**Status**: Fixed（2026-11-10，`fix/dashboard-trading-calendar-20261110` 按方案 A 落地：producer 与
+consumer 两侧白名单同步加入 `trading_calendar`，两侧各补测试；2026-12 前的续期仍需补 2027 年休市安排）  
+**Impact**: `ops/ai_filter_ops_check.py` 的 `CHECKS` 会执行交易日历覆盖检查，但写 dashboard 快照时
+`_DASHBOARD_CHECK_NAMES` 不含 `trading_calendar`，dashboard 读取端 `_HOST_CHECKS` 也没有这一项；
+日历缺年份的告警不会出现在页面与 attention 列表，只能从巡检日志/退出码看到。`_CHINA_HOLIDAYS_BY_YEAR`
+目前只有 2026，`check_trading_calendar` 会从 2026-12-02 起失败（horizon=+30 天进入 2027），
+而 2027-01-01 起收盘采集、事件结果与回测会因无法判断交易日而报错。  
+**Root Cause**: producer 与 consumer 两份白名单在 `check_trading_calendar` 加入 `CHECKS` 之前维护，
+之后没有同步；且 consumer 遇到未知检查名会把整块服务状态降为 `unknown`，所以只改一侧不够。  
+**Possible Solutions**:
+- 方案 A: 同一提交内同时给 producer `_DASHBOARD_CHECK_NAMES` 与 consumer `_HOST_CHECKS` 加
+  `trading_calendar`（标题「交易日历」），并补两侧测试
+- 方案 B: 抽一份共享检查清单，producer 与 consumer 都从它派生，避免再次漂移
+**Priority**: P1（本条「告警可见性」已修；**日历数据本身仍缺 2027 年休市安排**，`check_trading_calendar`
+会从 2026-12-02 起失败，需在这之前补 `_CHINA_HOLIDAYS_BY_YEAR[2027]`）
+
+### 每周 VACUUM 失败只写主机日志，巡检与 dashboard 都看不到（2026-11-10）
+**Status**: Fixed（2026-11-10，`fix/db-maintenance-visibility-20261110`：巡检新增 `db_maintenance`
+检查，读取 `/var/log/ai-filter-db-maintenance.log` 中最后一次运行的结果，producer 与 consumer
+两份白名单同步加入；维护脚本、调度与 VACUUM 参数均未改动）  
+**Impact**: `scripts/run_db_maintenance.py --host` 的失败只写
+`/var/log/ai-filter-db-maintenance.log`，此前没有任何巡检项读它，dashboard 也没有对应卡片；
+VACUUM 在写锁下等满 SQLite 默认 5 秒超时即失败（本机复现
+`vacuum failed after 5.2 s: database is locked`），周维护可以连续失败而无人知晓。  
+**Root Cause**: 维护结果只有日志、没有巡检读入口；enrichment 每 30 分钟跑一次（`:15`、`:45`），
+外层上限 18 分钟，02:45 那次最晚可跑到 03:03，与周日 03:00 的维护直接重叠。  
+**Possible Solutions**:
+- 方案 A（已落地）: 巡检新增 `db_maintenance`，取日志中最后一次 host 运行的 `finish` 记录；
+  `rc`、`outcome` 与三个阶段任一不成功即 FAIL，并把同一次运行里第一条失败的 phase 与 error
+  （例如 `vacuum` + `database is locked`）写进 detail；成功结果超过 8 天视为 stale；只有 `start`
+  且未超过 70 分钟预算时按「进行中」WARN，日志还没有任何结果时按「尚未运行」WARN（WARN 不会触发
+  Telegram，只有 FAIL 才通知）
+- 方案 B（未实施）: 把维护挪到不冲突的窗口。enrichment 每半小时一次、单次上限 18 分钟，任何
+  半小时窗口的尾部都可能与 VACUUM 重叠，移动只能收窄冲突概率，不能消除；且
+  `ops/README.md` 已明确记录「不引入调度/并发变更」，因此本次只做可见性
+**Priority**: P1（失败可见性已修；**02:45 enrichment 最晚 03:03 与周日 03:00 VACUUM 的重叠仍在**，
+届时巡检会以 `vacuum=failed ... error=database is locked` 报 FAIL）
+
+### 收盘回执目录在巡检与生产者之间按不同规则推导（2026-11-10）
+**Status**: Documented / 未修（潜在耦合；在仓库当前交付配置下没有可触发场景）  
+**Impact**: `ops/ai_filter_ops_check.py` 的 `_load_market_result` 固定读
+`settings.root/data/market_close/<kind>_last.json`，不读 `MARKET_CLOSE_RESULT_DIR`，也不看数据库路径；
+生产者三处却是「环境变量优先，否则按数据库目录」。只有当有人**只给生产者**设置覆盖、或巡检的
+`--root`/`OPS_DATABASE_PATH` 与数据库实际位置不一致时，两侧才会指向不同目录：巡检读不到回执，
+`market_timer` 以 `collector result missing` FAIL，`market_history` 在已有基线后 FAIL。分叉会以
+FAIL 暴露，不会静默假通过；`market_timer` 的缺失分支也不会把「无回执」误当成健康。  
+**Root Cause**: 巡检的 `Settings` 只有 `root`，结果目录直接从 root 推导；生产者各自解析：
+`scripts/run_market_close.sh` 用 `MARKET_CLOSE_RESULT_DIR` 或 `$ROOT/data/market_close`，
+`scripts/repair_market_close.py` 用 `MARKET_CLOSE_RESULT_DIR` 或 `DB.parent/market_close`
+（`DB = ROOT/data/cache.db`），`services/market_close_result.py::result_dir_from_env` 用
+`MARKET_CLOSE_RESULT_DIR` 或 `db_path.parent/market_close`。交付面没有任何入口设置该变量：
+三个收盘相关 systemd 单元都没有 `EnvironmentFile`/`Environment`，cron 只有
+`ai-filter-ops-check --quiet`（默认 root `/root/ai-rss-filter`），compose 固定
+`AI_FILTER_DB_PATH=/app/data/cache.db` 且 `./data:/app/data`，所以当前部署两侧落在同一目录。  
+**Possible Solutions**:
+- 方案 A（已选）: 只在此文档记录，不改代码。现状没有触发条件，人为制造分叉也会以 FAIL 暴露，
+  改路径语义的收益低于风险
+- 方案 B（未实施）: 巡检改为优先读 `MARKET_CLOSE_RESULT_DIR`（必须绝对路径，相对路径报
+  `ValueError`），否则按 `database_path.parent/market_close` 推导，与
+  `services.market_close_result.result_dir_from_env` 完全对齐；需要新分支、覆盖「覆盖变量 /
+  相对路径拒绝 / 数据库路径推导 / 默认目录不变」四类测试，并确认 `--dry-run` 与 dashboard
+  快照的路径语义不变
+**Priority**: P3（潜在耦合；当前无触发条件，且分叉会报 FAIL 而非静默误报）
 
 ---
 
@@ -90,10 +131,12 @@
 **Target**: 85%+
 
 **Low Coverage Areas**:
-- `routes/feedback_routes.py`: 0%
 - `core/metrics.py`: 25.53%
 - `db/event_migration.py`: 56.34%
 - `services/jin10_feed.py`: 63.64%
+
+> 2026-11-09 备注：发布门禁的当前总覆盖率是 83.11%（完整套件实测），上面这组模块数字尚未重新核对。
+> `routes/feedback_routes.py` 从未注册蓝图，因此测试不会导入它（该原型文件已随死代码清理移除）。
 
 **Action**: 添加单元测试覆盖这些模块
 
