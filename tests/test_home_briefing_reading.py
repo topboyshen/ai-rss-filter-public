@@ -233,6 +233,30 @@ def test_full_briefing_html_route_keeps_original_rendering(monkeypatch):
     assert "briefing-reading" not in response.get_data(as_text=True)
 
 
+def test_full_briefing_html_route_adds_dashboard_back_link_for_browsers(monkeypatch):
+    app, routes = _app()
+    result = _result()
+    expected = render_themes_html(result, 48)
+    monkeypatch.setattr(routes, "_cfg", lambda: {})
+    monkeypatch.setattr(routes, "_get_briefing_articles", lambda **kw: [("row",)])
+    monkeypatch.setattr(routes, "_briefing_article_from_row", lambda row: {"title": "原文"})
+    monkeypatch.setattr(routes, "enrich_article_analysis", lambda value, **kw: value)
+    monkeypatch.setattr(routes, "dedupe_articles", lambda values: values)
+    monkeypatch.setattr(routes, "_select_briefing_result", lambda *args, **kw: (result, "local"))
+    monkeypatch.setattr(routes, "attach_quant_market_context", lambda value: value)
+
+    response = app.test_client().get(
+        "/briefing?format=html&hours=48",
+        headers={"Accept": "text/html"},
+    )
+    body = response.get_data(as_text=True)
+
+    assert response.status_code == 200
+    assert 'href="/dashboard"' in body
+    assert "返回后台" in body
+    assert body.endswith(expected)
+
+
 @pytest.mark.parametrize("result", [
     {"themes": None},
     {"themes": [], "briefing_assembly": {"enabled": True, "input_count": "invalid"}},

@@ -9,6 +9,7 @@ import time
 import logging
 import re as _re
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
@@ -22,12 +23,12 @@ from scoring_provenance import (
 from services.intelligence_query import IRRELEVANT_TAGS
 from services.news_reading import (
     attach_score_contract_labels,
+    render_evidence_context,
     preferred_news_title,
     render_news_card,
     restore_reading_titles,
     score_contract_label,
 )
-from db.event_core import canonical_event_id
 from utils.helpers import (
     escape_html,
     normalize_direction,
@@ -209,14 +210,6 @@ _SOURCE_BRAND_MARKERS = (
 
 def _cutoff_ts(hours: int = REALTIME_FEED_HOURS) -> int:
     return int(time.time()) - max(1, int(hours)) * 3600
-
-
-def _is_recent_entry(entry: dict, hours: int = REALTIME_FEED_HOURS) -> bool:
-    ts = entry.get("time", 0) or entry.get("created_at", 0)
-    try:
-        return int(ts) >= _cutoff_ts(hours)
-    except (TypeError, ValueError):
-        return False
 
 
 def _entry_timestamp(entry: dict) -> int:
@@ -698,6 +691,7 @@ def _render_one_card(e: dict, *, reading: bool = False) -> str:
             selection_reason=selection_reason, level=level, evidence_note=_neutral_evidence_note(e),
             duplicate_note=duplicate_note, rule_pool_html=rule_pool_html,
             score_source_label=score_contract_label(e),
+            evidence_context_html=render_evidence_context(e),
         )
     return (
         f'<article style="position:relative;overflow:hidden;border-radius:16px;'
@@ -715,6 +709,7 @@ def _render_one_card(e: dict, *, reading: bool = False) -> str:
         f'<span style="font-size:11px;color:var(--color-text-subdue,inherit);font-weight:600;">{escape_html(meta)}{escape_html(duplicate_note)}</span>'
         f'</div>'
         + rule_pool_html
+        + render_evidence_context(e)
         + f'</div>'
         f'<div style="flex-shrink:0;text-align:right;">'
         f'<div style="background:{badge_bg};color:{accent};padding:4px 8px;border-radius:999px;'
@@ -731,20 +726,6 @@ def _row_safe_neutral_reason(row) -> str:
         return str(row["safe_neutral_reason"] or "")
     except (KeyError, IndexError):
         return ""
-
-
-def _resolve_event_version(conn, event_id: str):
-    """Resolve canonical event id and current version; fail closed."""
-    try:
-        event_id = canonical_event_id(conn, event_id)
-        version_row = conn.execute(
-            "SELECT version FROM events WHERE event_id = ?",
-            (event_id,),
-        ).fetchone()
-        return event_id, max(1, int(version_row[0])) if version_row else 0
-    except Exception:
-        return "", 0
-
 
 
 def _cache_score_source_projection(columns, event_columns) -> str:
@@ -947,6 +928,27 @@ def _realtime_candidate_rows(conn, query, params, *, cfg, feed_urls, min_score, 
     """, (*params, _cutoff_ts(REALTIME_PRIMARY_HOURS), max(0, int(limit)))).fetchall()
 
 
+def _allowed_feed_urls(conn, cfg: dict, feed_url: Optional[str], cutoff: str) -> list[str]:
+    """Return configured feed URLs present in the cache window."""
+    target_feed_cfg = _enabled_feed_config(cfg, feed_url) if feed_url else {}
+    if feed_url and not target_feed_cfg:
+        return []
+    target_config_url = str(target_feed_cfg.get("url") or "")
+    allowed: list[str] = []
+    for row in conn.execute(
+        "SELECT DISTINCT feed_url FROM news_cache WHERE created_at >= ?",
+        (cutoff,),
+    ).fetchall():
+        row_feed_url = str(row[0] or "")
+        row_feed_cfg = _enabled_feed_config(cfg, row_feed_url)
+        if not row_feed_cfg:
+            continue
+        if target_config_url and str(row_feed_cfg.get("url") or "") != target_config_url:
+            continue
+        allowed.append(row_feed_url)
+    return allowed
+
+
 def _load_from_db(
     limit: int = 10,
     min_score: Optional[float] = None,
@@ -960,28 +962,23 @@ def _load_from_db(
     conn = None
     try:
         import sqlite3
-        from db.database import DB_PATH, get_feed_thresholds
+        from db.database import (
+            DB_PATH,
+            SQLITE_BUSY_TIMEOUT_SECONDS,
+            get_feed_thresholds,
+        )
         cfg = load_config() if cfg is None else cfg
-        conn = sqlite3.connect(DB_PATH)
+        # Read-only URI: a missing/renamed DB must fail loudly instead of
+        # creating an empty file, and the connection itself cannot write.
+        conn = sqlite3.connect(
+            Path(DB_PATH).resolve().as_uri() + "?mode=ro",
+            uri=True,
+            timeout=SQLITE_BUSY_TIMEOUT_SECONDS,
+        )
         conn.row_factory = sqlite3.Row
         cutoff = _cutoff_ts(hours)
 
-        target_feed_cfg = _enabled_feed_config(cfg, feed_url) if feed_url else {}
-        if feed_url and not target_feed_cfg:
-            return []
-        target_config_url = str(target_feed_cfg.get("url") or "")
-        allowed_feed_urls = []
-        for row in conn.execute(
-            "SELECT DISTINCT feed_url FROM news_cache WHERE created_at >= ?",
-            (cutoff,),
-        ).fetchall():
-            row_feed_url = str(row[0] or "")
-            row_feed_cfg = _enabled_feed_config(cfg, row_feed_url)
-            if not row_feed_cfg:
-                continue
-            if target_config_url and str(row_feed_cfg.get("url") or "") != target_config_url:
-                continue
-            allowed_feed_urls.append(row_feed_url)
+        allowed_feed_urls = _allowed_feed_urls(conn, cfg, feed_url, cutoff)
         if not allowed_feed_urls:
             return []
 
@@ -1097,9 +1094,12 @@ def _load_from_db(
                 feed_url=row_feed_url, source=source,
             ))
         return attach_score_contract_labels(clean, cfg)
-    except Exception:
+    except Exception as exc:
         if strict:
             raise
+        # Keep the historical fail-neutral return, but make the failure
+        # observable without titles/URLs (exception type only).
+        logger.warning("Realtime DB load failed: %s", type(exc).__name__)
         return []
     finally:
         if conn is not None:
