@@ -19,8 +19,6 @@ def isolated_spool(monkeypatch, tmp_path):
         webhook_routes, "_webhook_spool_dir", tmp_path / "webhook-spool"
     )
     monkeypatch.setattr(webhook_routes, "_webhook_spool_max_tasks", 128)
-    with webhook_routes._webhook_replay_lock:
-        webhook_routes._webhook_replay_seen.clear()
     with webhook_routes._webhook_inflight_lock:
         webhook_routes._webhook_inflight.clear()
         webhook_routes._webhook_claims.clear()
@@ -29,8 +27,6 @@ def isolated_spool(monkeypatch, tmp_path):
     yield webhook_routes
 
     webhook_routes.stop_webhook_dispatcher(timeout=2.0)
-    with webhook_routes._webhook_replay_lock:
-        webhook_routes._webhook_replay_seen.clear()
     with webhook_routes._webhook_inflight_lock:
         webhook_routes._webhook_inflight.clear()
         webhook_routes._webhook_claims.clear()

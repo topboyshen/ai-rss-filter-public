@@ -21,6 +21,12 @@
     flex-wrap: wrap;
   }
 
+  /* A closed menu must not reserve its hidden links/actions inside the fixed bar. */
+  .mobile-navigation:not(:has(.mobile-navigation-page-links-input:checked)) .mobile-navigation-page-links,
+  .mobile-navigation:not(:has(.mobile-navigation-page-links-input:checked)) .mobile-navigation-actions {
+    display: none;
+  }
+
   /* Keep the existing custom-footer HTML/links; only unpin its outer wrapper. */
   body:has(.ai-home-news) footer.footer > div > div:has(> a[href*="beian.miit.gov.cn"]):has(> a[href*="beian.mps.gov.cn"]) {
     position: static !important;

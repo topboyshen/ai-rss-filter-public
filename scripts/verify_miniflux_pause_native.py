@@ -11,11 +11,13 @@ from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
+import math
 import os
 from pathlib import Path
 import platform
 import re
 import secrets
+import stat
 import subprocess
 import time
 import uuid
@@ -28,6 +30,7 @@ LABEL = "ai-filter.synthetic-miniflux-pause"
 MEMORY = 768 * 1024 * 1024
 PIDS = 256
 MAX_SECONDS = 600
+COMMAND_EVIDENCE_BYTES = 8 * 1024**2  # Existing selected-original file bound, not the control-record bound.
 CLIENT = """
 import json,sys,urllib.request,urllib.error
 p=json.load(sys.stdin);headers={'Content-Type':'application/json'}
@@ -36,15 +39,95 @@ body=json.dumps(p['value']).encode() if p.get('value') is not None else None
 r=urllib.request.Request(p['url'],data=body,headers=headers,method=p['method'])
 try:
  with urllib.request.urlopen(r,timeout=12) as s: value={'status':s.status,'body':s.read(1048576).decode()}
-except urllib.error.HTTPError as s: value={'status':s.code,'body':s.read(1048576).decode()}
+except urllib.error.HTTPError as s: value={'status':s.code,'body':s.read(1048576).decode(),'category':s.headers.get('X-Handoff-Error-Category')}
 print(json.dumps(value))
 """
 
 
-def save(path, value):
-    with path.open("x", encoding="utf-8") as stream:
+ERROR_CATEGORIES = frozenset({"unconfirmed", "deadline", "uncertain", "conflict", "closed", "no_rows", "lock", "db", "other"})
+OBSERVED_DOCKER_OPERATIONS = frozenset({"inspect", "run", "exec", "logs", "ps", "image", "network", "volume",
+    "start", "stop", "kill", "rm", "rmi", "build", "images", "info", "load", "save", "create", "wait"})
+
+
+def _command_observation(args, sequence, timeout, remaining):
+    operation = args[0] if type(args) in (list, tuple) and args and type(args[0]) is str else None
+
+    def seconds(value):
+        return value if type(value) in (int, float) and math.isfinite(value) and -600 <= value <= 600 else None
+
+    return {"schema": 1, "sequence": sequence,
+            "operation": "docker_" + operation if operation in OBSERVED_DOCKER_OPERATIONS else "unknown",
+            "timeout_seconds": seconds(timeout), "harness_remaining_seconds": seconds(remaining),
+            "elapsed_seconds": None, "returncode": None, "outcome": "unconfirmed"}
+
+
+def error_category(value):
+    """CI diagnostic only: a fixed Go enum header, never free-form error text."""
+    if value is None:
+        return None
+    return value if value in ERROR_CATEGORIES else "invalid"
+
+
+def save(path, value, *, retain_proof=False):
+    with path.open("x+" if retain_proof else "x", encoding="utf-8") as stream:
         json.dump(value, stream, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False)
         stream.write("\n")
+        if retain_proof:
+            stream.flush()
+            return command_original_proof(path, sync=True, fd=stream.fileno())
+
+
+def command_original_proof(path, *, sync=False, fd=None):
+    """A diagnostic original is not a small admission record; verify its exact FD."""
+    from scripts import production_host_ingress_native as host
+    from services import admission_fence as gate
+    owned = fd is None
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW) if owned else fd
+    try:
+        before = os.fstat(fd)
+        gate._require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1
+                      and before.st_uid == os.geteuid() and stat.S_IMODE(before.st_mode) == 0o600,
+                      "unsafe command original")
+        proof = host.file_proof(path, limit=COMMAND_EVIDENCE_BYTES, fd=fd)
+        if sync:
+            os.fsync(fd)
+            gate._sync_directory(path.parent)
+        gate._require(host.identity(os.fstat(fd)) == proof["identity"] == host.identity(path.lstat()),
+                      "command original changed during confirmation")
+        return proof
+    finally:
+        if owned:
+            os.close(fd)
+
+
+def retain_command_result(path, sequence, returncode, original):
+    """Publish small execution metadata only after the unchanged raw evidence is durable."""
+    from services import admission_fence as gate
+    from scripts import production_host_ingress_native as host
+    gate._require(type(sequence) is int and sequence > 0 and (returncode is None or type(returncode) is int),
+                  "invalid command result identity")
+    receipt = path.with_suffix(".result.json")
+    gate._require(not gate._present(receipt) and not gate._present(receipt.with_suffix(".json.pending")),
+                  "command result evidence already exists")
+    gate._require(gate._encoded(command_original_proof(path)) == gate._encoded(original), "command original changed after capture")
+    result = {"schema": 1, "sequence": sequence, "returncode": returncode, "original": original}
+    gate._require(len(host.encoded(result)) <= gate.MAX_RECORD_BYTES, "command result record byte limit")
+    host.durable(receipt, result)  # Exclusive creation; never replace a retained receipt.
+    return result
+
+
+def read_command_result(path, sequence, expected):
+    """The 16 KiB admission reader is used only for the small original-bound receipt."""
+    from services import admission_fence as gate
+    value = gate._read(path.with_suffix(".result.json"))
+    gate._require(set(value) == {"schema", "sequence", "returncode", "original"}
+                  and type(value["schema"]) is int and value["schema"] == 1
+                  and type(value["sequence"]) is int and value["sequence"] == sequence
+                  and (value["returncode"] is None or type(value["returncode"]) is int),
+                  "command result identity changed")
+    gate._require(gate._encoded(value) == gate._encoded(expected), "command result differs from actual execution")
+    gate._require(gate._encoded(command_original_proof(path)) == gate._encoded(value["original"]), "command original proof changed")
+    return value
 
 
 def sha(path):
@@ -138,6 +221,7 @@ class Harness:
         self.network = self.prefix + "-network"
         self.names, self.images, self.created = {}, {}, []
         self.sequence, self.started = 0, time.monotonic()
+        self.last_error_category = None
         self.phase_deadline = None
         self.password, self.token = secrets.token_hex(24), secrets.token_hex(32)
         self.auth = "Basic " + base64.b64encode(("synthetic:" + self.password).encode()).decode()
@@ -148,7 +232,12 @@ class Harness:
             value = value.replace(secret, "<synthetic-secret>")
         return value
 
-    def command(self, args, *, stdin=None, timeout=30, final=False, allowed_failure=False):
+    def command(self, args, *, stdin=None, timeout=30, final=False, allowed_failure=False, command_result=None,
+                command_observation=None):
+        if command_result is not None and (type(command_result) is not dict or command_result):
+            raise ValueError("command result must be a fresh output mapping")
+        if command_observation is not None and (type(command_observation) is not dict or command_observation):
+            raise ValueError("command observation must be a fresh output mapping")
         self.sequence += 1
         path = self.output / f"command-{self.sequence:04d}.json"
         remaining = MAX_SECONDS - (time.monotonic() - self.started)
@@ -157,21 +246,34 @@ class Harness:
         if remaining <= 0 and not final:
             raise TimeoutError("bounded isolated rehearsal elapsed")
         start = time.monotonic()
+        effective_timeout = timeout if final else min(timeout, remaining)
+        if command_observation is not None:
+            command_observation.update(_command_observation(args, self.sequence, effective_timeout, remaining))
         try:
             result = subprocess.run(DOCKER + list(map(str, args)), input=stdin, text=True,
-                                    capture_output=True, timeout=timeout if final else min(timeout, remaining),
+                                    capture_output=True, timeout=effective_timeout,
                                     check=False, env=self.env)
             rc, stdout, stderr = result.returncode, result.stdout, result.stderr
+            if command_observation is not None:
+                command_observation.update(returncode=rc, outcome="returned")
         except subprocess.TimeoutExpired as error:
             rc = None
             stdout = error.stdout or ""
             stderr = error.stderr or ""
             stdout = stdout.decode(errors="replace") if isinstance(stdout, bytes) else stdout
             stderr = stderr.decode(errors="replace") if isinstance(stderr, bytes) else stderr
-        save(path, {"argv": [self.redacted(str(v)) for v in DOCKER + list(args)], "rc": rc,
+            if command_observation is not None:
+                command_observation["outcome"] = "timeout"
+        finally:
+            if command_observation is not None:
+                elapsed = time.monotonic() - start
+                command_observation["elapsed_seconds"] = elapsed if math.isfinite(elapsed) and 0 <= elapsed <= 600 else None
+        original = save(path, {"argv": [self.redacted(str(v)) for v in DOCKER + list(args)], "rc": rc,
                     "stdin_sha256": hashlib.sha256((stdin or "").encode()).hexdigest(),
                     "elapsed_seconds": time.monotonic() - start, "utc": datetime.now(timezone.utc).isoformat(),
-                    "stdout": self.redacted(stdout), "stderr": self.redacted(stderr)})
+                    "stdout": self.redacted(stdout), "stderr": self.redacted(stderr)}, retain_proof=command_result is not None)
+        if command_result is not None:
+            command_result.update(retain_command_result(path, self.sequence, rc, original))
         if rc != 0 and not allowed_failure:
             raise RuntimeError(f"isolated command {self.sequence} failed rc={rc}")
         return stdout + stderr if args and args[0] == "logs" else stdout
@@ -187,6 +289,7 @@ class Harness:
         row = json.loads(self.command(["inspect", actual]))[0]
         checks = resource_checks(row, image_id, self.owner, self.network, memory, pids)
         save(self.output / ("PROFILE_" + name + ".json"), {"checks": checks, "inspect": self.safe_inspect(row)})
+        return row
 
     def safe_inspect(self, row):
         return {key: row.get(key) for key in ("Id", "Name", "Image", "Created", "State", "HostConfig", "Mounts", "RestartCount")}
@@ -255,6 +358,7 @@ class Harness:
         row = json.loads(self.command(["inspect", name]))[0]
         resource_checks(row, self.python_id, self.owner, "container:" + sender["Id"])
         result = json.loads(raw)
+        self.last_error_category = error_category(result.get("category"))
         return result["status"], json.loads(result["body"]) if result["body"] else None
 
     def private_control(self, path, method="GET", value=None, *, expected=200):
@@ -263,16 +367,21 @@ class Harness:
             raise ValueError(f"private control {path}: {status} != {expected}")
         return result
 
+    def postgres_ready(self):
+        return self.command(["exec", self.names["pg"], "pg_isready", "-U", "synthetic", "-d", "synthetic_pause"])
+
+    def sender_ready(self):
+        return self.http("sender", "/healthcheck")
+
+    def fixture_ready(self):
+        return self.http("fixture", "/health")
+
     def prepare(self):
         info = json.loads(self.command(["info", "--format", "{{json .}}"]))
         native_host(info)
         save(self.output / "HOST.json", {"native_amd64": True, "machine": platform.machine(),
                                          "docker_architecture": info["Architecture"]})
-        self.command(["network", "create", "--internal", "--label", LABEL + "=" + self.owner, self.network])
-        network = json.loads(self.command(["network", "inspect", self.network]))[0]
-        if network["Internal"] is not True:
-            raise ValueError("isolation network is not internal")
-        save(self.output / "NETWORK.json", network)
+        self.prepare_network()
         images = {}
         for name, reference in (("sender", self.image_id), ("python", PYTHON_IMAGE), ("postgres", PG_IMAGE)):
             row = json.loads(self.command(["image", "inspect", reference]))[0]
@@ -285,14 +394,21 @@ class Harness:
         self.launch("pg", pg_id, ["--mount", "type=volume,src=" + volume + ",dst=/var/lib/postgresql/data",
                     "-e", "POSTGRES_USER=synthetic", "-e", "POSTGRES_DB=synthetic_pause",
                     "-e", "POSTGRES_PASSWORD=" + self.password], memory=384 * 1024 * 1024, pids=64)
-        self.wait(lambda: self.command(["exec", self.names["pg"], "pg_isready", "-U", "synthetic", "-d", "synthetic_pause"]), readiness=True)
+        self.wait(self.postgres_ready, readiness=True)
         evidence = self.output / "fixture"
         evidence.mkdir(mode=0o700)
         self.launch("fixture", self.python_id, ["--read-only", "--cap-drop=ALL", "--user", f"{os.getuid()}:{os.getgid()}",
                     "--mount", "type=bind,src=" + str(evidence) + ",dst=/evidence",
                     "--mount", "type=bind,src=" + str(self.repo / "scripts/miniflux_pause_fixture.py") + ",dst=/fixture.py,readonly",
                     "-e", "MINIFLUX_PAUSE_FIXTURE_TOKEN=" + self.token], ["python", "-B", "/fixture.py"])
-        self.wait(lambda: self.http("fixture", "/health"), readiness=True)
+        self.wait(self.fixture_ready, readiness=True)
+
+    def prepare_network(self):
+        self.command(["network", "create", "--internal", "--label", LABEL + "=" + self.owner, self.network])
+        network = json.loads(self.command(["network", "inspect", self.network]))[0]
+        if network["Internal"] is not True:
+            raise ValueError("isolation network is not internal")
+        save(self.output / "NETWORK.json", network)
 
     def launch_sender(self):
         lock = json.loads((self.repo / "ops/miniflux/pause-source-lock.json").read_text())
@@ -303,14 +419,14 @@ class Harness:
                                               "source_lock": sha(self.repo / "ops/miniflux/pause-source-lock.json")}, sort_keys=True).encode()).hexdigest()
         self.manifest = manifest
         self.launch("sender", self.image_id, ["--read-only", "--cap-drop=ALL", "--tmpfs", "/tmp:rw,nosuid,nodev,size=16777216",
-                    "--label", "io.ai-filter.handoff.role=miniflux-synthetic",
+                    "--label", "io.ai-filter.handoff.role=" + getattr(self, "sender_role", "miniflux-synthetic"),
                     "--mount", "type=bind,src=" + str(self.repo / "ops/miniflux/pause-source-lock.json") + ",dst=/handoff-source-lock.json,readonly",
                     "-e", "DATABASE_URL=postgres://synthetic:" + self.password + "@pg:5432/synthetic_pause?sslmode=disable",
                     "-e", "RUN_MIGRATIONS=1", "-e", "CREATE_ADMIN=1", "-e", "ADMIN_USERNAME=synthetic",
                     "-e", "ADMIN_PASSWORD=" + self.password, "-e", "LISTEN_ADDR=0.0.0.0:8080",
                     "-e", "LOG_LEVEL=debug", "-e", "POLLING_FREQUENCY=1", "-e", "WORKER_POOL_SIZE=1",
                     "-e", "INTEGRATION_ALLOW_PRIVATE_NETWORKS=1", "-e", "FETCHER_ALLOW_PRIVATE_NETWORKS=1", "-e", "WEBHOOK_OUTBOX=1",
-                    "-e", "WEBHOOK_OUTBOX_CONTRACT=synthetic-no-model-contract", "-e", "HANDOFF_ENABLED=1",
+                    "-e", "WEBHOOK_OUTBOX_CONTRACT=" + getattr(self, "sender_contract", "synthetic-no-model-contract"), "-e", "HANDOFF_ENABLED=1",
                     "-e", "HANDOFF_MANIFEST=" + manifest, "-e", "HANDOFF_CONTROL_ADDR=127.0.0.1:8787",
                     "-e", "HANDOFF_CONTROL_TOKEN=" + self.token])
         copied = self.output / "actual-miniflux"
@@ -320,7 +436,7 @@ class Harness:
         save(self.output / "SENDER_BINDING.json", {"image_id": self.image_id, "binary_sha256": sha(copied),
              "lock_sha256": sha(self.repo / "ops/miniflux/pause-source-lock.json"), "manifest": manifest,
              "patched_files_sha256": lock["patched_files_sha256"], "production_access": False, "models": 0})
-        self.wait(lambda: self.http("sender", "/healthcheck"), readiness=True)
+        self.wait(self.sender_ready, readiness=True)
 
     def case(self, name, value):
         save(self.output / ("CASE_" + name + ".json"), {"status": "passed", "observed_utc": datetime.now(timezone.utc).isoformat(), **value})
@@ -457,7 +573,7 @@ class Harness:
         self.sample_memory("sender", "before_restart")
         self.command(["stop", "--time=15", self.names["sender"]], timeout=20)
         self.command(["start", self.names["sender"]])
-        self.wait(lambda: self.http("sender", "/healthcheck"), readiness=True)
+        self.wait(self.sender_ready, readiness=True)
         self.refresh(expected=503)
         result = self.wait(lambda: self.query_closed(closed))
         after = json.loads(self.command(["inspect", self.names["sender"]]))[0]
@@ -491,6 +607,102 @@ class Harness:
                   "inflight_postgres": snapshot, "closed": result, "acked_outbox": row})
         return operation
 
+    def checked_draining(self, value, operation, *, confirmed=True):
+        result = self.checked_receipt(value, operation, "draining", action="stop_new", confirmed=confirmed)
+        for field in ("active_producer_leases", "uncertain_producer_leases"):
+            if type(result.get(field)) is not int or result[field] < 0 or (confirmed and result[field] != 0):
+                raise ValueError("stop-new lacks exact producer completion counts")
+        return result
+
+    def stop_new_drain_case(self, prior):
+        # Operation identities are retained across every native scenario. Keep
+        # this added scenario separate from the existing joint-host 5/6 IDs.
+        resumed = self.resume(prior, hashlib.sha256(b"native:stop-new-drain:resume").hexdigest())
+        self.items.extend(["drain_first", "drain_queued"])
+        self.control(self.items, hold=True)
+        self.refresh()
+        received = self.wait(lambda: next((r for r in self.events()
+            if r["kind"] == "webhook_received" and r["held"]
+            and any(json.loads(base64.b64decode(r["body_b64"]))["entries"][0]["url"].endswith("/" + key)
+                    for key in ("drain_first", "drain_queued"))), None), seconds=4)
+        backlog = [r for r in self.outbox() if any(
+            json.loads(base64.b64decode(r["body_b64"]))["entries"][0]["url"].endswith("/" + key)
+            for key in ("drain_first", "drain_queued"))]
+        if len(backlog) != 2 or not any(r["attempts"] == 0 and r["state"] == "pending" for r in backlog):
+            raise ValueError("no actual unclaimed durable backlog before stop-new")
+        operation = hashlib.sha256(b"native:stop-new-drain:stop-new").hexdigest()
+        pending = self.private_control("/stop-new", "POST", {"operation_id": operation}, expected=(200, 409))
+        self.checked_draining(pending, operation, confirmed=pending.get("confirmed") is True)
+        self.refresh(expected=503)
+        self.http("sender", f"/v1/entries/{self.entry_id}/save", "POST", expected=503)
+        self.control(self.items, release=True)
+        rows = [self.wait(lambda key=key: self.proved_row(key)) for key in ("drain_first", "drain_queued")]
+        if {r["body_sha256"] for r in rows} != {r["body_sha256"] for r in backlog}:
+            raise ValueError("drain changed original durable body identity")
+        result = self.checked_draining(self.private_control("/operations/" + operation), operation)
+        before = self.gate_snapshot()
+        if before["state"][0]["phase"] != "draining":
+            raise ValueError("stop-new did not retain durable draining phase")
+        # A real scheduler timer must reach the closed producer boundary.
+        baseline = self.command(["logs", self.names["sender"]]).count("Handoff scheduler admission refused")
+        feeds_before = len([r for r in self.events() if r["kind"] == "feed"])
+        self.sql("UPDATE feeds SET next_check_at=clock_timestamp()-interval '1 second' WHERE id=" + str(self.feed_id) + ";")
+        logs = self.wait(lambda: r if (r := self.command(["logs", self.names["sender"]])).count("Handoff scheduler admission refused") > baseline else None, seconds=75)
+        if len([r for r in self.events() if r["kind"] == "feed"]) != feeds_before:
+            raise ValueError("draining scheduler produced another feed request")
+        self.sample_memory("sender", "before_draining_restart")
+        self.command(["stop", "--time=15", self.names["sender"]], timeout=20)
+        self.command(["start", self.names["sender"]])
+        self.wait(self.sender_ready, readiness=True)
+        self.refresh(expected=503)
+        restarted = self.checked_draining(self.private_control("/operations/" + operation), operation)
+        freeze = hashlib.sha256(b"native:stop-new-drain:freeze").hexdigest()
+        self.private_control("/pause", "POST", {"operation_id": freeze}, expected=(200, 409))
+        closed = self.wait(lambda: self.query_closed(freeze))
+        self.case("STOP_NEW_DRAINS_BACKLOG_AND_RESTART", {"resume": resumed, "inflight_handshake": received,
+            "backlog_before_stop_new": backlog, "stop_new_response": pending, "confirmed_stop_new": result,
+            "acked_originals": rows, "draining_postgres": before, "restart_draining": restarted,
+            "scheduler_refusal_observed": logs.count("Handoff scheduler admission refused") > baseline,
+            "full_pause": closed, "stop_new_is_queue_empty_proof": False})
+        return freeze
+
+    def staged_host_bridge_case(self):
+        from miniflux_handoff_adapter import MinifluxDrainControl, source_sha256 as bridge_source
+        from miniflux_host_joint_native import component
+
+        prior = self.gate_snapshot()["state"]
+        if len(prior) != 1 or prior[0]["phase"] != "closed":
+            raise ValueError("staged host bridge requires the actual prior closed operation")
+        resume = hashlib.sha256(b"native:staged-host:resume").hexdigest()
+        resumed = self.resume(prior[0]["current_operation"], resume)
+        def inspect():
+            return json.loads(self.command(["inspect", self.names["sender"]]))
+        row = inspect()[0]
+        binding = {"schema": 1, "scope": "instrumented_sender_only", "run_id": self.owner,
+                   "control_id": "miniflux", "component_name": row["Name"].lstrip("/"), "component": component(row),
+                   "manifest": self.manifest, "application_source_sha256": sha(self.repo / "ops/miniflux/pause-source-lock.json"),
+                   "source_sha256": bridge_source(), "generation": resumed["generation"],
+                   "initial_operation_id": resume, "entrances": ["miniflux_scheduler", "miniflux_manual", "legacy_async_sender"]}
+        harness = self
+        class Client:
+            def request(self, method, path, payload):
+                return harness.private_exchange(path, method, payload)
+        control = MinifluxDrainControl(binding, Client(), inspect, self.output / "staged-host-bridge")
+        operation = hashlib.sha256(b"native:staged-host:stop-new").hexdigest()
+        stop = control.stop_new(operation, resumed["generation"], "actual synthetic host producer stop")
+        queried_stop = control.query_stop_new(operation)
+        self.refresh(expected=503)
+        stopped_snapshot = self.gate_snapshot()
+        freeze = hashlib.sha256(b"native:staged-host:freeze").hexdigest()
+        paused = control.freeze(freeze, operation, "actual synthetic host full pause")
+        queried_pause = control.query_freeze(freeze)
+        closed = self.query_closed(freeze)
+        self.case("ACTUAL_STAGED_HOST_BRIDGE", {"binding": binding, "producer_stop": stop,
+            "queried_stop": queried_stop, "draining_postgres": stopped_snapshot,
+            "pause": paused, "queried_pause": queried_pause, "closed": closed,
+            "queue_checked": False, "legacy_originals_proven": False, "switch_authorized": False,
+            "scope": "actual host bridge phases only; independent inventory and receiver transfer tested separately"})
+
     def postgres_restart_case(self, closed):
         before = self.gate_snapshot()
         self.sample_memory("pg", "before_restart")
@@ -503,7 +715,7 @@ class Harness:
         if unavailable.get("confirmed") is not False:
             raise ValueError("database unavailable returned confirmed stop")
         self.command(["start", self.names["pg"]])
-        self.wait(lambda: self.command(["exec", self.names["pg"], "pg_isready", "-U", "synthetic", "-d", "synthetic_pause"]), readiness=True)
+        self.wait(self.postgres_ready, readiness=True)
         after = self.wait(lambda: self.query_closed(closed))
         self.refresh(expected=503)
         self.case("POSTGRES_RESTART_CLOSED_DURABLE", {"before": before, "unavailable": unavailable, "after": after,
@@ -598,10 +810,12 @@ def run(repo, source, image_id, binary, output):
         closed = harness.legacy_async_case()
         harness.restart_closed_case(closed)
         closed = harness.outbox_inflight_case(closed)
+        closed = harness.stop_new_drain_case(closed)
         harness.postgres_restart_case(closed)
         harness.closed_scheduler_case()
         from miniflux_host_joint_native import run as joint_run
         joint_run(harness, closed)
+        harness.staged_host_bridge_case()
     except Exception as failure:
         error = {"type": type(failure).__name__, "message": harness.redacted(str(failure))}
         save(output / "FAILURE.json", error)
@@ -616,7 +830,7 @@ def run(repo, source, image_id, binary, output):
         if error is None and evidence_errors:
             error = {"type": "EvidencePreservationIncomplete", "message": str(evidence_errors)}
     cases = sorted(path.name for path in output.glob("CASE_*.json"))
-    result = {"status": "passed" if error is None and len(cases) == 8 else "failed_or_evidence_insufficient",
+    result = {"status": "passed" if error is None and len(cases) == 10 else "failed_or_evidence_insufficient",
               "cases": cases, "error": error, "evidence_errors": evidence_errors, "elapsed_seconds": time.monotonic() - harness.started,
               "native_amd64": True, "resource_limits": {"sender_memory_bytes": MEMORY, "sender_pids": PIDS},
               "retained_network": harness.network, "retained_containers": list(harness.names.values()),

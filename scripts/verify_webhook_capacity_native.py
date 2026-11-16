@@ -1,9 +1,11 @@
-"""Build exact baseline/candidate images and run bounded native-amd64 probes.
+"""Build source-bound baseline/candidate images for bounded native-amd64 probes.
 
 No production Docker contexts, binds, secrets, network or model transport are
 used. Containers and private synthetic volumes are retained for the CI job's
 lifetime. Candidate failures, missing results, OOMs or timeouts fail this gate;
-the immutable old baseline is measured, not assumed to OOM or required to pass.
+the old baseline is measured, not assumed to OOM or required to pass. Its frozen
+source stays intact; a separately hashed build recipe changes only two package
+download URLs and is explicitly labelled as a derived image.
 """
 from __future__ import annotations
 
@@ -26,6 +28,10 @@ BASELINE = "0f3f56120f95c2ddcec81f5d38b1287cfce2275c"
 BASELINE_DIRECTORY = Path("tests/fixtures/webhook_capacity_baseline")
 BASELINE_ARCHIVE_SHA256 = "71209f0961fc8306f606ac71e7c22daf8a82047cc9d1784287cd5eeb8388e278"
 BASELINE_MANIFEST_SHA256 = "b29a8df0ac2a0f429900bfdfef114bcc39c5609620d518fbc91b5560bbd18245"
+BASELINE_DOCKERFILE_SHA256 = "ce77e9153b6c16744f48a11d8f9bfab8716cc831da27270dcac385e482b8c851"
+BASELINE_DERIVED_DOCKERFILE_SHA256 = "07d4ef71bf5f9c42e5739f24e85074fef9b5303c10097ece344cf7507c419122"
+CI_PIP_INDEX = "https://pypi.org/simple"
+BASELINE_PIP_INDEX = "https://pypi.tuna.tsinghua.edu.cn/simple"
 BASELINE_MAX_ARCHIVE_BYTES = 2 * 1024 * 1024
 BASELINE_MAX_SOURCE_BYTES = 8 * 1024 * 1024
 MEMORY = 768 * 1024 * 1024
@@ -182,6 +188,34 @@ def extract_baseline(repo, destination):
             "source_history_included": False, "sanitizations": manifest["sanitizations"]}
 
 
+def derive_baseline_dockerfile(raw):
+    """Exact transport-only derivation; the published source is never rewritten."""
+    if type(raw) is not bytes or digest_bytes(raw) != BASELINE_DOCKERFILE_SHA256:
+        raise ValueError("baseline Dockerfile identity mismatch")
+    old, new = BASELINE_PIP_INDEX.encode(), CI_PIP_INDEX.encode()
+    if raw.count(old) != 2 or raw.count(b"-i " + old + b" \\\n") != 2:
+        raise ValueError("baseline download index replacement count mismatch")
+    derived = raw.replace(old, new)
+    if digest_bytes(derived) != BASELINE_DERIVED_DOCKERFILE_SHA256:
+        raise ValueError("derived baseline Dockerfile identity mismatch")
+    return derived
+
+
+def baseline_build_recipe(context, folder):
+    raw = baseline_file(context / "Dockerfile", maximum=64 * 1024, expected_hash=BASELINE_DOCKERFILE_SHA256)
+    derived = derive_baseline_dockerfile(raw)
+    path = folder / "Dockerfile.download-index-only"
+    with path.open("xb") as stream:
+        os.fchmod(stream.fileno(), 0o600)
+        if stream.write(derived) != len(derived):
+            raise ValueError("derived baseline Dockerfile short write")
+        stream.flush()
+        os.fsync(stream.fileno())
+    return path, {"kind": "derived-download-index-only", "original_dockerfile_sha256": digest_bytes(raw),
+                  "derived_dockerfile_sha256": digest_bytes(derived), "url_replacements": 2,
+                  "from_url": BASELINE_PIP_INDEX, "to_url": CI_PIP_INDEX, "original_context_unchanged": True}
+
+
 def build_image(docker, repo, out, role, revision, run_id):
     folder = out / role
     folder.mkdir(mode=0o700)
@@ -190,15 +224,24 @@ def build_image(docker, repo, out, role, revision, run_id):
         if revision != BASELINE:
             raise ValueError("baseline revision is fixed")
         provenance = extract_baseline(repo, context)
+        build_path, recipe = baseline_build_recipe(context, folder)
+        build_options = ["--file", str(build_path)]
     else:
         provenance = {"archive_sha256": extract_revision(repo, revision, context),
                       "source_kind": "git_archive", "source_revision": revision}
+        recipe = {"kind": "source-dockerfile-fixed-download-arg", "dockerfile_sha256": sha(context / "Dockerfile"),
+                  "pip_index_url": CI_PIP_INDEX}
+        build_options = ["--build-arg", "PIP_INDEX_URL=" + CI_PIP_INDEX]
     source_identity = (revision + ":public-baseline:" + provenance["archive_sha256"]
+                       + ":derived-download-index-only:" + recipe["derived_dockerfile_sha256"]
                        if role == "baseline" else revision + ":clean")
+    provenance["build_recipe"] = recipe
+    save(folder / "BUILD_PROVENANCE.json", {**provenance, "source_identity": source_identity})
     tag = f"ai-filter-capacity-{role}:{run_id}-{revision[:12]}"
     version = tag
     argv = docker + ["build", "--pull=false", "--platform=linux/amd64", "--tag", tag,
                     "--label", "ai-filter.synthetic-capacity=" + run_id,
+                    *build_options,
                     "--build-arg", "AI_FILTER_BUILD_VERSION=" + version,
                     "--build-arg", "AI_FILTER_BUILD_GIT_SHA=" + revision,
                     "--build-arg", "AI_FILTER_BUILD_SOURCE_ID=" + source_identity,

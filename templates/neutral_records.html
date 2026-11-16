@@ -18,7 +18,7 @@
 </head>
 <body>
 <main>
-    <nav><a href="https://example.invalid/quality">返回模型质量</a> · <a href="/dashboard">后台首页</a></nav>
+    <nav>{% if news_home_origin %}<a href="{{ news_home_origin }}/quality">返回模型质量</a>{% else %}<span>模型质量入口未配置</span>{% endif %} · <a href="/dashboard">后台首页</a></nav>
     <h1>保守处理记录</h1>
     <section class="scope" aria-label="查看范围">
         <p>仅当前评分契约 · 近24小时收录 · 最新50条以内 · 按收录时间倒序</p>

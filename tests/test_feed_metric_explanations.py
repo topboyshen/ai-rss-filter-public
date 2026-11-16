@@ -413,3 +413,61 @@ def test_zero_passed_does_not_mark_data_degraded_by_itself(feed_metrics_db):
     assert rows[0][7] == 0
     assert feed_data_health(rows[0], cfg)["data_degraded"] is False
     assert feed_data_health(rows[0], cfg)["data_state"] == "healthy"
+
+
+def test_last_check_never_borrows_article_publish_time(feed_metrics_db):
+    from datetime import datetime
+    from pathlib import Path
+
+    from flask import Flask, render_template_string
+
+    database, dashboard, cfg = feed_metrics_db
+    url = _add_feed(cfg)
+    now = int(time.time())
+    checked_at = now - 300
+    with database.get_connection() as conn:
+        conn.execute(
+            "INSERT INTO feed_health "
+            "(url, name, last_check, response_time_ms, success, fail) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (url, "测试源", checked_at, 0, 10, 0),
+        )
+        conn.commit()
+    # Publish time later than the observation time: the old code promoted this
+    # value into "last check" and rendered a future timestamp.
+    _insert_news(database, [(url, 8, "llm", -3600)])
+    with database.get_connection() as conn:
+        published_at = int(
+            conn.execute(
+                "SELECT created_at FROM news_cache WHERE feed_url = ?", (url,)
+            ).fetchone()[0]
+        )
+    assert published_at > checked_at
+
+    rows, details = dashboard._get_feed_health_snapshot()
+
+    assert rows[0][2] == checked_at
+    assert rows[0][3] == 0
+    assert details[url]["latest_article_at"] == published_at
+
+    template = Path(dashboard.DASHBOARD_TEMPLATE).read_text(encoding="utf-8")
+    section = template.split("<h2>📡 源健康状态</h2>", 1)[1].split(
+        "<h2>📝 最近20条请求日志</h2>", 1
+    )[0]
+    app = Flask(__name__)
+    with app.test_request_context("/dashboard"):
+        body = render_template_string(
+            section,
+            health_rows=rows,
+            feed_metric_details=details,
+            cfg=cfg,
+            datetime=datetime,
+            feed_data_health=dashboard.feed_data_health,
+            beijing_fromtimestamp=dashboard.beijing_fromtimestamp,
+        )
+
+    assert "最新文章" in body
+    assert "未测" in body
+    assert "0ms" not in body
+    assert dashboard.beijing_fromtimestamp(checked_at).strftime("%m-%d %H:%M") in body
+    assert dashboard.beijing_fromtimestamp(published_at).strftime("%m-%d %H:%M") in body

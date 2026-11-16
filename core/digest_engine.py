@@ -392,18 +392,6 @@ def enrich_article_analysis(
     return enriched
 
 
-def build_market_pulse_summary(articles: List[Dict[str, Any]], hours: int) -> str:
-    if not articles:
-        return "暂无明确市场主线"
-    deduped = dedupe_articles(articles)
-    themes = []
-    for article in deduped[:3]:
-        tag = str(article.get("tag") or "高分情报").strip()
-        assets = infer_market_analysis(article)["assets"].split("、")[0]
-        themes.append(f"{tag}→{assets}")
-    return f"近{hours}小时主线：" + "；".join(themes)
-
-
 def _briefing_article_theme(article: Dict[str, Any]) -> str:
     explicit = str(article.get("briefing_theme") or "").strip()
     if explicit:

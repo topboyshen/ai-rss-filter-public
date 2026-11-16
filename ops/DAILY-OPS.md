@@ -23,6 +23,9 @@
 
 - **新闻刷新与收盘采集是两套工件，不能互证**：`data/market_close/*_last.json` 只证明收盘任务结果；
   新闻刷新看 `/readiness`。
+- 健康 cron 除镜像 digest 与健康状态外，还会比对归档 manifest 明确声明的只读挂载/配置
+  （如 `/app/config.yaml`、`/etc/nginx/nginx.conf`）与运行容器的实际挂载（target、只读、source）；
+  旧 manifest 没有声明时维持原行为，不会因此额外失败。探针失败仍按既有阈值计数并定向 reconcile。
 - 保守处理记录说明的是**保守处理的已记录原因**：主题关联、事实表述、格式字段属于校验类别；
   「初次中性」「原因未完整记录」不能当作已确认的校验失败。它不指出具体缺少哪条证据，
   也不代表模型准确率或投资效果。
@@ -73,6 +76,10 @@ sed -n '1,2p' data/releases/previous.state     # 再只读：可回退的目标
 - **先确认是否已自动回滚**：脚本默认支持自动回滚。失败后先只读查看
   `data/releases/current.state` 与 `data/releases/history.tsv` 最新记录，确认实际运行版本，
   再决定是否需要手动回退，避免重复操作。
+- 部署最终校验失败时，`history.tsv` 的 status 记为 `health_failed:<stage>`：
+  `wait_healthy`（健康超时/服务异常）、`source_immutable`（运行中源码或 `config.yaml`
+  漂移）、`private_runtime`（私有契约运行时校验拒绝）。前缀仍是 `health_failed`，
+  按子串匹配的旧告警仍有效；先按阶段定位，再决定回退或复现。
 - 保留信息：失败命令与输出、`history.tsv` 对应行、`data/releases/` 下的 build contract 与
   manifest、相关 systemd 日志、当时的健康与源健康输出。不要删除失败证据。
 - 明确不做：不手改 `complete` 标记、不伪造 attestation、不为“补通过”放宽校验或阈值、

@@ -4,8 +4,9 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 import sys
 import threading
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import durable_handoff_cutover as cutover  # noqa: E402
@@ -135,6 +136,184 @@ class CrashRecoveryDiagnosticsTests(unittest.TestCase):
         self.assertNotIn("payload", request)
         self.assertNotIn("headers", request)
         self.assertNotIn(self.protocol.token, cutover.encoded(result).decode())
+
+
+class _DeadlineMocks:
+    """The real Controller with fake clocks, HTTP, sockets, Timer and journal."""
+
+    def __init__(self, fire=False, error=None, shutdown_error=False):
+        self.fire, self.error, self.shutdown_error = fire, error, shutdown_error
+        self.connections, self.wires, self.timers, self.flags_at_shutdown = [], [], [], []
+        self.now, self.monotonic = 999.0, 10.0
+        self.http_exception = cutover.http.client.HTTPException
+        self.controller = cutover.Controller.__new__(cutover.Controller)
+        self.controller.endpoint = SimpleNamespace(port=12345)
+        self.controller.started = 10.0
+        self.controller.manifest = {"run_id": "a" * 32, "token": "b" * 64,
+            "adapter_identity": "synthetic-cutover-v1", "adapter_sha256": "c" * 64,
+            "targets": {"receiver": "synthetic-new-receiver", "sender": "synthetic-new-sender"},
+            "budget": {"total_seconds": 10, "drain_seconds": 0.3, "request_seconds": 0.2, "max_polls": 30}}
+        self.controller.state = {"expires_at": 1000.0, "phase": "verified", "intent": None, "stopped": None}
+        self.controller.last_request = None
+
+    def timer(self, interval, callback):
+        timer = SimpleNamespace(interval=interval, callback=callback, start=Mock(), cancel=Mock())
+        self.timers.append(timer)
+        return timer
+
+    def connection(self, host, port, timeout):
+        wire = SimpleNamespace(closed=False)
+
+        def shutdown(_how):
+            self.flags_at_shutdown.append(self.controller.last_request.get("deadline_abort_entered"))
+            if wire.closed or self.shutdown_error:
+                raise OSError("synthetic shutdown error")
+
+        wire.shutdown = Mock(side_effect=shutdown)
+        wire.close = Mock(side_effect=lambda: setattr(wire, "closed", True))
+        self.wires.append(wire)
+        connection = SimpleNamespace(host=host, port=port, timeout=timeout,
+            sock=SimpleNamespace(dup=Mock(return_value=wire)), connect=Mock(), request=Mock(), close=Mock())
+
+        def response():
+            if self.fire:
+                self.timers[-1].callback()
+            if self.error is not None:
+                raise self.error
+            raw = cutover.encoded({"run_id": "a" * 32, "mode": "isolation",
+                "adapter_identity": "synthetic-cutover-v1", "adapter_sha256": "c" * 64})
+            return SimpleNamespace(status=200, read1=Mock(side_effect=[raw, b""]))
+
+        connection.getresponse = Mock(side_effect=response)
+        self.connections.append(connection)
+        return connection
+
+    @contextmanager
+    def patched(self):
+        with patch.object(cutover, "time", SimpleNamespace(time=lambda: self.now, monotonic=lambda: self.monotonic)), \
+                patch.object(cutover, "threading", SimpleNamespace(Timer=self.timer)), \
+                patch.object(cutover, "http", SimpleNamespace(client=SimpleNamespace(
+                    HTTPConnection=self.connection, HTTPException=self.http_exception))):
+            yield self
+
+    def request(self):
+        return self.controller.request("/control/apply", {"action": "resume"})
+
+    def stopped_run(self):
+        controller = self.controller
+
+        def record(**changes):
+            controller.state = {**controller.state, **changes}
+
+        controller.record = record
+        controller.inspect = lambda: {"generation": 3, "entrances": dict.fromkeys(cutover.ENTRANCES, "buffering"),
+                                      **dict.fromkeys(cutover.ZERO_COUNTERS, 0)}
+        controller.journal = SimpleNamespace(close=Mock())
+        return controller.run()
+
+
+class RequestDeadlineObservationTests(unittest.TestCase):
+    """No real HTTP, timer threads, socket operations or durable files."""
+
+    def test_request_bool_starts_false_and_original_request_budget_is_preserved(self):
+        environment = _DeadlineMocks()
+        with environment.patched():
+            value = environment.request()
+        self.assertEqual(value["mode"], "isolation")
+        self.assertIs(environment.controller.last_request["deadline_abort_entered"], False)
+        self.assertEqual(environment.controller.last_request["outcome"], "returned")
+        self.assertAlmostEqual(environment.timers[0].interval, 0.2)
+        self.assertEqual(environment.connections[0].host, "127.0.0.1")
+        self.assertEqual(environment.connections[0].timeout, 0.2)
+        environment.connections[0].connect.assert_called_once_with()
+        environment.connections[0].close.assert_called_once_with()
+        environment.wires[0].close.assert_called_once_with()
+
+    def test_abort_marks_its_observation_before_original_shutdown_and_preserves_error(self):
+        error = protocol_tests.http.client.RemoteDisconnected("synthetic no ACK")
+        environment = _DeadlineMocks(fire=True, error=error)
+        with environment.patched(), self.assertRaises(protocol_tests.http.client.RemoteDisconnected) as caught:
+            environment.request()
+        self.assertIs(caught.exception, error)
+        self.assertIs(environment.controller.last_request["deadline_abort_entered"], True)
+        self.assertEqual(environment.flags_at_shutdown, [True])
+        environment.wires[0].shutdown.assert_called_once_with(cutover.socket.SHUT_RDWR)
+        environment.timers[0].cancel.assert_called_once_with()
+
+    def test_cancelled_timer_does_not_invent_entry_or_add_wait(self):
+        environment = _DeadlineMocks()
+        with environment.patched():
+            environment.request()
+        environment.timers[0].start.assert_called_once_with()
+        environment.timers[0].cancel.assert_called_once_with()
+        self.assertTrue(environment.timers[0].daemon)
+        self.assertFalse(hasattr(environment.timers[0], "join"))
+        self.assertIs(environment.controller.last_request["deadline_abort_entered"], False)
+        environment.wires[0].shutdown.assert_not_called()
+
+    def test_late_old_callback_cannot_mark_a_later_request(self):
+        environment = _DeadlineMocks()
+        with environment.patched():
+            environment.request()
+            original, timer = environment.controller.last_request, environment.timers[0]
+            environment.request()
+            later = environment.controller.last_request
+            timer.callback()  # The old closed wire's original OSError is still handled.
+        self.assertIsNot(original, later)
+        self.assertIs(original["deadline_abort_entered"], True)
+        self.assertIs(later["deadline_abort_entered"], False)
+        environment.wires[0].shutdown.assert_called_once()
+        environment.wires[1].shutdown.assert_not_called()
+        self.assertEqual(len(environment.connections), 2)
+
+    def test_shutdown_oserror_does_not_reset_flag_or_replace_http_primary(self):
+        error = protocol_tests.http.client.RemoteDisconnected("synthetic original")
+        environment = _DeadlineMocks(fire=True, error=error, shutdown_error=True)
+        with environment.patched(), self.assertRaises(protocol_tests.http.client.RemoteDisconnected) as caught:
+            environment.request()
+        self.assertIs(caught.exception, error)
+        self.assertIs(environment.controller.last_request["deadline_abort_entered"], True)
+        environment.wires[0].shutdown.assert_called_once()
+        environment.connections[0].close.assert_called_once_with()
+
+    def test_observed_deadline_failure_stays_stopped_keeps_intent_without_retry(self):
+        error = protocol_tests.http.client.RemoteDisconnected("synthetic unknown")
+        environment = _DeadlineMocks(fire=True, error=error)
+        with environment.patched():
+            result = environment.stopped_run()
+        self.assertEqual(result["status"], "stopped")
+        self.assertEqual(result["phase"], "verified")
+        self.assertIs(result["last_request"]["deadline_abort_entered"], True)
+        self.assertEqual(environment.controller.state["intent"]["action"], "resume")
+        self.assertFalse(result["automatic_rollback"])
+        self.assertEqual(len(environment.connections), 1)
+        environment.connections[0].request.assert_called_once()
+        self.assertEqual(environment.connections[0].request.call_args.args[:2], ("POST", "/control/apply"))
+        environment.controller.journal.close.assert_called_once_with()
+        self.assertEqual(environment.controller.manifest["budget"],
+                         {"total_seconds": 10, "drain_seconds": 0.3, "request_seconds": 0.2, "max_polls": 30})
+
+    def test_unobserved_disconnect_is_still_unknown_and_never_promoted_to_success(self):
+        error = protocol_tests.http.client.RemoteDisconnected("synthetic unclassified close")
+        environment = _DeadlineMocks(error=error)
+        with environment.patched():
+            result = environment.stopped_run()
+        self.assertEqual(result["status"], "stopped")
+        self.assertEqual(result["error_type"], "RemoteDisconnected")
+        self.assertIs(result["last_request"]["deadline_abort_entered"], False)
+        self.assertEqual(environment.controller.state["intent"]["action"], "resume")
+        self.assertEqual(len(environment.connections), 1)
+        environment.wires[0].shutdown.assert_not_called()
+
+    def test_expired_total_budget_blocks_before_http_with_flag_false(self):
+        environment = _DeadlineMocks()
+        environment.now = 1000.0
+        with environment.patched(), self.assertRaises(cutover.CutoverError):
+            environment.request()
+        self.assertEqual(environment.connections, [])
+        self.assertEqual(environment.timers, [])
+        self.assertIs(environment.controller.last_request["deadline_abort_entered"], False)
+        self.assertEqual(environment.controller.last_request["stage"], "budget")
 
 
 if __name__ == "__main__":

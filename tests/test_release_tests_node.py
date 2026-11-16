@@ -298,10 +298,11 @@ def test_ci_installs_exact_node_and_passes_only_executable_to_full_runner():
     assert node[0]["uses"] == "actions/setup-node@v6"
     assert node[0]["with"] == {"node-version": "24.21.0", "package-manager-cache": False}
     python_index = next(index for index, step in enumerate(steps) if step.get("uses", "").startswith("actions/setup-python@"))
+    preparation_index = next(index for index, step in enumerate(steps) if step.get("id") == "isolated_node")
     suite_index = next(index for index, step in enumerate(steps) if step.get("name") == "Run isolated full test suite with coverage")
-    assert python_index < steps.index(node[0]) < suite_index
+    assert python_index < steps.index(node[0]) < preparation_index < suite_index
     suite = steps[suite_index]["run"]
-    assert 'AI_FILTER_TEST_NODE="$(command -v node)"' in suite
+    assert 'AI_FILTER_TEST_NODE="${{ steps.isolated_node.outputs.path }}"' in suite
     assert "./scripts/run-release-tests.sh full" in suite
     assert "AI_FILTER_TEST_COVERAGE_OUTPUT=" in suite
     assert "AI_FILTER_CUTOVER_EVIDENCE_DIR=" in suite

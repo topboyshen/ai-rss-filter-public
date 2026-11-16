@@ -9,10 +9,11 @@
 ### 短期改进（已完成 2/3）
 
 #### 1. ✅ Prometheus Metrics 监控系统
-**状态：已部署并运行**
+**状态：端点已上线；本文档原写的路径与导出范围已过时（2026-11-09 更正）**
 
-- **文件创建**：`core/metrics.py` - 完整的 metrics 收集器
-- **端点添加**：`/prometheus-metrics` - 可通过 http://127.0.0.1:5000/prometheus-metrics 访问
+- **文件创建**：`core/metrics.py` - metrics 收集器；计数器由评分/刷新流程记录，但 `get_prometheus_metrics()` 没有调用方，这些指标目前不会导出
+- **端点添加**：实际端点是 `/metrics`，需要 `X-API-Key`；`/prometheus-metrics` 已删除，匿名访问返回 404
+- 下面这组指标来自 `core/metrics.py`，当前**不在** `/metrics` 的输出中；`/metrics` 输出的是 `routes/admin_routes.py` 自己组装的一组指标
 - **监控指标**：
   - `ai_filter_uptime_seconds` - 系统运行时间
   - `ai_filter_llm_calls_total` - LLM API 总调用次数（按后端分类）

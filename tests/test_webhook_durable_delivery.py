@@ -103,10 +103,7 @@ def test_changed_body_cannot_reuse_original_query_signature(delivery):
 
 def test_process_memory_duplicate_cannot_acknowledge_failed_durable_write(delivery, monkeypatch):
     body = raw_body()
-    key = hashlib.sha256(body).hexdigest()
     calls = []
-    with delivery.webhook._webhook_replay_lock:
-        delivery.webhook._webhook_replay_seen[key] = time.time()
 
     def unavailable(task, exact_body):
         calls.append((task, exact_body))
@@ -171,8 +168,6 @@ def test_http_202_binds_actual_body_and_query_is_not_a_second_delivery(delivery)
 def test_repeated_http_delivery_after_memory_loss_uses_one_durable_task(delivery):
     body = raw_body()
     first = receipt(signed_post(delivery, body), body)
-    with delivery.webhook._webhook_replay_lock:
-        delivery.webhook._webhook_replay_seen.clear()
     repeated = signed_post(delivery, body)
     assert repeated.status_code == 202
     duplicate = receipt(repeated, body)

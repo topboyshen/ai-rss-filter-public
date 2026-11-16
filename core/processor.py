@@ -42,7 +42,9 @@ from scoring_provenance import (
     RECOGNIZED_SCORE_PATHS,
     SAFE_NEUTRAL_CONTRACT_VALUES,
     SAFE_NEUTRAL_SCORE_PATHS_BY_RESOLUTION,
+    SEMANTIC_RESOLUTION_INSUFFICIENT_INPUT,
     is_fixed_safe_neutral_fields,
+    is_insufficient_input_fields,
     normalize_score_path,
 )
 from core.metrics import get_metrics
@@ -289,8 +291,10 @@ def _model_name(scorer: Optional[Scorer]) -> str:
     try:
         if scorer and getattr(scorer, "backends", None):
             return getattr(scorer, "last_backend_name", "") or scorer.backends[0].model or scorer.backends[0].name
-    except Exception:
-        pass
+    except (AttributeError, IndexError, TypeError):
+        # 只容忍「后端对象形状不符合预期」；其余异常说明 scorer 本身有问题，
+        # 不应被一个展示字段静默掩盖。
+        logger.debug("Could not read model identity from scorer", exc_info=True)
     return ""
 
 
@@ -316,7 +320,10 @@ def _score_stage_with_identity(
             raise TypeError(f"{bound_name} returned an invalid bound score")
         if semantic_resolution not in ALLOWED_SEMANTIC_RESOLUTIONS:
             raise TypeError(f"{bound_name} returned an invalid semantic resolution")
-        if semantic_resolution and values != SAFE_NEUTRAL_CONTRACT_VALUES:
+        if semantic_resolution == SEMANTIC_RESOLUTION_INSUFFICIENT_INPUT:
+            if not is_insufficient_input_fields(*values):
+                raise TypeError(f"{bound_name} returned an invalid insufficient-input tuple")
+        elif semantic_resolution and values != SAFE_NEUTRAL_CONTRACT_VALUES:
             raise TypeError(f"{bound_name} returned an invalid safe-neutral tuple")
         if neutral_reason and not semantic_resolution:
             raise TypeError(f"{bound_name} returned a reason without a resolution")
@@ -382,8 +389,12 @@ def _set_scoring_meta(entry, **meta) -> None:
     explanation = meta.pop("score_explanation", {}) or {}
     try:
         entry.scoring_meta = {**meta, **{key: explanation.get(key) for key in EXPLANATION_FIELDS}}
-    except Exception:
-        pass
+    except (AttributeError, TypeError):
+        # 不可变/无该属性的条目类型属于预期内形状，降级为 debug；
+        # 其它异常是编程错误，必须继续向上暴露。
+        logger.debug(
+            "Entry of type %s does not accept scoring_meta", type(entry).__name__
+        )
 
 
 def _stable_event_id(value: Any) -> str:
@@ -438,21 +449,34 @@ def _assign_event_identity(entry: Any, event_id: str, event_version: int) -> Non
     """Attach persisted identity without assuming a mutable feed-entry class."""
     if not event_id:
         return
+    version = int(event_version or 0)
+    attached = False
     try:
         entry.event_id = event_id
-        entry.event_version = int(event_version or 0)
-    except Exception:
+        entry.event_version = version
+        attached = True
+    except (AttributeError, TypeError):
         try:
             entry["event_id"] = event_id
-            entry["event_version"] = int(event_version or 0)
-        except Exception:
+            entry["event_version"] = version
+            attached = True
+        except (AttributeError, KeyError, TypeError):
             pass
     meta = dict(getattr(entry, "scoring_meta", {}) or {})
-    meta.update({"event_id": event_id, "event_version": int(event_version or 0)})
+    meta.update({"event_id": event_id, "event_version": version})
     try:
         entry.scoring_meta = meta
-    except Exception:
+        attached = True
+    except (AttributeError, TypeError):
         pass
+    if not attached:
+        # ``FeedEntry`` 等带 __slots__ 的类型没有 event_id 槽位，身份本来就
+        # 存在 scoring_meta 里，不算失败；只有三条路都不通才需要留痕。
+        logger.debug(
+            "Entry of type %s accepts neither attributes, items, nor scoring_meta; "
+            "persisted event identity was not attached",
+            type(entry).__name__,
+        )
 
 
 def _persisted_event_identity(entry: Any, write_result: Any = None) -> Tuple[str, int]:
@@ -729,6 +753,49 @@ def _cap_irrelevant_high_score(score: float, tag: str, logic: str, cfg: Optional
     return score, tag, logic
 
 
+_LOW_VALUE_ANNOUNCEMENT_TITLE = re.compile(
+    r"会议|论坛|年会|现场会|致辞|学术年会|峰会|研讨会|座谈会|拍卖"
+)
+_LOW_VALUE_POLICY_RESEARCH = re.compile(
+    r"(?:深化|提出|加强|推进|开展)[^。；\n]{0,24}研究"
+)
+_LOW_VALUE_CONCRETE_ACTION = re.compile(
+    r"订单|中标|签约|合同|获批|批准|业绩|营收|净利|利润|指引|回购|重组|并购|收购|"
+    r"投资|产能|投产|扩产|涨价|降价|裁员|上市|注册|证书|批文|发布|亮相|"
+    r"超预期|不及预期|同比|环比"
+)
+_LOW_VALUE_COMPANY = re.compile(
+    r"[\u4e00-\u9fffA-Za-z0-9]{2,}(?:公司|集团|银行|证券|基金|科技|医药|半导体|"
+    r"能源|汽车|电子|控股|股份)"
+)
+_LOW_VALUE_TAGS = {"艺术", "拍卖"}
+_LOW_VALUE_CAP = 5.0
+
+
+def _cap_low_value_announcement(score: float, tag: str, logic: str, raw_title: str) -> Tuple[float, str, str]:
+    """Cap routine meetings, speeches, auctions and principle-only research.
+
+    The contract puts these in 3-4, but the model sometimes scores them 6.0 and
+    the aggregation threshold then selects them.  The cap only applies when the
+    title names no company and states no concrete action, so a conference with
+    an order, launch or filing keeps its score.
+    """
+    if score <= _LOW_VALUE_CAP:
+        return score, tag, logic
+    title = re.sub(r"\s+", "", raw_title or "")
+    normalized_tag = re.sub(r"\s+", "", tag or "")
+    low_value = (
+        normalized_tag in _LOW_VALUE_TAGS
+        or _LOW_VALUE_ANNOUNCEMENT_TITLE.search(title) is not None
+        or _LOW_VALUE_POLICY_RESEARCH.search(title) is not None
+    )
+    if not low_value:
+        return score, tag, logic
+    if _LOW_VALUE_CONCRETE_ACTION.search(title) or _LOW_VALUE_COMPANY.search(title):
+        return score, tag, logic
+    return _LOW_VALUE_CAP, tag, logic
+
+
 def _apply_score_adjustments(score, tag, logic, cfg, feed_url, raw_title, non_substantive):
     """Apply the existing cap and time weight without changing their order."""
     if non_substantive:
@@ -739,6 +806,7 @@ def _apply_score_adjustments(score, tag, logic, cfg, feed_url, raw_title, non_su
     if score >= 0 and time_bonus != 0:
         score = min(10.0, max(0.0, score + time_bonus))
         logger.info("[TimeWeight] '%s' %s bonus %+.1f -> %.1f", raw_title[:40], time_label, time_bonus, score)
+    score, tag, logic = _cap_low_value_announcement(score, tag, logic, raw_title)
     return score, tag, logic
 
 
@@ -1139,10 +1207,10 @@ def _persist_similar_entry(ctx, similar_info, notify_threshold):
                 "independence_key": event_id,
             }
         )
-    effective_notify = (
-        notify_threshold
-        if notify_threshold is not None
-        else DB.get_feed_thresholds(cfg, feed_url)["notify"]
+    # A reused score still produces a fresh alert, so quiet hours must raise its
+    # bar exactly like the main scoring path.
+    effective_notify = _effective_notify_threshold(
+        cfg, feed_url, notify_threshold, raw_title
     )
     if score >= effective_notify:
         send_telegram_notification(
