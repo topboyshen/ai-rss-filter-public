@@ -23,11 +23,11 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode, urlsplit
 
 from flask import Blueprint, Response, g, request
 
 from routes.shared import _cfg, DB
+from core.article_identity import per_item_link, shared_section_urls
 from core.processor import (
     SCORE_DEFERRED_REASON, SCORE_TERMINAL_UNSCORED_REASON, process_entry,
 )
@@ -2087,82 +2087,16 @@ def _score_in_background(task: dict) -> bool | str:
         _queue_committed_dashboard_inputs()
 
 
-# Publisher section pages that some upstream feeds (e.g. RSSHub
-# ``/cls/telegraph``, which emits no <link>) hand to Miniflux as the URL of
-# every item.  ``link`` is the article identity everywhere downstream (score
-# cache, event identity, evidence), so distinct items sharing one section URL
-# silently reused one cached score and one event.  An explicit list is used on
-# purpose instead of a heuristic; extend it via
+# Shared section pages (e.g. the CLS telegraph, which RSSHub hands to
+# Miniflux as the URL of every item) get a stable per-item link here.  The
+# rule itself lives in ``core.article_identity`` together with the identity
+# digest and the NFC text form; extend the list via
 # ``webhook_shared_section_urls`` in the config.
-_DEFAULT_SHARED_SECTION_URLS = ("https://www.cls.cn/telegraph",)
-_SYNTHETIC_ITEM_PARAM = "ai_filter_item"
-_ITEM_KEY_CHARS = 128
-
-
-def _section_url_key(url: Any) -> str | None:
-    try:
-        parts = urlsplit(str(url or "").strip())
-        host = (parts.hostname or "").lower()
-        port = parts.port
-    except (TypeError, ValueError):
-        return None
-    if parts.scheme.lower() not in {"http", "https"} or not host:
-        return None
-    if parts.query or parts.fragment or parts.username or parts.password:
-        return None
-    if ":" in host:
-        host = f"[{host}]"
-    default_port = (parts.scheme.lower() == "http" and port == 80) or (
-        parts.scheme.lower() == "https" and port == 443
-    )
-    if port is not None and not default_port:
-        host = f"{host}:{port}"
-    return f"{host}{parts.path.rstrip('/') or '/'}"
-
-
-def _shared_section_urls(cfg: Any) -> dict[str, str]:
-    """Map equivalent section spellings to the first configured canonical URL."""
-    configured = (cfg or {}).get("webhook_shared_section_urls") if isinstance(cfg, dict) else None
-    urls = configured if isinstance(configured, (list, tuple)) else _DEFAULT_SHARED_SECTION_URLS
-    shared = {}
-    for url in urls:
-        key = _section_url_key(url)
-        if key:
-            scheme = urlsplit(str(url).strip()).scheme.lower()
-            shared.setdefault(key, f"{scheme}://{key}")
-    return shared
-
-
-def _upstream_item_key(entry: dict, title: str) -> str:
-    """Stable per-item key: Miniflux entry hash, else entry id, else title digest."""
-    for field in ("hash", "id"):
-        value = entry.get(field)
-        if isinstance(value, bool) or value is None:
-            continue
-        text = str(value).strip()
-        if text:
-            return f"{field[0]}-{text[:_ITEM_KEY_CHARS]}"
-    digest = hashlib.sha256(str(title or "").strip().encode("utf-8")).hexdigest()
-    return f"t-{digest[:32]}"
-
-
-def _article_link(entry: dict, url: str, title: str, shared: dict[str, str]) -> str:
-    """Return ``url`` or, for a shared section page, a stable per-item link.
-
-    A query parameter is used rather than a ``#fragment`` because article
-    identity normalisation (``db.database._normalized_article_identity``)
-    drops fragments, which would collapse distinct items into one event again.
-    """
-    key = _section_url_key(url)
-    if not key or key not in shared:
-        return url
-    item = _upstream_item_key(entry, title)
-    return f"{shared[key]}?{urlencode({_SYNTHETIC_ITEM_PARAM: item})}"
 
 
 def _normalize_webhook_entries(entries: list, cfg: Any) -> list:
     """Clip/clean Miniflux entries into the durable task shape."""
-    shared = _shared_section_urls(cfg)
+    shared = shared_section_urls(cfg)
     normalized_entries = []
     for entry in entries:
         if not isinstance(entry, dict):
@@ -2175,7 +2109,7 @@ def _normalize_webhook_entries(entries: list, cfg: Any) -> list:
         url = _clip_text(entry.get("url", "") or entry.get("link", ""), _MAX_URL_CHARS)
         normalized_entries.append({
             "title": title,
-            "url": _clip_text(_article_link(entry, url, source_title, shared), _MAX_URL_CHARS),
+            "url": _clip_text(per_item_link(entry, url, source_title, shared), _MAX_URL_CHARS),
             "content": _clip_utf8(content, _MAX_CONTENT_BYTES),
         })
     return normalized_entries

@@ -12,8 +12,9 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from utils.beijing_time import beijing_now, utc_naive_fromtimestamp
 from typing import Optional, Tuple, List, Dict, Any
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import quote
 
+from core.article_identity import article_identity_key, is_safe_article_url
 from db.first_rejection_evidence import (
     init_first_rejection_storage,
     safe_bounded_int,
@@ -126,106 +127,13 @@ def _require_event_mapping_write_authorized(
     require_event_mapping_connection_write_authorized(conn, mapping_version)
 
 
-# Presentation-only query parameters: transports append them, but they never
-# identify a different article.  Item identity parameters (for example
-# ``ai_filter_item``) are deliberately absent from this set.
-_TRACKING_QUERY_KEYS = frozenset(
-    {
-        "from",
-        "spm",
-        "ref",
-        "ref_src",
-        "fbclid",
-        "gclid",
-        "yclid",
-        "msclkid",
-        "igshid",
-        "mc_cid",
-        "mc_eid",
-        "share_source",
-        "share_token",
-    }
-)
-
-
-def _strip_tracking_query(query: str) -> str:
-    """Drop known tracking parameters, preserving order and every other key."""
-    if not query:
-        return ""
-    kept = []
-    for part in query.split("&"):
-        if not part:
-            continue
-        key = part.split("=", 1)[0].strip().lower()
-        if key.startswith("utm_") or key in _TRACKING_QUERY_KEYS:
-            continue
-        kept.append(part)
-    return "&".join(kept)
-
-
-def _canonical_article_path(path: str) -> str:
-    """Fold trailing slashes only: HTTP path letter case is identity-bearing.
-
-    Short links and base64-style ids can differ only in case, so lowercasing
-    the path would merge two distinct articles into one event.  That merge is
-    irreversible and overwrites the first article's title and priority, so a
-    missed merge is preferred here.
-    """
-    normalized = path or "/"
-    if normalized != "/":
-        normalized = normalized.rstrip("/") or "/"
-    return normalized
-
-
 def _normalized_article_identity(link: str) -> tuple[str, str]:
-    """Return a durable observation key without exposing the source URL.
-
-    The digest is an external identity lookup key only.  The event's public,
-    long-lived identity is the UUID stored in ``events.event_id``.
-    """
-    raw = str(link or "").strip()
-    if not raw:
-        raise ValueError("article link is required for stable event identity")
-    normalized = raw
-    try:
-        parsed = urlsplit(raw)
-        if parsed.scheme.lower() in {"http", "https"} and parsed.hostname:
-            hostname = parsed.hostname.encode("idna").decode("ascii").lower()
-            port = parsed.port
-            default_port = (parsed.scheme.lower() == "http" and port == 80) or (
-                parsed.scheme.lower() == "https" and port == 443
-            )
-            netloc = hostname if not port or default_port else f"{hostname}:{port}"
-            normalized = urlunsplit(
-                (
-                    parsed.scheme.lower(),
-                    netloc,
-                    _canonical_article_path(parsed.path),
-                    _strip_tracking_query(parsed.query),
-                    "",
-                )
-            )
-    except (UnicodeError, ValueError):
-        # Non-URL fixture or malformed legacy input: exact normalized text is
-        # still deterministic and is never fetched by the event core.
-        normalized = raw
-    digest = hashlib.sha256(
-        b"ai-filter-article-observation-v1\0" + normalized.encode("utf-8", errors="replace")
-    ).hexdigest()
-    return "article_url_sha256", digest
+    """Durable observation key; see ``core.article_identity.article_identity_key``."""
+    return article_identity_key(link)
 
 
 def _safe_evidence_url(link: str) -> bool:
-    try:
-        parsed = urlsplit(str(link or "").strip())
-    except ValueError:
-        return False
-    return bool(
-        parsed.scheme.lower() in {"http", "https"}
-        and parsed.hostname
-        and parsed.username is None
-        and parsed.password is None
-    )
+    return is_safe_article_url(link)
 
 
 def _resolve_article_event(
