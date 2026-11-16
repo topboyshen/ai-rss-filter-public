@@ -57,6 +57,10 @@ python3.11 -m venv .venv-release-gate
 存在不同且完整的 previous/current 状态时，失败才有可用的自动回滚目标。首次发布或没有
 distinct previous 时不能假定脚本可以自动恢复。
 
+健康检查要求每个服务**恰好一个**容器：`docker compose ps -q` 返回多个容器时（例如同一服务
+残留了第二个容器），部署会立即失败并进入原有的回滚路径，而不是等到健康超时；这与宿主巡检
+「服务必须唯一匹配」的口径一致。
+
 `run-release-gate.sh` 先在隔离的 clean-HEAD worktree 中固定执行 shell 语法检查、完整 pytest
 和 75% 覆盖率门槛。成功后才会在 `/run/ai-filter-release-gate/attestations` 原子写入权限
 `0600`、最长有效 6 小时且绑定 HEAD、runner、Python 与测试日志的本机收据。新一轮测试开始
@@ -96,6 +100,19 @@ CURRENT_REF="$(cat data/releases/current.ref)"
 修改宿主机配置不会改变该回滚目标。`deploy` 仍会在发现未封存旧 manifest 时先做保底封存并
 在任何新版本 preflight/容器变更之前持久化 current state；但它只能捕获 deploy 当时已经可见
 的配置，不能证明这是 checkout/pull 之前的旧发布配置，不能代替上述显式步骤。
+
+### 热重载的边界
+
+`POST /config/reload` 只重载处理该请求的进程，不会通知其它角色。生产镜像里的
+`config.yaml` 随镜像构建写入，容器不挂载它，环境变量也在创建时固定，因此生产运行中这条
+命令读到的总是与原启动相同的字节：响应里的 `changed` 为 `false`，没有任何新配置生效，
+配置变更必须走新的不可变发布。
+
+拆分布署（`AI_FILTER_ROLE=web`）下 worker 没有重载入口，响应会如实带上
+`scope: api-process` 和 `worker_reloaded: false`。若候选配置改变了评分契约，接口直接返回
+409（`reason: split_deployment`）而不是假装成功——API 单独切换契约会让之后接收的投递带
+新策略，而 worker 仍按旧契约 claim，永远无法认领。本地单进程（`role=all`，例如在
+worktree 里直接改 `config.yaml`）是该接口唯一切实可用的场景。
 
 ## 3. 应用回滚不等于数据回滚
 

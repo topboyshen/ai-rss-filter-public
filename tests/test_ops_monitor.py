@@ -7,12 +7,13 @@ import os
 import sqlite3
 import subprocess
 import tarfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
 
+from db import database
 from ops import ai_filter_ops_check as monitor
 
 
@@ -39,6 +40,7 @@ def _healthy_metrics(**updates: float) -> bytes:
 
 def _settings(tmp_path: Path, **updates) -> monitor.Settings:
     base = monitor.Settings(
+        db_maintenance_log=tmp_path / "db-maintenance.log",
         root=tmp_path / "app",
         backup_dir=tmp_path / "backups",
         backup_max_age_seconds=108000,
@@ -354,6 +356,128 @@ def test_event_enrichment_check_accepts_explicit_successful_noop(tmp_path):
     assert "completed" in result.detail
 
 
+def _utc(at: int) -> str:
+    return datetime.fromtimestamp(at, timezone.utc).isoformat(timespec="seconds")
+
+
+def _write_db_maintenance_log(path: Path, *records: dict) -> None:
+    path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+    )
+
+
+def _maintenance_start(at: int, **fields) -> dict:
+    record = {
+        "utc": _utc(at),
+        "task": "db_maintenance",
+        "run_id": "a" * 32,
+        "scope": "host",
+        "event": "start",
+        "timeout_seconds": 3600,
+        "kill_after_seconds": 60,
+    }
+    record.update(fields)
+    return record
+
+
+def _maintenance_finish(at: int, **fields) -> dict:
+    record = {
+        "utc": _utc(at),
+        "task": "db_maintenance",
+        "run_id": "a" * 32,
+        "scope": "host",
+        "event": "finish",
+        "rc": 0,
+        "outcome": "success",
+        "integrity_check": "success",
+        "vacuum": "success",
+        "close": "success",
+    }
+    record.update(fields)
+    return record
+
+
+def test_db_maintenance_check_surfaces_a_locked_vacuum(tmp_path):
+    """The weekly VACUUM fails after 5s of write lock and nothing else reads it."""
+    now = 2_000_000_000
+    log = tmp_path / "db-maintenance.log"
+    _write_db_maintenance_log(
+        log,
+        _maintenance_start(now - 30),
+        {
+            "utc": _utc(now - 28),
+            "task": "db_maintenance",
+            "run_id": "a" * 32,
+            "scope": "database",
+            "event": "phase_end",
+            "phase": "vacuum",
+            "status": "failed",
+            "error_type": "OperationalError",
+            "error": "database is locked",
+        },
+        _maintenance_finish(now - 27, rc=1, outcome="failed", vacuum="failed"),
+    )
+
+    result = monitor.check_db_maintenance(
+        _settings(tmp_path, db_maintenance_log=log), now
+    )
+
+    assert result.ok is False
+    assert "vacuum=failed" in result.detail
+    assert "error=database is locked" in result.detail
+
+
+def test_db_maintenance_check_tracks_weekly_freshness(tmp_path):
+    now = 2_000_000_000
+    log = tmp_path / "db-maintenance.log"
+    settings = _settings(tmp_path, db_maintenance_log=log)
+
+    # Only the newest run counts: an older failure must not mask a later success.
+    _write_db_maintenance_log(
+        log,
+        _maintenance_finish(now - 7200, rc=1, outcome="failed", vacuum="failed"),
+        _maintenance_finish(now - 3600),
+    )
+    fresh = monitor.check_db_maintenance(settings, now)
+    assert fresh.ok is True
+    assert "vacuum complete" in fresh.detail
+
+    stale_at = now - monitor._DB_MAINTENANCE_MAX_AGE_SECONDS - 1
+    _write_db_maintenance_log(log, _maintenance_finish(stale_at))
+    stale = monitor.check_db_maintenance(settings, now)
+    assert stale.ok is False
+    assert "stale" in stale.detail
+
+
+def test_db_maintenance_check_waits_for_an_unfinished_run_then_fails(tmp_path):
+    now = 2_000_000_000
+    log = tmp_path / "db-maintenance.log"
+    settings = _settings(tmp_path, db_maintenance_log=log)
+
+    _write_db_maintenance_log(log, _maintenance_start(now - 60))
+    running = monitor.check_db_maintenance(settings, now)
+    assert running.ok is True and running.warning is True
+    assert "in progress" in running.detail
+
+    wedged_at = now - monitor._DB_MAINTENANCE_RUNNING_GRACE_SECONDS - 60
+    _write_db_maintenance_log(log, _maintenance_start(wedged_at))
+    wedged = monitor.check_db_maintenance(settings, now)
+    assert wedged.ok is False
+    assert "did not finish" in wedged.detail
+
+
+def test_db_maintenance_check_is_pending_before_the_first_weekly_run(tmp_path):
+    result = monitor.check_db_maintenance(
+        _settings(tmp_path, db_maintenance_log=tmp_path / "absent.log"), 2_000_000_000
+    )
+    assert result.ok is True and result.warning is True
+    assert "no maintenance result" in result.detail
+
+
+def test_db_maintenance_check_is_registered():
+    assert monitor.check_db_maintenance in monitor.CHECKS
+
+
 def _market_database(path: Path, trade_date: str, source_ts: int) -> None:
     connection = sqlite3.connect(path)
     try:
@@ -393,6 +517,48 @@ def _write_market_result(tmp_path: Path, kind: str, **fields) -> None:
     path = directory / f"{kind}_last.json"
     path.write_text(json.dumps(payload) + "\n", encoding="ascii")
     path.chmod(0o600)
+
+
+def test_trading_calendar_check_warns_before_the_calendar_runs_out(tmp_path):
+    """The calendar must be added before 1 January, not discovered that morning."""
+    zone = ZoneInfo("Asia/Shanghai")
+    settings = _settings(tmp_path)
+    covered = int(datetime(2026, 12, 1, 9, 0, tzinfo=zone).timestamp())
+    expiring = int(datetime(2026, 12, 2, 9, 0, tzinfo=zone).timestamp())
+
+    fresh = monitor.check_trading_calendar(settings, covered)
+    stale = monitor.check_trading_calendar(settings, expiring)
+
+    assert fresh.ok is True
+    assert stale.ok is False
+    assert "2027" in stale.detail
+
+
+def test_trading_calendar_check_is_registered(tmp_path):
+    """A check nobody runs cannot alert; the tuple is the whole schedule."""
+    assert monitor.check_trading_calendar in monitor.CHECKS
+
+
+def test_host_calendar_copy_matches_the_database_calendar():
+    """The host monitor runs standalone, so its calendar is a hand-kept copy.
+
+    `ops/ai_filter_ops_check.py` is installed on the host independently of the
+    image, so the two holiday sets cannot share an import. A silent divergence
+    makes the collector and the monitor disagree about whether a day is a
+    trading day, which the monitor reports as "collector skipped a trading day".
+    """
+    host = monitor._CHINA_HOLIDAYS_BY_YEAR
+    image = database.CHINA_HOLIDAYS_BY_YEAR
+    differences = [
+        f"{year}: host_only={sorted(host.get(year, set()) - image.get(year, set()))} "
+        f"image_only={sorted(image.get(year, set()) - host.get(year, set()))}"
+        for year in sorted(set(host) | set(image))
+        if host.get(year) != image.get(year)
+    ]
+
+    assert differences == [], (
+        "host and image holiday calendars diverged: " + "; ".join(differences)
+    )
 
 
 def test_market_timer_checks_service_result_and_expected_database_date(
@@ -456,6 +622,50 @@ def test_market_timer_checks_service_result_and_expected_database_date(
     assert missing_after_failure.ok is False
     assert "missing required benchmark" in missing_after_failure.detail
 
+
+def test_next_trading_morning_after_a_holiday_skip_is_not_a_failure(
+    monkeypatch, tmp_path
+):
+    """Full check: the holiday receipt stays on disk until the next 15:10 run."""
+    zone = ZoneInfo("Asia/Shanghai")
+    close_ts = int(datetime(2026, 9, 30, 15, 0, tzinfo=zone).timestamp())
+    database_path = tmp_path / "cache.db"
+    _market_database(database_path, "2026-09-30", close_ts)
+    settings = _settings(tmp_path, database_path=database_path)
+    holiday_run = int(datetime(2026, 10, 7, 15, 10, 30, tzinfo=zone).timestamp())
+    _write_market_result(
+        tmp_path,
+        "collector",
+        status="skipped_nontrading",
+        trade_date="",
+        started_at=holiday_run - 30,
+        completed_at=holiday_run,
+    )
+
+    def systemctl(command, timeout):
+        del timeout
+        if command[1] in {"is-enabled", "is-active"}:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if "--value" in command:
+            return subprocess.CompletedProcess(
+                command, 0, "Thu 2026-10-08 15:10:00 CST\n", ""
+            )
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            "ActiveState=inactive\nResult=success\nExecMainStatus=0\n"
+            "ExecMainExitTimestamp=Wed 2026-10-07 15:10:30 CST\n",
+            "",
+        )
+
+    monkeypatch.setattr(monitor, "_run", systemctl)
+    now = int(datetime(2026, 10, 8, 9, 0, tzinfo=zone).timestamp())
+    morning = monitor.check_market_timer(settings, now)
+
+    assert morning.ok is True
+    assert morning.warning is False
+    assert "no close due yet" in morning.detail
+
     monkeypatch.setattr(monitor, "_run", systemctl)
     connection = sqlite3.connect(database_path)
     connection.execute(
@@ -489,15 +699,124 @@ def test_market_timer_rejects_coverage_replay_success(tmp_path):
             "benchmark_rows=4 pending=0"
         ),
     )
-    replayed = monitor._market_timer_from_results(_settings(tmp_path), "2026-08-04", 4)
+    replayed = monitor._market_timer_from_results(
+        _settings(tmp_path),
+        "2026-08-04",
+        4,
+        now=int(datetime(2026, 8, 4, 16, 5, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp()),
+    )
     assert replayed.ok is False
     assert "coverage replay" in replayed.detail
     assert "not natural close" in replayed.detail
 
     _write_market_result(tmp_path, "collector", status="success")
-    natural = monitor._market_timer_from_results(_settings(tmp_path), "2026-08-04", 4)
+    natural = monitor._market_timer_from_results(
+        _settings(tmp_path),
+        "2026-08-04",
+        4,
+        now=int(datetime(2026, 8, 4, 16, 5, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp()),
+    )
     assert natural.ok is True
     assert "coverage replay" not in natural.detail
+
+
+def test_holiday_skip_without_previous_receipt_is_not_a_failure(tmp_path):
+    now = int(datetime(2026, 10, 1, 16, 5, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp())
+    # persist_host_fallback writes this payload when the host has no previous
+    # collector receipt, so it carries no trade_date at all.
+    _write_market_result(tmp_path, "collector", status="skipped_nontrading", trade_date="")
+
+    result = monitor._market_timer_from_results(
+        _settings(tmp_path), "2026-09-30", 4, now=now
+    )
+
+    assert result.ok is True
+    assert result.warning is False
+    assert "non-trading" in result.detail
+
+
+def test_skip_on_a_trading_day_is_still_a_failure(tmp_path):
+    now = int(datetime(2026, 9, 30, 16, 5, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp())
+    _write_market_result(
+        tmp_path,
+        "collector",
+        status="skipped_nontrading",
+        trade_date="",
+        started_at=now - 30,
+        completed_at=now,
+    )
+
+    result = monitor._market_timer_from_results(
+        _settings(tmp_path), "2026-09-30", 4, now=now
+    )
+
+    assert result.ok is False
+    assert "trading day" in result.detail
+
+
+def test_holiday_skip_receipt_does_not_fail_the_next_trading_morning(tmp_path):
+    """The last close run may be a holiday skip; the new trading day has no run yet."""
+    zone = ZoneInfo("Asia/Shanghai")
+    holiday_run = int(datetime(2026, 10, 7, 15, 10, 30, tzinfo=zone).timestamp())
+    _write_market_result(
+        tmp_path,
+        "collector",
+        status="skipped_nontrading",
+        trade_date="",
+        started_at=holiday_run - 30,
+        completed_at=holiday_run,
+    )
+    now = int(datetime(2026, 10, 8, 9, 0, tzinfo=zone).timestamp())
+
+    result = monitor._market_timer_from_results(
+        _settings(tmp_path), "2026-09-30", 4, now=now
+    )
+
+    assert result.ok is True
+    assert result.warning is False
+    assert "non-trading" in result.detail
+    assert "no close due yet" in result.detail
+    assert "2026-10-07" in result.detail
+
+
+def test_stale_holiday_skip_receipt_fails_once_todays_close_is_due(tmp_path):
+    zone = ZoneInfo("Asia/Shanghai")
+    holiday_run = int(datetime(2026, 10, 7, 15, 10, 30, tzinfo=zone).timestamp())
+    _write_market_result(
+        tmp_path,
+        "collector",
+        status="skipped_nontrading",
+        trade_date="",
+        started_at=holiday_run - 30,
+        completed_at=holiday_run,
+    )
+    now = int(datetime(2026, 10, 8, 16, 5, tzinfo=zone).timestamp())
+
+    result = monitor._market_timer_from_results(
+        _settings(tmp_path), "2026-10-08", 4, now=now
+    )
+
+    assert result.ok is False
+    assert "no receipt for 2026-10-08" in result.detail
+
+
+def test_skip_receipt_without_timestamps_is_malformed(tmp_path):
+    zone = ZoneInfo("Asia/Shanghai")
+    now = int(datetime(2026, 10, 8, 9, 0, tzinfo=zone).timestamp())
+    _write_market_result(
+        tmp_path, "collector", status="skipped_nontrading", trade_date=""
+    )
+    path = tmp_path / "app" / "data" / "market_close" / "collector_last.json"
+    payload = json.loads(path.read_text(encoding="ascii"))
+    payload.pop("completed_at")
+    path.write_text(json.dumps(payload) + "\n", encoding="ascii")
+
+    result = monitor._market_timer_from_results(
+        _settings(tmp_path), "2026-09-30", 4, now=now
+    )
+
+    assert result.ok is False
+    assert "timestamps invalid" in result.detail
 
 
 def test_market_history_reports_backlog_without_failing_same_day(tmp_path):
@@ -534,6 +853,148 @@ def test_market_history_reports_backlog_without_failing_same_day(tmp_path):
     assert failed.ok is False
 
 
+def test_failed_history_run_fails_despite_remaining_backlog(tmp_path):
+    now = int(datetime(2026, 8, 4, 17, 0, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp())
+    _write_market_result(
+        tmp_path,
+        "history",
+        status="incomplete",
+        trade_date="2026-08-03",
+        remaining_total=3,
+        truncated=False,
+        unresolved=2,
+        exit_code=1,
+        started_at=now - 1800,
+        completed_at=now - 1740,
+    )
+
+    result = monitor.check_market_history(_settings(tmp_path), now)
+
+    assert result.ok is False
+    assert result.warning is False
+    assert "exit_code=1" in result.detail
+
+
+def test_history_receipt_with_a_non_integer_exit_code_fails(tmp_path):
+    now = int(datetime(2026, 8, 4, 17, 0, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp())
+    _write_market_result(
+        tmp_path,
+        "history",
+        status="complete",
+        exit_code="0",
+        started_at=now - 1800,
+        completed_at=now - 1740,
+    )
+
+    result = monitor.check_market_history(_settings(tmp_path), now)
+
+    assert result.ok is False
+    assert "exit_code" in result.detail
+
+
+def test_missing_history_receipt_fails_after_a_recorded_baseline(tmp_path):
+    state = tmp_path / "state" / "state.json"
+    state.parent.mkdir(parents=True)
+    state.write_text(
+        json.dumps({"version": 2, "market_history_seen": True}), encoding="utf-8"
+    )
+    now = int(datetime(2026, 8, 4, 17, 0, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp())
+
+    result = monitor.check_market_history(_settings(tmp_path, state_file=state), now)
+
+    assert result.ok is False
+    assert "after a previous run" in result.detail
+    assert "cause not determined" in result.detail
+
+
+def test_seen_history_receipt_is_exported_to_state(monkeypatch, tmp_path):
+    state = tmp_path / "state" / "state.json"
+    arguments = [
+        "--config",
+        str(tmp_path / "missing-monitor.env"),
+        "--backup-config",
+        str(tmp_path / "missing-backup.env"),
+        "--root",
+        str(tmp_path / "app"),
+        "--backup-dir",
+        str(tmp_path / "backups"),
+        "--state-file",
+        str(state),
+    ]
+
+    def run_with(result):
+        monkeypatch.setattr(monitor, "CHECKS", (lambda _settings, _now: result,))
+        assert monitor.main(arguments) == 0
+
+    run_with(
+        monitor.CheckResult(
+            "market_history", True, "historical pending complete", evidence_present=True
+        )
+    )
+    assert json.loads(state.read_text(encoding="utf-8"))["market_history_seen"] is True
+
+    run_with(monitor.CheckResult("market_history", True, "historical pending complete"))
+    assert json.loads(state.read_text(encoding="utf-8"))["market_history_seen"] is True
+
+
+def _monitor_arguments(tmp_path: Path, state: Path, now: int) -> list[str]:
+    return [
+        "--config", str(tmp_path / "missing-monitor.env"),
+        "--backup-config", str(tmp_path / "missing-backup.env"),
+        "--root", str(tmp_path / "app"),
+        "--backup-dir", str(tmp_path / "backups"),
+        "--state-file", str(state),
+        "--now", str(now),
+    ]
+
+
+def _valid_history_receipt(tmp_path: Path, now: int) -> Path:
+    _write_market_result(
+        tmp_path,
+        "history",
+        status="complete",
+        started_at=now - 1800,
+        completed_at=now - 60,
+    )
+    return tmp_path / "app" / "data" / "market_close" / "history_last.json"
+
+
+def test_history_receipt_lost_after_a_successful_run_fails(monkeypatch, tmp_path):
+    state = tmp_path / "state" / "state.json"
+    now = int(datetime(2026, 8, 4, 17, 0, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp())
+    arguments = _monitor_arguments(tmp_path, state, now)
+    monkeypatch.setattr(monitor, "CHECKS", (monitor.check_market_history,))
+    receipt = _valid_history_receipt(tmp_path, now)
+
+    assert monitor.main(arguments) == 0
+    observed = json.loads(state.read_text(encoding="utf-8"))
+    assert observed["status"] == "healthy"
+    assert observed["market_history_seen"] is True
+
+    receipt.unlink()
+    assert monitor.main(arguments) == 1
+    missing = json.loads(state.read_text(encoding="utf-8"))
+    assert missing["status"] == "failing"
+    assert missing["market_history_seen"] is True
+
+
+def test_dry_run_does_not_establish_the_history_baseline(monkeypatch, tmp_path):
+    state = tmp_path / "state" / "state.json"
+    now = int(datetime(2026, 8, 4, 17, 0, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp())
+    arguments = _monitor_arguments(tmp_path, state, now)
+    monkeypatch.setattr(monitor, "CHECKS", (monitor.check_market_history,))
+    receipt = _valid_history_receipt(tmp_path, now)
+
+    assert monitor.main([*arguments, "--dry-run"]) == 0
+    assert not state.exists()
+
+    receipt.unlink()
+    assert monitor.main(arguments) == 0
+    first_missing = json.loads(state.read_text(encoding="utf-8"))
+    assert first_missing["status"] == "healthy"
+    assert first_missing["market_history_seen"] is False
+
+
 def test_root_disk_warns_before_it_fails(monkeypatch, tmp_path):
     class _Usage:
         def __init__(self, used, total, free):
@@ -565,7 +1026,12 @@ def test_same_day_repair_must_follow_collector_completion(tmp_path, started, com
     _write_market_result(tmp_path, "collector", status="incomplete", completed_at=2)
     _write_market_result(tmp_path, "repair", status="complete",
                          started_at=started, completed_at=completed)
-    result = monitor._market_timer_from_results(_settings(tmp_path), "2026-08-04", 4)
+    result = monitor._market_timer_from_results(
+        _settings(tmp_path),
+        "2026-08-04",
+        4,
+        now=int(datetime(2026, 8, 4, 16, 5, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp()),
+    )
     assert result.ok is accepted
 
 

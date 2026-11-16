@@ -4,6 +4,74 @@ from urllib.request import Request, urlopen
 
 from utils.helpers import escape_html, safe_http_url
 
+# Telegram rejects messages above 4096 characters, so keep headroom for entity
+# parsing instead of losing an oversized alert inside the failure branch.
+_MAX_MESSAGE_CHARS = 3900
+_FALLBACK_TITLE_CHARS = 300
+_FALLBACK_TAG_CHARS = 120
+_FALLBACK_LOGIC_CHARS = 300
+_LAST_RESORT_TITLE_CHARS = 120
+_LAST_RESORT_TAG_CHARS = 60
+_LAST_RESORT_LOGIC_CHARS = 200
+_LINK_OMITTED = "\n\U0001f517 原文链接超过单条消息上限，已省略"
+
+
+def _telegram_message(title, link, score, tag, logic):
+    msg = (
+        "\U0001f6a8 <b>超重磅 A 股情报</b>\n\n"
+        f"\U0001f4ca 评分：<b>{escape_html(score)}分</b>\n"
+        f"\U0001f3f7 标签：{escape_html(tag)}\n"
+        f"\U0001f4a1 逻辑：{escape_html(logic)}\n\n"
+        f"\U0001f4c4 标题：{escape_html(title)}"
+    )
+    if link:
+        msg += f'\n\U0001f517 链接：<a href="{escape_html(link)}">打开原文</a>'
+    return msg
+
+
+def _clip(value, limit):
+    return str(value or "")[:limit]
+
+
+def _bounded_telegram_message(title, link, score, tag, logic):
+    """Degrade an oversized alert instead of letting the provider reject it whole.
+
+    The source link is the only way back to the article, so it survives the
+    first two degradations: title, tag and explanation are shortened before the
+    link is considered.  A link that still cannot fit the smallest message is
+    omitted explicitly; it is never truncated, which would forge a different
+    address.  tag/logic are contract-bounded upstream; shortening them only
+    protects callers outside that contract.
+    """
+    msg = _telegram_message(title, link, score, tag, logic)
+    if len(msg) <= _MAX_MESSAGE_CHARS:
+        return msg
+    msg = _telegram_message(
+        _clip(title, _FALLBACK_TITLE_CHARS),
+        link,
+        score,
+        _clip(tag, _FALLBACK_TAG_CHARS),
+        _clip(logic, _FALLBACK_LOGIC_CHARS),
+    )
+    if len(msg) <= _MAX_MESSAGE_CHARS:
+        return msg
+    msg = _telegram_message(
+        _clip(title, _LAST_RESORT_TITLE_CHARS),
+        link,
+        score,
+        _clip(tag, _LAST_RESORT_TAG_CHARS),
+        _clip(logic, _LAST_RESORT_LOGIC_CHARS),
+    )
+    if len(msg) <= _MAX_MESSAGE_CHARS:
+        return msg
+    return _telegram_message(
+        _clip(title, _LAST_RESORT_TITLE_CHARS),
+        "",
+        score,
+        _clip(tag, _LAST_RESORT_TAG_CHARS),
+        _clip(logic, _LAST_RESORT_LOGIC_CHARS),
+    ) + _LINK_OMITTED
+
 
 def send_telegram_notification(title, link, score, tag, logic, cfg, notify_threshold=None):
     if not cfg.get("telegram", {}).get("enabled"):
@@ -20,16 +88,8 @@ def send_telegram_notification(title, link, score, tag, logic, cfg, notify_thres
     if not token or not chat_id:
         return False
     try:
-        msg = (
-            "\U0001f6a8 <b>\u8d85\u91cd\u78c5 A \u80a1\u60c5\u62a5</b>\n\n"
-            f"\U0001f4ca \u8bc4\u5206\uff1a<b>{escape_html(score)}\u5206</b>\n"
-            f"\U0001f3f7 \u6807\u7b7e\uff1a{escape_html(tag)}\n"
-            f"\U0001f4a1 \u903b\u8f91\uff1a{escape_html(logic)}\n\n"
-            f"\U0001f4c4 \u6807\u9898\uff1a{escape_html(title)}"
-        )
         safe_link = safe_http_url(link, fallback="")
-        if safe_link:
-            msg += f'\n\U0001f517 \u94fe\u63a5\uff1a<a href="{escape_html(safe_link)}">\u6253\u5f00\u539f\u6587</a>'
+        msg = _bounded_telegram_message(title, safe_link, score, tag, logic)
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         payload = json.dumps({
             "chat_id": chat_id,
@@ -40,7 +100,14 @@ def send_telegram_notification(title, link, score, tag, logic, cfg, notify_thres
         req = Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
         with urlopen(req, timeout=10) as resp:
             return resp.status == 200
-    except Exception as e:
+    except Exception as exc:
         import logging
-        logging.warning(f"[WARN] Telegram \u63a8\u9001\u5931\u8d25: {e}")
+        # Never interpolate the exception text: provider errors can embed the
+        # request URL, which carries the bot token.
+        logging.warning(
+            "[WARN] Telegram 推送失败 type=%s score=%s title=%s",
+            type(exc).__name__,
+            score,
+            str(title or "")[:40],
+        )
         return False

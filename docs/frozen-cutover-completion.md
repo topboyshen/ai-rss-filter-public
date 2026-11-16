@@ -60,3 +60,20 @@ held 在固定 PostgreSQL 中用真实独立登录与 HTTP 校验，不拿游标
 一旦产生新 outbox/回执/别名/journal/负收据/终态记录，旧镜像不能盲目回退。
 应先静止所有生产者消费者、独立保全原件，再核各状态可读写及人工恢复边界。
 本轮不重评、不补发，不修改既有阈值、NO_BACKUP、封存样本与留存开关。
+
+## 合成证据上传准备
+
+主 CI 的 synthetic 目录与本 workflow 的四个证据根通过
+`scripts/prepare_synthetic_evidence.py` 生成新的独占 0700 上传目录，原目录不修改或删除。
+普通文件以锚定目录 FD、O_NOFOLLOW 和复制前后身份校验读取；目录及文件在完成标记前
+再核对原始输出 inode、清单和权限。2 GiB 稀疏夹具通过 SEEK_DATA/SEEK_HOLE 保留空洞；
+不支持时按最多 1 MiB 的零块跳写。`extent_stream_sha256` 绑定逻辑大小和数据区段，
+不是完整文件内容 SHA256。空目录及原身份保留在清单中。
+
+符号链接只保存内部目标的路径和身份 metadata，不打开、复制或上传链接本身。
+容器绝对路径只接受 FIXTURE_STORAGE.json 与实际目录 dev/inode 一致的固定映射。
+硬链接仅在同一根库存内同 dev/inode 路径数量恰等于 nlink 时复制；缺少任一路径即拒绝读取。
+外部、链式、歧义目标、数量/字节/metadata/时间超限、源或输出漂移均保留 STOP，不能写 COMPLETE。
+上限为 50,000 项、8 GiB 逻辑文件、8 MiB 输入 metadata 和 300 秒；输出 metadata 上限 32 MiB。
+always 上传只指向准备目录，包含部分普通文件与 STOP；不回退上传原始目录。
+输出必须由本准备过程独占，完成标记不声称能防止完成后同 UID 的另一个进程修改文件。

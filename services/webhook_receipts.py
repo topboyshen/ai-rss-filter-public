@@ -19,6 +19,8 @@ MAX_RECORDS = 4096
 MAX_BYTES = 256 * 1024 * 1024
 MAX_RECORD_BYTES = 8 * 1024 * 1024
 MAX_COMPLETION_BYTES = 16 * 1024
+_READ_VERIFY_CHUNK = 64 * 1024
+_READ_IDENTITY = ("st_dev", "st_ino", "st_size", "st_mode", "st_uid", "st_nlink", "st_mtime_ns", "st_ctime_ns")
 _INDEX_RESERVE = 2048
 # A new alias must have this much admission headroom before its first intent
 # write. A truncated intent cannot prove its actual size/identity, so charge a
@@ -68,26 +70,68 @@ def _private_directory(path):
 
 def _open_private(path):
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    info = os.fstat(fd)
-    if (not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600
-            or info.st_nlink != 1 or info.st_uid != os.getuid() or info.st_size > MAX_RECORD_BYTES):
-        os.close(fd)
-        raise ReceiptCorrupt("unsafe receipt file")
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_nlink != 1 or info.st_uid != os.getuid() or info.st_size > MAX_RECORD_BYTES):
+            raise ReceiptCorrupt("unsafe receipt file")
+    except BaseException as exc:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        if isinstance(exc, OSError):
+            raise ReceiptCorrupt("receipt metadata unavailable after open") from exc
+        raise
     return fd
 
 
-def _read(path):
-    with os.fdopen(_open_private(path), "rb") as stream:
-        before = os.fstat(stream.fileno())
-        if before.st_size > MAX_RECORD_BYTES:
-            raise ReceiptCorrupt("receipt exceeds per-file safety limit")
-        # The store's 256 MiB budget is not a per-read allocation. CPython
-        # allocates the requested buffer even when a receipt is only 1 KiB.
-        data = stream.read(before.st_size + 1)
-        after = os.fstat(stream.fileno())
-    identity = ("st_dev", "st_ino", "st_size", "st_mode", "st_uid", "st_nlink", "st_mtime_ns", "st_ctime_ns")
-    if len(data) != before.st_size or any(getattr(before, key) != getattr(after, key) for key in identity):
+def _verify_read(fd, data):
+    # Equal timestamps do not imply equal content. Read the same descriptor
+    # afresh: seeking a BufferedReader can reuse its stale cached bytes.
+    expected = memoryview(data)
+    for offset in range(0, len(data), _READ_VERIFY_CHUNK):
+        size = min(_READ_VERIFY_CHUNK, len(data) - offset)
+        if os.pread(fd, size, offset) != expected[offset:offset + size]:
+            raise ReceiptCorrupt("receipt changed during bounded read")
+    if os.pread(fd, 1, len(data)):
         raise ReceiptCorrupt("receipt changed during bounded read")
+
+
+def _read(path):
+    # Only failure of the initial open may mean "absent" to callers. Once a
+    # descriptor exists, any I/O/metadata failure must fail closed, not become
+    # a new admission or a proven partial-JSON hold.
+    fd = _open_private(path)
+    try:
+        stream = os.fdopen(fd, "rb")
+    except BaseException as exc:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        if isinstance(exc, OSError):
+            raise ReceiptCorrupt("receipt stream unavailable after open") from exc
+        raise
+    try:
+        with stream:
+            before = os.fstat(stream.fileno())
+            if before.st_size > MAX_RECORD_BYTES:
+                raise ReceiptCorrupt("receipt exceeds per-file safety limit")
+            # The store budget is not a per-read allocation. The second pass
+            # adds at most one fixed-size chunk, not another complete record.
+            data = stream.read(before.st_size + 1)
+            after = os.fstat(stream.fileno())
+            if len(data) != before.st_size or any(
+                getattr(before, key) != getattr(after, key) for key in _READ_IDENTITY
+            ):
+                raise ReceiptCorrupt("receipt changed during bounded read")
+            _verify_read(stream.fileno(), data)
+            final = os.fstat(stream.fileno())
+            if any(getattr(before, key) != getattr(final, key) for key in _READ_IDENTITY):
+                raise ReceiptCorrupt("receipt changed during bounded read")
+    except OSError as exc:
+        raise ReceiptCorrupt("receipt I/O failed during bounded read") from exc
     return data
 
 
@@ -122,7 +166,9 @@ def _reservation(record):
 
 
 def _head(path):
-    with os.fdopen(_open_private(path), "rb") as stream:
+    # Buffer at the header cap: the default 8 KiB buffer would read far more
+    # than the reservation line on a cold scan.
+    with os.fdopen(_open_private(path), "rb", buffering=1024) as stream:
         line = stream.readline(1024)
         size = os.fstat(stream.fileno()).st_size
     if not line.endswith(b",\n"):
@@ -548,6 +594,24 @@ class ReceiptStore:
         self._barrier(path)
         return {key: original[key] for key in _HEAD_KEYS}
 
+    def _validated_head(self, path, delivery_id):
+        data = _read(path)
+        try:
+            stored = _validate(_decode(data), delivery_id)
+        except ReceiptMalformedJSON:
+            return self._held_header(path, delivery_id, data)
+        head = _head(path)
+        if stored.get("alias_intent_schema") == 1 and self._alias_intent(delivery_id) != stored:
+            raise ReceiptConflict("alias receipt differs from immutable intent")
+        if path.name.endswith(".pending"):
+            original = self._read_record(self.directory / (delivery_id + ".json"), delivery_id)
+            self._check_transition(original, stored)
+        if head != {key: stored[key] for key in _HEAD_KEYS}:
+            raise ReceiptCorrupt("reservation header disagrees with receipt")
+        if head["delivery_id"] != delivery_id:
+            raise ReceiptConflict("receipt filename mismatch")
+        return head
+
     def _headers(self):
         headers = self._intent_headers()
         for path in self.directory.iterdir():
@@ -557,29 +621,36 @@ class ReceiptStore:
             if not name.endswith(".json"):
                 raise ReceiptCorrupt("unknown receipt entry")
             delivery_id = _identifier(name[:-5])
-            data = _read(path)
-            try:
-                stored = _validate(_decode(data), delivery_id)
-            except ReceiptMalformedJSON:
-                head = self._held_header(path, delivery_id, data)
-                stored = None
+            head = self._validated_head(path, delivery_id)
+            old = headers.get(delivery_id)
+            if old is not None and old != head:
+                raise ReceiptConflict("pending receipt identity mismatch")
+            headers[delivery_id] = head
+        return headers
+
+    def _header_index(self):
+        """Bounded identity/capacity view; final bodies are not read.
+
+        Final receipts contribute only _head(path) (1 KiB cap, including the
+        size-versus-reservation bound). Pending files still take the full
+        validated path because a truncated write can only be held or rejected
+        with its original/intent context. Full body validation stays in
+        load(), duplicate confirmation, and _headers().
+        """
+        headers = self._intent_headers()
+        for path in self.directory.iterdir():
+            if path.name in {"tasks", "alias-intents"}:
+                continue
+            name = path.name.removesuffix(".pending")
+            if not name.endswith(".json"):
+                raise ReceiptCorrupt("unknown receipt entry")
+            delivery_id = _identifier(name[:-5])
+            if path.name.endswith(".pending"):
+                head = self._validated_head(path, delivery_id)
             else:
                 head = _head(path)
-                if stored.get("alias_intent_schema") == 1 and self._alias_intent(delivery_id) != stored:
-                    raise ReceiptConflict("alias receipt differs from immutable intent")
-                if path.name.endswith(".pending"):
-                    original = self._read_record(self.directory / (delivery_id + ".json"), delivery_id)
-                    self._check_transition(original, stored)
-            if stored is None:
-                old = headers.get(delivery_id)
-                if old is not None and old != head:
-                    raise ReceiptConflict("partial receipt identity mismatch")
-                headers[delivery_id] = head
-                continue
-            if head != {key: stored[key] for key in _HEAD_KEYS}:
-                raise ReceiptCorrupt("reservation header disagrees with receipt")
-            if head["delivery_id"] != delivery_id:
-                raise ReceiptConflict("receipt filename mismatch")
+                if head["delivery_id"] != delivery_id:
+                    raise ReceiptConflict("receipt filename mismatch")
             old = headers.get(delivery_id)
             if old is not None and old != head:
                 raise ReceiptConflict("pending receipt identity mismatch")
@@ -696,7 +767,7 @@ class ReceiptStore:
         try:
             index = _decode(_read(path))
         except FileNotFoundError:
-            matches = [head["delivery_id"] for head in self._headers().values()
+            matches = [head["delivery_id"] for head in self._header_index().values()
                        if head["task_digest"] == task_digest and head["primary_delivery_id"] == head["delivery_id"]]
             if len(matches) > 1:
                 raise ReceiptConflict("multiple primary receipts")
@@ -718,7 +789,7 @@ class ReceiptStore:
 
     def _reserve(self, record, *, reserve_bytes=None):
         record["_reserved_bytes"] = _reservation(record)
-        headers = self._headers()
+        headers = self._header_index()
         requested = record["_reserved_bytes"] if reserve_bytes is None else reserve_bytes
         if len(headers) >= min(self.max_records, MAX_RECORDS) or sum(item["_reserved_bytes"] for item in headers.values()) + requested > min(self.max_bytes, MAX_BYTES):
             raise ReceiptCapacityError("receipt capacity exhausted; existing evidence retained")

@@ -35,6 +35,8 @@ data/webhook_spool/.completed-digests
 data/webhook_spool/.lock
 data/webhook_spool/inflight/
 data/webhook_spool/dead-letter/
+# Strict webhook receipt records, task index and alias intents are runtime state.
+/data/webhook_spool/receipts/
 data/dashboard_snapshots/
 # Collector/repair receipts are persistent host runtime state, not source.
 data/market_close/
@@ -51,6 +53,9 @@ data/.last-refresh-trigger
 data/.event-mapping-migration-required
 data/releases/
 *.patch
+# Reviewed, digest-locked source inputs are required to build Miniflux in CI.
+!/ops/miniflux/0001-durable-webhook-outbox.patch
+!/ops/miniflux/0002-unified-pause-and-held-originals.patch
 
 # Private local review/transport evidence must never enter the public repository.
 /data/diagnostics/
