@@ -38,6 +38,18 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# These paths acquire the real release lock through the activation capability.
+# Dispatch before this shell opens another lock description or touches registry.
+case "${1:-}" in
+  controlled-finalize|controlled-finalize-query)
+    [[ "$#" -eq 3 ]] || { echo "Usage: $0 $1 <immutable-image-ref> <private-request.json>" >&2; exit 2; }
+    action=finalize
+    [[ "$1" == "controlled-finalize-query" ]] && action=query
+    exec python3 -I "${ROOT}/scripts/controlled_release_finalize.py" \
+      --action "$action" --image-ref "$2" --request "$3"
+    ;;
+esac
+
 REGISTRY_DIR="${RELEASE_REGISTRY_DIR:-${ROOT}/data/releases}"
 MANIFEST_DIR="${REGISTRY_DIR}/manifests"
 BUILD_CONTRACT_DIR="${REGISTRY_DIR}/build-contracts"
@@ -46,6 +58,21 @@ COMPOSE_FILE="${RELEASE_COMPOSE_FILE:-${ROOT}/docker-compose.yml}"
 # Dockerfile COPY is intentionally fixed to this path. Allowing an alternate
 # hash input would let the build contract describe a config absent from image.
 CONFIG_FILE="${ROOT}/config.yaml"
+# A private contract changes deployment inputs only, never Docker build context.
+PRIVATE_CONTRACT="${RELEASE_PRIVATE_CONTRACT:-}"
+PRIVATE_CONTRACT_SHA=""
+PRIVATE_RUNTIME_CONFIG_SHA=""
+PRIVATE_HELPER="${ROOT}/scripts/private_release_contract.py"
+private_contract() {
+  python3 -I "$PRIVATE_HELPER" --root "$ROOT" --contract "$PRIVATE_CONTRACT" "$@"
+}
+release_compose() {
+  if [[ -n "$PRIVATE_CONTRACT" ]]; then
+    private_contract compose --image "${IMAGE_REF:-}" -- "$@"
+  else
+    docker compose --project-directory "$ROOT" "$@"
+  fi
+}
 HEALTH_TIMEOUT="${RELEASE_HEALTH_TIMEOUT_SECONDS:-180}"
 HEALTH_POLL="${RELEASE_HEALTH_POLL_SECONDS:-2}"
 HEALTH_SERVICES="${RELEASE_HEALTH_SERVICES:-redis rsshub ai-filter-api ai-filter-web ai-filter-worker}"
@@ -300,8 +327,37 @@ acquire_release_lock
 cmd="${1:-}"
 image_ref="${2:-${IMAGE_REF:-}}"
 
+if [[ ( -e "${REGISTRY_DIR}/controlled-finalize.pending.json" ||
+        -L "${REGISTRY_DIR}/controlled-finalize.pending.json" ||
+        -e "${REGISTRY_DIR}/controlled-finalize.pending.json.pending" ||
+        -L "${REGISTRY_DIR}/controlled-finalize.pending.json.pending" ) && "$cmd" != "controlled-check" ]]; then
+  echo "Controlled finalize is pending; query its original operation before another release command" >&2
+  exit 8
+fi
+
+if [[ -n "$PRIVATE_CONTRACT" ]]; then
+  if [[ "$ALLOW_DIRTY_TREE" != "0" || "$REQUIRE_BUILD_CONTRACT" != "1" ||
+        "$AUTO_ROLLBACK" != "0" || "$CAPTURE_HEALTH_DIAGNOSTICS" != "0" ||
+        -n "${RELEASE_COMPOSE_FILE:-}" || "$cmd" == "rollback" || "$cmd" == "seal-current" ]]; then
+    echo "Private release requires clean source, build contract, automatic rollback/diagnostics off, and no manifest override or direct rollback" >&2
+    exit 8
+  fi
+  umask 077
+  private_contract check
+  PRIVATE_CONTRACT_SHA="$(private_contract field --field sha256)"
+  PRIVATE_RUNTIME_CONFIG_SHA="$(private_contract field --field runtime_config_sha256)"
+  COMPOSE_FILE="$(private_contract field --field manifest)"
+  private_health_services="$(private_contract field --field health_services)"
+  if [[ -n "${RELEASE_HEALTH_SERVICES:-}" && "$HEALTH_SERVICES" != "$private_health_services" ]]; then
+    echo "Private release health service override differs from sealed contract" >&2
+    exit 8
+  fi
+  HEALTH_SERVICES="$private_health_services"
+  chmod 0700 "$MANIFEST_DIR"
+fi
+
 usage() {
-  echo "Usage: $0 {build|deploy|rollback|verify|seal-current} <immutable-image-ref>" >&2
+  echo "Usage: $0 {build|deploy|rollback|verify|seal-current|controlled-finalize|controlled-finalize-query} <immutable-image-ref> [private-request.json]" >&2
   exit 1
 }
 
@@ -846,13 +902,28 @@ write_build_contract() {
   local target bundle
   target="$(build_contract_path "$ref")"
   bundle="${ref}"$'\n'"${digest}"$'\n'"${manifest}"$'\n'"${config_hash}"$'\n'"${source_id}"$'\n'"${EVENT_MAPPING_MIGRATION_GENERATION}"
+  if [[ -n "$PRIVATE_CONTRACT" ]]; then
+    bundle+=$'\n'"${PRIVATE_CONTRACT_SHA}"
+  fi
   write_atomic "$target" "$bundle"
   chmod 0600 "$target"
 }
 
+# MODE is "strict" for the release being deployed or explicitly verified, and
+# "recorded" for an already-registered release state. A recorded private build
+# may have been produced under an earlier sealed contract; rotation is allowed
+# there because its immutable digest and contract stay recorded, while the
+# newly deployed ref remains strictly matched below.
 read_build_contract() {
-  local ref="$1" target value
+  local ref="$1" mode="${2:-strict}" target value
   local -a values=()
+  case "$mode" in
+    strict|recorded) ;;
+    *)
+      echo "Invalid build contract read mode" >&2
+      return 2
+      ;;
+  esac
   target="$(build_contract_path "$ref")"
   if [[ ! -f "$target" || ! -r "$target" || -L "$target" ]]; then
     echo "No trusted build contract is recorded for $ref; run release.sh build first" >&2
@@ -861,7 +932,7 @@ read_build_contract() {
   while IFS= read -r value; do
     values[${#values[@]}]="$value"
   done < "$target"
-  if [[ "${#values[@]}" -ne 5 && "${#values[@]}" -ne 6 ]] || \
+  if [[ "${#values[@]}" -ne 5 && "${#values[@]}" -ne 6 && "${#values[@]}" -ne 7 ]] || \
      [[ "${values[0]}" != "$ref" ]] || \
      [[ ! "${values[1]}" =~ ^sha256:[0-9a-f]{64}$ ]] || \
      [[ ! "${values[2]}" =~ ^[0-9a-f]{64}$ ]] || \
@@ -876,6 +947,21 @@ read_build_contract() {
   CONTRACT_CONFIG_HASH="${values[3]}"
   CONTRACT_SOURCE_ID="${values[4]}"
   CONTRACT_MAPPING_GENERATION="${values[5]:-}"
+  CONTRACT_PRIVATE_SHA="${values[6]:-}"
+  if [[ -n "$CONTRACT_PRIVATE_SHA" ]]; then
+    if [[ ! "$CONTRACT_PRIVATE_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+      echo "Private build contract is missing or mismatched" >&2
+      return 3
+    fi
+    if [[ "$mode" == "strict" && "$CONTRACT_PRIVATE_SHA" != "$PRIVATE_CONTRACT_SHA" ]]; then
+      echo "Private build contract is missing or mismatched" >&2
+      return 3
+    fi
+    if [[ "$mode" == "recorded" && -z "$PRIVATE_CONTRACT_SHA" ]]; then
+      echo "Private build contract is missing or mismatched" >&2
+      return 3
+    fi
+  fi
   if [[ -n "$CONTRACT_MAPPING_GENERATION" && \
         "$CONTRACT_MAPPING_GENERATION" != "$EVENT_MAPPING_MIGRATION_GENERATION" ]]; then
     echo "Invalid event-mapping generation in build contract for $ref" >&2
@@ -900,7 +986,7 @@ validate_event_mapping_release_target() {
   fi
   manifest_path="${MANIFEST_DIR}/${manifest}.compose.yml"
   if ! manifest_config="$(
-    IMAGE_REF="$digest" docker compose --project-directory "$ROOT" \
+    IMAGE_REF="$digest" release_compose \
       -f "$manifest_path" --profile cron config --format json
   )"; then
     echo "Release manifest cannot prove the event-mapping generation" >&2
@@ -1217,6 +1303,12 @@ validate_image_contract() {
   local -a expected_values=(
     "$ref" "$git_head" "$manifest" "$config_hash" "$source_id"
   )
+  if [[ -n "$PRIVATE_CONTRACT" && "$manifest" == "$(sha256sum "$COMPOSE_FILE" | awk '{print $1}')" ]]; then
+    private_contract check || return $?
+    keys+=("io.ai-filter.private-release.sha256")
+    keys+=("io.ai-filter.runtime-config.sha256")
+    expected_values+=("$PRIVATE_CONTRACT_SHA" "$PRIVATE_RUNTIME_CONFIG_SHA")
+  fi
   if [[ -n "$mapping_generation" ]]; then
     keys+=("io.ai-filter.event-mapping-generation")
     expected_values+=("$mapping_generation")
@@ -1259,7 +1351,7 @@ validate_recorded_image_contract_if_present() {
   local ref="$1" digest="$2" manifest="${3:-}" target
   target="$(build_contract_path "$ref")"
   [[ -e "$target" || -L "$target" ]] || return 0
-  read_build_contract "$ref"
+  read_build_contract "$ref" recorded
   if [[ "$CONTRACT_DIGEST" != "$digest" ]] || \
      [[ -n "$manifest" && "$CONTRACT_MANIFEST" != "$manifest" ]]; then
     echo "Recorded release does not match its build contract: $ref" >&2
@@ -1272,6 +1364,7 @@ validate_recorded_image_contract_if_present() {
 
 validate_build_contract_for_deploy() {
   local ref="$1" digest="$2" manifest="$3" config_hash source_id
+  local freshness="${4:-fresh}"
   local reason actor audit_file
   if [[ "$REQUIRE_BUILD_CONTRACT" != "1" ]]; then
     reason="${RELEASE_BUILD_CONTRACT_OVERRIDE_REASON:-}"
@@ -1287,6 +1380,15 @@ validate_build_contract_for_deploy() {
     echo "WARNING: accepted audited deploy build-contract override" >&2
     return 0
   fi
+  if [[ -n "$PRIVATE_CONTRACT" ]]; then
+    if [[ "$freshness" == "fresh" ]]; then
+      private_contract check --fresh || return $?
+    elif [[ "$freshness" == "recovery" ]]; then
+      private_contract check || return $?
+    else
+      return 3
+    fi
+  fi
   config_hash="$(release_config_hash)"
   source_id="$RELEASE_SOURCE_ID"
   if [[ ! "$source_id" =~ ^[0-9a-f]{40,64}:(clean|[0-9a-f]{64})$ ]]; then
@@ -1297,7 +1399,8 @@ validate_build_contract_for_deploy() {
   if [[ "$CONTRACT_DIGEST" != "$digest" ]] || \
      [[ "$CONTRACT_MANIFEST" != "$manifest" ]] || \
      [[ "$CONTRACT_CONFIG_HASH" != "$config_hash" ]] || \
-     [[ "$CONTRACT_SOURCE_ID" != "$source_id" ]]; then
+     [[ "$CONTRACT_SOURCE_ID" != "$source_id" ]] || \
+     [[ "$CONTRACT_PRIVATE_SHA" != "$PRIVATE_CONTRACT_SHA" ]]; then
     echo "Build/deploy contract mismatch for $ref (image, manifest, config, or source changed)" >&2
     return 3
   fi
@@ -1348,7 +1451,11 @@ archive_manifest() {
   if [[ ! -f "$target" ]]; then
     tmp="${target}.tmp.$$"
     cp -- "$source" "$tmp"
-    chmod 0644 "$tmp"
+    if [[ -n "$PRIVATE_CONTRACT" ]]; then
+      chmod 0400 "$tmp"
+    else
+      chmod 0644 "$tmp"
+    fi
     mv -f "$tmp" "$target"
   fi
   if [[ "$(sha256sum "$target" | awk '{print $1}')" != "$hash" ]]; then
@@ -1480,6 +1587,15 @@ PY
 
 seal_legacy_config_manifest() {
   local manifest="$1" file config_hash snapshot_dir snapshot tmp replacements
+  if [[ -n "$PRIVATE_CONTRACT" ]]; then
+    file="$(manifest_path "$manifest")"
+    if grep -Eq '(\./config\.yaml|@RUNTIME_CONFIG@)' "$file"; then
+      echo "Private deployment requires the previous runtime config to be independently sealed before cutover" >&2
+      return 3
+    fi
+    printf '%s\n' "$manifest"
+    return 0
+  fi
   local archived_snapshot sealed
   file="$(manifest_path "$manifest")"
   config_hash="$(release_config_hash "$CONFIG_FILE")"
@@ -1518,19 +1634,30 @@ seal_legacy_config_manifest() {
   printf '%s\n' "$sealed"
 }
 
+# Archived manifests are either the historical YAML documents or the compact
+# JSON emitted by private_release_contract.encoded() (sorted keys, ',' and ':'
+# separators, one trailing newline). Match the versioned gateway *config key*
+# in either serialization; the quoted form only occurs for a mapping key, so a
+# service reference ("source":"ai-filter-gateway-nginx") does not match.
+manifest_declares_gateway_config() {
+  local file="$1"
+  grep -Fq 'ai-filter-gateway-nginx:' "$file" ||
+    grep -Fq '"ai-filter-gateway-nginx":' "$file"
+}
+
 compose_validate() {
   local ref="$1" manifest="$2" file
   file="$(manifest_path "$manifest")"
-  IMAGE_REF="$ref" docker compose --project-directory "$ROOT" -f "$file" \
+  IMAGE_REF="$ref" release_compose -f "$file" \
     config --quiet || return $?
 
   # Compose may return success after warning about an interpolated Nginx
   # variable and silently render it as an empty string.  For manifests that
-  # contain the versioned gateway, validate the *mounted* config with the
+  # declare the versioned gateway, validate the *mounted* config with the
   # pinned Nginx image.  Older archived manifests do not have this config and
   # remain valid rollback targets.
-  if grep -Fq 'ai-filter-gateway-nginx:' "$file"; then
-    IMAGE_REF="$ref" docker compose --project-directory "$ROOT" -f "$file" \
+  if manifest_declares_gateway_config "$file"; then
+    IMAGE_REF="$ref" release_compose -f "$file" \
       run --rm --no-deps ai-filter-web nginx -t || return $?
   fi
 }
@@ -1538,12 +1665,21 @@ compose_validate() {
 validate_runtime_secrets_for_manifest() {
   local manifest="$1" file secret_name secret_file mode
   file="$(manifest_path "$manifest")"
+  if [[ -n "$PRIVATE_CONTRACT" ]]; then
+    private_contract check
+    return $?
+  fi
   for secret_name in \
     dashboard_session_secret \
     ai_filter_integration_token \
     quant_market_context_token
   do
-    if ! grep -Fq "${secret_name}:" "$file"; then
+    # The archived manifest may be YAML (`name:`) or JSON (`"name":`), and
+    # YAML keys may be single- or double-quoted. Match the key with an
+    # optional quote and optional whitespace before the colon. This pattern
+    # is a strict superset of the previous fixed-string check, so a manifest
+    # that mentions the name at all is still validated (fail closed).
+    if ! grep -Eq "${secret_name}[\"']?[[:space:]]*:" "$file"; then
       continue
     fi
     secret_file="${ROOT}/secrets/${secret_name}"
@@ -1569,7 +1705,7 @@ compose_config_services() {
   local ref="$1" manifest="$2" file
   validate_runtime_digest "$ref"
   file="$(manifest_path "$manifest")"
-  IMAGE_REF="$ref" docker compose --project-directory "$ROOT" -f "$file" config --services
+  IMAGE_REF="$ref" release_compose -f "$file" config --services
 }
 
 validate_manifest_health_services() {
@@ -1589,43 +1725,57 @@ compose_up() {
   local ref="$1" manifest="$2" file
   validate_runtime_digest "$ref"
   file="$(manifest_path "$manifest")"
+  # Controlled startup grants bind exact container IDs. Ordinary convergence
+  # would recreate/remove them, so it may never handle those manifests.
+  python3 -I "${ROOT}/scripts/check_release_container_lifecycle.py" "$file" || return $?
   # Modern gateway manifests are converged in dependency order. Keeping the
   # old gateway alive while replacing a slow-starting API can make its proxied
   # health check turn unhealthy, which causes Compose to abandon the worker.
   # Each command has an explicit return because this function is called from
   # an `if ! compose_up` condition, where Bash suppresses errexit semantics.
-  if grep -Fq 'ai-filter-gateway-nginx:' "$file"; then
-    IMAGE_REF="$ref" docker compose --project-directory "$ROOT" -f "$file" \
+  if manifest_declares_gateway_config "$file"; then
+    IMAGE_REF="$ref" release_compose -f "$file" \
       up -d --no-build --pull never redis rsshub || return $?
     wait_healthy "$ref" "$manifest" "redis rsshub" "infra" || return $?
-    IMAGE_REF="$ref" docker compose --project-directory "$ROOT" -f "$file" \
+    IMAGE_REF="$ref" release_compose -f "$file" \
       up -d --no-build --pull never --no-deps --force-recreate ai-filter-api || return $?
     wait_healthy "$ref" "$manifest" "ai-filter-api" "api" || return $?
     # Compose does not always recreate a container when only inline config
     # content changes under the same config name. Recreate the lightweight
     # gateway after the API is healthy so its end-to-end probe stays useful.
-    IMAGE_REF="$ref" docker compose --project-directory "$ROOT" -f "$file" \
+    IMAGE_REF="$ref" release_compose -f "$file" \
       up -d --no-build --pull never --no-deps --force-recreate ai-filter-web || return $?
     wait_healthy "$ref" "$manifest" "ai-filter-web" "web" || return $?
-    IMAGE_REF="$ref" docker compose --project-directory "$ROOT" -f "$file" \
+    IMAGE_REF="$ref" release_compose -f "$file" \
       up -d --no-build --pull never --no-deps --force-recreate ai-filter-worker || return $?
     wait_healthy "$ref" "$manifest" "ai-filter-worker" "worker" || return $?
   fi
-  IMAGE_REF="$ref" docker compose --project-directory "$ROOT" -f "$file" \
+  IMAGE_REF="$ref" release_compose -f "$file" \
     up -d --no-build --pull never --remove-orphans || return $?
 }
 
 service_state() {
-  local ref="$1" manifest="$2" service="$3" file container_id
+  local ref="$1" manifest="$2" service="$3" file container_ids container_id count
   validate_runtime_digest "$ref"
   file="$(manifest_path "$manifest")"
-  container_id="$(IMAGE_REF="$ref" docker compose --project-directory "$ROOT" -f "$file" ps --all -q "$service")"
-  if [[ -z "$container_id" ]]; then
+  container_ids="$(IMAGE_REF="$ref" release_compose -f "$file" ps --all -q "$service")"
+  if [[ -z "$container_ids" ]]; then
     printf '%s\n' "missing"
     return
   fi
+  count="$(grep -c . <<<"$container_ids")"
+  if (( count != 1 )); then
+    # Inspecting a newline-joined argument fails, so the health gate would only
+    # time out without saying why. The host check refuses to guess as well.
+    printf 'ambiguous|%s\n' "$count"
+    return
+  fi
+  container_id="$container_ids"
+  # Docker keeps the last health result after a container exits, so the health
+  # value alone can call a stopped service "healthy". Report both fields and
+  # require State.Status=running before accepting a service.
   IMAGE_REF="$ref" docker inspect "$container_id" \
-    --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}'
+    --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}'
 }
 
 capture_health_timeout_diagnostics() {
@@ -1673,7 +1823,11 @@ wait_healthy() {
     all_healthy=1
     for service in $services; do
       state="$(service_state "$ref" "$manifest" "$service" 2>/dev/null || true)"
-      if [[ "$state" != "healthy" && "$state" != "running" ]]; then
+      if [[ "$state" == ambiguous\|* ]]; then
+        echo "Health check cannot identify a single container for $service in $ref (found ${state#ambiguous|}); refusing to guess" >&2
+        return 1
+      fi
+      if [[ "$state" != "running|healthy" && "$state" != "running|none" ]]; then
         all_healthy=0
         break
       fi
@@ -1696,7 +1850,7 @@ verify_runtime_source_immutable() {
   local ref="$1" manifest="$2" service container_id drift
   validate_runtime_digest "$ref"
   for service in ai-filter-api ai-filter-worker webhook-worker ai-filter-web; do
-    container_id="$(IMAGE_REF="$ref" docker compose --project-directory "$ROOT" \
+    container_id="$(IMAGE_REF="$ref" release_compose \
       -f "$(manifest_path "$manifest")" ps -q "$service" 2>/dev/null || true)"
     if [[ -z "$container_id" ]]; then
       continue
@@ -1866,18 +2020,29 @@ record_current() {
 }
 
 restore_previous() {
-  local ref="$1" digest="$2" manifest="$3" services="$4" actual
+  local action="$1" ref="$2" digest="$3" manifest="$4" services="$5" actual
   if [[ -z "$ref" ]]; then
     echo "No previous release state is recorded" >&2
     return 1
   fi
-  echo "Restoring previous release $ref with manifest $manifest" >&2
+  # During a rollback "previous" is the release being rolled away from, so the
+  # same sentence would read as a successful rollback while the rejected
+  # release is actually being put back.
+  if [[ "$action" == "rollback" ]]; then
+    echo "Rollback target failed; restoring recorded current release $ref with manifest $manifest" >&2
+  else
+    echo "Restoring previous release $ref with manifest $manifest" >&2
+  fi
   validate_recorded_state "$ref" "$digest" "$manifest" "$services"
   validate_event_mapping_release_target \
     "auto-rollback" "$ref" "$digest" "$manifest" "" "" "" || return $?
   compose_up "$digest" "$manifest"
   if ! wait_healthy "$digest" "$manifest" "$services" "rollback-final"; then
-    echo "Automatic rollback also failed health checks" >&2
+    if [[ "$action" == "rollback" ]]; then
+      echo "The recorded current release also failed health checks" >&2
+    else
+      echo "Automatic rollback also failed health checks" >&2
+    fi
     return 1
   fi
   actual="$(resolved_image_id "$ref")"
@@ -1887,7 +2052,7 @@ restore_previous() {
 deploy_ref() {
   local action="$1" ref="$2" manifest="$3" services="$4"
   local previous_ref="" previous_digest="" previous_manifest="" previous_services=""
-  local digest sealed_manifest
+  local digest sealed_manifest verification_stage=""
   validate_image_ref "$ref"
   services="$(normalize_health_services "$services")"
   bootstrap_or_validate_registry
@@ -1939,31 +2104,41 @@ deploy_ref() {
     return 3
   fi
 
+  if [[ -n "$PRIVATE_CONTRACT" ]]; then
+    private_contract preflight --fresh || return 3
+    private_contract image-probe --image "$digest" || return 3
+  fi
   if ! compose_up "$digest" "$manifest"; then
     record_history "$action" "$ref" "$digest" "compose_failed" "$manifest" "$services"
     if [[ -n "$previous_ref" ]] && \
        [[ "$previous_ref|$previous_manifest" != "$ref|$manifest" ]]; then
       if [[ "$AUTO_ROLLBACK" == "1" ]]; then
-        restore_previous "$previous_ref" "$previous_digest" "$previous_manifest" "$previous_services" || return 5
+        restore_previous "$action" "$previous_ref" "$previous_digest" "$previous_manifest" "$previous_services" || return 5
       else
         echo "Automatic image rollback is disabled; leaving recovery to the maintenance caller" >&2
       fi
     fi
     return 4
   fi
-  if wait_healthy "$digest" "$manifest" "$services" "release-final" && \
-     verify_runtime_source_immutable "$digest" "$manifest"; then
+  if ! wait_healthy "$digest" "$manifest" "$services" "release-final"; then
+    verification_stage="health_failed:wait_healthy"
+  elif ! verify_runtime_source_immutable "$digest" "$manifest"; then
+    verification_stage="health_failed:source_immutable"
+  elif ! verify_private_runtime "$digest"; then
+    verification_stage="health_failed:private_runtime"
+  fi
+  if [[ -z "$verification_stage" ]]; then
     record_current "$action" "$ref" "$digest" "$manifest" "$services" \
       "$previous_ref" "$previous_digest" "$previous_manifest" "$previous_services"
     echo "${action}: ${ref} (${digest}), manifest ${manifest}"
     return 0
   fi
 
-  record_history "$action" "$ref" "$digest" "health_failed" "$manifest" "$services"
+  record_history "$action" "$ref" "$digest" "$verification_stage" "$manifest" "$services"
   if [[ -n "$previous_ref" ]] && \
      [[ "$previous_ref|$previous_manifest" != "$ref|$manifest" ]]; then
     if [[ "$AUTO_ROLLBACK" == "1" ]]; then
-      restore_previous "$previous_ref" "$previous_digest" "$previous_manifest" "$previous_services" || return 5
+      restore_previous "$action" "$previous_ref" "$previous_digest" "$previous_manifest" "$previous_services" || return 5
     else
       echo "Automatic image rollback is disabled; leaving recovery to the maintenance caller" >&2
     fi
@@ -1971,6 +2146,12 @@ deploy_ref() {
     echo "Release unhealthy and no distinct previous release state is recorded" >&2
   fi
   return 4
+}
+
+verify_private_runtime() {
+  local digest="$1"
+  [[ -n "$PRIVATE_CONTRACT" ]] || return 0
+  private_contract verify-runtime --image "$digest"
 }
 
 recorded_target_for_rollback() {
@@ -1992,6 +2173,37 @@ recorded_target_for_rollback() {
 [[ -n "$cmd" && -n "$image_ref" ]] || usage
 
 case "$cmd" in
+  controlled-check)
+    # Read/verify only. The caller holds a real activation/release capability;
+    # this command can never register, start, recreate, resume or roll back.
+    [[ "$#" -eq 8 && -n "$PRIVATE_CONTRACT" && -n "${RELEASE_LOCK_FD:-}" ]] || exit 8
+    manifest="$3"
+    freshness="$4"
+    [[ "$freshness" == "fresh" || "$freshness" == "recovery" ]] || exit 8
+    [[ "$8" == "health" || "$8" == "preflight" ]] || exit 8
+    require_clean_release_tree "controlled-check" "$image_ref"
+    validate_image_ref "$image_ref"
+    verify_requested_digest "$image_ref"
+    digest="$(resolved_image_id "$image_ref")"
+    assert_ref_consistency "$image_ref" "$digest"
+    manifest_path "$manifest" >/dev/null
+    validate_image_ref "$5"
+    [[ "$(resolved_image_id "$5")" == "$6" ]] || exit 8
+    manifest_path "$7" >/dev/null
+    [[ "$(sha256sum "$COMPOSE_FILE" | awk '{print $1}')" == "$manifest" ]] || exit 8
+    if [[ "$freshness" == "fresh" ]]; then
+      require_valid_release_test_attestation "$RELEASE_SOURCE_ID"
+    fi
+    validate_build_contract_for_deploy "$image_ref" "$digest" "$manifest" "$freshness"
+    validate_event_mapping_release_target "deploy" "$image_ref" "$digest" "$manifest" "$5" "$6" "$7"
+    IMAGE_REF="$digest" release_compose -f "$(manifest_path "$manifest")" config --quiet
+    validate_runtime_secrets_for_manifest "$manifest"
+    validate_manifest_health_services "$digest" "$manifest" "$HEALTH_SERVICES"
+    if [[ "$8" == "health" ]]; then
+      wait_healthy "$digest" "$manifest" "$HEALTH_SERVICES" "controlled-finalize"
+    fi
+    echo "controlled-check:ok"
+    ;;
   build)
     validate_image_ref "$image_ref"
     if [[ "$image_ref" == *@sha256:* || "$image_ref" == sha256:* ]]; then
@@ -2000,11 +2212,14 @@ case "$cmd" in
     fi
     assert_ref_unused_for_build "$image_ref"
     require_clean_release_tree "$cmd" "$image_ref"
-    if [[ "$COMPOSE_FILE" != "${ROOT}/docker-compose.yml" ]]; then
+    if [[ -z "$PRIVATE_CONTRACT" && "$COMPOSE_FILE" != "${ROOT}/docker-compose.yml" ]]; then
       echo "Refusing build with RELEASE_COMPOSE_FILE; the test attestation covers the committed Compose manifest only" >&2
       exit 8
     fi
     require_valid_release_test_attestation "$RELEASE_SOURCE_ID"
+    if [[ -n "$PRIVATE_CONTRACT" ]]; then
+      private_contract check --fresh
+    fi
     if docker image inspect "$image_ref" >/dev/null 2>&1; then
       echo "Refusing to overwrite existing immutable version: $image_ref" >&2
       exit 3
@@ -2024,6 +2239,8 @@ case "$cmd" in
       --build-arg "AI_FILTER_BUILD_MANIFEST_SHA=$manifest" \
       --build-arg "AI_FILTER_BUILD_CONFIG_SHA=$config_hash" \
       --build-arg "AI_FILTER_BUILD_SOURCE_ID=$RELEASE_SOURCE_ID" \
+      --build-arg "AI_FILTER_PRIVATE_RELEASE_SHA=${PRIVATE_CONTRACT_SHA:-none}" \
+      --build-arg "AI_FILTER_RUNTIME_CONFIG_SHA=${PRIVATE_RUNTIME_CONFIG_SHA:-$config_hash}" \
       --build-arg "AI_FILTER_MAPPING_MIGRATION_GENERATION=$EVENT_MAPPING_MIGRATION_GENERATION" \
       "$BUILD_SNAPSHOT_DIR"
     ensure_image "$image_ref"
@@ -2035,6 +2252,9 @@ case "$cmd" in
       "$EVENT_MAPPING_MIGRATION_GENERATION"; then
       record_history "build" "$image_ref" "$digest" "contract_failed" "$manifest" "$HEALTH_SERVICES"
       exit 3
+    fi
+    if [[ -n "$PRIVATE_CONTRACT" ]]; then
+      private_contract image-probe --image "$digest"
     fi
     write_build_contract "$image_ref" "$digest" "$manifest" "$config_hash" "$RELEASE_SOURCE_ID"
     record_history "build" "$image_ref" "$digest" "built" "$manifest" "$HEALTH_SERVICES"
@@ -2059,6 +2279,15 @@ case "$cmd" in
     digest="$(resolved_image_id "$image_ref")"
     assert_ref_consistency "$image_ref" "$digest"
     validate_recorded_image_contract_if_present "$image_ref" "$digest"
+    if [[ -n "$PRIVATE_CONTRACT" ]]; then
+      read_build_contract "$image_ref"
+      if [[ "$CONTRACT_PRIVATE_SHA" != "$PRIVATE_CONTRACT_SHA" ]]; then
+        echo "Private verification requires the matching private build contract" >&2
+        exit 3
+      fi
+      private_contract image-probe --image "$digest"
+      verify_private_runtime "$digest"
+    fi
     echo "Verified ${image_ref} (${digest})"
     ;;
   seal-current)

@@ -2,15 +2,15 @@
 
 import re
 
-from scoring_provenance import NON_SUBSTANTIVE_SCORE_PATHS
+from scoring_provenance import NON_SUBSTANTIVE_SCORE_PATHS, normalize_score_path
 from utils.helpers import escape_html, plain_text_from_markup
 
 
 _PATH_LABELS = {
     "llm": "模型评分", "stage2": "模型二阶段评分",
     "fast_pass": "本地快速规则", "local_reject": "本地拒绝规则",
-    "fallback_local": "本地兜底", "similarity": "相似结果复用",
-    "radar": "雷达路径", "parse_error": "解析失败",
+    "fallback_local": "系统兜底", "similarity": "相似结果复用",
+    "radar": "雷达路径", "parse_error": "处理异常（解析失败）",
     "quality_quarantine": "质量隔离",
 }
 
@@ -21,16 +21,16 @@ def render_evidence_context(entry: dict) -> str:
     # Older projections collapse absent/NULL titles to "". Neither absence
     # nor an empty display value establishes what the scorer originally saw.
     has_title = isinstance(raw_title, str) and bool(plain_text_from_markup(raw_title).strip())
-    path = str(entry.get("score_path") or "").strip().casefold()
-    if path in NON_SUBSTANTIVE_SCORE_PATHS:
-        path_label = "缓存处理记录：系统兜底（保守中性）"
-    else:
-        path_label = "缓存处理记录：" + _PATH_LABELS.get(path, "未知")
-    title_label = "本卡片提供原始标题" if has_title else "本卡片未提供原始标题"
+    path = normalize_score_path(entry.get("score_path"))
+    # Keep conservative-neutral distinct from system fallback (do not merge labels).
+    path_label = (
+        "保守中性" if path in NON_SUBSTANTIVE_SCORE_PATHS
+        else _PATH_LABELS.get(path, "未知路径")
+    )
     lines = (
-        title_label,
-        "无法从本卡片确认评分时使用的正文范围",
-        path_label,
+        "本卡片提供原始标题" if has_title else "标题缺失",
+        "评分时使用的正文范围：未记录，无法从本卡片确认",
+        "缓存处理路径：" + path_label,
         "当前展示分数与方向的逐项生成来源未确认；分数仅为阅读优先级",
         "保守中性是处理结果，不表示新闻不重要",
         "标题点名仅说明提及，不支持投资结论；主题背景与规则池不是本文点名或受益证据",

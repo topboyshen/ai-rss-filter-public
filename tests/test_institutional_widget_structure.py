@@ -58,7 +58,8 @@ def _quality_result():
     }
 
 
-def test_quality_sections_preserve_original_counters_context_and_auth_explanation():
+def test_quality_sections_preserve_original_counters_context_and_auth_explanation(monkeypatch):
+    monkeypatch.setenv("AI_FILTER_PUBLIC_DASHBOARD_ORIGIN", "https://dashboard.example.test")
     result = _quality_result()
     saved = deepcopy(result)
     parsed = _Sections(render_quality_overview(result))
@@ -93,7 +94,7 @@ def test_quality_sections_preserve_original_counters_context_and_auth_explanatio
     assert "研究查询窗口：评分 23 条 · 入选 3 条" in parsed.text("mq-research")
     assert "市场表现仅作事后参考" in parsed.text("mq-research")
     links = [node["attrs"]["href"] for node in parsed.nodes if node["tag"] == "a"]
-    assert links == ["https://ai.example.invalid/dashboard/neutral-records"]
+    assert links == ["https://dashboard.example.test/dashboard/neutral-records"]
 
 
 @pytest.mark.parametrize("state,expected", [

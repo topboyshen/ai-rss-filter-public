@@ -37,6 +37,85 @@ def _public_source_name(value: str) -> str | None:
     return raw[:200]
 
 
+_PUBLIC_ATTEMPT_INTS = (
+    "version", "started_at", "finished_at",
+    "enabled_sources", "succeeded_sources", "failed_sources", "partial_sources",
+    "source_unrecognized_entries", "score_deferred_entries",
+    "score_terminal_unscored_entries",
+)
+_PUBLIC_CONTINUATION_INTS = (
+    "attempted", "completed", "deferred", "terminal_unscored", "errors",
+)
+_PUBLIC_REMAINING_INTS = ("total", "active", "due", "terminal")
+_PUBLIC_FAILURE_NAMES = 50
+
+
+def public_refresh_attempt(attempt: object) -> dict | None:
+    """Anonymous projection of the persisted refresh attempt.
+
+    Liveness probes need status and counters, not the writer's raw failure
+    text: error strings can carry internal hostnames or credential-bearing
+    URLs, and a feed without ``name`` falls back to its full URL. The
+    authenticated ``/status`` and keyed ``/readiness`` keep the full record.
+
+    An explicit ``remaining: null``, and any non-dict remaining value, stays
+    null. The refresh writer uses null when the post-feed journal cannot be
+    read; dropping the key would make an unknown queue look like the legacy
+    shape with no snapshot.
+    """
+    if not isinstance(attempt, dict):
+        return None
+    public: dict = {}
+    status = attempt.get("status")
+    if isinstance(status, str) and status in {"success", "partial", "failed", "noop"}:
+        public["status"] = status
+    for field in _PUBLIC_ATTEMPT_INTS:
+        value = attempt.get(field)
+        if type(value) is int:
+            public[field] = value
+    failures = attempt.get("failures")
+    if isinstance(failures, list):
+        names: list[str] = []
+        omitted = 0
+        for item in failures:
+            source = item.get("source") if isinstance(item, dict) else None
+            name = _public_source_name(source) if isinstance(source, str) else None
+            if name is None:
+                omitted += 1
+            elif not name or name in names:
+                continue
+            elif len(names) < _PUBLIC_FAILURE_NAMES:
+                names.append(name)
+            else:
+                omitted += 1
+        public["failures"] = {
+            "count": len(failures),
+            "sources": names,
+            "omitted_sources": omitted,
+        }
+    continuation = attempt.get("score_continuations")
+    if isinstance(continuation, dict):
+        projection = {
+            field: continuation[field]
+            for field in _PUBLIC_CONTINUATION_INTS
+            if type(continuation.get(field)) is int
+        }
+        if "remaining" in continuation:
+            remaining = continuation.get("remaining")
+            # A dict is a real snapshot. Null and every other shape mean the
+            # queue is unknown; omitting the key would look like no snapshot.
+            if isinstance(remaining, dict):
+                projection["remaining"] = {
+                    field: remaining[field]
+                    for field in _PUBLIC_REMAINING_INTS
+                    if type(remaining.get(field)) is int
+                }
+            else:
+                projection["remaining"] = None
+        public["score_continuations"] = projection
+    return public
+
+
 def _continuation_gaps(attempt: dict) -> tuple[int, int, int, int] | None:
     """Read only explicit batch gaps; historical terminal totals are not new failures."""
     continuation = attempt.get("score_continuations", {})

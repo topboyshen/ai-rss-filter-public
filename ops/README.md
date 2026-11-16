@@ -130,6 +130,17 @@ The complete integrity result must be one `ok` row before VACUUM starts. A non-o
 or check exception skips VACUUM and exits nonzero. A VACUUM or close exception
 also exits nonzero, and close is attempted after a database exception.
 
+The hourly ops check reads the last `host`/`finish` record in that log as the
+`db_maintenance` result: any nonzero `rc`, an `outcome` other than `success`, or
+a non-success `integrity_check`/`vacuum`/`close` phase fails the check and names
+the first failed phase and its error text. A success older than eight days is
+reported as stale. A run that has only a `start` record is reported as in
+progress for up to the 70-minute budget and then fails as unfinished, and a log
+that has no result yet is a warning rather than a failure, so a fresh install
+does not page before its first Sunday. The check only reads the log; the
+maintenance schedule, its locks, and the SQLite connection settings are
+unchanged.
+
 The host records real transport failures, including timeout exit 124 and killed
 exit 137. A timeout ends observation of the Docker client; it does **not** prove
 the container's Python process stopped. Already observed phase results remain

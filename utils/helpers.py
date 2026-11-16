@@ -1,3 +1,4 @@
+import random
 import re
 import time
 import threading
@@ -5,9 +6,59 @@ import email.utils
 import html
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Optional, Dict, Any
+from urllib.error import HTTPError
 from urllib.request import Request, ProxyHandler, build_opener
+
+# 4xx 是永久失败，重试不会改变结果；只有超时与限流值得再试。
+_RETRYABLE_HTTP_STATUS = frozenset({408, 429})
+
+
+@dataclass
+class _FeedFetchTrace:
+    phase: str = "request"
+    family: int | None = None
+    dns_errno: int | None = None
+    http_status: int | None = None
+
+    def mark_phase(self, phase, *, family=None, dns_errno=None, http_status=None):
+        self.phase = phase
+        if phase in {"request", "policy", "dns", "connect"}:
+            self.family = family
+        self.dns_errno = dns_errno
+        self.http_status = http_status
+
+
+_FEED_FETCH_TRACE: ContextVar[_FeedFetchTrace | None] = ContextVar(
+    "feed_fetch_trace", default=None,
+)
+
+
+@contextmanager
+def capture_feed_fetch_trace():
+    """Observe one fetch in the current thread, including its retry attempts."""
+    trace = _FeedFetchTrace()
+    token = _FEED_FETCH_TRACE.set(trace)
+    try:
+        yield trace
+    finally:
+        _FEED_FETCH_TRACE.reset(token)
+
+
+def mark_feed_fetch_phase(phase, *, family=None, dns_errno=None):
+    trace = _FEED_FETCH_TRACE.get()
+    if trace is not None:
+        trace.mark_phase(phase, family=family, dns_errno=dns_errno)
+
+
+def mark_feed_fetch_status(http_status):
+    trace = _FEED_FETCH_TRACE.get()
+    if trace is not None:
+        trace.http_status = http_status
 
 
 # 预编译正则（避免重复编译）
@@ -544,6 +595,7 @@ def fetch_feed(
     }
 
     def _do_fetch():
+        mark_feed_fetch_phase("request")
         # An environment proxy would perform a fresh, untrusted DNS lookup and
         # defeat address pinning. Feed fetches therefore always use a direct
         # connection through the pinned handlers.
@@ -557,6 +609,9 @@ def fetch_feed(
         req = Request(target_url, headers=headers)
         pin_request_target(req, policy_cfg)
         with opener.open(req, timeout=timeout) as resp:
+            trace = _FEED_FETCH_TRACE.get()
+            if trace is not None:
+                trace.mark_phase("body", http_status=getattr(resp, "status", None))
             payload = resp.read(max_feed_bytes + 1)
             if len(payload) > max_feed_bytes:
                 raise ValueError(
@@ -571,11 +626,17 @@ def fetch_feed(
         except PermissionError:
             # Policy failures cannot become valid through retry/backoff.
             raise
+        except HTTPError as e:
+            if e.code not in _RETRYABLE_HTTP_STATUS and not 500 <= e.code < 600:
+                # A 404/403 will answer the same way next time.
+                raise
+            last_err = e
         except Exception as e:
             last_err = e
-            if attempt == max_attempts - 1:
-                break
-            _time.sleep(backoff_base * (attempt + 1))
+        if attempt == max_attempts - 1:
+            break
+        # 抖动把同时失败的多个源错开，避免同一秒集体重试。
+        _time.sleep(backoff_base * (attempt + 1) * random.uniform(0.5, 1.0))
     if last_err:
         raise last_err
     raise RuntimeError("fetch_feed: no attempts")
