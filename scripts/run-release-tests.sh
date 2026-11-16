@@ -247,6 +247,12 @@ if [[ "${MODE}" == "focused" ]]; then
 else
   PYTEST_ARGS=(
     -I -m pytest
+    # CI full runs parallelize by file; the release gate keeps its own
+    # serial invocation as the authoritative check. ``loadfile`` keeps
+    # tests that share a repo-relative fixture (release secrets) on one
+    # worker.
+    -n auto
+    --dist loadfile
     --cov
     --cov-config=.coveragerc
     --cov-report=xml

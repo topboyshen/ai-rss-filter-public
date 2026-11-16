@@ -537,7 +537,7 @@ class WorkflowEvidenceTests(unittest.TestCase):
                        "RUNNER_TEMP": str(root), "PG_ID": "a" * 64, "CALLS": str(root / "calls.jsonl"),
                        "FAIL_COMMANDS": failed_commands}
         result = subprocess.run(["/bin/bash", "-e", "-c", self.preservation_step()], env=environment,
-                                capture_output=True, text=True, timeout=5, check=False)
+                                capture_output=True, text=True, timeout=30, check=False)
         calls = [json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()]
         return root / "pause-source-evidence", result, calls
 
