@@ -295,7 +295,7 @@ def test_ci_installs_exact_node_and_passes_only_executable_to_full_runner():
     steps = workflow["jobs"]["test"]["steps"]
     node = [step for step in steps if step.get("uses", "").startswith("actions/setup-node@")]
     assert len(node) == 1
-    assert node[0]["uses"] == "actions/setup-node@v6"
+    assert node[0]["uses"] == "actions/setup-node@v7"
     assert node[0]["with"] == {"node-version": "24.21.0", "package-manager-cache": False}
     python_index = next(index for index, step in enumerate(steps) if step.get("uses", "").startswith("actions/setup-python@"))
     preparation_index = next(index for index, step in enumerate(steps) if step.get("id") == "isolated_node")
