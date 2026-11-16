@@ -235,6 +235,8 @@ AI ↔ Quant 的双向边界、游标和恢复语义见 [Quant 集成契约](doc
 ## 文档导航
 
 - [文档索引](docs/index.md)
+- [架构说明](docs/architecture.md)
+- [部署说明](docs/deployment.md)
 - [新闻首页、手机布局与配套 Glance 配置](ops/GLANCE-READING.md)
 - [模型质量与数据契约](docs/model-quality.md)
 - [保守处理记录与登录入口](docs/neutral-records.md)
