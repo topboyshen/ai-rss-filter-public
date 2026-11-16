@@ -98,7 +98,9 @@ def score_quality_prometheus(strategy_version: str) -> list[str]:
     lines = []
     for hours in (2, 24):
         data = score_quality_snapshot(strategy_version, hours)
-        window = {'window': f'{hours}h', 'strategy_version': strategy_version}
+        # The series follows the contract bucket; the full patch stays in JSON.
+        contract = data.get('contract_version') or strategy_version
+        window = {'window': f'{hours}h', 'strategy_version': contract}
         lines.append(f'ai_filter_score_quality_available{{{_labels(window)}}} {int(data["available"])}')
         if not data['available']:
             continue

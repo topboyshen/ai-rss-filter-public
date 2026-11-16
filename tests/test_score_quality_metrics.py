@@ -30,6 +30,34 @@ def test_format_unknown_grounding_and_transport_are_distinct(monkeypatch):
     assert read_score_quality(24, 'other-contract')['validation'] == []
 
 
+def test_patch_only_identity_keeps_the_posterior_series(isolate_ai_filter_db):
+    database.init_db()
+    database.log_llm_call(
+        'stage1', 'qwen', 'fixture', success=True,
+        strategy_version='2026-11-17-rrp-v9:patch-a',
+    )
+
+    same_contract = read_score_quality(24, '2026-11-17-rrp-v9:patch-b')
+    other_contract = read_score_quality(24, '2026-11-16-rrp-v8:patch-a')
+
+    assert [row['attempts'] for row in same_contract['transport']] == [1]
+    assert other_contract['transport'] == []
+
+
+def test_prometheus_labels_follow_the_contract_bucket(monkeypatch):
+    fixture = {
+        'available': True, 'transport': [], 'validation': [],
+        'final_paths': {'llm': 1},
+        'strategy_version': 'manual:patch', 'contract_version': 'manual',
+    }
+    monkeypatch.setattr(score_quality, 'read_score_quality', lambda *a: dict(fixture))
+
+    text = '\n'.join(score_quality.score_quality_prometheus('manual:patch'))
+
+    assert 'strategy_version="manual"' in text
+    assert 'strategy_version="manual:patch"' not in text
+
+
 def test_legacy_transport_does_not_fabricate_validation_or_final_success():
     database.init_db()
     database.log_llm_call('stage1', 'kimi', 'fixture', success=True, strategy_version='legacy')

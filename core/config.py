@@ -318,7 +318,12 @@ def load_config():
     # Runtime-only host rewrites must not change the strategy identity. Compute
     # from the canonical YAML URLs first, then expose container-reachable URLs.
     auto_version = _strategy_fingerprint(cfg)
+    # Split identity into the stable contract bucket and the code/config patch.
+    # Read models compare buckets so a patch-only change keeps the posterior
+    # series; caches and provenance keep the full version and stay exact.
     cfg["scoring_strategy_fingerprint"] = auto_version
+    cfg["scoring_rule_patch"] = auto_version
+    cfg["scoring_contract_version"] = manual_version or auto_version
     cfg["scoring_strategy_version"] = f"{manual_version}:{auto_version}" if manual_version else auto_version
     _apply_rsshub_base_url_from_env(cfg)
     return cfg
