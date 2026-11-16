@@ -373,6 +373,19 @@ def test_dead_letter_and_expired_task_are_actionable(tmp_path):
     assert result["status"] not in {"ok", "info"}
 
 
+def test_stale_dead_letters_alone_do_not_turn_queue_red(tmp_path):
+    from services.dashboard_ops import read_queue_status
+
+    dead = tmp_path / "dead-letter"
+    dead.mkdir()
+    (dead / f"{'c' * 64}.5.1.json").write_text("{}", encoding="utf-8")
+
+    result = read_queue_status(tmp_path, now=NOW)
+
+    assert result["status"] in {"ok", "info"}
+    assert "死信 1" in result["detail"]  # still visible, just not an alert
+
+
 def test_complete_overview_cannot_turn_service_unknown_into_all_green(
     tmp_path, monkeypatch
 ):

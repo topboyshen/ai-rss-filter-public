@@ -238,7 +238,8 @@ def _queue_status(metrics: dict[str, Any], now: float) -> dict[str, Any]:
     startup_grace = max(0.0, now - _WORKER_STARTED_AT) < STARTUP_GRACE_SECONDS
     scan_ok = metrics.get("scan_ok") is True
     # A DLQ entry needs operator remediation, but restarting the worker cannot
-    # clear durable dead letters.  Keep DLQ as an alert/metric and reserve
+    # clear durable dead letters.  Keep DLQ as a metric (new arrivals alert via
+    # ai_filter_dead_letter_new_alert) and reserve
     # liveness failure for states a restart can plausibly recover from.
     # Queue age is an operational alert, not a liveness failure: restarting a
     # healthy dispatcher cannot make old durable work younger and can prolong a

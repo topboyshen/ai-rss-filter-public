@@ -327,7 +327,10 @@ def read_queue_status(directory, now=None) -> dict:
         )
     stale = metrics["oldest_age"] > QUEUE_MAX_AGE_SECONDS
     needs_attention = (
-        stale or metrics["dead_letter"] > 0 or metrics["invalid_files"] > 0
+        # Total DLQ is informational only: triaged dead letters stay on disk
+        # and must not keep the queue red.  New arrivals are alerted through
+        # ai_filter_dead_letter_new_alert.
+        stale or metrics["invalid_files"] > 0
     )
     detail = (
         f"待处理 {metrics['pending']} / 处理中 {metrics['inflight']} / "
