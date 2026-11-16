@@ -2,6 +2,8 @@ import time
 
 import pytest
 
+from scoring_provenance import DEFAULT_FEED_SCORE_COUNTS
+
 
 @pytest.fixture
 def feed_metrics_db(tmp_path, monkeypatch):
@@ -82,16 +84,14 @@ def test_mixed_paths_are_exclusive_and_keep_existing_formal_eligibility(
     # fallback_local is a model-link failure, not 正式达标.
     assert rows[0][6:9] == (15, 5, 6.75)
     assert details[url]["counts"] == {
+        **DEFAULT_FEED_SCORE_COUNTS,
         "passed": 5,
         "below_threshold": 2,
         "similarity": 1,
         "safe_contract": 2,
         "safe_grounding": 2,
-        "insufficient_input": 0,
-        "market_flash": 0,
         "model_failure": 1,
         "processing_error": 2,
-        "other_excluded": 0,
     }
     assert details[url]["breakdown_text"].count("模型链路失败 1") == 1
     assert details[url]["breakdown_text"].count("条目处理异常 2") == 1
@@ -317,7 +317,7 @@ def test_zero_output_reason_lists_counts_and_never_guesses(feed_metrics_db):
 
     reason = details[url]["zero_output_reason"]
     assert details[url]["counts"]["passed"] == 0
-    for expected in ("未达阈值 2", "重复稿 1", "模型链路失败 1", "条目处理异常 1"):
+    for expected in ("低于阈值 2", "重复稿 1", "模型链路失败 1", "条目处理异常 1"):
         assert expected in reason
     assert "原因未完整记录" not in reason
 
