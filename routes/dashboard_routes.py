@@ -42,11 +42,11 @@ from db import database
 from services.navigation_origins import news_home_origin
 from db.database import db_lock, get_connection
 from scoring_provenance import (
+    DEFAULT_FEED_SCORE_COUNTS,
+    FEED_SCORE_CATEGORY_LABEL_BY_KEY,
+    FEED_SCORE_CATEGORY_LABELS,
     FORMAL_SIGNAL_SCORE_PATHS,
-    INSUFFICIENT_INPUT_SCORE_PATHS,
-    MARKET_FLASH_SCORE_PATHS,
-    SAFE_NEUTRAL_CONTRACT_SCORE_PATHS,
-    SAFE_NEUTRAL_GROUNDING_SCORE_PATHS,
+    SCORE_PATH_SPECS,
     normalize_score_path,
 )
 from utils.helpers import (
@@ -1324,18 +1324,6 @@ def _get_briefing_articles(
     )
 
 
-_FEED_SCORE_REASON_LABELS = (
-    ("passed", "正式达标"),
-    ("below_threshold", "低于阈值"),
-    ("similarity", "重复稿"),
-    ("safe_contract", "格式/字段中性"),
-    ("safe_grounding", "来源依据中性"),
-    ("insufficient_input", "信息不足（0分）"),
-    ("market_flash", "行情规则（3分）"),
-    ("model_failure", "模型链路失败"),
-    ("processing_error", "条目处理异常"),
-    ("other_excluded", "其他未计入"),
-)
 
 
 def _feed_score_category(score_path, score, threshold, error_type=""):
@@ -1346,16 +1334,15 @@ def _feed_score_category(score_path, score, threshold, error_type=""):
     """
     path = normalize_score_path(score_path)
     error = str(error_type or "").strip().casefold()
-    if path == "similarity":
-        return "similarity"
-    if path in SAFE_NEUTRAL_CONTRACT_SCORE_PATHS.values():
-        return "safe_contract"
-    if path in SAFE_NEUTRAL_GROUNDING_SCORE_PATHS.values():
-        return "safe_grounding"
-    if path in INSUFFICIENT_INPUT_SCORE_PATHS.values():
-        return "insufficient_input"
-    if path in MARKET_FLASH_SCORE_PATHS.values():
-        return "market_flash"
+    spec = SCORE_PATH_SPECS.get(path)
+    if spec and spec.category in {
+        "similarity",
+        "safe_contract",
+        "safe_grounding",
+        "insufficient_input",
+        "market_flash",
+    }:
+        return spec.category
     if path == "fallback_local" or error == "llm_backends_exhausted":
         return "model_failure"
     if path in {"parse_error", "quality_quarantine"} or error in {
@@ -1387,7 +1374,7 @@ def _summarize_feed_score_rows(rows, cfg):
             "articles_total": 0, "articles_passed": 0,
             "other_contract_total": 0,
             "score_sum": 0.0, "score_count": 0, "latest_article_at": 0,
-            "counts": dict.fromkeys(dict(_FEED_SCORE_REASON_LABELS), 0),
+            "counts": DEFAULT_FEED_SCORE_COUNTS.copy(),
         })
         # ``news_cache.created_at`` is the article's publish/update time, not
         # the time this source was checked.  Keep it as a separate signal and
@@ -1446,19 +1433,21 @@ def _feed_zero_output_reason(bucket, health):
         else:
             reasons.append("近24h无新文章；原因未完整记录")
     else:
-        for key, label in (
-            ("below_threshold", "未达阈值"),
-            ("similarity", "重复稿"),
-            ("safe_contract", "格式/字段中性"),
-            ("safe_grounding", "来源依据中性"),
-            ("market_flash", "行情规则（3分）"),
-            ("insufficient_input", "信息不足（0分）"),
-            ("model_failure", "模型链路失败"),
-            ("processing_error", "条目处理异常"),
-            ("other_excluded", "其他未计入"),
+        for key in (
+            "below_threshold",
+            "similarity",
+            "safe_contract",
+            "safe_grounding",
+            "market_flash",
+            "insufficient_input",
+            "model_failure",
+            "processing_error",
+            "other_excluded",
         ):
             if counts.get(key):
-                reasons.append(f"{label} {counts[key]}")
+                reasons.append(
+                    f"{FEED_SCORE_CATEGORY_LABEL_BY_KEY[key]} {counts[key]}"
+                )
         if not reasons:
             reasons.append("原因未完整记录")
         if other_contract:
@@ -1468,7 +1457,7 @@ def _feed_zero_output_reason(bucket, health):
 
 def _feed_metric_detail(row, bucket, threshold, health=None):
     total, passed = row[6:8]
-    counts = bucket.get("counts") or dict.fromkeys(dict(_FEED_SCORE_REASON_LABELS), 0)
+    counts = bucket.get("counts") or DEFAULT_FEED_SCORE_COUNTS.copy()
     return {
         "threshold": threshold,
         "counts": counts,
@@ -1477,7 +1466,7 @@ def _feed_metric_detail(row, bucket, threshold, health=None):
         "latest_article_at": int(bucket.get("latest_article_at") or 0),
         "zero_output_reason": _feed_zero_output_reason(bucket, health),
         "breakdown_text": " · ".join(
-            f"{label} {counts[key]}" for key, label in _FEED_SCORE_REASON_LABELS
+            f"{label} {counts[key]}" for key, label in FEED_SCORE_CATEGORY_LABELS
         ) if total else "未计入近24h主来源样本，不代表抓取失败",
     }
 
@@ -1585,7 +1574,7 @@ def _get_feed_health_snapshot():
         "articles_total": 0,
         "articles_passed": 0,
         "other_contract_total": 0,
-        "counts": dict.fromkeys(dict(_FEED_SCORE_REASON_LABELS), 0),
+        "counts": DEFAULT_FEED_SCORE_COUNTS.copy(),
     }
     details = {
         row[0]: _feed_metric_detail(

@@ -2,23 +2,8 @@
 
 import re
 
-from scoring_provenance import (
-    INSUFFICIENT_INPUT_SCORE_PATHS,
-    NON_SUBSTANTIVE_SCORE_PATHS,
-    normalize_score_path,
-)
+from scoring_provenance import normalize_score_path, score_path_reading_label
 from utils.helpers import escape_html, plain_text_from_markup
-
-
-_PATH_LABELS = {
-    "llm": "模型评分", "stage2": "模型二阶段评分",
-    "fast_pass": "本地快速规则", "local_reject": "本地拒绝规则",
-    "fallback_local": "系统兜底", "similarity": "相似结果复用",
-    "radar": "雷达路径", "parse_error": "处理异常（解析失败）",
-    "quality_quarantine": "质量隔离",
-    "market_flash_rule": "行情规则（3分）",
-    "stage2_market_flash_rule": "行情规则（3分）",
-}
 
 
 def render_evidence_context(entry: dict) -> str:
@@ -28,12 +13,7 @@ def render_evidence_context(entry: dict) -> str:
     # nor an empty display value establishes what the scorer originally saw.
     has_title = isinstance(raw_title, str) and bool(plain_text_from_markup(raw_title).strip())
     path = normalize_score_path(entry.get("score_path"))
-    if path in INSUFFICIENT_INPUT_SCORE_PATHS.values():
-        path_label = "信息不足（0分）"
-    elif path in NON_SUBSTANTIVE_SCORE_PATHS:
-        path_label = "保守中性"
-    else:
-        path_label = _PATH_LABELS.get(path, "未知路径")
+    path_label = score_path_reading_label(path)
     lines = (
         "本卡片提供原始标题" if has_title else "标题缺失",
         "评分时使用的正文范围：未记录，无法从本卡片确认",

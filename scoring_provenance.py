@@ -1,5 +1,6 @@
 """Bounded scoring-resolution labels shared by scoring and persistence."""
 
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 
 SEMANTIC_RESOLUTION_SAFE_NEUTRAL_CONTRACT = "safe_neutral_contract"
@@ -170,3 +171,84 @@ NEUTRAL_EVIDENCE_REASONS = frozenset(
         NEUTRAL_REASON_INSUFFICIENT,
     }
 )
+
+# One read-surface registry for every persisted score path.  Adding a path here
+# is enough for dashboard count defaults, breakdown labels and reading labels;
+# those surfaces must not keep parallel copies that drift.
+FEED_SCORE_CATEGORY_LABELS = (
+    ("passed", "正式达标"),
+    ("below_threshold", "低于阈值"),
+    ("similarity", "重复稿"),
+    ("safe_contract", "格式/字段中性"),
+    ("safe_grounding", "来源依据中性"),
+    ("insufficient_input", "信息不足（0分）"),
+    ("market_flash", "行情规则（3分）"),
+    ("model_failure", "模型链路失败"),
+    ("processing_error", "条目处理异常"),
+    ("other_excluded", "其他未计入"),
+)
+FEED_SCORE_CATEGORY_LABEL_BY_KEY = dict(FEED_SCORE_CATEGORY_LABELS)
+FEED_SCORE_CATEGORY_KEYS = tuple(FEED_SCORE_CATEGORY_LABEL_BY_KEY)
+DEFAULT_FEED_SCORE_COUNTS = dict.fromkeys(FEED_SCORE_CATEGORY_KEYS, 0)
+
+
+@dataclass(frozen=True)
+class ScorePathSpec:
+    """Category and human label for one persisted score path."""
+
+    path_id: str
+    category: str
+    reading_label: str
+
+
+SCORE_PATH_SPECS = {
+    spec.path_id: spec
+    for spec in (
+        ScorePathSpec("llm", "", "模型评分"),
+        ScorePathSpec("stage2", "", "模型二阶段评分"),
+        ScorePathSpec("fast_pass", "", "本地快速规则"),
+        ScorePathSpec("local_reject", "", "本地拒绝规则"),
+        ScorePathSpec("fallback_local", "model_failure", "系统兜底"),
+        ScorePathSpec("parse_error", "processing_error", "处理异常（解析失败）"),
+        ScorePathSpec("quality_quarantine", "processing_error", "质量隔离"),
+        ScorePathSpec("similarity", "similarity", "相似结果复用"),
+        ScorePathSpec("radar", "", "雷达路径"),
+        *(
+            ScorePathSpec(path, "safe_contract", "保守中性")
+            for path in SAFE_NEUTRAL_CONTRACT_SCORE_PATHS.values()
+        ),
+        *(
+            ScorePathSpec(path, "safe_grounding", "保守中性")
+            for path in SAFE_NEUTRAL_GROUNDING_SCORE_PATHS.values()
+        ),
+        *(
+            ScorePathSpec(path, "other_excluded", "保守中性")
+            for path in SAFE_NEUTRAL_INITIAL_SCORE_PATHS.values()
+        ),
+        *(
+            ScorePathSpec(path, "insufficient_input", "信息不足（0分）")
+            for path in INSUFFICIENT_INPUT_SCORE_PATHS.values()
+        ),
+        *(
+            ScorePathSpec(path, "market_flash", "行情规则（3分）")
+            for path in MARKET_FLASH_SCORE_PATHS.values()
+        ),
+    )
+}
+
+if set(SCORE_PATH_SPECS) != RECOGNIZED_SCORE_PATHS:
+    raise RuntimeError(
+        "score path registry is out of sync with RECOGNIZED_SCORE_PATHS"
+    )
+if not set(FEED_SCORE_CATEGORY_KEYS) >= {
+    spec.category for spec in SCORE_PATH_SPECS.values() if spec.category
+}:
+    raise RuntimeError(
+        "score path category is not declared in FEED_SCORE_CATEGORY_LABELS"
+    )
+
+
+def score_path_reading_label(value: object) -> str:
+    """Reading-surface explanation for a persisted path; never guess."""
+    spec = SCORE_PATH_SPECS.get(normalize_score_path(value))
+    return spec.reading_label if spec else "未知路径"
