@@ -7,17 +7,6 @@ SEMANTIC_RESOLUTION_SAFE_NEUTRAL_GROUNDING = "safe_neutral_grounding"
 SEMANTIC_RESOLUTION_SAFE_NEUTRAL_INITIAL = "safe_neutral_initial"
 SEMANTIC_RESOLUTION_INSUFFICIENT_INPUT = "insufficient_input"
 INSUFFICIENT_INPUT_TAG = "信息不足"
-INSUFFICIENT_INPUT_EXPLANATIONS = (
-    "缺少可识别主体",
-    "缺少可识别事件",
-    "缺少可识别主体和事件",
-)
-INSUFFICIENT_INPUT_PROMPT = (
-    f'标题和摘要合起来仍无法识别主体或事件时，不要猜，也不要给 4 分。输出 score=0、'
-    f'tag="{INSUFFICIENT_INPUT_TAG}"、sentiment="中性"。logic 只可原样选择'
-    + "、".join(f"“{reason}”" for reason in INSUFFICIENT_INPUT_EXPLANATIONS)
-    + "之一，不得附加其他内容。"
-)
 SAFE_NEUTRAL_CONTRACT_VALUES = (
     4.0,
     "其他",
@@ -40,10 +29,14 @@ def is_insufficient_input_fields(score, tag, logic, direction) -> bool:
         zero_score = Decimal(str(score)).is_zero()
     except InvalidOperation:
         return False
+    # The explanation stays free text: requiring a fixed menu pushed the model
+    # to choose the sentinel far more often and cost relevant items.  What the
+    # contract needs is an exact zero, the reserved tag, a recorded reason and
+    # a neutral direction; the reserved tag is rejected otherwise.
     return (
         zero_score
         and tag == INSUFFICIENT_INPUT_TAG
-        and logic in INSUFFICIENT_INPUT_EXPLANATIONS
+        and bool(str(logic or "").strip())
         and str(direction or "").strip() in {"中性", "⚖️"}
     )
 

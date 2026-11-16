@@ -15,7 +15,6 @@ from core.scorer import (
 from db import database
 from db.score_quality import read_score_quality
 from scoring_provenance import (
-    INSUFFICIENT_INPUT_EXPLANATIONS,
     SEMANTIC_RESOLUTION_INSUFFICIENT_INPUT,
     is_insufficient_input_fields,
 )
@@ -35,7 +34,12 @@ def _score_text(fmt, *, score=0, tag="信息不足", logic=SENTINEL[2], sentimen
 
 
 @pytest.mark.parametrize("fmt", ["json", "named", "brackets"])
-@pytest.mark.parametrize("logic", INSUFFICIENT_INPUT_EXPLANATIONS)
+@pytest.mark.parametrize("logic", [
+    "缺少可识别事件",
+    "缺少可识别主体和事件",
+    "标题仅含节目名称和日期，无点名主体或具体事件",
+    "缺少点名的公司、机构、国家、政策或资产",
+])
 def test_parser_accepts_insufficient_sentinel(fmt, logic):
     parsed, detail = Scorer._parse_score_result_with_detail(_score_text(fmt, logic=logic))
     assert parsed == (0.0, "信息不足", logic, "⚖️")
@@ -45,9 +49,6 @@ def test_parser_accepts_insufficient_sentinel(fmt, logic):
 
 @pytest.mark.parametrize("fmt", ["json", "named", "brackets"])
 @pytest.mark.parametrize("fields", [
-    {"logic": "公司营业收入增长99%"},
-    {"logic": "缺少可识别事件（公司营业收入增长99%）"},
-    {"logic": "缺少可识别事件1"},
     {"score": 4},
     {"sentiment": "看空"},
 ])
@@ -83,13 +84,40 @@ def test_json_parser_rejects_out_of_range_integer():
     assert detail == "invalid_score"
 
 
-def test_writer_rejects_freeform_insufficient_explanation():
+def _insufficient_signal(score, logic, link="https://example.test/freeform-insufficient"):
+    return {
+        "link": link,
+        "score_path": "insufficient_input",
+        "score": score,
+        "event_type": "信息不足",
+        "logic": logic,
+        "direction": "中性",
+        "selected": False,
+        "aggregation_threshold": 6,
+    }
+
+
+def test_writer_accepts_freeform_insufficient_explanation():
+    database.init_db()
+    logic = "缺少点名的公司、机构或具体事件"
+    database.set_cached_entry(
+        "https://example.test/freeform-insufficient", "栏目名", "栏目名", 0,
+        "信息不足", logic, score_path="insufficient_input",
+        model_name="fixture-model", stage1_score=0.0, stage1_model="fixture-model",
+        safe_neutral_reason="insufficient",
+        backtest_signal=_insufficient_signal(0, logic),
+    )
+
+
+def test_writer_rejects_scored_insufficient_tag():
     database.init_db()
     with pytest.raises(ValueError, match="insufficient-input tuple"):
         database.set_cached_entry(
-            "https://example.test/invalid-insufficient", "栏目名", "栏目名", 0,
-            "信息不足", "公司营业收入增长99%", score_path="insufficient_input",
-            backtest_signal={"score_path": "insufficient_input"},
+            "https://example.test/invalid-insufficient", "栏目名", "栏目名", 3,
+            "信息不足", "缺少可识别事件", score_path="insufficient_input",
+            backtest_signal=_insufficient_signal(
+                3, "缺少可识别事件", "https://example.test/invalid-insufficient"
+            ),
         )
 
 
@@ -264,10 +292,9 @@ def test_processor_persists_insufficient_input_as_filtered_and_unselected(monkey
 
 def test_builtin_prompts_preserve_title_only_rule_and_insufficient_sentinel():
     from core.prompts import BUILTIN_PROMPTS
-    from scoring_provenance import INSUFFICIENT_INPUT_PROMPT
 
     for prompt in BUILTIN_PROMPTS.values():
-        assert INSUFFICIENT_INPUT_PROMPT in prompt
+        assert 'logic 说明缺什么' in prompt
         assert "只有“标题和摘要都无法识别主体或事件”时才用信息不足" in prompt
         assert "“摘要为空”不等于信息不足" in prompt
         assert "这些属于待核查" in prompt
