@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 import re
 import time
@@ -12,6 +13,8 @@ from scoring_provenance import (
     PUBLIC_SCORE_PATHS,
 )
 from utils.helpers import normalize_direction
+
+logger = logging.getLogger(__name__)
 
 
 IRRELEVANT_TAGS = {"无", "无关", "无相关", "无相关标签", "未知"}
@@ -96,7 +99,13 @@ def equivalent_feed_urls(cfg: dict, feed_url: str | None = None) -> list[str]:
         return []
     try:
         return _unique_urls(DB.equivalent_feed_urls(cfg, feed_url))
-    except Exception:
+    except Exception as e:
+        # 回退到原始 URL 会静默丢掉运行时别名；数据库故障必须留痕。
+        logger.warning(
+            "[intelligence] equivalent_feed_urls failed for %s: %s",
+            feed_url,
+            str(e)[:160],
+        )
         return _unique_urls([feed_url])
 
 
@@ -105,7 +114,12 @@ def canonical_feed_url(cfg: dict, feed_url: str | None = None) -> str:
         return ""
     try:
         return str(DB.canonical_feed_url(cfg, feed_url) or feed_url)
-    except Exception:
+    except Exception as e:
+        logger.warning(
+            "[intelligence] canonical_feed_url failed for %s: %s",
+            feed_url,
+            str(e)[:160],
+        )
         return str(feed_url or "")
 
 

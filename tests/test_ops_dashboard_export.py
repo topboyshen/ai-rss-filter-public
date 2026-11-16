@@ -93,6 +93,30 @@ def test_check_allowlist_drops_secrets_and_normalizes_budget_failures():
     ]
 
 
+def test_trading_calendar_result_reaches_the_allowlisted_rows():
+    result = monitor.CheckResult(
+        "trading_calendar",
+        False,
+        "calendar missing for 2027; trading-day decisions fail from 2027-01-01",
+    )
+
+    assert monitor._dashboard_check_rows([result]) == [
+        {"name": "trading_calendar", "status": "FAIL"}
+    ]
+
+
+def test_db_maintenance_result_reaches_the_allowlisted_rows():
+    result = monitor.CheckResult(
+        "db_maintenance",
+        False,
+        "rc=1 outcome=failed vacuum=failed error=database is locked",
+    )
+
+    assert monitor._dashboard_check_rows([result]) == [
+        {"name": "db_maintenance", "status": "FAIL"}
+    ]
+
+
 def test_duplicate_check_names_do_not_produce_healthy_snapshot():
     results = [
         monitor.CheckResult("metrics", True, "first"),

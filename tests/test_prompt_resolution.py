@@ -95,6 +95,7 @@ def _expected_body(cfg, key):
 def model(monkeypatch):
     """FAKE model behind the real Scorer; records every system prompt it gets."""
     database.init_db()
+    monkeypatch.setattr(Scorer, "_instance", None)
     seen = []
     backend = LLMBackend("fixture", "", "https://invalid.test", "fixture-model")
     monkeypatch.setattr(backend, "client", object())

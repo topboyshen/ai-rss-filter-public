@@ -4,9 +4,11 @@ from __future__ import annotations
 import base64
 import copy
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -77,7 +79,235 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(rows[1].findtext("link"), "https://example.invalid/scheduler")
 
 
+FIXTURE_PROCESS = r'''
+import json, linecache, os, pathlib, signal, sys, threading
+sys.path.insert(0, sys.argv[1])
+import miniflux_pause_fixture as fixture
+root = pathlib.Path(sys.argv[2])
+server = fixture.ThreadingHTTPServer(('127.0.0.1', 0), fixture.Handler)
+server.fixture = fixture.Fixture(root / 'events', 'a' * 64)
+if sys.argv[3] == 'nested_term':
+    def nested(frame, event, arg):
+        line = linecache.getline(frame.f_code.co_filename, frame.f_lineno).strip() if event == 'line' else ''
+        locked_event = (frame.f_code is threading.Event.set.__code__ and line == 'self._flag = True'
+                        and frame.f_back.f_code.co_name == 'request_stop')
+        plain_assignment = frame.f_code.co_name == 'request_stop' and line == 'stopping = True'
+        if locked_event or plain_assignment:
+            sys.settrace(None)
+            (root / 'nested-term.json').write_text(json.dumps({'signal': 'SIGTERM', 'handler_active': True}))
+            # Test-only bound: reverting to Event.set must fail, never leave a
+            # subprocess deadlocked while its signal handler holds that lock.
+            signal.alarm(2)
+            os.kill(os.getpid(), signal.SIGTERM)
+        return nested
+    sys.settrace(nested)
+if sys.argv[3].startswith('failure'):
+    def fail(**kwargs):
+        if sys.argv[3] == 'failure_term':
+            os.kill(os.getpid(), signal.SIGTERM)
+        raise RuntimeError('synthetic serve failure retained')
+    server.serve_forever = fail
+# Test-only input releases a request already accepted before TERM. It does not
+# add a release endpoint or change the production fixture's hold deadline.
+def release():
+    if sys.stdin.readline() == 'release\n':
+        server.fixture.control({'items': ['seed'], 'hold': False, 'release': True})
+threading.Thread(target=release, daemon=True).start()
+(root / 'port.json').write_text(json.dumps(server.server_port))
+fixture.serve_until_term(server)
+'''
+
+
+class FixtureProcessTests(unittest.TestCase):
+    def setUp(self):
+        parent = os.environ.get("AI_FILTER_CUTOVER_EVIDENCE_DIR")
+        if parent:
+            Path(parent).mkdir(parents=True, exist_ok=True)
+        self.root = Path(tempfile.mkdtemp(prefix="miniflux-term-fixture-", dir=parent))
+        self.process = None
+
+    def tearDown(self):
+        if self.process is not None:
+            try:
+                if self.process.poll() is None:
+                    self.release()
+                    self.process.send_signal(signal.SIGTERM)
+                self.process.wait(timeout=8)
+            finally:
+                self.process.stdin.close()
+
+    def start(self, mode="normal"):
+        with (self.root / "stdout.log").open("wb") as stdout, (self.root / "stderr.log").open("wb") as stderr:
+            self.process = subprocess.Popen([sys.executable, "-I", "-B", "-c", FIXTURE_PROCESS,
+                                             str(SCRIPTS), str(self.root), mode],
+                                            stdin=subprocess.PIPE, stdout=stdout, stderr=stderr, bufsize=0)
+        if mode.startswith("failure"):
+            return
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            self.assertIsNone(self.process.poll(), (self.root / "stderr.log").read_text())
+            try:
+                self.port = json.loads((self.root / "port.json").read_bytes())
+                status, _ = self.request("GET", "/health")
+                if status == 200:
+                    return
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
+                pass
+            time.sleep(0.01)
+        self.fail("synthetic HTTP fixture did not become ready")
+
+    def request(self, method, path, body=None):
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=3)
+        try:
+            connection.request(method, path, body=body, headers={"Authorization": "Bearer " + "a" * 64})
+            response = connection.getresponse()
+            return response.status, response.read()
+        finally:
+            connection.close()
+
+    def release(self):
+        try:
+            self.process.stdin.write(b"release\n")
+            self.process.stdin.flush()
+        except BrokenPipeError:
+            pass
+
+    def test_real_request_then_term_exits_zero_and_preserves_original_event(self):
+        self.start()
+        status, body = self.request("GET", "/feed")
+        self.assertEqual(status, 200)
+        self.assertIn(b"<guid>seed</guid>", body)
+        event = self.root / "events/event-00001.json"
+        original = event.read_bytes()
+        self.assertEqual(json.loads(original)["kind"], "feed")
+        self.process.send_signal(signal.SIGTERM)
+        self.assertEqual(self.process.wait(timeout=3), 0)
+        self.assertEqual(event.read_bytes(), original)
+        self.assertEqual((self.root / "stderr.log").read_bytes(), b"")
+
+    def test_repeated_term_waits_for_inflight_original_and_response(self):
+        self.start()
+        status, _ = self.request("POST", "/control", fixture.canonical({"items": ["seed"], "hold": True, "release": False}))
+        self.assertEqual(status, 200)
+        body, response, failures = b'{"synthetic":"original whitespace"} ', [], []
+
+        def deliver():
+            try:
+                response.append(self.request("POST", "/hook", body))
+            except Exception as error:
+                failures.append(error)
+
+        request = threading.Thread(target=deliver)
+        request.start()
+        try:
+            deadline, events = time.monotonic() + 2, []
+            while time.monotonic() < deadline:
+                status, raw = self.request("GET", "/events")
+                self.assertEqual(status, 200)
+                events = json.loads(raw)["events"]
+                if events:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(len(events), 1)
+            self.assertIs(events[0]["held"], True)
+            event = self.root / "events/event-00001.json"
+            original = event.read_bytes()
+            for _ in range(2):
+                self.process.send_signal(signal.SIGTERM)
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    self.process.wait(timeout=0.15)
+                self.assertEqual(response, [])
+                self.assertEqual(event.read_bytes(), original)
+            self.release()
+            request.join(timeout=3)
+            self.assertFalse(request.is_alive())
+            self.assertEqual(failures, [])
+            self.assertEqual(response[0][0], 202)
+            self.assertEqual(json.loads(response[0][1])["body_sha256"], hashlib.sha256(body).hexdigest())
+            self.assertEqual(self.process.wait(timeout=3), 0)
+            self.assertEqual(event.read_bytes(), original)
+            self.assertEqual(base64.b64decode(json.loads(original)["body_b64"]), body)
+            self.assertEqual(json.loads((self.root / "events/event-00002.json").read_bytes())["kind"], "webhook_response")
+            self.assertEqual((self.root / "stderr.log").read_bytes(), b"")
+        finally:
+            self.release()
+            request.join(timeout=3)
+
+    def test_term_reentering_active_signal_handler_exits_zero(self):
+        self.start("nested_term")
+        status, _ = self.request("GET", "/feed")
+        self.assertEqual(status, 200)
+        event = self.root / "events/event-00001.json"
+        original = event.read_bytes()
+        self.process.send_signal(signal.SIGTERM)
+        self.assertEqual(self.process.wait(timeout=3), 0)
+        self.assertEqual(json.loads((self.root / "nested-term.json").read_bytes()),
+                         {"signal": "SIGTERM", "handler_active": True})
+        self.assertEqual(event.read_bytes(), original)
+        self.assertEqual((self.root / "stderr.log").read_bytes(), b"")
+
+    def test_server_exception_is_retained_and_never_claims_normal_term_exit(self):
+        root = self.root
+        for attempt in range(4):
+            for mode in ("failure", "failure_term"):
+                with self.subTest(attempt=attempt, mode=mode):
+                    self.root = root / f"{mode}-{attempt}"
+                    self.root.mkdir(mode=0o700)
+                    self.start(mode)
+                    self.assertEqual(self.process.wait(timeout=3), 1)
+                    self.process.stdin.close()
+                    self.assertIn(b"RuntimeError: synthetic serve failure retained", (self.root / "stderr.log").read_bytes())
+                    self.assertEqual(list((self.root / "events").iterdir()), [])
+
+
 class NativeGuardTests(unittest.TestCase):
+    def test_added_drain_and_existing_joint_scenarios_use_distinct_resume_operations(self):
+        import miniflux_host_joint_native as joint
+
+        class ReachedResume(Exception):
+            pass
+
+        harness = object.__new__(native.Harness)
+        harness.output = Path("unused-synthetic-evidence")
+        harness.owner = "a" * 32
+        # Exercise both real scenario entry points up to their first control
+        # request. No Docker, cron child, or synthetic file creation is needed.
+        operations = []
+        with patch.object(harness, "resume", side_effect=ReachedResume) as resume, \
+                patch.object(joint, "old_cron_proof", return_value={}):
+            for scenario in (harness.stop_new_drain_case, lambda prior: joint.run(harness, prior)):
+                with self.assertRaises(ReachedResume):
+                    scenario("4" * 64)
+                operations.append(resume.call_args.args[1])
+        self.assertEqual(len(set(operations)), 2)
+        for operation in operations:
+            self.assertRegex(operation, r"^[0-9a-f]{64}$")
+
+    def test_stop_new_confirmation_requires_exact_producer_counts_and_distinct_state(self):
+        harness = object.__new__(native.Harness)
+        harness.manifest = "a" * 64
+        receipt = {"confirmed": True, "result": {"schema": 1, "manifest": harness.manifest,
+            "operation_id": "b" * 64, "action": "stop_new", "state": "draining", "durable": True,
+            "confirmed": True, "previous_generation": 0, "generation": 1,
+            "active_leases": 2, "uncertain_leases": 0,
+            "active_producer_leases": 0, "uncertain_producer_leases": 0}}
+        self.assertEqual(harness.checked_draining(receipt, "b" * 64), receipt["result"])
+        for field in ("active_producer_leases", "uncertain_producer_leases"):
+            for value in (None, True, -1, 1):
+                wrong = copy.deepcopy(receipt)
+                wrong["result"][field] = value
+                with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                    harness.checked_draining(wrong, "b" * 64)
+        for field, value in (("action", "pause"), ("state", "closed"), ("generation", 3)):
+            wrong = copy.deepcopy(receipt)
+            wrong["result"][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                harness.checked_draining(wrong, "b" * 64)
+        pending = copy.deepcopy(receipt)
+        pending["confirmed"] = pending["result"]["confirmed"] = False
+        pending["result"]["active_producer_leases"] = 1
+        self.assertEqual(harness.checked_draining(pending, "b" * 64, confirmed=False), pending["result"])
+
     def test_consecutive_commands_share_remaining_phase_budget(self):
         with tempfile.TemporaryDirectory(prefix="phase-command-") as directory:
             harness = object.__new__(native.Harness)
