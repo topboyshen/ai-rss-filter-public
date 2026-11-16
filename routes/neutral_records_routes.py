@@ -15,6 +15,7 @@ from routes.browser_auth import (
 )
 from routes.shared import _cfg
 from services.neutral_records import NEUTRAL_RECORDS_PATH, present_neutral_records
+from services.navigation_origins import news_home_origin
 
 
 logger = logging.getLogger(__name__)
@@ -40,7 +41,8 @@ def neutral_records_page():
         snapshot = {"available": False, "strategy_version": "", "has_more": False}
         records = []
     response = Response(
-        render_template("neutral_records.html", snapshot=snapshot, records=records),
+        render_template("neutral_records.html", snapshot=snapshot, records=records,
+                        news_home_origin=news_home_origin()),
         status=200 if snapshot["available"] else 503,
         mimetype="text/html",
     )

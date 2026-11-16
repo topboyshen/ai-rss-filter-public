@@ -300,10 +300,12 @@ def test_unstable_existing_receipt_never_acknowledges_or_isolates_as_partial(
     monkeypatch.setattr(os, "pread", unstable_pread)
     monkeypatch.setattr(receipts.ReceiptStore, "_held_header", not_partial)
     assert signed_post(delivery, body, path).status_code == 503
-    assert signed_post(delivery, raw_body(711)).status_code == 503
+    # Capacity/index checks read only reservation headers (P2-6), so an
+    # unrelated delivery does not read this unstable body.
+    assert signed_post(delivery, raw_body(711)).status_code == 202
     assert final.read_bytes() == original
-    assert len(list(directory.glob("*.json"))) == 1
-    assert len(pending(delivery)) == 1
+    assert len(list(directory.glob("*.json"))) == 2
+    assert len(pending(delivery)) == 2
     assert delivery.calls == []
     # Removing the injected I/O fault must expose the same durable receipt,
     # not poison it, create a duplicate task, or spend a scoring attempt.
@@ -315,7 +317,7 @@ def test_unstable_existing_receipt_never_acknowledges_or_isolates_as_partial(
     assert duplicate.get_json()["status"] == "duplicate"
     assert queried.get_json()["task_digest"] == duplicate.get_json()["task_digest"]
     assert final.read_bytes() == original
-    assert len(pending(delivery)) == 1
+    assert len(pending(delivery)) == 2
     assert signed_post(delivery, raw_body(711)).status_code == 202
     assert len(pending(delivery)) == 2
     assert delivery.calls == []

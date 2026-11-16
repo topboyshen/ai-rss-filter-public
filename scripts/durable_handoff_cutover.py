@@ -219,10 +219,10 @@ class Controller:
 
     def request(self, path, payload=None):
         started = time.monotonic()
-        self.last_request = {"method": "POST" if payload is not None else "GET", "path": path,
+        observation = self.last_request = {"method": "POST" if payload is not None else "GET", "path": path,
             "action": payload.get("action") if payload is not None else None,
             "phase": self.state["phase"], "stage": "budget", "outcome": "not_started",
-            "request_seconds": self.manifest["budget"]["request_seconds"]}
+            "request_seconds": self.manifest["budget"]["request_seconds"], "deadline_abort_entered": False}
         remaining = min(self.state["expires_at"] - time.time(), self.manifest["budget"]["total_seconds"] - (time.monotonic() - self.started))
         self.last_request["remaining_total_seconds"] = remaining
         require(remaining > 0, "frozen total deadline expired")
@@ -236,6 +236,7 @@ class Controller:
             connection.connect()
             wire = connection.sock.dup()
             def abort():
+                observation["deadline_abort_entered"] = True
                 try:
                     wire.shutdown(socket.SHUT_RDWR)
                 except OSError:

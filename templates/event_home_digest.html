@@ -3,7 +3,7 @@
   <div class="event-radar-summary-top">
     <span class="event-radar-summary-type{% if item.correction_kind %} is-correction{% endif %}">{% if item.correction_kind == 'request' %}要求澄清／问询 · 非否认{% elif item.correction_kind == 'denial' %}澄清／更正线索{% elif item.block == 'pending' %}待验证{% elif item.block == 'advanced' %}推进{% else %}新增{% endif %}</span>
   </div>
-  <h4 class="event-radar-summary-title"><a href="{{ dashboard_origin }}/dashboard/events?event_id={{ item.event_id|urlencode }}&amp;tab=overview#event-detail" target="_blank" rel="noopener noreferrer">{{ item.title or '未命名事件' }}</a></h4>
+  <h4 class="event-radar-summary-title">{% if dashboard_origin %}<a href="{{ dashboard_origin }}/dashboard/events?event_id={{ item.event_id|urlencode }}&amp;tab=overview#event-detail" target="_blank" rel="noopener noreferrer">{{ item.title or '未命名事件' }}</a>{% else %}{{ item.title or '未命名事件' }}{% endif %}</h4>
   <p class="event-radar-summary-change">{{ item.change }}</p>
   {% if item.background_note %}<p class="event-radar-summary-background">{{ item.background_note }}</p>{% endif %}
   {% if item.companies %}<p class="event-radar-summary-companies">原文提及：{{ item.companies[:3]|join('、') }}</p>{% endif %}
@@ -78,9 +78,11 @@
   {% endif %}
 
   <nav class="event-radar-summary-nav" aria-label="事件报告入口">
+    {% if dashboard_origin %}
     <a href="{{ dashboard_origin }}{{ digest.daily_url }}" target="_blank" rel="noopener noreferrer">今日日报 →</a>
     <a href="{{ dashboard_origin }}{{ digest.weekly_url }}" target="_blank" rel="noopener noreferrer">本周周报 →</a>
     <a href="{{ dashboard_origin }}/dashboard/events" target="_blank" rel="noopener noreferrer">完整事件雷达 →</a>
+    {% else %}<span>后台入口未配置</span>{% endif %}
   </nav>
   <p class="event-radar-summary-foot">仅摘录已入库报告中的变化，非全网覆盖；原文提及不代表推荐或受益。完整来源与验证说明请看日报、周报。</p>
 </div>
