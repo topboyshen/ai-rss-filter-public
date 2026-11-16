@@ -147,6 +147,10 @@ def test_actual_worker_spool_probe_keeps_git_and_release_guard_clean(
     "data/webhook_spool/.lock",
     "data/webhook_spool/.completed-digests",
     "data/webhook_spool/queued.json",
+    "data/webhook_spool/receipts/" + "a" * 64 + ".json",
+    "data/webhook_spool/receipts/" + "a" * 64 + ".json.pending",
+    "data/webhook_spool/receipts/tasks/" + "b" * 64 + ".json",
+    "data/webhook_spool/receipts/alias-intents/" + "c" * 64 + ".json",
 ])
 def test_runtime_spool_paths_remain_ignored(clean_repo, relative):
     repo, env = clean_repo
@@ -165,6 +169,7 @@ def test_runtime_spool_paths_remain_ignored(clean_repo, relative):
     "data/other/.health-synthetic",
     "nested/data/webhook_spool/.tmp-synthetic",
     "nested/data/webhook_spool/.health-synthetic",
+    "nested/data/webhook_spool/receipts/" + "a" * 64 + ".json",
     "data/webhook_spool/other/.tmp-synthetic",
     "data/webhook_spool/other/.health-synthetic",
     "data/webhook_spool/.tmp",

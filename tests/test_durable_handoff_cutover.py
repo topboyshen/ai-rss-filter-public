@@ -9,6 +9,7 @@ import base64
 import copy
 import hashlib
 import http.client
+from http.server import ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
@@ -24,7 +25,44 @@ from unittest.mock import patch
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 import durable_handoff_cutover as cutover  # noqa: E402
-from durable_handoff_cutover_fixture import Fixture  # noqa: E402
+from durable_handoff_cutover_fixture import Fixture, Handler, after_unlock_notice, write_notice  # noqa: E402
+
+
+def read_fixture_line(stream, evidence, expires_at):
+    """One bounded raw frame; never use a buffered readline on this pipe."""
+    raw = bytearray()
+    deadline = time.monotonic() + max(0, expires_at - time.time())
+    try:
+        while True:
+            remaining = min(expires_at - time.time(), deadline - time.monotonic())
+            cutover.require(remaining > 0, "fixture notification deadline expired")
+            ready, _, _ = select.select([stream], [], [], remaining)
+            cutover.require(ready, "fixture notification missing before deadline")
+            chunk = os.read(stream.fileno(), 4097 - len(raw))
+            raw.extend(chunk)
+            cutover.require(len(raw) <= 4096, "fixture notification too large")
+            cutover.require(chunk, "fixture notification EOF before complete line")
+            if b"\n" in raw:
+                cutover.require(raw.count(b"\n") == 1 and raw.endswith(b"\n"), "multiple fixture frames")
+                cutover.require(time.time() < expires_at and time.monotonic() < deadline,
+                                "fixture notification arrived after deadline")
+                return cutover.parsed(raw)
+    finally:
+        with evidence.open("xb") as output:
+            os.chmod(evidence, 0o600)
+            output.write(raw)
+            output.flush()
+            os.fsync(output.fileno())
+        cutover.sync_directory(evidence.parent)
+
+
+def read_after_unlock(stream, evidence, expires_at, run_id, request):
+    value = read_fixture_line(stream, evidence, expires_at)
+    expected = {"schema": 1, "event": "delayed_apply_unlocked", "run_id": run_id,
+                "operation_id": request["operation_id"], "action": request["action"],
+                "request_sha256": cutover.digest(request)}
+    cutover.require(value == expected and type(value["schema"]) is int, "wrong fixture notification identity")
+    return value
 
 
 class CutoverProtocolTests(unittest.TestCase):
@@ -67,13 +105,9 @@ class CutoverProtocolTests(unittest.TestCase):
         self.handles.append(stderr)
         process = subprocess.Popen([sys.executable, "-B", str(SCRIPTS / "durable_handoff_cutover_fixture.py"),
             "--root", str(self.root / "adapter"), "--config", str(config), "--port", str(port)],
-            stdout=subprocess.PIPE, stderr=stderr, text=True)
+            stdout=subprocess.PIPE, stderr=stderr)
         self.processes.append(process)
-        ready, _, _ = select.select([process.stdout], [], [], 4)
-        self.assertTrue(ready, "owned adapter did not announce readiness")
-        line = process.stdout.readline()
-        self.assertTrue(line, f"owned adapter exited before readiness; stderr retained in {self.root}")
-        identity = json.loads(line)
+        identity = read_fixture_line(process.stdout, self.root / f"ready-{len(self.processes)}.raw", time.time() + 4)
         self.port = identity["port"]
         if self.manifest is None:
             self.manifest = {"schema": 1, "mode": "isolation", "production_adapter_bound": False,
@@ -110,6 +144,44 @@ class CutoverProtocolTests(unittest.TestCase):
         controller = self.controller()
         controller.apply("pause", controller.inspect())
         controller.journal.close()
+
+    def wait_delayed_apply(self, action):
+        controller = self.controller()
+        try:
+            request = copy.deepcopy(controller.state["intent"])
+            expires_at = controller.state["expires_at"]
+        finally:
+            controller.journal.close()
+        self.assertEqual(request["action"], action)
+        self.delayed_expires_at = expires_at
+        cutover.durable_write(self.root / "delayed-original-intent.json", request)
+        read_after_unlock(self.processes[-1].stdout, self.root / "after-unlock.raw",
+                          expires_at, self.run_id, request)
+        return request
+
+    def recover_delayed_apply(self, request):
+        original = self.root / "adapter/operations" / (request["operation_id"] + ".json")
+        before = original.read_bytes()
+        actual_request = cutover.Controller.request
+        requests = []
+
+        def record(controller, path, payload=None):
+            requests.append((path, copy.deepcopy(payload)))
+            return actual_request(controller, path, payload)
+
+        with patch.object(cutover.Controller, "request", record):
+            result = self.run_controller(resume=True)
+        expected = ("/control/operation/" + request["operation_id"], None)
+        self.assertEqual(requests[0], expected)
+        self.assertEqual(requests.count(expected), 1)
+        self.assertFalse(any(payload and payload["action"] == request["action"] for _, payload in requests))
+        if request["action"] == "resume":
+            self.assertTrue(all(payload is None for _, payload in requests))
+        self.assertEqual(original.read_bytes(), before)
+        latest = cutover.read_private(sorted((self.root / "journal/records").glob("*.json"))[-1])
+        self.assertEqual(latest["expires_at"], self.delayed_expires_at)
+        cutover.durable_write(self.root / "recovery-requests.json", {"requests": requests})
+        return result
 
     def test_happy_protocol_single_switch_and_duplicate_controller(self):
         self.start()
@@ -229,8 +301,8 @@ class CutoverProtocolTests(unittest.TestCase):
         self.start({"delay_after": "pause"})
         first = self.run_controller()
         self.assertEqual(first["status"], "stopped")
-        time.sleep(0.25)
-        second = self.run_controller(resume=True)
+        request = self.wait_delayed_apply("pause")
+        second = self.recover_delayed_apply(request)
         self.assertEqual(second["status"], "passed_isolation_protocol_only")
         self.assertEqual(second["final"]["generation"], 4)
         self.assertEqual(len(list((self.root / "adapter/operations").glob("*.json"))), 4)
@@ -247,12 +319,12 @@ class CutoverProtocolTests(unittest.TestCase):
         first = self.run_controller()
         self.assertEqual(first["status"], "stopped")
         self.assertEqual(first["phase"], "verified")
-        time.sleep(0.25)
+        request = self.wait_delayed_apply("resume")
         receipt_path = self.root / "adapter/receipts" / (delivery + ".json")
         retained_path = self.root / "adapter/retained" / (delivery + ".json")
         receipt_bytes = receipt_path.read_bytes()
         self.assertEqual(retained_path.read_bytes(), original)
-        result = self.run_controller(resume=True)
+        result = self.recover_delayed_apply(request)
         self.assertEqual(result["status"], "passed_isolation_protocol_only")
         self.assertEqual(result["final"]["generation"], 4)
         self.assertEqual(result["final"]["receipt_delivery_ids"], [delivery])
@@ -263,6 +335,128 @@ class CutoverProtocolTests(unittest.TestCase):
         self.assertEqual(receipt_path.read_bytes(), receipt_bytes)
         self.assertEqual(retained_path.read_bytes(), original)
         self.assertEqual(base64.b64decode(cutover.read_private(receipt_path)["body_b64"]), raw)
+
+    def test_delay_notice_occurs_after_unlock_and_never_on_query_or_replay(self):
+        fixture = Fixture(self.root / "adapter", self.run_id, self.token, {"delay_after": "pause"})
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.fixture = fixture
+        self.port = server.server_port
+        serving = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+        entered, release, announced = threading.Event(), threading.Event(), threading.Event()
+        actual_apply, notices, responses = fixture.apply, [], []
+        request = {"operation_id": "e" * 64, "action": "pause", "expected_generation": 0,
+                   "manifest_sha256": "f" * 64, "targets": {}}
+
+        def held_apply(value):
+            receipt = actual_apply(value)
+            entered.set()
+            cutover.require(release.wait(2), "test-only unlock release missing")
+            return receipt
+
+        def observe(value):
+            self.assertTrue(fixture.lock.acquire(blocking=False), "notification preceded mutex release")
+            fixture.lock.release()
+            notices.append(value)
+            announced.set()
+
+        applying = threading.Thread(target=lambda: responses.append(self.http("/control/apply", request)))
+        serving.start()
+        try:
+            with patch.object(fixture, "apply", held_apply), patch(
+                    "durable_handoff_cutover_fixture.write_notice", side_effect=observe):
+                applying.start()
+                self.assertTrue(entered.wait(1))
+                self.assertTrue(fixture.lock.locked())
+                self.assertEqual(notices, [])  # Durable receipt exists, but the mutex is still held.
+                operation = fixture.root / "operations" / (request["operation_id"] + ".json")
+                original = operation.read_bytes()
+                release.set()
+                self.assertTrue(announced.wait(1))
+                applying.join(2)
+                self.assertFalse(applying.is_alive())
+                self.assertEqual(responses[0][0], 200)
+                self.assertEqual(self.http("/control/operation/" + request["operation_id"])[0], 200)
+                self.assertEqual(self.http("/control/apply", request)[0], 200)
+                self.assertEqual(notices, [after_unlock_notice(self.run_id, request)])
+                self.assertEqual(operation.read_bytes(), original)
+                self.assertNotIn(self.token, cutover.encoded(notices).decode())
+        finally:
+            release.set()
+            if applying.ident is not None:
+                applying.join(2)
+            server.shutdown()
+            server.server_close()
+            serving.join(2)
+
+    def test_after_unlock_frame_identity_and_original_deadline_are_strict(self):
+        request = {"operation_id": "e" * 64, "action": "pause", "expected_generation": 0}
+        expected = after_unlock_notice(self.run_id, request)
+        mutations = ({"schema": True}, {"schema": 2}, {"event": "committed_before_unlock"},
+                     {"run_id": "f" * 32}, {"operation_id": "f" * 64}, {"action": "resume"},
+                     {"request_sha256": "f" * 64}, {"extra": "forbidden"})
+        frames = [(cutover.encoded(expected) + b"\n", True, False)]
+        frames += [(cutover.encoded({**expected, **change}) + b"\n", False, False) for change in mutations]
+        frames += [(b'{"schema":1,"schema":1}\n', False, False), (b"{}\n{}\n", False, False),
+                   (b"x" * 4097, False, False), (b"partial", False, False), (b"", False, False),
+                   (cutover.encoded(expected) + b"\n", False, True)]
+        for index, (raw, succeeds, expired) in enumerate(frames):
+            with self.subTest(index=index):
+                read_fd, write_fd = os.pipe()
+                evidence = self.root / f"frame-{index}.raw"
+                os.write(write_fd, raw)
+                os.close(write_fd)
+                with os.fdopen(read_fd, "rb", buffering=0) as stream:
+                    expiry = time.time() + (-1 if expired else 1)
+                    if succeeds:
+                        self.assertEqual(read_after_unlock(stream, evidence, expiry, self.run_id, request), expected)
+                    else:
+                        with self.assertRaises((cutover.CutoverError, ValueError)):
+                            read_after_unlock(stream, evidence, expiry, self.run_id, request)
+                self.assertEqual(evidence.read_bytes(), b"" if expired else raw)
+
+    def test_after_unlock_missing_or_partial_live_pipe_is_bounded(self):
+        request = {"operation_id": "e" * 64, "action": "pause"}
+        for index, raw in enumerate((b"", b'{"schema":')):
+            read_fd, write_fd = os.pipe()
+            try:
+                os.write(write_fd, raw)
+                evidence = self.root / f"incomplete-{index}.raw"
+                with os.fdopen(read_fd, "rb", buffering=0) as stream:
+                    started = time.monotonic()
+                    with self.assertRaises(cutover.CutoverError):
+                        read_after_unlock(stream, evidence, time.time() + .03, self.run_id, request)
+                self.assertLess(time.monotonic() - started, .5)
+                self.assertEqual(evidence.read_bytes(), raw)
+            finally:
+                os.close(write_fd)
+
+    def test_fixture_notice_write_is_single_bounded_nonblocking_and_failure_propagates(self):
+        request = {"operation_id": "e" * 64, "action": "pause"}
+        notice = after_unlock_notice(self.run_id, request)
+        read_fd, write_fd = os.pipe()
+        try:
+            write_notice(notice, write_fd)
+            self.assertEqual(os.read(read_fd, 4096), cutover.encoded(notice) + b"\n")
+            self.assertTrue(os.get_blocking(write_fd))
+            with patch("durable_handoff_cutover_fixture.os.write", return_value=1) as write:
+                with self.assertRaises(cutover.CutoverError):
+                    write_notice(notice, write_fd)
+                self.assertEqual(write.call_count, 1)
+            self.assertTrue(os.get_blocking(write_fd))
+            with self.assertRaises(cutover.CutoverError):
+                write_notice({"oversize": "x" * 4096}, write_fd)
+            os.set_blocking(write_fd, False)
+            while True:
+                try:
+                    os.write(write_fd, b"x" * 4096)
+                except BlockingIOError:
+                    break
+            with self.assertRaises(BlockingIOError):
+                write_notice(notice, write_fd)
+            self.assertFalse(os.get_blocking(write_fd))
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
 
     def test_adapter_abrupt_exit_then_restart_recovers_same_operation(self):
         process = self.start({"exit_after": "switch_receiver"})

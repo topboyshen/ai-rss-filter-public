@@ -23,6 +23,25 @@ from durable_handoff_cutover import (CutoverError, ENTRANCES, MAX_BYTES, ZERO_CO
                                      read_private, require, sync_directory)
 
 KINDS = ("pending", "running", "continuations", "legacy", "buffer", "receipts", "operations", "retained", "blockers")
+NOTICE_BYTES = 4096
+
+
+def after_unlock_notice(run_id, request):
+    """Synthetic timing observation only; never an operation authorization."""
+    return {"schema": 1, "event": "delayed_apply_unlocked", "run_id": run_id,
+            "operation_id": request["operation_id"], "action": request["action"],
+            "request_sha256": hashlib.sha256(encoded(request)).hexdigest()}
+
+
+def write_notice(value, descriptor=1):
+    raw = encoded(value) + b"\n"
+    require(len(raw) <= NOTICE_BYTES, "fixture notification too large")
+    blocking = os.get_blocking(descriptor)
+    try:
+        os.set_blocking(descriptor, False)
+        require(os.write(descriptor, raw) == len(raw), "short fixture notification")
+    finally:
+        os.set_blocking(descriptor, blocking)
 
 
 class Fixture:
@@ -35,6 +54,8 @@ class Fixture:
         self.identity = {"mode": "isolation", "run_id": run_id, "adapter_identity": "synthetic-cutover-v1",
                          "adapter_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
         self.lock = threading.Lock()
+        self.delayed_receipt = None
+        self.delay_notification_claimed = False
         if not (self.root / "state.json").exists():
             durable_write(self.root / "state.json", {"run_id": run_id, "generation": 0, "schema": 131,
                 "entrances": {name: "open" for name in ENTRANCES},
@@ -163,6 +184,7 @@ class Fixture:
             os._exit(73)
         if self.faults.get("delay_after") == action:
             time.sleep(0.4)
+            self.delayed_receipt = receipt
         return receipt
 
     def recover(self):
@@ -197,7 +219,14 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/control/snapshot":
                 return 200, fixture.snapshot()
             if self.path == "/control/apply":
-                return 200, fixture.apply(json.loads(raw))
+                receipt = fixture.apply(json.loads(raw))
+                # Object identity selects only this original delayed POST, not
+                # a replay or GET returning the same durable receipt bytes.
+                if receipt is fixture.delayed_receipt:
+                    require(not fixture.delay_notification_claimed, "fixture delay notification already claimed")
+                    fixture.delay_notification_claimed = True
+                    self.unlocked_notice = after_unlock_notice(fixture.run_id, receipt["request"])
+                return 200, receipt
             if self.path.startswith("/control/operation/"):
                 operation = self.path.rsplit("/", 1)[-1]
                 require(len(operation) == 64 and all(c in "0123456789abcdef" for c in operation), "bad operation query")
@@ -221,6 +250,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             status, value = self.dispatch()
+            # dispatch's with fixture.lock has exited. This is independent of
+            # whether the timed-out client's response socket still exists.
+            if getattr(self, "unlocked_notice", None) is not None:
+                write_notice(self.unlocked_notice)
         except (CutoverError, OSError, ValueError, KeyError) as error:
             status, value = 503, {**self.server.fixture.identity, "error": type(error).__name__}
         raw = encoded(value)
