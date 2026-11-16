@@ -38,11 +38,13 @@ from services.news_processing_trace import (
 from scoring_explanation import EXPLANATION_FIELDS, build_score_explanation
 from scoring_provenance import (
     ALLOWED_SEMANTIC_RESOLUTIONS,
+    MARKET_FLASH_VALUES,
     NON_SUBSTANTIVE_SCORE_PATHS,
     RECOGNIZED_SCORE_PATHS,
+    RESOLUTION_SCORE_PATHS,
     SAFE_NEUTRAL_CONTRACT_VALUES,
-    SAFE_NEUTRAL_SCORE_PATHS_BY_RESOLUTION,
     SEMANTIC_RESOLUTION_INSUFFICIENT_INPUT,
+    SEMANTIC_RESOLUTION_MARKET_FLASH,
     is_fixed_safe_neutral_fields,
     is_insufficient_input_fields,
     normalize_score_path,
@@ -323,6 +325,9 @@ def _score_stage_with_identity(
         if semantic_resolution == SEMANTIC_RESOLUTION_INSUFFICIENT_INPUT:
             if not is_insufficient_input_fields(*values):
                 raise TypeError(f"{bound_name} returned an invalid insufficient-input tuple")
+        elif semantic_resolution == SEMANTIC_RESOLUTION_MARKET_FLASH:
+            if values != MARKET_FLASH_VALUES:
+                raise TypeError(f"{bound_name} returned an invalid market-flash tuple")
         elif semantic_resolution and values != SAFE_NEUTRAL_CONTRACT_VALUES:
             raise TypeError(f"{bound_name} returned an invalid safe-neutral tuple")
         if neutral_reason and not semantic_resolution:
@@ -1378,7 +1383,7 @@ def _review_entry_score(
         result.error_type = "llm_backends_exhausted"
         result.neutral_reason = ""
     elif result.stage2_resolution:
-        result.score_path = SAFE_NEUTRAL_SCORE_PATHS_BY_RESOLUTION[
+        result.score_path = RESOLUTION_SCORE_PATHS[
             result.stage2_resolution
         ]["stage2"]
         result.error_type = ""
@@ -1438,7 +1443,7 @@ def _score_entry_with_llm(
             result.error_type = "llm_backends_exhausted"
             result.neutral_reason = ""
         elif result.stage1_resolution:
-            result.score_path = SAFE_NEUTRAL_SCORE_PATHS_BY_RESOLUTION[
+            result.score_path = RESOLUTION_SCORE_PATHS[
                 result.stage1_resolution
             ]["stage1"]
             result.neutral_reason = stage1_reason

@@ -6,6 +6,7 @@ SEMANTIC_RESOLUTION_SAFE_NEUTRAL_CONTRACT = "safe_neutral_contract"
 SEMANTIC_RESOLUTION_SAFE_NEUTRAL_GROUNDING = "safe_neutral_grounding"
 SEMANTIC_RESOLUTION_SAFE_NEUTRAL_INITIAL = "safe_neutral_initial"
 SEMANTIC_RESOLUTION_INSUFFICIENT_INPUT = "insufficient_input"
+SEMANTIC_RESOLUTION_MARKET_FLASH = "market_flash_rule"
 INSUFFICIENT_INPUT_TAG = "信息不足"
 SAFE_NEUTRAL_CONTRACT_VALUES = (
     4.0,
@@ -48,6 +49,7 @@ ALLOWED_SEMANTIC_RESOLUTIONS = frozenset(
         SEMANTIC_RESOLUTION_SAFE_NEUTRAL_GROUNDING,
         SEMANTIC_RESOLUTION_SAFE_NEUTRAL_INITIAL,
         SEMANTIC_RESOLUTION_INSUFFICIENT_INPUT,
+        SEMANTIC_RESOLUTION_MARKET_FLASH,
     }
 )
 
@@ -71,6 +73,20 @@ INSUFFICIENT_INPUT_SCORE_PATHS = {
     "stage2": "stage2_insufficient_input",
 }
 
+# A deterministic guard, not a model verdict: a terse index/asset move is a
+# real subject and event, so it gets a low substantive score instead of the
+# insufficient-input sentinel.  Kept out of NON_SUBSTANTIVE so it is never
+# treated as a conservative neutral, and out of the exportable set because it
+# is not model evidence.
+MARKET_FLASH_TAG = "行情"
+MARKET_FLASH_SCORE = 3.0
+MARKET_FLASH_LOGIC = "标题含明确指数或资产价格变动，按行情快讯处理"
+MARKET_FLASH_VALUES = (MARKET_FLASH_SCORE, MARKET_FLASH_TAG, MARKET_FLASH_LOGIC, "⚖️")
+MARKET_FLASH_SCORE_PATHS = {
+    "stage1": "market_flash_rule",
+    "stage2": "stage2_market_flash_rule",
+}
+
 SAFE_NEUTRAL_SCORE_PATHS_BY_RESOLUTION = {
     SEMANTIC_RESOLUTION_SAFE_NEUTRAL_INITIAL: SAFE_NEUTRAL_INITIAL_SCORE_PATHS,
     SEMANTIC_RESOLUTION_SAFE_NEUTRAL_CONTRACT: (SAFE_NEUTRAL_CONTRACT_SCORE_PATHS),
@@ -84,6 +100,13 @@ NON_SUBSTANTIVE_SCORE_PATHS = frozenset(
     for path in paths.values()
 )
 
+# Resolution-to-path lookup for the processor.  Safe-neutral resolutions stay
+# non-substantive; the market-flash resolution is a substantive rule score.
+RESOLUTION_SCORE_PATHS = {
+    **SAFE_NEUTRAL_SCORE_PATHS_BY_RESOLUTION,
+    SEMANTIC_RESOLUTION_MARKET_FLASH: MARKET_FLASH_SCORE_PATHS,
+}
+
 # These paths are audit/read-model states, not independent score evidence.
 # They must never seed similarity copies or cross the Quant integration
 # boundary, even if a legacy row carries an otherwise usable numeric score.
@@ -91,6 +114,7 @@ NON_EXPORTABLE_SCORE_PATHS = NON_SUBSTANTIVE_SCORE_PATHS | frozenset({
     "parse_error",
     "quality_quarantine",
     "similarity",
+    *MARKET_FLASH_SCORE_PATHS.values(),
 })
 
 RECOGNIZED_SCORE_PATHS = frozenset({
@@ -103,6 +127,7 @@ RECOGNIZED_SCORE_PATHS = frozenset({
     "similarity",
     "quality_quarantine",
     "radar",
+    *MARKET_FLASH_SCORE_PATHS.values(),
 }) | NON_SUBSTANTIVE_SCORE_PATHS
 
 PUBLIC_SCORE_PATHS = RECOGNIZED_SCORE_PATHS - (

@@ -44,6 +44,7 @@ from db.database import db_lock, get_connection
 from scoring_provenance import (
     FORMAL_SIGNAL_SCORE_PATHS,
     INSUFFICIENT_INPUT_SCORE_PATHS,
+    MARKET_FLASH_SCORE_PATHS,
     SAFE_NEUTRAL_CONTRACT_SCORE_PATHS,
     SAFE_NEUTRAL_GROUNDING_SCORE_PATHS,
     normalize_score_path,
@@ -1330,6 +1331,7 @@ _FEED_SCORE_REASON_LABELS = (
     ("safe_contract", "格式/字段中性"),
     ("safe_grounding", "来源依据中性"),
     ("insufficient_input", "信息不足（0分）"),
+    ("market_flash", "行情规则（3分）"),
     ("model_failure", "模型链路失败"),
     ("processing_error", "条目处理异常"),
     ("other_excluded", "其他未计入"),
@@ -1352,6 +1354,8 @@ def _feed_score_category(score_path, score, threshold, error_type=""):
         return "safe_grounding"
     if path in INSUFFICIENT_INPUT_SCORE_PATHS.values():
         return "insufficient_input"
+    if path in MARKET_FLASH_SCORE_PATHS.values():
+        return "market_flash"
     if path == "fallback_local" or error == "llm_backends_exhausted":
         return "model_failure"
     if path in {"parse_error", "quality_quarantine"} or error in {
@@ -1447,6 +1451,7 @@ def _feed_zero_output_reason(bucket, health):
             ("similarity", "重复稿"),
             ("safe_contract", "格式/字段中性"),
             ("safe_grounding", "来源依据中性"),
+            ("market_flash", "行情规则（3分）"),
             ("insufficient_input", "信息不足（0分）"),
             ("model_failure", "模型链路失败"),
             ("processing_error", "条目处理异常"),
