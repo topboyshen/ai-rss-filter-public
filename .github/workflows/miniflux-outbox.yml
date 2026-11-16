@@ -1,0 +1,130 @@
+name: Miniflux outbox
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    paths:
+      - 'ops/miniflux/**'
+      - 'scripts/*miniflux*outbox*.py'
+      - 'scripts/verify_miniflux_held_local.py'
+      - 'tests/test_miniflux_held_harness.py'
+      - 'tests/test_miniflux_outbox_patch.py'
+      - 'scripts/observe_handoff_capacity.py'
+      - 'tests/test_handoff_capacity_observer.py'
+      - 'tests/test_miniflux_held_access.py'
+      - '.github/workflows/miniflux-outbox.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'ops/miniflux/**'
+      - 'scripts/*miniflux*outbox*.py'
+      - 'scripts/verify_miniflux_held_local.py'
+      - 'tests/test_miniflux_held_harness.py'
+      - 'scripts/observe_handoff_capacity.py'
+      - 'tests/test_handoff_capacity_observer.py'
+      - 'tests/test_miniflux_held_access.py'
+      - '.github/workflows/miniflux-outbox.yml'
+
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  fixed-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+        env:
+          POSTGRES_DB: synthetic_outbox
+          POSTGRES_PASSWORD: synthetic-ci-only
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres -d synthetic_outbox"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+          --memory 384m --memory-swap 384m --cpus 1 --pids-limit 64
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.4'
+          cache: false
+      - name: Obtain only the fixed upstream source and apply reviewed patch
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch 2.3.2 https://github.com/miniflux/v2.git "$RUNNER_TEMP/miniflux-outbox"
+          python scripts/apply_miniflux_outbox.py --source "$RUNNER_TEMP/miniflux-outbox" --apply
+      - name: Full upstream tests plus actual PostgreSQL regression
+        env:
+          MINIFLUX_OUTBOX_TEST_DSN: 'postgres://postgres:synthetic-ci-only@127.0.0.1:5432/synthetic_outbox?sslmode=disable'
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/miniflux-outbox"
+          test -z "$(gofmt -l $(git ls-files --modified --others --exclude-standard -- '*.go'))"
+          go test -count=1 ./...
+          go vet ./...
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-X miniflux.app/v2/internal/version.Version=2.3.2 -X miniflux.app/v2/internal/version.Commit=51f2e0d-outbox-0bf94e8f" -o "$RUNNER_TEMP/miniflux-outbox-linux-amd64" .
+      - name: Isolation-only held review against the actual locked PostgreSQL schema
+        working-directory: ops/miniflux/heldtool
+        env:
+          HELD_PG_CONTAINER: '${{ job.services.postgres.id }}'
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/held-evidence"
+          test "$(uname -m)" = x86_64
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go build -trimpath -o "$RUNNER_TEMP/held-isolation-review" .
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test -c -o "$RUNNER_TEMP/held.test" .
+          sha256sum ./*.go go.mod go.sum ../held-access/install.sql ../held-access/execution.sql "$RUNNER_TEMP/miniflux-outbox/internal/database/webhook_outbox.go" > "$RUNNER_TEMP/held-evidence/SOURCE_SHA256.txt"
+          docker inspect "$HELD_PG_CONTAINER" | jq '.[0] | {Id,Image,State,HostConfig:(.HostConfig|{Memory,MemorySwap,PidsLimit,NanoCpus})}' > "$RUNNER_TEMP/held-evidence/BEFORE.json"
+          test "$(docker image inspect "$(docker inspect --format '{{.Image}}' "$HELD_PG_CONTAINER")" --format '{{.Architecture}}')" = amd64
+          test "$(docker inspect --format '{{.HostConfig.Memory}}' "$HELD_PG_CONTAINER")" = 402653184
+          test "$(docker inspect --format '{{.HostConfig.PidsLimit}}' "$HELD_PG_CONTAINER")" = 64
+          docker cp "$RUNNER_TEMP/held.test" "$HELD_PG_CONTAINER:/tmp/held.test"
+          docker exec "$HELD_PG_CONTAINER" mkdir -p /tmp/fixed-source/internal/database
+          docker cp "$RUNNER_TEMP/miniflux-outbox/internal/database/webhook_outbox.go" "$HELD_PG_CONTAINER:/tmp/fixed-source/internal/database/webhook_outbox.go"
+          docker exec "$HELD_PG_CONTAINER" mkdir -p /tmp/held-access
+          docker cp ../held-access/install.sql "$HELD_PG_CONTAINER:/tmp/held-access/install.sql"
+          docker cp ../held-access/execution.sql "$HELD_PG_CONTAINER:/tmp/held-access/execution.sql"
+          docker exec -e MINIFLUX_OUTBOX_TEST_DSN='postgres://postgres:synthetic-ci-only@127.0.0.1:5432/synthetic_outbox?sslmode=disable' -e MINIFLUX_PATCHED_SOURCE=/tmp/fixed-source -e HELD_ACCESS_SQL_DIR=/tmp/held-access "$HELD_PG_CONTAINER" /tmp/held.test -test.v -test.count=1 2>&1 | tee "$RUNNER_TEMP/held-evidence/TEST.log"
+          test "$(docker inspect --format '{{.State.OOMKilled}}' "$HELD_PG_CONTAINER")" = false
+      - name: Preserve held isolation evidence on success or failure
+        if: always()
+        env:
+          HELD_PG_CONTAINER: '${{ job.services.postgres.id }}'
+        run: |
+          mkdir -p "$RUNNER_TEMP/held-evidence"
+          docker inspect "$HELD_PG_CONTAINER" | jq '.[0] | {Id,Image,State,HostConfig:(.HostConfig|{Memory,MemorySwap,PidsLimit,NanoCpus})}' > "$RUNNER_TEMP/held-evidence/AFTER.json"
+          docker exec "$HELD_PG_CONTAINER" cat /sys/fs/cgroup/memory.peak > "$RUNNER_TEMP/held-evidence/MEMORY_PEAK.txt"
+          docker exec "$HELD_PG_CONTAINER" cat /sys/fs/cgroup/memory.events > "$RUNNER_TEMP/held-evidence/MEMORY_EVENTS.txt"
+          docker exec "$HELD_PG_CONTAINER" pg_dump -U postgres -d synthetic_outbox --schema='held_isolation_*' --schema='held_access_isolation_*' > "$RUNNER_TEMP/held-evidence/SYNTHETIC_ONLY.sql"
+          sha256sum "$RUNNER_TEMP/held-evidence/"* > "$RUNNER_TEMP/held-evidence/MANIFEST.sha256"
+      - name: Held role separation and append-only audit against actual PostgreSQL
+        env:
+          HELD_PG_CONTAINER: '${{ job.services.postgres.id }}'
+        run: |
+          set -euo pipefail
+          python ops/miniflux/held-access/verify.py \
+            --container "$HELD_PG_CONTAINER" \
+            --source "$RUNNER_TEMP/miniflux-outbox" \
+            --output "$RUNNER_TEMP/held-access-evidence" --run
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: miniflux-held-access-${{ github.sha }}
+          path: ${{ runner.temp }}/held-access-evidence/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: miniflux-held-isolation-${{ github.sha }}
+          path: ${{ runner.temp }}/held-evidence/
+          if-no-files-found: error

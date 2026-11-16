@@ -230,3 +230,21 @@ def test_invalid_candidate_never_changes_source_or_output(tmp_path, invalid, out
         assert output.read_bytes() == previous_candidate
     else:
         assert not output.exists()
+
+
+def test_mobile_navigation_touch_targets_and_closed_menu_rules():
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    mobile = (scripts / "glance_reading_mobile.css").read_text(encoding="utf-8")
+    skin = (scripts / "glance_reading_skin.css").read_text(encoding="utf-8")
+    assert (
+        ".mobile-navigation:not(:has(.mobile-navigation-page-links-input:checked)) "
+        ".mobile-navigation-page-links" in mobile
+    )
+    assert (
+        ".mobile-navigation:not(:has(.mobile-navigation-page-links-input:checked)) "
+        ".mobile-navigation-actions" in mobile
+    )
+    assert "height: 44px; line-height: 42px" in skin
+    assert ".mobile-navigation-actions .theme-picker .size-h3" in skin
+    assert "white-space: nowrap" in skin
+    assert "color: #9aa7ba !important" in skin

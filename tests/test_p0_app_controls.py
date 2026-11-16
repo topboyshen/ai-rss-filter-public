@@ -3,15 +3,6 @@ import json
 import pytest
 
 
-@pytest.fixture(autouse=True)
-def reset_webhook_replay_cache():
-    import routes.webhook_routes as webhook_routes
-
-    with webhook_routes._webhook_replay_lock:
-        webhook_routes._webhook_replay_seen.clear()
-    yield
-    with webhook_routes._webhook_replay_lock:
-        webhook_routes._webhook_replay_seen.clear()
 
 
 @pytest.fixture

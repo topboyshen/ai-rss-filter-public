@@ -1,5 +1,9 @@
+import errno
+import io
 import json
+import socket
 import xml.etree.ElementTree as ET
+from urllib.error import HTTPError, URLError
 
 import feedparser
 import pytest
@@ -79,6 +83,219 @@ def test_csrc_does_not_invent_missing_article_metadata(monkeypatch, payload):
     monkeypatch.setattr(feeds, "_fetch", lambda *args: payload)
     with pytest.raises(ValueError):
         feeds._csrc_article("https://www.csrc.gov.cn/csrc/c100028/c1/content.shtml", 20, 3)
+
+
+def _addrinfo(*addresses):
+    return [(socket.AF_INET6 if ":" in ip else socket.AF_INET, socket.SOCK_STREAM,
+             socket.IPPROTO_TCP, "", (ip, 443, 0, 0) if ":" in ip else (ip, 443)) for ip in addresses]
+
+
+class _PublisherSocket:
+    def __init__(self, response):
+        self.response = io.BytesIO(response)
+        self.destination = None
+        self.timeout = None
+        self.sent = b""
+
+    def connect(self, destination):
+        self.destination = destination
+
+    def settimeout(self, timeout):
+        self.timeout = timeout
+
+    def sendall(self, request):
+        self.sent += request
+
+    def makefile(self, *_args, **_kwargs):
+        return self.response
+
+    def close(self):
+        pass
+
+
+def _http_response(status, reason, body=b"", headers=b""):
+    return (f"HTTP/1.1 {status} {reason}\r\nContent-Length: {len(body)}\r\n".encode()
+            + headers + b"Connection: close\r\n\r\n" + body)
+
+
+def _install_publisher_transport(monkeypatch, raw_responses, *, tls_error=None):
+    from routes import security
+
+    sockets = []
+    responses = iter(raw_responses)
+
+    def socket_factory(family, kind):
+        assert family == socket.AF_INET and kind == socket.SOCK_STREAM
+        sock = _PublisherSocket(next(responses))
+        sockets.append(sock)
+        return sock
+
+    class Context:
+        check_hostname = True
+        verify_mode = security.ssl.CERT_REQUIRED
+
+        def wrap_socket(self, sock, *, server_hostname):
+            assert server_hostname == "www.csrc.gov.cn"
+            if tls_error:
+                raise tls_error
+            return sock
+
+    monkeypatch.setattr(security.socket, "getaddrinfo", lambda *_args, **_kwargs: _addrinfo("93.184.216.34"))
+    monkeypatch.setattr(security.socket, "socket", socket_factory)
+    monkeypatch.setattr(security.ssl, "create_default_context", Context)
+    return sockets
+
+
+def test_csrc_diagnostic_reports_last_failed_pinned_address_family(monkeypatch):
+    from routes import security
+
+    attempted = []
+
+    def refuse(family, _kind):
+        attempted.append(family)
+        errnum = errno.ECONNREFUSED if family == socket.AF_INET else errno.ENETUNREACH
+        raise OSError(errnum, "private address and credentials")
+
+    monkeypatch.setattr(security.socket, "getaddrinfo", lambda *_args, **_kwargs: _addrinfo(
+        "2606:4700:4700::1111", "93.184.216.34"))
+    monkeypatch.setattr(security.socket, "socket", refuse)
+
+    with pytest.raises(URLError) as failure:
+        feeds.load_publisher_feed(cfg()["feeds"][0]["url"], cfg(), 20, 1)
+    assert attempted == [socket.AF_INET, socket.AF_INET6]
+    assert str(failure.value.reason) == (
+        f"CSRC fetch stage=index phase=connect family=IPv6 errno={errno.ENETUNREACH} http_status=unknown"
+    )
+    assert failure.value.__suppress_context__ is True
+
+
+@pytest.mark.parametrize("resolver_error", [True, False], ids=["dns-failure", "mixed-public-private"])
+def test_csrc_diagnostic_distinguishes_dns_failure_from_rejected_address(monkeypatch, resolver_error):
+    from routes import security
+
+    def resolve(*_args, **_kwargs):
+        if resolver_error:
+            raise socket.gaierror(socket.EAI_AGAIN, "private DNS detail")
+        return _addrinfo("93.184.216.34", "169.254.169.254")
+
+    monkeypatch.setattr(security.socket, "getaddrinfo", resolve)
+    monkeypatch.setattr(security.socket, "socket", lambda *_args: pytest.fail("must stop before socket"))
+    phase, errnum = ("dns", socket.EAI_AGAIN) if resolver_error else ("policy", "unknown")
+    with pytest.raises(PermissionError) as failure:
+        feeds.load_publisher_feed(cfg()["feeds"][0]["url"], cfg(), 20, 3)
+    assert str(failure.value) == f"CSRC fetch stage=index phase={phase} family=unknown errno={errnum} http_status=unknown"
+
+
+def test_csrc_diagnostic_redacts_detail_http_error_and_retains_pinned_request(monkeypatch):
+    sockets = _install_publisher_transport(monkeypatch, [
+        _http_response(200, "OK", index()),
+        _http_response(403, "private reason https://secret.invalid", b"private response"),
+    ])
+
+    with pytest.raises(HTTPError) as failure:
+        feeds.load_publisher_feed(cfg()["feeds"][0]["url"], cfg(limit=1), 17, 3)
+    error = failure.value
+    assert error.code == 403
+    assert str(error) == "CSRC fetch stage=detail phase=http family=IPv4 errno=unknown http_status=403"
+    assert error.filename == "" and error.read() == b"" and error.hdrs is None
+    assert [sock.destination for sock in sockets] == [("93.184.216.34", 443)] * 2
+    assert [sock.timeout for sock in sockets] == [17, 17]
+    assert b"GET /csrc/xwfb/index.shtml " in sockets[0].sent
+    assert b"GET /csrc/c100028/c1/content.shtml " in sockets[1].sent
+    assert all(b"Host: www.csrc.gov.cn\r\n" in sock.sent for sock in sockets)
+
+
+def test_csrc_diagnostic_keeps_successful_response_and_retry_contract(monkeypatch, caplog):
+    sockets = _install_publisher_transport(monkeypatch, [
+        _http_response(503, "temporary failure"),
+        _http_response(200, "OK", index()),
+        _http_response(200, "OK", article()),
+    ])
+    pauses = []
+    monkeypatch.setattr("utils.helpers.time.sleep", pauses.append)
+    monkeypatch.setattr("utils.helpers.random.uniform", lambda *_args: 0.75)
+
+    rss = feeds.load_publisher_feed(cfg()["feeds"][0]["url"], cfg(limit=1), 17, 2)
+
+    assert len(feedparser.parse(rss).entries) == 1
+    assert len(sockets) == 3 and pauses == [1.5]
+    assert "CSRC fetch" not in caplog.text
+
+
+def test_csrc_diagnostic_does_not_follow_unconfigured_redirect(monkeypatch):
+    sockets = _install_publisher_transport(monkeypatch, [
+        _http_response(302, "Found", headers=b"Location: https://169.254.169.254/private?token=secret\r\n"),
+    ])
+
+    with pytest.raises(PermissionError) as failure:
+        feeds.load_publisher_feed(cfg()["feeds"][0]["url"], cfg(), 17, 3)
+    assert len(sockets) == 1
+    assert str(failure.value) == "CSRC fetch stage=index phase=policy family=unknown errno=unknown http_status=302"
+
+
+def test_csrc_diagnostic_identifies_tls_before_http(monkeypatch):
+    from routes import security
+
+    sockets = _install_publisher_transport(monkeypatch, [b""], tls_error=security.ssl.SSLError(1, "private cert"))
+    with pytest.raises(URLError) as failure:
+        feeds.load_publisher_feed(cfg()["feeds"][0]["url"], cfg(), 17, 1)
+    assert sockets[0].sent == b""
+    assert str(failure.value.reason) == "CSRC fetch stage=index phase=tls family=IPv4 errno=1 http_status=unknown"
+
+
+def test_csrc_diagnostic_retains_http_status_when_the_response_body_fails(monkeypatch):
+    _install_publisher_transport(monkeypatch, [
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        b"FF\r\nprivate truncated body",
+    ])
+    with pytest.raises(OSError, match="^CSRC fetch stage=index phase=body family=IPv4 errno=unknown http_status=200$"):
+        feeds.load_publisher_feed(cfg()["feeds"][0]["url"], cfg(), 17, 1)
+
+
+@pytest.mark.parametrize("fail_phase", ["http", "request"])
+def test_csrc_diagnostic_survives_processor_truncation_on_the_failure_path(monkeypatch, caplog, fail_phase):
+    from core import processor
+
+    if fail_phase == "http":
+        _install_publisher_transport(monkeypatch, [
+            _http_response(200, "OK", index()),
+            _http_response(403, "private reason https://secret.invalid", b"private response"),
+        ])
+        family, status = "IPv4", 403
+    else:
+        def fail_request(url, *_args):
+            if url == feeds.CSRC_INDEX:
+                return index()
+            raise URLError(OSError("private reason https://secret.invalid"))
+
+        monkeypatch.setattr(feeds, "_fetch", fail_request)
+        family, status = "unknown", "unknown"
+    feed_cfg = cfg(limit=1) | {"rss_timeout": 17, "rss_max_fetch_attempts": 1}
+    route = feed_cfg["feeds"][0]["url"]
+    writes = []
+    monkeypatch.setattr(processor, "resolve_scoring_contract", lambda cfg, **_kwargs: cfg)
+    monkeypatch.setattr(processor.DB, "update_feed_health", lambda *args: writes.append(args))
+
+    entries, _, error, _ = processor.process_feed(
+        route, "synthetic prompt", "证监会新闻", feed_cfg, check_output_cache=False,
+    )
+
+    assert entries == []
+    assert error == (f"RSS解析失败: CSRC fetch stage=detail phase={fail_phase} "
+                     f"family={family} errno=unknown http_status={status}")
+    assert writes == [(route, "证监会新闻", 0, False, 0, 0, None, error)]
+    assert error in caplog.text and "private" not in caplog.text and "secret.invalid" not in caplog.text
+
+
+@pytest.mark.parametrize("payload, expected", [
+    (b'<div class><p>private response</p></div>', "CSRC detail response could not be parsed"),
+    (article(date="private date"), "CSRC article publication date invalid"),
+])
+def test_csrc_diagnostic_does_not_echo_raw_body_from_parser(monkeypatch, payload, expected):
+    monkeypatch.setattr(feeds, "_fetch", lambda *_args: payload)
+    with pytest.raises(ValueError) as failure:
+        feeds._csrc_article("https://www.csrc.gov.cn/csrc/c100028/c1/content.shtml", 20, 1)
+    assert str(failure.value) == expected
 
 
 def test_caixin_fetches_one_public_list_without_article_fanout(monkeypatch):
@@ -169,9 +386,10 @@ def test_adapter_requires_configured_enabled_route(monkeypatch):
 @pytest.mark.parametrize("url", ["https://127.0.0.1/csrc/c100028/c1/content.shtml",
     "https://www.csrc.gov.cn.evil.test/csrc/c100028/c1/content.shtml",
     "https://user:secret@www.csrc.gov.cn/csrc/c100028/c1/content.shtml",
+    "https://www.csrc.gov.cn:secret/csrc/c100028/c1/content.shtml",
     "https://www.csrc.gov.cn/csrc/c100028/c1/content.shtml?redirect=x"])
 def test_csrc_article_identity_is_strict(url):
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="^CSRC article URL identity invalid$"):
         feeds._csrc_url(url)
 
 

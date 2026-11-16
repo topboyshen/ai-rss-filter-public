@@ -690,12 +690,21 @@ class WorkflowScopeContractTests(unittest.TestCase):
             "AI_FILTER_TEST_COVERAGE_OUTPUT=",
             "docker compose config --quiet",
             "docker build --tag",
+            "--build-arg PIP_INDEX_URL=https://pypi.org/simple",
             "scripts/check_runtime_image.py",
             "actions/upload-artifact@v7",
             "if-no-files-found: error",
         ):
             with self.subTest(command=command):
                 self.assertIn(command, tests)
+
+    def test_ci_image_index_is_fixed_without_changing_production_default(self):
+        tests = self.jobs["test"]
+        self.assertEqual(tests.count("--build-arg PIP_INDEX_URL=https://pypi.org/simple"), 1)
+        self.assertNotIn("--build-arg PIP_INDEX_URL=\"$", tests)
+        self.assertNotIn("--build-arg PIP_INDEX_URL=${", tests)
+        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple", dockerfile)
 
 
 if __name__ == "__main__":

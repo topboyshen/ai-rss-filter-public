@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from ops import ai_filter_ops_check as monitor
 from services import dashboard_ops as ops
 from tests import test_dashboard_browser_auth as browser_tests
 from tests import test_dashboard_ops as dashboard_tests
@@ -19,8 +20,10 @@ CHECK_NAMES = (
     "metrics",
     "notification_transport",
     "event_enrichment",
+    "db_maintenance",
     "market_timer",
     "market_history",
+    "trading_calendar",
     "root_disk",
     "backup",
     "restore_drill",
@@ -159,7 +162,7 @@ def test_unknown_or_secret_top_level_fields_reject_entire_snapshot(tmp_path, key
         [{"name": "release_containers", "status": True}],
         [{"name": ["release_containers"], "status": "PASS"}],
         [{"name": "metrics", "status": "PASS"}] * 2,
-        [{"name": "metrics", "status": "PASS"}] * 11,
+        [{"name": "metrics", "status": "PASS"}] * 13,
     ],
 )
 def test_invalid_or_ambiguous_check_rows_reject_entire_snapshot(tmp_path, checks):
@@ -216,6 +219,42 @@ def test_policy_skip_cannot_mask_unrelated_checks(tmp_path, name):
 
     assert result["status"] == "unknown"
     assert result["checks"] == []
+
+
+def test_trading_calendar_gap_is_shown_and_enters_attention(tmp_path, monkeypatch):
+    payload = _change_check(_payload(), "trading_calendar", "FAIL")
+
+    result = _read(tmp_path, payload)
+
+    assert _check(result, "trading_calendar") == {
+        "name": "trading_calendar",
+        "title": "交易日历",
+        "status": "warn",
+        "label": "检查失败",
+    }
+    built = _build(tmp_path, monkeypatch, payload)
+    assert any(
+        item["title"] == "宿主巡检 · 交易日历：检查失败"
+        for item in built["attention"]
+    )
+
+
+def test_db_maintenance_failure_is_shown_and_enters_attention(tmp_path, monkeypatch):
+    payload = _change_check(_payload(), "db_maintenance", "FAIL")
+
+    result = _read(tmp_path, payload)
+
+    assert _check(result, "db_maintenance") == {
+        "name": "db_maintenance",
+        "title": "数据库维护",
+        "status": "warn",
+        "label": "检查失败",
+    }
+    built = _build(tmp_path, monkeypatch, payload)
+    assert any(
+        item["title"] == "宿主巡检 · 数据库维护：检查失败"
+        for item in built["attention"]
+    )
 
 
 def _build(tmp_path, monkeypatch, payload):
@@ -317,3 +356,23 @@ def test_authenticated_dashboard_renders_real_snapshot_and_private_headers(
     assert 'href="#host-checks"' in body
     assert response.headers["Cache-Control"].startswith("no-store")
     assert response.headers["X-Content-Type-Options"] == "nosniff"
+
+
+def test_every_host_check_reaches_the_dashboard_and_the_consumer():
+    produced = {
+        monitor._DASHBOARD_CHECK_ALIASES.get(check.__name__, check.__name__)
+        for check in monitor.CHECKS
+    }
+    # An unexported check is silently dropped by the producer, and a name the
+    # consumer does not know turns its whole card into "unknown". Both sides
+    # must therefore change together; this pins them to the check list.
+    assert len(produced) == len(monitor.CHECKS)
+    assert produced == set(monitor._DASHBOARD_CHECK_NAMES)
+    assert produced == set(ops._HOST_CHECKS)
+    # The consumer rejects SKIPPED_BY_POLICY outside this allowlist, again
+    # degrading the whole card, so a policy-disabled check must live inside it.
+    assert set(monitor._POLICY_DISABLED_CHECKS.values()) <= {
+        "backup",
+        "restore_drill",
+        "offsite_upload",
+    }

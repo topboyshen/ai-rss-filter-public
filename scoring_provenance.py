@@ -3,6 +3,8 @@
 SEMANTIC_RESOLUTION_SAFE_NEUTRAL_CONTRACT = "safe_neutral_contract"
 SEMANTIC_RESOLUTION_SAFE_NEUTRAL_GROUNDING = "safe_neutral_grounding"
 SEMANTIC_RESOLUTION_SAFE_NEUTRAL_INITIAL = "safe_neutral_initial"
+SEMANTIC_RESOLUTION_INSUFFICIENT_INPUT = "insufficient_input"
+INSUFFICIENT_INPUT_TAG = "信息不足"
 SAFE_NEUTRAL_CONTRACT_VALUES = (
     4.0,
     "其他",
@@ -19,12 +21,29 @@ def is_fixed_safe_neutral_fields(score, tag, logic, direction) -> bool:
     }
 
 
+def is_insufficient_input_fields(score, tag, logic, direction) -> bool:
+    """Semantic 'not enough input' is a sentinel, never a substantive score."""
+    if isinstance(score, bool):
+        return False
+    try:
+        value = float(score)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return (
+        value == 0.0
+        and str(tag or "").strip() == INSUFFICIENT_INPUT_TAG
+        and bool(str(logic or "").strip())
+        and str(direction or "").strip() in {"中性", "⚖️"}
+    )
+
+
 ALLOWED_SEMANTIC_RESOLUTIONS = frozenset(
     {
         "",
         SEMANTIC_RESOLUTION_SAFE_NEUTRAL_CONTRACT,
         SEMANTIC_RESOLUTION_SAFE_NEUTRAL_GROUNDING,
         SEMANTIC_RESOLUTION_SAFE_NEUTRAL_INITIAL,
+        SEMANTIC_RESOLUTION_INSUFFICIENT_INPUT,
     }
 )
 
@@ -43,10 +62,16 @@ SAFE_NEUTRAL_INITIAL_SCORE_PATHS = {
     "stage2": "stage2_safe_neutral_initial",
 }
 
+INSUFFICIENT_INPUT_SCORE_PATHS = {
+    "stage1": "insufficient_input",
+    "stage2": "stage2_insufficient_input",
+}
+
 SAFE_NEUTRAL_SCORE_PATHS_BY_RESOLUTION = {
     SEMANTIC_RESOLUTION_SAFE_NEUTRAL_INITIAL: SAFE_NEUTRAL_INITIAL_SCORE_PATHS,
     SEMANTIC_RESOLUTION_SAFE_NEUTRAL_CONTRACT: (SAFE_NEUTRAL_CONTRACT_SCORE_PATHS),
     SEMANTIC_RESOLUTION_SAFE_NEUTRAL_GROUNDING: (SAFE_NEUTRAL_GROUNDING_SCORE_PATHS),
+    SEMANTIC_RESOLUTION_INSUFFICIENT_INPUT: INSUFFICIENT_INPUT_SCORE_PATHS,
 }
 
 NON_SUBSTANTIVE_SCORE_PATHS = frozenset(
@@ -106,11 +131,13 @@ NEUTRAL_REASON_THEME = "theme"
 NEUTRAL_REASON_FACTS = "facts"
 NEUTRAL_REASON_CONTRACT = "contract"
 NEUTRAL_REASON_INITIAL = "initial"
+NEUTRAL_REASON_INSUFFICIENT = "insufficient"
 NEUTRAL_EVIDENCE_REASONS = frozenset(
     {
         NEUTRAL_REASON_THEME,
         NEUTRAL_REASON_FACTS,
         NEUTRAL_REASON_CONTRACT,
         NEUTRAL_REASON_INITIAL,
+        NEUTRAL_REASON_INSUFFICIENT,
     }
 )

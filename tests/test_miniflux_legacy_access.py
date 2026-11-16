@@ -3,6 +3,7 @@ import importlib.util
 import copy
 import json
 from pathlib import Path
+import re
 import subprocess
 
 import pytest
@@ -78,6 +79,68 @@ def test_actual_verifier_reads_both_locked_migrations_and_negative_boundaries():
     assert "large_byte_fixture_raw_not_exported" in source
     assert "audit['SCHEMA']}.shared_inventory()" in source
     assert '"shared hard quota exceeded" not in command["stderr"]' in source
+
+
+@pytest.mark.parametrize("suffix,bodies,size,batches", [("_rows", 4999, 32, 1), ("_bytes", 254, 1048576, 32)])
+def test_materialization_preserves_full_fixture_with_bounded_no_retry_sql(tmp_path, monkeypatch,
+                                                                       suffix, bodies, size, batches):
+    runner = module.Runner("synthetic-owned", tmp_path, tmp_path)
+    commands = []
+
+    def execute(argv, **kwargs):
+        commands.append(kwargs)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(module.base.subprocess, "run", execute)
+    schema = runner.names["SOURCE"] + suffix
+    runner.materialize_boundary(schema, suffix, bodies, size)
+    assert len(commands) == batches
+    entries = []
+    for command in commands:
+        sql = command["input"]
+        assert command["timeout"] == 15
+        assert "SET statement_timeout='3s'; SET lock_timeout='3s';" in sql
+        assert f"INSERT INTO {schema}.webhook_outbox" in sql
+        assert sql.count("encode(sha256(convert_to(b,'UTF8')),'hex')") == 2
+        assert ",1,1,n,'http://synthetic.invalid/webhook',repeat('a',64),'synthetic-contract'," in sql
+        assert "convert_to(b,'UTF8'),'held',0" in sql
+        assert f"SELECT n,repeat('x',{size}-8)||lpad(n::text,8,'0') b" in sql
+        first, last = map(int, re.search(r"generate_series\((\d+),(\d+)\)", sql).groups())
+        assert (last - first + 1) * size <= 8 * 1048576
+        entries.extend(range(first, last + 1))
+    assert entries == list(range(1, bodies + 1))
+    plan = json.loads((tmp_path / (suffix + "_MATERIALIZATION.json")).read_text())
+    assert plan["rows"] == bodies and plan["body_bytes"] == size
+    assert plan["logical_body_bytes"] == bodies * size
+    assert plan["retry"] is plan["cleanup"] is False
+    assert len(list(tmp_path.glob(suffix + "_MATERIALIZED-*.json"))) == batches
+
+
+def test_materialization_failure_retains_partial_evidence_and_stops_without_retry_or_cleanup(tmp_path, monkeypatch):
+    runner = module.Runner("synthetic-owned", tmp_path, tmp_path)
+    commands = []
+
+    def execute(argv, **kwargs):
+        commands.append(kwargs["input"])
+        if len(commands) == 2:
+            return subprocess.CompletedProcess(argv, 3, "", "ERROR: canceling statement due to statement timeout\n")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(module.base.subprocess, "run", execute)
+    with pytest.raises(AssertionError, match="unexpected real PostgreSQL"):
+        runner.materialize_boundary(runner.names["SOURCE"] + "_bytes", "_bytes", 254, 1048576)
+    assert len(commands) == 2
+    assert "generate_series(1,8)" in commands[0]
+    assert "generate_series(9,16)" in commands[1]
+    assert all(sql.count("INSERT INTO") == 1 for sql in commands)
+    assert not any(word in " ".join(commands).upper() for word in ("DELETE", "TRUNCATE", "DROP", "RESTART"))
+    assert json.loads((tmp_path / "_bytes_MATERIALIZED-001.json").read_text()) == {
+        "first": 1, "last": 8, "command_evidence": "COMMAND-001.json",
+    }
+    assert not (tmp_path / "_bytes_MATERIALIZED-002.json").exists()
+    failed = json.loads((tmp_path / "COMMAND-002.json").read_text())
+    assert failed["exit_code"] == 3 and "statement timeout" in failed["stderr"]
+    assert (tmp_path / "_bytes_MATERIALIZATION.json").exists()
 
 
 def valid_cgroup():

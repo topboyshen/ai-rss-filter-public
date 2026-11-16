@@ -16,11 +16,38 @@
 这是短时受控模式的功能限制，不是透明替换；正式启用前须确认可用的既有 UI 会话／私有控制通路。
 关闭该模式时保留上游登录行为。清空历史和删除用户在启用时同步完成，避免 HTTP 已结束而后台仍写库。
 
-控制接口是 `/registration`、`/initialize`、`/pause`、`/operations/<operation_id>`、`/resume`。
+控制接口是 `/registration`、`/initialize`、`/stop-new`、`/pause`、`/operations/<operation_id>`、`/resume`。
 回执必须同时绑定 manifest、精确 operation/action/代次/状态、`durable/confirmed` 和活动／未知 lease 数。
 普通 200/202 或仅外层 `confirmed=true` 不够。Pause 先持久拒绝新准入，再等已准入工作退出；
 HTTP 超时、409、PG 不可用都不是“已停成功”。丢回执只查询原 operation；不能盲发新暂停或自动 resume。
 恢复必须以准确已闭合操作和新 operation 显式 CAS，不能把旧回执跨代次使用。
+
+### 停止新生产者与完整冻结分开
+
+`/stop-new` 将 `open` 持久变为 `draining`：scheduler、queued refresh、API/UI 手动刷新、
+manual save 和其他普通 HTTP 生产入口拒绝新准入；此前已准入的生产生命周期继续完成，包含原始消息保全。
+只有专用 `BeginOutbox` 可继续领取、发送和完成已有 durable outbox 行；普通生产者不能借用
+`outbox_pass/outbox_sender` 名称获得这一权限。空轮询、原始 body/HMAC、重试预算和 held 保留规则不变。
+
+`action=stop_new,state=draining` 的确认要求 `active_producer_leases=0` 且
+`uncertain_producer_leases=0`。`active_leases/uncertain_leases` 仍计全部工作，可能包含尚在发送的消费者；
+这一确认只证明已登记生产者退出，**不证明 outbox/held 已排空或接收端已保全**。
+未确认只查询同一 operation；死进程遗留的 active/uncertain 生产 lease 不能自动当作完成。
+
+核对独立库存后再 `/pause`：它可以从 `open` 或 `draining` 进入 `closing`，同时拒绝新消费者，
+仍待所有已准入 lease 完成才确认 `closed`。紧急冻结不要求先取得 stop-new 确认；冻结也不会补造旧
+stop-new 的成功回执。重启保留 draining/closed；resume 仍只接受准确的已确认 closed 操作，不能从
+draining 自动恢复生产。stop-new 必须预留最后一个完整 pause 操作名额，容量不足时拒绝变更。
+
+新增本地补丁迁移134只扩展133的phase/action约束，不改写旧操作、lease或原始消息；占用上游版本槽的
+升级与回退限制继续适用。现有 `MinifluxControlBridge.stop()` 仍调用完整 `/pause`，不会隐式改成
+stop-new。外部切换控制器若要采用排空流程，须显式接线 `/stop-new → 独立库存 → /pause` 并核验动作。
+
+**不能直接回退到旧133补丁镜像。** 旧 `Begin` 只允许open，所以遇到draining会拒绝业务生产与消费者；
+但旧 `readReceipt` 不认识stop_new，会把该动作的状态投影成open。旧数据库版本检查只拒绝低于预期的
+schema，不能指望schema134阻止旧程序启动。因此旧镜像的启动成功、query或普通HTTP成功都不能当成
+新状态证明，不能笼统声称所有旧控制路径都会fail closed。必须持续绑定新镜像、源码锁、manifest和
+精确action/state；回退需要独立核验及明确方案，不能降版本号、改操作记录或删除lease来凑兼容。
 
 暂停保护的是**新版本中实际接入的入口和在途生命周期**。它不能回溯已运行的未打补丁旧 Miniflux
 goroutine，也不能恢复以前未保留的 raw body。旧实例的在途消息仍须在受控切换前单独保全和核清。
@@ -36,6 +63,16 @@ lease 归零说明这些工作已结束，不代表 outbox、held、接收端 qu
 空 outbox 轮询只做有界只读候选查询，不为每秒空轮询新建 lease；查询结果既不是可靠接收回执，
 也不能证明排空。并发插入在下一 tick 再观察，真正领取、清理和网络发送仍在已准入生命周期内。
 保留容量不是无限运行承诺；正式启用前必须批准容量观察、停流与证据处置方式。
+
+有待发送候选时，pass与其首个sender的两条lease在同一metadata事务内原子登记，各自持独立PG session
+及共享生命周期锁；并发pass或producer只能看见已占用的两条记录，不能抢占“估算预留”。只剩一格时
+整对拒绝且零新增，不先耗掉最后一格再发现sender无法准入。cleanup-only仍只登记一条，本轮不转入发送；
+新候选下一tick再观察。首个候选被其他worker抢先领取时，两条lease正常结束，不补发。
+
+10000条是累计硬上限，不清理历史lease、不扩大重试预算；即使stop-new确认，剩余容量也可能不足以
+排空全部backlog。容量不足必须终止本次切换窗口、保留未送达原件及未知lease，再执行可确认的完整pause；
+不能把stop-new确认、空轮询或HTTP成功写成排空完成。第二连接/写入失败不会留半对记录；两条提交后
+进程丢失则保留active证据，最终pause继续受阻，不由连接或锁消失推断完成。
 
 ## 实际隔离 harness
 
@@ -53,13 +90,13 @@ Python 短生命周期客户端加入准确 sender network namespace 后访问�
 进程重启前后分别留档。失败仍保存命令 stdout/stderr、inspect、固定身份、PG 合成 dump、HTTP 原文和 fixture。
 只停止本 run 精确标签容器，不清卷、不删原件、不改变任何已有标签。
 
-Go 回归及独立 legacy 权限审计使用专用 service 数据库 `synthetic_outbox`，与实际镜像八场景另建的 `synthetic_pause` 分开。
+Go 回归及独立 legacy 权限审计使用专用 service 数据库 `synthetic_outbox`，与实际镜像九场景另建的 `synthetic_pause` 分开。
 CI 总会尝试保存前者的实际非系统 schema 清单和**整库合成 dump**，涵盖 `handoff_test_*`、
 `outbox_test_*`、`legacy_integration_*`、`pause_worker_*`、`pause_http_*` 及后续新增的回归 schema；
 不再只保存 `handoff_test_*`。inspect、内存峰值、schema 清单和 dump 各自保留 stdout、stderr 和真实退出码；
 一项失败不阻止尝试保存其余材料，最终仍以失败退出，不把截断 dump 当完整证据。旧 CI 原件不改、不补造。
 
-### 八个独立结论
+### 九个独立验收场景
 
 1. 未初始化时实际公共 API 返回 503；精确 initialize 后正常手动刷新写出 outbox，真实 sender 获取准确协议 ACK。
 2. 合成 feed 到期后，由**真实一分钟 scheduler timer**处理，核 `scheduler→queued_refresh` lease 和新增 outbox。
@@ -78,6 +115,10 @@ CI 总会尝试保存前者的实际非系统 schema 清单和**整库合成 dum
    子进程自然结束并严格记录 finish 后只查询同一个操作。再通过真实镜像、真实 PG 私有协议及逐次 Docker
    身份核验的 bridge 完成在途 pause→原操作 query。原旧 cron 字节、逐行替换与实际登记 argv 留档，
    不读取或安装宿主系统 cron。这只覆盖三组 sender 入口及一个合成旧 cron，不冒充其他应用入口全覆盖。
+9. 实际刷新产生两条 durable backlog，第一条HTTP握手阻塞、第二条尚未领取时调用 `/stop-new`。
+   手动刷新与保存拒绝；释放后第二条仍由真实消费者领取并按原body确认。真实scheduler timer到达后拒绝
+   新生产，sender重启后仍draining；再完整pause确认closed。场景继续使用768 MiB/256 PID发送端与
+   384 MiB/64 PID PostgreSQL，不提高预算。新增场景在其对应CI实际成功前仅是待执行验收。
 
 fixture 的 ACK 只用于发送端协议测试，不是实际 AI-Filter durable receiver 的保全证明，也不证明评分完成。
 真实 sender→真实 receiver 联合交接、控制器排空及旧实例切换仍要分别使用对应固定镜像证据，不能互相替代。

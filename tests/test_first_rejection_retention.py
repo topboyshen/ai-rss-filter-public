@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -110,6 +111,31 @@ def rows(flush=True):
         assert retention.flush(10)
     with database.get_connection() as conn:
         return [dict(r) for r in conn.execute(f"SELECT * FROM {TABLE} ORDER BY id")]
+
+
+@contextmanager
+def retention_after_processing(monkeypatch):
+    """Isolate config assertions from the producer's later diagnostic writes.
+
+    Keep the real queue, worker, SQLite write and timeout, but let processing
+    finish before the worker opens its connection. Busy/drop behavior is tested
+    separately; flush alone only means work finished, not that a row was saved.
+    """
+    assert retention.flush(10)
+    release = threading.Event()
+    write_row = retention._write_row
+
+    def after_processing(*args, **kwargs):
+        assert release.wait(10), "test did not release the retention writer"
+        return write_row(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(retention, "_write_row", after_processing)
+        try:
+            yield
+        finally:
+            release.set()
+            assert retention.flush(10)
 
 
 def stats():
@@ -465,6 +491,109 @@ def test_locked_database_write_is_bounded_by_the_timeout(model, tmp_path):
     assert rows(flush=False) == []
 
 
+def test_post_scoring_diagnostic_lock_can_drop_retention_after_successful_flush(
+    monkeypatch, model,
+):
+    """Force the real competing transaction, without guessing a CI lock cause."""
+    from db import news_processing
+
+    baseline = scoring_outcome(run(model, base_cfg(), link="https://invalid.test/base"))
+    model.scorer.clear_runtime_cache()
+    assert retention.flush(10)
+    before = stats()
+    diagnostic_locked = threading.Event()
+    writer_done = threading.Event()
+    writes, errors, diagnostic_waits = [], [], []
+    write_row = retention._write_row
+    insert = retention.insert_evidence
+    execute = news_processing._execute
+
+    def observed_insert(*args, **kwargs):
+        try:
+            return insert(*args, **kwargs)
+        except sqlite3.OperationalError as error:
+            errors.append((error.sqlite_errorcode, error.sqlite_errorname))
+            raise
+
+    def competing_write(db_path, options, row):
+        try:
+            assert diagnostic_locked.wait(5)
+            started = time.monotonic()
+            write_row(db_path, options, row)
+            writes.append((options["write_timeout_ms"], time.monotonic() - started,
+                           threading.current_thread().name))
+        finally:
+            writer_done.set()
+
+    def held_diagnostic_insert(conn, deadline, sql, params=()):
+        cursor = execute(conn, deadline, sql, params)
+        if sql.startswith("INSERT INTO news_processing_logs"):
+            # This is the actual post-score trace transaction. Model a delayed
+            # storage operation holding its write lock until retention times out.
+            assert conn.in_transaction
+            diagnostic_locked.set()
+            diagnostic_waits.append(writer_done.wait(5))
+        return cursor
+
+    monkeypatch.setattr(retention, "insert_evidence", observed_insert)
+    monkeypatch.setattr(retention, "_write_row", competing_write)
+    monkeypatch.setattr(news_processing, "_execute", held_diagnostic_insert)
+    try:
+        got = scoring_outcome(run(
+            model, base_cfg({"enabled": True, "write_timeout_ms": float("-inf")}),
+            link="https://invalid.test/contended",
+        ))
+        assert retention.flush(10)  # task_done also happens for a counted skip
+    finally:
+        diagnostic_locked.set()
+        assert retention.flush(10)
+    assert diagnostic_waits == [True]
+    assert len(writes) == 1  # no retry and no extended busy timeout
+    timeout_ms, elapsed, thread_name = writes[0]
+    assert timeout_ms == 200 and elapsed < 1.5
+    assert thread_name == retention.WRITER_THREAD_NAME
+    assert errors == [(sqlite3.SQLITE_BUSY, "SQLITE_BUSY")]
+    assert delta(before) == {"failed_locked": 1}
+    assert got[0] == baseline[0] == "filtered"
+    assert got[1][0] == baseline[1][0] and len(got[1]) == 2
+    assert model.calls == ["first", "second", "first", "second"]
+    assert rows(flush=False) == []
+
+
+def test_config_isolation_keeps_real_async_writer_after_diagnostic_commit(monkeypatch, model):
+    from db import news_processing
+
+    committed = threading.Event()
+    writes, diagnostic_inserts = [], []
+    write_row = retention._write_row
+    execute = news_processing._execute
+    before = stats()
+
+    def observed_write(db_path, options, row):
+        writes.append((committed.is_set(), options["write_timeout_ms"],
+                       threading.current_thread().name))
+        return write_row(db_path, options, row)
+
+    def observed_diagnostic(conn, deadline, sql, params=()):
+        cursor = execute(conn, deadline, sql, params)
+        if sql.startswith("INSERT INTO news_processing_logs"):
+            diagnostic_inserts.append(not writes and conn.in_transaction)
+        elif sql == "COMMIT":
+            committed.set()
+        return cursor
+
+    monkeypatch.setattr(retention, "_write_row", observed_write)
+    monkeypatch.setattr(news_processing, "_execute", observed_diagnostic)
+    with retention_after_processing(monkeypatch):
+        result = run(model, base_cfg({"enabled": True, "queue_max": "abc"}))
+    assert scoring_outcome(result)[0] == "filtered"
+    assert diagnostic_inserts == [True]
+    assert writes == [(True, 200, retention.WRITER_THREAD_NAME)]
+    assert delta(before) == {"inserted": 1}
+    [row] = rows()
+    assert row["replayable"] == 1
+
+
 # ── idempotency / single flight ──────────────────────────────────────────
 
 
@@ -765,12 +894,14 @@ def scoring_outcome(entry_and_result):
 @pytest.mark.parametrize("bad", BAD_VALUES, ids=repr)
 @pytest.mark.parametrize("key", ["max_rows", "retention_days", "source_max_chars",
                                  "write_timeout_ms", "queue_max", "max_total_bytes"])
-def test_bad_config_never_interrupts_scoring_on_the_real_path(model, key, bad):
+def test_bad_config_never_interrupts_scoring_on_the_real_path(monkeypatch, model, key, bad):
     baseline = scoring_outcome(run(model, base_cfg(), link="https://invalid.test/base"))
     model.scorer.clear_runtime_cache()
     before = list(model.calls)
-    got = scoring_outcome(run(model, base_cfg({"enabled": True, key: bad}),
-                              link="https://invalid.test/cfg"))
+    with retention_after_processing(monkeypatch):
+        result = run(model, base_cfg({"enabled": True, key: bad}),
+                     link="https://invalid.test/cfg")
+    got = scoring_outcome(result)
     assert got[0] == baseline[0] == "filtered"
     assert model.calls[len(before):] == ["first", "second"]  # scored normally
     assert got[1][0] == baseline[1][0] and len(got[1]) == 2
