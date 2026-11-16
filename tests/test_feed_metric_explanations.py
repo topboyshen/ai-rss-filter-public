@@ -88,6 +88,7 @@ def test_mixed_paths_are_exclusive_and_keep_existing_formal_eligibility(
         "safe_contract": 2,
         "safe_grounding": 2,
         "insufficient_input": 0,
+        "market_flash": 0,
         "model_failure": 1,
         "processing_error": 2,
         "other_excluded": 0,
@@ -491,3 +492,16 @@ def test_last_check_never_borrows_article_publish_time(feed_metrics_db):
     assert "0ms" not in body
     assert dashboard.beijing_fromtimestamp(checked_at).strftime("%m-%d %H:%M") in body
     assert dashboard.beijing_fromtimestamp(published_at).strftime("%m-%d %H:%M") in body
+
+
+def test_market_flash_path_has_its_own_category():
+    import routes.dashboard_routes as dashboard_routes
+
+    assert (
+        dashboard_routes._feed_score_category("market_flash_rule", 3.0, 6)
+        == "market_flash"
+    )
+    assert (
+        dashboard_routes._feed_score_category("stage2_market_flash_rule", 3.0, 6)
+        == "market_flash"
+    )

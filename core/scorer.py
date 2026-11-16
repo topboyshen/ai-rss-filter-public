@@ -37,11 +37,13 @@ from services.news_processing_trace import (
 from scoring_provenance import (
     ALLOWED_SEMANTIC_RESOLUTIONS,
     INSUFFICIENT_INPUT_TAG,
+    MARKET_FLASH_VALUES,
     SAFE_NEUTRAL_CONTRACT_VALUES,
     SEMANTIC_RESOLUTION_SAFE_NEUTRAL_CONTRACT,
     SEMANTIC_RESOLUTION_SAFE_NEUTRAL_GROUNDING,
     SEMANTIC_RESOLUTION_SAFE_NEUTRAL_INITIAL,
     SEMANTIC_RESOLUTION_INSUFFICIENT_INPUT,
+    SEMANTIC_RESOLUTION_MARKET_FLASH,
     NEUTRAL_EVIDENCE_REASONS,
     NEUTRAL_REASON_CONTRACT,
     NEUTRAL_REASON_FACTS,
@@ -1036,6 +1038,24 @@ def _is_insufficient_input_score(parsed: object) -> bool:
     )
 
 
+_MARKET_FLASH_SUBJECT = re.compile(
+    r"指数|恒生|恒指|日经|上证|深证|创业板|科创50|沪深300|中证|纳斯达克|标普|道指|富时|A50|"
+    r"美元指数|汇率|人民币|黄金|原油|期货|夜盘|收盘|开盘|盘初|美债|国债"
+)
+_MARKET_FLASH_MOVE = re.compile(
+    r"(?:涨|跌)[超]?[0-9]|[0-9]+(?:\.[0-9]+)?\s*[%％点]|报[0-9]|"
+    r"上涨|下跌|跌幅(?:扩大|收窄)|涨幅(?:扩大|收窄)"
+)
+
+
+def _is_market_flash_title(title: str) -> bool:
+    """Narrow guard: a named index/asset with a numeric move is not 'no input'."""
+    value = str(title or "")
+    return bool(
+        _MARKET_FLASH_SUBJECT.search(value) and _MARKET_FLASH_MOVE.search(value)
+    )
+
+
 def _check_reserved_score(parsed, *, raw_fields=None):
     """Check the reserved tag before legacy cleaning can hide added content."""
     score, tag, logic, direction = parsed
@@ -1431,6 +1451,9 @@ class ScoringResult:
         if self.semantic_resolution == SEMANTIC_RESOLUTION_INSUFFICIENT_INPUT:
             if not _is_insufficient_input_score(self.values):
                 raise ValueError("insufficient-input resolution requires its sentinel")
+        elif self.semantic_resolution == SEMANTIC_RESOLUTION_MARKET_FLASH:
+            if self.values != MARKET_FLASH_VALUES:
+                raise ValueError("market-flash resolution requires its fixed tuple")
         elif self.semantic_resolution and not _contract_repair_result_is_safe(
             self.values
         ):
@@ -2353,6 +2376,7 @@ class Scorer:
         cache_cfg: dict,
         cache_key: str,
         stage: str,
+        title: str = "",
     ) -> ScoringResult:
         repair_outcome = ""
         if attempt_name == "repair":
@@ -2376,16 +2400,25 @@ class Scorer:
             _neutral_reason_from_trigger(repair_trigger_reason)
             if repair_outcome else ""
         )
-        if _is_insufficient_input_score(parsed):
+        model_name = backend.model or backend.name
+        if _is_insufficient_input_score(parsed) and _is_market_flash_title(title):
+            parsed = MARKET_FLASH_VALUES
+            resolution = SEMANTIC_RESOLUTION_MARKET_FLASH
+            neutral_reason = ""
+            model_name = "local_market_flash_rule"
+            logger.info(
+                "[Score] market_flash_override purpose=%s title=%s",
+                stage or "score",
+                title[:40],
+            )
+        elif _is_insufficient_input_score(parsed):
             resolution = SEMANTIC_RESOLUTION_INSUFFICIENT_INPUT
             neutral_reason = NEUTRAL_REASON_INSUFFICIENT
         elif attempt_name == "initial" and _is_fixed_safe_neutral_score(parsed):
             resolution = SEMANTIC_RESOLUTION_SAFE_NEUTRAL_INITIAL
             neutral_reason = NEUTRAL_REASON_INITIAL
         backend.record_success()
-        scored = ScoringResult(
-            parsed, backend.model or backend.name, resolution, neutral_reason
-        )
+        scored = ScoringResult(parsed, model_name, resolution, neutral_reason)
         if cache_cfg.get("enabled", False):
             self._set_cached_score(cache_key, scored)
         return scored
@@ -2515,7 +2548,7 @@ class Scorer:
                 )
                 if not failure_reason:
                     return self._finish_valid_score(
-                        parsed, backend, "initial", "", cache_cfg, key, stage,
+                        parsed, backend, "initial", "", cache_cfg, key, stage, title,
                     )
                 logger.warning(
                     "[Score] semantic_reject backend=%s purpose=%s "

@@ -16,6 +16,8 @@ _PATH_LABELS = {
     "fallback_local": "系统兜底", "similarity": "相似结果复用",
     "radar": "雷达路径", "parse_error": "处理异常（解析失败）",
     "quality_quarantine": "质量隔离",
+    "market_flash_rule": "行情规则（3分）",
+    "stage2_market_flash_rule": "行情规则（3分）",
 }
 
 
