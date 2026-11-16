@@ -51,8 +51,6 @@ def _partial_write(monkeypatch, body, fragment, status="accepted"):
 
 def _new_store(delivery):
     """No process-memory receipts are used by this fresh store instance."""
-    with delivery.webhook._webhook_replay_lock:
-        delivery.webhook._webhook_replay_seen.clear()
     return receipts.ReceiptStore(delivery.webhook._webhook_spool_dir)
 
 

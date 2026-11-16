@@ -145,9 +145,58 @@ probe_tcp() {
         >/dev/null 2>&1
 }
 
+verify_runtime_mounts() {
+    local expected=$1 actual=$2
+    python3 - "$expected" "$actual" <<'PY'
+import json
+import os
+import sys
+
+try:
+    expected = json.loads(sys.argv[1])
+    actual = json.loads(sys.argv[2])
+except (TypeError, ValueError):
+    print("mount evidence is not valid JSON")
+    raise SystemExit(2)
+
+if not isinstance(expected, list) or not isinstance(actual, list):
+    print("mount evidence has an unexpected shape")
+    raise SystemExit(2)
+
+by_target = {}
+for mount in actual:
+    if isinstance(mount, dict) and isinstance(mount.get("Destination"), str):
+        by_target[mount["Destination"]] = mount
+
+for want in expected:
+    if not isinstance(want, dict):
+        raise SystemExit(2)
+    target = want.get("target")
+    seen = by_target.get(target)
+    if seen is None:
+        print(f"missing mount {target}")
+        raise SystemExit(1)
+    if seen.get("Type") != want.get("type"):
+        print(f"mount {target} type {seen.get('Type')} != {want.get('type')}")
+        raise SystemExit(1)
+    if want.get("readOnly") and seen.get("RW") is not False:
+        print(f"mount {target} is not read-only")
+        raise SystemExit(1)
+    source = want.get("source")
+    if source:
+        current = seen.get("Source")
+        if not isinstance(current, str) or os.path.realpath(current) != source:
+            print(f"mount {target} source does not match the recorded manifest")
+            raise SystemExit(1)
+raise SystemExit(0)
+PY
+}
+
 probe_compose_health() {
     local compose_dir=$1 service=$2 manifest=$3 image_ref=$4 expected_image_id=$5
+    local expected_mounts="${6:-[]}"
     local container_ids="" container_id inspect_state state_status actual_image_id found=0
+    local actual_mounts="" mount_reason=""
 
     [[ "$expected_image_id" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
 
@@ -171,12 +220,23 @@ probe_compose_health() {
         # HEALTHCHECK.  They remain valid rollback targets, so a service with
         # no Health object is accepted only when Docker reports it running.
         [[ "$state_status" == "healthy" || "$state_status" == "running" ]] || return 1
+        # Only mounts that the recorded manifest declares are enforced. Old
+        # releases without volume/config declarations keep their old behavior.
+        if [[ "$expected_mounts" != "[]" ]]; then
+            actual_mounts=$(timeout --signal=TERM --kill-after=1s 4s \
+                docker inspect --format '{{json .Mounts}}' "$container_id" 2>/dev/null) || return 1
+            if ! mount_reason=$(verify_runtime_mounts "$expected_mounts" "$actual_mounts" 2>&1); then
+                log "WARN: ${service} runtime mount does not match the recorded manifest: ${mount_reason}"
+                return 1
+            fi
+        fi
     done <<< "$container_ids"
 
     (( found == 1 ))
 }
 
 AI_RELEASE_EXPECTED_IMAGE_MAP=""
+AI_RELEASE_EXPECTED_MOUNT_MAP=""
 
 expected_release_image_id() {
     local wanted=$1 service image_id
@@ -189,9 +249,20 @@ expected_release_image_id() {
     return 1
 }
 
+expected_release_mounts() {
+    local wanted=$1 service mounts
+    while IFS=$'\t' read -r service mounts; do
+        if [[ "$service" == "$wanted" ]]; then
+            printf '%s\n' "$mounts"
+            return 0
+        fi
+    done <<< "$AI_RELEASE_EXPECTED_MOUNT_MAP"
+    printf '[]\n'
+}
+
 resolve_release_image_ids() {
     local manifest=$1 image_ref=$2 services=$3 config_json mapping
-    local service expected_ref expected_id count=0 expected_count=0
+    local service expected_ref expected_mounts expected_id count=0 expected_count=0
 
     config_json=$(
         IMAGE_REF="$image_ref" timeout --signal=TERM --kill-after=1s 7s \
@@ -201,33 +272,97 @@ resolve_release_image_ids() {
     ) 2>/dev/null || return 1
     mapping=$(printf '%s' "$config_json" | python3 -c '
 import json
+import os
 import sys
 
+COMPACT = (",", ":")
+project_dir = sys.argv[1]
 config = json.load(sys.stdin)
 declared = config.get("services")
-if not isinstance(declared, dict):
+declared_configs = config.get("configs") or {}
+if not isinstance(declared, dict) or not isinstance(declared_configs, dict):
     raise SystemExit(1)
-for service in sys.argv[1:]:
+
+
+def clean(value):
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and not any(character in value for character in "\t\n\r|")
+    )
+
+
+def absolute(path):
+    if not os.path.isabs(path):
+        path = os.path.join(project_dir, path)
+    return os.path.realpath(path)
+
+
+for service in sys.argv[2:]:
     item = declared.get(service)
     image = item.get("image") if isinstance(item, dict) else None
-    if not isinstance(image, str) or not image or "\t" in image or "\n" in image:
+    if not clean(image):
         raise SystemExit(1)
-    print(f"{service}\t{image}")
-' $services) || return 1
+    mounts = []
+    for volume in item.get("volumes") or []:
+        if not isinstance(volume, dict):
+            raise SystemExit(1)
+        kind = volume.get("type")
+        target = volume.get("target")
+        source = volume.get("source")
+        if kind not in ("bind", "volume", "tmpfs"):
+            continue
+        if not clean(target) or not target.startswith("/"):
+            raise SystemExit(1)
+        expected = {"type": kind, "target": target,
+                    "readOnly": volume.get("read_only") is True}
+        if kind == "bind":
+            if not clean(source):
+                raise SystemExit(1)
+            expected["source"] = absolute(source)
+        mounts.append(expected)
+    for entry in item.get("configs") or []:
+        if not isinstance(entry, dict):
+            raise SystemExit(1)
+        name = entry.get("source")
+        target = entry.get("target")
+        if not clean(name) or not clean(target) or not target.startswith("/"):
+            raise SystemExit(1)
+        declared_config = declared_configs.get(name)
+        if not isinstance(declared_config, dict):
+            raise SystemExit(1)
+        file_path = declared_config.get("file")
+        content = declared_config.get("content")
+        expected = {"type": "bind", "target": target, "readOnly": True}
+        if clean(file_path):
+            expected["source"] = absolute(file_path)
+        elif isinstance(content, str) and content:
+            # Old releases used inline config content. Compose materializes it
+            # to a runtime file whose path is not stable, so only the target
+            # and read-only flag are comparable.
+            pass
+        else:
+            raise SystemExit(1)
+        mounts.append(expected)
+    print(f"{service}\t{image}\t{json.dumps(mounts, separators=COMPACT)}")
+' "$AI_FILTER_ROOT" $services) || return 1
 
     AI_RELEASE_EXPECTED_IMAGE_MAP=""
+    AI_RELEASE_EXPECTED_MOUNT_MAP=""
     for service in $services; do
         expected_count=$((expected_count + 1))
     done
-    while IFS=$'\t' read -r service expected_ref; do
-        [[ -n "$service" && -n "$expected_ref" ]] || return 1
+    while IFS=$'\t' read -r service expected_ref expected_mounts; do
+        [[ -n "$service" && -n "$expected_ref" && -n "$expected_mounts" ]] || return 1
         expected_id=$(timeout --signal=TERM --kill-after=1s 5s \
             docker image inspect "$expected_ref" --format '{{.Id}}' 2>/dev/null) || return 1
         [[ "$expected_id" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
         if [[ -n "$AI_RELEASE_EXPECTED_IMAGE_MAP" ]]; then
             AI_RELEASE_EXPECTED_IMAGE_MAP+=$'\n'
+            AI_RELEASE_EXPECTED_MOUNT_MAP+=$'\n'
         fi
         AI_RELEASE_EXPECTED_IMAGE_MAP+="${service}"$'\t'"${expected_id}"
+        AI_RELEASE_EXPECTED_MOUNT_MAP+="${service}"$'\t'"${expected_mounts}"
         count=$((count + 1))
     done <<< "$mapping"
     (( count == expected_count ))
@@ -446,7 +581,8 @@ run_probe() {
                 compose-health)
                     probe_compose_health "$compose_dir" "$target_service" \
                         "$RELEASE_STATE_MANIFEST_FILE" "$RELEASE_STATE_DIGEST" \
-                        "$(expected_release_image_id "$target_service")"
+                        "$(expected_release_image_id "$target_service")" \
+                        "$(expected_release_mounts "$target_service")"
                     ;;
                 *)
                     perform_probe "$probe_kind" "$compose_dir" "$target_service" "$@"

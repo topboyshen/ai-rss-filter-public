@@ -319,6 +319,7 @@ def _isolated_main(monkeypatch, tmp_path, image_paths):
     ))
     monkeypatch.setattr(checker.shutil, "which", lambda _name: None)
     monkeypatch.setattr(checker, "debian_version_errors", lambda: [])
+    monkeypatch.setattr(checker, "installed_certifi_report", lambda _versions: {"errors": []})
 
 
 def test_main_reports_runtime_import_failure_and_returns_nonzero(
@@ -374,6 +375,25 @@ def test_main_reports_debian_version_failure_before_runtime_imports(
     result = json.loads(capsys.readouterr().out)
     assert result["runtime_imports"] == []
     assert result["errors"] == ["Debian package missing: gzip"]
+
+
+def test_main_rejects_bad_certifi_store_before_runtime_imports(
+    monkeypatch, tmp_path, image_paths, capsys,
+):
+    _isolated_main(monkeypatch, tmp_path, image_paths)
+    report = {"version": "2026.10.19", "errors": ["distrusted root present"]}
+    monkeypatch.setattr(checker, "installed_certifi_report", lambda _versions: report)
+
+    def unexpected_import(module):
+        pytest.fail(f"runtime import must wait for certifi validation: {module}")
+
+    monkeypatch.setattr(checker.importlib, "import_module", unexpected_import)
+
+    assert checker.main() == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["runtime_imports"] == []
+    assert result["errors"] == ["distrusted root present"]
+    assert result["certifi_bundle"] == report
 
 
 def test_docker_installs_binary_dependencies_before_checking_and_removing_tools():

@@ -38,14 +38,14 @@
       </div>
       <div class="event-radar-summary-note">展示 6 分以上且有留存关联记录的非概念个股事件。历史映射保留但未按当前规则重算；只有契约与来源均匹配时才标为当前标题映射。“事件重要度”不是个股评分。</div>
     </div>
-    <a class="event-radar-summary-open" href="{{ dashboard_origin }}/dashboard/events?has_stocks=1" target="_blank" rel="noopener noreferrer">打开完整事件雷达 ↗</a>
+    {% if dashboard_origin %}<a class="event-radar-summary-open" href="{{ dashboard_origin }}/dashboard/events?has_stocks=1" target="_blank" rel="noopener noreferrer">打开完整事件雷达 ↗</a>{% else %}<span>后台入口未配置</span>{% endif %}
   </div>
 
   {% if events %}
   <div class="event-radar-summary-grid">
     {% for event in events %}
     {% set direction = event.direction or '中性' %}
-    <a class="event-radar-summary-item" href="{{ dashboard_origin }}/dashboard/events?event_id={{ event.event_id|urlencode }}&amp;has_stocks=1&amp;tab=overview#event-detail" target="_blank" rel="noopener noreferrer">
+    {% if dashboard_origin %}<a class="event-radar-summary-item" href="{{ dashboard_origin }}/dashboard/events?event_id={{ event.event_id|urlencode }}&amp;has_stocks=1&amp;tab=overview#event-detail" target="_blank" rel="noopener noreferrer">{% else %}<div class="event-radar-summary-item">{% endif %}
       <div class="event-radar-summary-top">
         <span class="event-radar-summary-badges">
           <span class="event-radar-summary-type">{{ event.event_type or '其他事件' }}</span>
@@ -62,7 +62,7 @@
         <span class="event-radar-summary-source">{{ event.source_count or 0 }} 条原文链接 · 转载关系未核验</span>
         <span class="event-radar-summary-score"><span class="event-radar-summary-score-label">事件重要度</span>{{ event.priority_label or '0.0' }}/10</span>
       </div>
-    </a>
+    {% if dashboard_origin %}</a>{% else %}</div>{% endif %}
     {% endfor %}
   </div>
   {% else %}

@@ -48,8 +48,9 @@
 普通未进入续作的业务异常保持原来的异常语义。
 
 `score_continuations` 列出本轮续作的 attempted/completed/deferred/errors、
-terminal_unscored、物理模型调用数以及剩余活跃/到期/终态数量。尚有活跃任务或续作失败时不
-推进完整刷新时间。旧轮的 `partial` 不被倒写成成功；后续完整自然刷新
+terminal_unscored、物理模型调用数，以及 feed 处理结束后重算的剩余活跃/到期/终态数量
+（含本轮新递延的条目）。尚有活跃任务或续作失败时不推进完整刷新时间。
+旧轮的 `partial` 不被倒写成成功；后续完整自然刷新
 才可推进 `last_full_refresh`。终态 `expired/exhausted` 是未完成原因，
 不是“得分低”或“事实校验通过”，也不自动恢复历史新闻。
 
