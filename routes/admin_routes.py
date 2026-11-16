@@ -9,6 +9,7 @@ from utils.beijing_time import beijing_now, beijing_fromtimestamp
 from flask import Blueprint, Response, request
 from services.release_info import release_version
 from core.user_feedback import resolve_scoring_contract
+from services.call_volume_alerts import prometheus_lines as call_volume_prometheus
 from services.score_quality import score_quality_prometheus, score_quality_snapshot
 from services.ingestion_status import public_refresh_attempt
 from utils.helpers import feed_data_health
@@ -51,7 +52,6 @@ def _worker_queue_metrics() -> dict:
     )
     metrics["alert"] = bool(
         not metrics.get("scan_ok")
-        or metrics.get("dead_letter", 0) > 0
         or metrics.get("invalid_files", 0) > 0
         or metrics["stale"]
     )
@@ -701,7 +701,7 @@ def metrics():
         "# HELP ai_filter_worker_queue_inflight Durable tasks currently claimed",
         "# TYPE ai_filter_worker_queue_inflight gauge",
         f"ai_filter_worker_queue_inflight {worker_queue['inflight']}",
-        "# HELP ai_filter_worker_queue_dead_letter Tasks requiring operator remediation",
+        "# HELP ai_filter_worker_queue_dead_letter Total dead letters (informational; never alerts by itself)",
         "# TYPE ai_filter_worker_queue_dead_letter gauge",
         f"ai_filter_worker_queue_dead_letter {worker_queue['dead_letter']}",
         "# HELP ai_filter_worker_queue_invalid_files Malformed active spool files",
@@ -713,7 +713,7 @@ def metrics():
         "# HELP ai_filter_worker_queue_stale Oldest task exceeded the configured age limit",
         "# TYPE ai_filter_worker_queue_stale gauge",
         f"ai_filter_worker_queue_stale {1 if worker_queue['stale'] else 0}",
-        "# HELP ai_filter_worker_queue_alert Queue needs attention due to scan failure, DLQ, or stale work",
+        "# HELP ai_filter_worker_queue_alert Queue needs attention due to scan failure, invalid files, or stale work (DLQ: see ai_filter_dead_letter_new_alert)",
         "# TYPE ai_filter_worker_queue_alert gauge",
         f"ai_filter_worker_queue_alert {1 if worker_queue['alert'] else 0}",
         "# HELP ai_filter_cold_filter_limit Maximum concurrent RSS/LLM cold paths in the API worker",
@@ -728,7 +728,7 @@ def metrics():
     ]
 
     response = Response(
-        "\n".join(lines + _insufficient_input_prometheus(score_fallback) + score_quality_prometheus(_quality_strategy_version(c))) + "\n", mimetype="text/plain; version=0.0.4"
+        "\n".join(lines + _insufficient_input_prometheus(score_fallback) + score_quality_prometheus(_quality_strategy_version(c)) + call_volume_prometheus(c)) + "\n", mimetype="text/plain; version=0.0.4"
     )
     response.headers["Cache-Control"] = "no-store"
     return response

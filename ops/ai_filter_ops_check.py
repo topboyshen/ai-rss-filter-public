@@ -505,6 +505,13 @@ def _parse_prometheus_scalars(text: str) -> dict[str, float]:
     return values
 
 
+_OPTIONAL_ALERT_GAUGES = (
+    "ai_filter_llm_call_volume_alert",
+    "ai_filter_llm_cost_alert",
+    "ai_filter_dead_letter_new_alert",
+)
+
+
 def check_metrics(settings: Settings, _now: int) -> CheckResult:
     key = _load_api_key(settings)
     if not key:
@@ -542,10 +549,14 @@ def check_metrics(settings: Settings, _now: int) -> CheckResult:
             failures.append("refresh_degraded")
         if values["ai_filter_feed_empty_degraded_sources"] > 0:
             failures.append("feed_empty_degraded")
-        if values["ai_filter_worker_queue_alert"] != 0:
+        if _worker_queue_alert_active(values):
             failures.append("worker_queue_alert")
         if values["ai_filter_score_fallback_alert"] != 0:
             failures.append("score_fallback_alert")
+        # Optional (older images do not export them): alert gauges only.
+        for gauge in _OPTIONAL_ALERT_GAUGES:
+            if values.get(gauge, 0) != 0:
+                failures.append(gauge.removeprefix("ai_filter_"))
         cold_inflight = values["ai_filter_cold_filter_inflight"]
         cold_limit = values["ai_filter_cold_filter_limit"]
         if cold_limit <= 0:
@@ -1768,6 +1779,26 @@ def notification_decision(
     return ""
 
 
+def _worker_queue_alert_active(values: dict[str, float]) -> bool:
+    """Queue alert without the retired DLQ-total trigger.
+
+    New images already exclude dead letters from ai_filter_worker_queue_alert
+    and export ai_filter_dead_letter_new_alert.  Older images (no new-item
+    gauge) still raise the queue alert for any DLQ file, so discount it when
+    dead letters are the only visible cause (no stale work, no invalid files).
+    """
+    if values.get("ai_filter_worker_queue_alert", 0) == 0:
+        return False
+    if "ai_filter_dead_letter_new_alert" in values:
+        return True
+    dlq_only = (
+        values.get("ai_filter_worker_queue_dead_letter", 0) > 0
+        and values.get("ai_filter_worker_queue_stale", 0) == 0
+        and values.get("ai_filter_worker_queue_invalid_files", 0) == 0
+    )
+    return not dlq_only
+
+
 def _notification_text(kind: str, results: list[CheckResult], now: int) -> str:
     if kind == "recovery":
         return f"AI-Filter 运维检查已恢复 | ts={now}"
@@ -1778,6 +1809,7 @@ def _notification_text(kind: str, results: list[CheckResult], now: int) -> str:
     allowed = {
         "refresh_stale", "refresh_degraded", "feed_empty_degraded",
         "worker_queue_alert", "score_fallback_alert",
+        "llm_call_volume_alert", "llm_cost_alert", "dead_letter_new_alert",
         "cold_filter_capacity_invalid", "cold_filter_capacity_inconsistent",
     }
     reasons = []

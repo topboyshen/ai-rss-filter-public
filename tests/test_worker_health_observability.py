@@ -172,7 +172,7 @@ def test_stale_tasks_alert_without_failing_worker_liveness(
     assert queue_metrics["alert"] is True
 
 
-def test_dlq_only_stays_healthy_but_emits_alert(
+def test_stale_dlq_only_stays_healthy_and_no_longer_alerts(
     isolated_worker_health, monkeypatch
 ):
     worker_health, spool = isolated_worker_health
@@ -200,7 +200,9 @@ def test_dlq_only_stays_healthy_but_emits_alert(
     queue_metrics = admin_routes._worker_queue_metrics()
     assert queue_metrics["dead_letter"] == 1
     assert queue_metrics["stale"] is False
-    assert queue_metrics["alert"] is True
+    # Total DLQ no longer alerts (old behaviour: True); new arrivals do, via
+    # ai_filter_dead_letter_new_alert (tests/test_call_volume_alerts.py).
+    assert queue_metrics["alert"] is False
 
 
 def test_startup_grace_suppresses_stale_task_liveness(
