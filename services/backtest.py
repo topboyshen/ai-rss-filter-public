@@ -25,6 +25,7 @@ from core.asset_mapping import get_mapping_version, map_article_to_assets
 from core.digest_engine import dedupe_articles
 from core.config import load_config
 from core.user_feedback import resolve_scoring_contract
+from scoring_provenance import scoring_contract_bucket
 from db.database import (
     db_lock, get_connection, get_feed_thresholds,
     get_future_price,
@@ -808,8 +809,9 @@ def _snapshot_articles(
     evaluation_at = int(time.time())
     cutoff = evaluation_at - max(1, days) * 86400
     strategy_version = str(cfg.get("scoring_strategy_version") or "")
+    contract_version = scoring_contract_bucket(strategy_version)
     stats = get_backtest_signal_stats(
-        strategy_version=strategy_version,
+        strategy_contract=contract_version,
         mapping_version=mapping_version,
     )
     ledger_stats = get_backtest_signal_stats()
@@ -820,12 +822,12 @@ def _snapshot_articles(
     )
     rows = get_backtest_signals(
         cutoff=cutoff,
-        strategy_version=strategy_version,
+        strategy_contract=contract_version,
         mapping_version=mapping_version,
         min_score=min_score,
         # The production view and its rejected-signal control must come from
         # the same final-revision population.  Selection is split only after
-        # this single exact-contract read.
+        # this single contract-bucket read; patch-only changes stay comparable.
         selected_only=False,
         include_similarity=False,
     )

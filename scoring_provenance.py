@@ -145,6 +145,23 @@ def normalize_score_path(value: object) -> str:
     return str(value or "").strip().casefold()
 
 
+def scoring_contract_bucket(value: object) -> str:
+    """Stable contract bucket; the rule patch and feedback suffix are metadata.
+
+    A full identity looks like ``manual:patch`` or ``manual:patch:fb-...``.
+    Read models compare this bucket so a code/config patch does not cut the
+    posterior series; caches and provenance keep using the full identity.
+    """
+    text = str(value or "").strip()
+    return text.split(":", 1)[0] if ":" in text else text
+
+
+def scoring_rule_patch(value: object) -> str:
+    """The rule-patch segment of a full identity, or "" when none is recorded."""
+    parts = str(value or "").strip().split(":", 2)
+    return parts[1] if len(parts) > 1 else ""
+
+
 def is_recognized_score_path(value: object) -> bool:
     return normalize_score_path(value) in RECOGNIZED_SCORE_PATHS
 

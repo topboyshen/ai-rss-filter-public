@@ -48,6 +48,7 @@ from scoring_provenance import (
     FORMAL_SIGNAL_SCORE_PATHS,
     SCORE_PATH_SPECS,
     normalize_score_path,
+    scoring_contract_bucket,
 )
 from utils.helpers import (
     escape_xml,
@@ -1361,10 +1362,14 @@ def _summarize_feed_score_rows(rows, cfg):
     """Count only the current scoring contract; other contracts stay separate.
 
     Old-contract rejection counts must not be used to judge the running
-    version, so rows whose ``strategy_version`` differs from the configured
-    one go to ``other_contract_total`` and never enter the reason counts.
+    version, so rows whose contract bucket differs from the configured one go
+    to ``other_contract_total`` and never enter the reason counts. A patch-only
+    identity change shares the bucket and keeps the posterior series.
     """
-    current_version = str(cfg.get("scoring_strategy_version") or "").strip()
+    current_version = scoring_contract_bucket(
+        cfg.get("scoring_contract_version")
+        or cfg.get("scoring_strategy_version")
+    )
     stats_map = {}
     for feed_url, score, created_at, score_path, error_type, strategy_version in rows:
         feed_url = feed_url or ""
@@ -1383,7 +1388,7 @@ def _summarize_feed_score_rows(rows, cfg):
             bucket["latest_article_at"], int(created_at or 0)
         )
         version = str(strategy_version or "").strip()
-        if current_version and version != current_version:
+        if current_version and scoring_contract_bucket(version) != current_version:
             bucket["other_contract_total"] += 1
             continue
         bucket["articles_total"] += 1

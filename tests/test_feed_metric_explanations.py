@@ -384,6 +384,28 @@ def test_other_scoring_contract_samples_are_excluded_and_reported(feed_metrics_d
     assert "来源依据中性 1" not in details[url]["breakdown_text"]
 
 
+def test_patch_only_change_keeps_previous_rows_in_the_current_contract(
+    feed_metrics_db,
+):
+    database, dashboard, cfg = feed_metrics_db
+    cfg["scoring_strategy_version"] = "2026-11-17-rrp-v9:patch-b"
+    cfg["scoring_contract_version"] = "2026-11-17-rrp-v9"
+    url = _add_feed(cfg)
+    _insert_news_with_version(
+        database,
+        [
+            (url, 5, "llm", "2026-11-17-rrp-v9:patch-a", 60),
+            (url, 9, "llm", "2026-11-16-rrp-v8:patch-a", 60),
+        ],
+    )
+
+    rows, details = dashboard._get_feed_health_snapshot()
+
+    assert rows[0][6:8] == (1, 0)
+    assert details[url]["counts"]["below_threshold"] == 1
+    assert details[url]["other_contract_total"] == 1
+
+
 def test_old_contract_only_samples_are_not_reported_as_no_new_articles(
     feed_metrics_db,
 ):

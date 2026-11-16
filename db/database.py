@@ -73,6 +73,7 @@ from scoring_provenance import (
     is_insufficient_input_fields,
     is_recognized_score_path,
     normalize_score_path,
+    scoring_contract_bucket,
 )
 from db.event_core import (
     EVENT_CORE_BACKFILL_META_KEY,
@@ -4462,10 +4463,29 @@ def store_backtest_signal(signal: Dict[str, Any]) -> bool:
             return inserted
 
 
+def _strategy_scope_clause(
+    strategy_version: Optional[str],
+    strategy_contract: Optional[str],
+) -> tuple[str, List[Any]]:
+    """Exact identity by default; an explicit contract bucket for posteriors."""
+    if strategy_contract is not None:
+        bucket = scoring_contract_bucket(strategy_contract)
+        if bucket:
+            return (
+                "(strategy_version = ? OR strategy_version LIKE ?)",
+                [bucket, f"{bucket}:%"],
+            )
+        return "strategy_version = ?", [""]
+    if strategy_version is not None:
+        return "strategy_version = ?", [str(strategy_version)]
+    return "", []
+
+
 def get_backtest_signals(
     *,
     cutoff: int,
     strategy_version: Optional[str] = None,
+    strategy_contract: Optional[str] = None,
     mapping_version: Optional[str] = None,
     min_score: Optional[float] = None,
     selected_only: bool = True,
@@ -4474,9 +4494,12 @@ def get_backtest_signals(
     """Return the final immutable revision without applying current feed policy."""
     where = ["available_at >= ?"]
     params: List[Any] = [int(cutoff)]
-    if strategy_version is not None:
-        where.append("strategy_version = ?")
-        params.append(str(strategy_version))
+    strategy_clause, strategy_params = _strategy_scope_clause(
+        strategy_version, strategy_contract
+    )
+    if strategy_clause:
+        where.append(strategy_clause)
+        params.extend(strategy_params)
     if mapping_version is not None:
         where.append("mapping_version = ?")
         params.append(str(mapping_version))
@@ -4561,6 +4584,7 @@ def _canonicalize_backtest_rows(
 def get_backtest_signal_stats(
     strategy_version: Optional[str] = None,
     mapping_version: Optional[str] = None,
+    strategy_contract: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Return independently scored ledger coverage and collection start.
 
@@ -4570,9 +4594,12 @@ def get_backtest_signal_stats(
     """
     clauses: List[str] = []
     params_list: List[Any] = []
-    if strategy_version is not None:
-        clauses.append("strategy_version = ?")
-        params_list.append(str(strategy_version))
+    strategy_clause, strategy_params = _strategy_scope_clause(
+        strategy_version, strategy_contract
+    )
+    if strategy_clause:
+        clauses.append(strategy_clause)
+        params_list.extend(strategy_params)
     if mapping_version is not None:
         clauses.append("mapping_version = ?")
         params_list.append(str(mapping_version))
