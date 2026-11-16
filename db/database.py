@@ -6060,8 +6060,8 @@ def log_llm_call(
     usage_status: str = "legacy",
     processing_id: str = "",
     article_key: str = "",
-) -> None:
-    """Record one physical call, preserving unknown usage as unknown metadata."""
+) -> int:
+    """Record one physical call and return its committed log row ID."""
     bounded_attempt_kind = str(attempt_kind or "").strip().lower()
     if bounded_attempt_kind not in {"initial", "fallback", "repair", "direct"}:
         bounded_attempt_kind = ""
@@ -6074,7 +6074,7 @@ def log_llm_call(
     timestamp = int(time.time())
     with db_lock:
         with get_connection() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 "INSERT INTO llm_call_logs (timestamp, purpose, backend_name, model_name, "
                 "prompt_tokens, completion_tokens, total_tokens, estimated_cost, latency_ms, "
                 "success, error_type, strategy_version, request_id, attempt_kind, response_mode, "
@@ -6100,6 +6100,7 @@ def log_llm_call(
                 (timestamp,),
             )
             conn.commit()
+            return cursor.lastrowid
 
 
 def get_score_fallback_stats(hours: int = 24) -> Dict[str, Any]:

@@ -60,6 +60,23 @@
 最多 200 条已关联的现有调用日志。执行编号可由 `news_processing_logs` 中的
 `article_key` 索引查找；同一文章多次执行应分开核对，再按需累计，不能只取末次。
 
+新闻评分日志中的 `[Score] semantic_reject` 与 `[Score] sdk_failure` 使用同一个
+`processing_id`。前者给出校验原因和契约子原因，后者只从 SDK 的 HTTP 状态异常
+读取数字 `http_status`。没有状态时显示 `unknown`。SDK 成功返回只证明调用成功，
+其日志不推断 HTTP 200。等待本地限流且尚未分派时没有物理调用记录。
+`failure=other` 也可能来自处理已收到的响应，例如候选项为空。仅凭这个字段无法
+判定传输失败。摘要调用继续沿用其现有日志。
+
+先用 `processing_id` 查处理结果和调用，再用日志里的 `call_log_id` 匹配
+`calls[].id`。`attempt_ordinal` 是本次新闻处理内从 1 开始的 SDK 分派顺序，
+格式兼容重试各有自己的序号。调用行写入失败时 `call_log_id=unknown`，仍可用
+`processing_id` 和序号辨认该日志事件，不能把它硬配给另一条调用行。最终状态
+以 `processing` 为准。调用成功、校验通过、最终入选是不同的事实。
+按调用行计数。同一次请求可能同时产生 SDK 失败诊断和评分路径告警。
+这组字段不保存请求消息、响应正文、地址、凭证或异常正文。已有数据库结构不变。
+`core/scorer.py` 按整文件计算评分代码指纹，发布此诊断改动会改变评分契约，
+需单独评估旧链接重评及调用风险。
+
 返回结果包括 `processing`、`calls`、`found`、`calls_linked`、`truncated` 和
 `usage`。没有最终记录时不编造结果，即使调用日志仍在。用量汇总仅覆盖返回的
 调用行，`reported_*` 是已报告部分，不是完整账单或真实扣费。

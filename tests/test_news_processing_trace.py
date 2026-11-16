@@ -11,10 +11,10 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from feedparser import FeedParserDict
-from openai import APITimeoutError
+from openai import APIStatusError, APITimeoutError
 
 from core import processor
-from core.scorer import LLMBackend, Scorer
+from core.scorer import LLMBackend, RateLimitTimeoutException, Scorer
 from db import database
 from services import news_processing_trace as tracing
 from tests.test_scorer import POLLUTED_TECH_EXAMPLE, _valid_quality_circuit_response
@@ -247,6 +247,107 @@ def test_semantic_fallback_keeps_same_execution_and_final_ledger_score(pipeline)
     assert len({call["request_id"] for call in calls}) == 1
     assert {call["processing_id"] for call in calls} == {row["processing_id"]}
     assert row["signal_key"] == _table("backtest_signals")[0]["signal_key"]
+
+
+@pytest.mark.parametrize("status", [503, None])
+def test_deferred_score_diagnostics_bind_rejection_and_sdk_failure(pipeline, caplog, status):
+    state = pipeline
+    secret = "private-fixture-key"
+    url = "https://private.invalid/?credential=" + secret
+    request = httpx.Request("POST", url)
+
+    def respond(name, _kwargs):
+        if name == "primary":
+            return _response(POLLUTED_TECH_EXAMPLE)
+        if status is None:
+            raise APITimeoutError(request=request)
+        raise APIStatusError(secret, response=httpx.Response(status, request=request), body={"key": secret})
+
+    state.control["respond"] = respond
+    assert _process(state.scorer, state.cfg) == (None, "score_deferred")
+    row, = _table("news_processing_logs")
+    first, second = _table("llm_call_logs")
+    assert row["state"] == "deferred" and row["signal_key"] is None
+    assert row["model_attempts"] == len(state.requests) == 2
+    assert first["processing_id"] == second["processing_id"] == row["processing_id"]
+    rejection, = [record.message for record in caplog.records if "[Score] semantic_reject " in record.message]
+    failure, = [record.message for record in caplog.records if "[Score] sdk_failure " in record.message]
+    assert f"processing_id={row['processing_id']} attempt_ordinal=1 call_log_id={first['id']}" in rejection
+    assert "attempt_kind=initial" in rejection and "reason=ungrounded_score_theme" in rejection
+    assert f"processing_id={row['processing_id']} attempt_ordinal=2 call_log_id={second['id']}" in failure
+    expected_status = f"http_status={status} failure=http_status" if status else "http_status=unknown failure=timeout"
+    assert f"attempt_kind=fallback format_retry=0 {expected_status}" in failure
+    assert secret not in caplog.text and url not in caplog.text and POLLUTED_TECH_EXAMPLE not in caplog.text
+
+
+def test_format_retry_diagnostics_bind_validation_to_last_physical_call(pipeline, monkeypatch, caplog):
+    monkeypatch.setattr(pipeline.scorer, "_structured_output_modes", {})
+
+    def respond(name, kwargs):
+        if name == "backup":
+            return _response()
+        if kwargs.get("response_format", {}).get("type") == "json_schema":
+            request = httpx.Request("POST", "https://private.invalid")
+            raise APIStatusError(
+                "response_format not supported", response=httpx.Response(400, request=request), body=None,
+            )
+        return _response(POLLUTED_TECH_EXAMPLE)
+
+    pipeline.control["respond"] = respond
+    assert _process(pipeline.scorer, pipeline.cfg)[1] == "scored"
+    row, = _table("news_processing_logs")
+    first, second, third = _table("llm_call_logs")
+    assert row["state"] == "completed" and row["signal_association"] == "written_in_processing"
+    assert row["model_attempts"] == len(pipeline.requests) == 3
+    assert first["processing_id"] == second["processing_id"] == third["processing_id"] == row["processing_id"]
+    assert first["request_id"] == second["request_id"] == third["request_id"]
+    failure, = [record.message for record in caplog.records if "[Score] sdk_failure " in record.message]
+    rejection, = [record.message for record in caplog.records if "[Score] semantic_reject " in record.message]
+    assert f"attempt_ordinal=1 call_log_id={first['id']} attempt_kind=initial format_retry=0 http_status=400" in failure
+    assert f"attempt_kind=initial format_retry=1 processing_id={row['processing_id']}" in rejection
+    assert f"attempt_ordinal=2 call_log_id={second['id']}" in rejection
+    assert f"call_log_id={third['id']}" not in rejection
+    assert "http_status=200" not in caplog.text
+
+
+def test_missing_call_log_keeps_exact_attempt_and_business_outcome(pipeline, monkeypatch, caplog):
+    def unavailable(**_kwargs):
+        raise OSError("private-diagnostic-storage-path")
+
+    monkeypatch.setattr(database.DB, "log_llm_call", unavailable)
+    state = pipeline
+    def respond(name, _kwargs):
+        if name == "primary":
+            return _response(POLLUTED_TECH_EXAMPLE)
+        raise APITimeoutError(request=httpx.Request("POST", "https://private.invalid"))
+
+    state.control["respond"] = respond
+    caplog.set_level("DEBUG", logger="core.scorer")
+    assert _process(state.scorer, state.cfg) == (None, "score_deferred")
+    row, = _table("news_processing_logs")
+    assert row["model_attempts"] == 2 and row["state"] == "deferred"
+    assert _table("llm_call_logs") == []
+    rejection, = [record.message for record in caplog.records if "[Score] semantic_reject " in record.message]
+    failure, = [record.message for record in caplog.records if "[Score] sdk_failure " in record.message]
+    assert f"processing_id={row['processing_id']} attempt_ordinal=1 call_log_id=unknown" in rejection
+    assert f"processing_id={row['processing_id']} attempt_ordinal=2 call_log_id=unknown" in failure
+    assert "http_status=unknown failure=timeout" in failure
+    assert "private-diagnostic-storage-path" not in caplog.text
+
+
+def test_local_rate_limit_wait_does_not_invent_physical_attempt(pipeline, monkeypatch, caplog):
+    def wait():
+        raise RateLimitTimeoutException("private-local-wait-detail")
+
+    state = pipeline
+    monkeypatch.setattr(state.scorer.backends[0], "rate_limit_wait", wait)
+    assert _process(state.scorer, state.cfg)[1] == "scored"
+    row, = _table("news_processing_logs")
+    call, = _table("llm_call_logs")
+    assert row["model_attempts"] == len(state.requests) == 1
+    assert call["processing_id"] == row["processing_id"] and call["attempt_kind"] == "fallback"
+    assert "local rate-limit timeout" in caplog.text
+    assert "[Score] sdk_failure" not in caplog.text and "private-local-wait-detail" not in caplog.text
 
 
 def test_stage1_and_stage2_share_execution_but_final_trace_uses_reviewed_score(pipeline):
