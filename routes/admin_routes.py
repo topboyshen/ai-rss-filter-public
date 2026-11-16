@@ -88,6 +88,8 @@ def _score_fallback_metrics() -> dict:
             "safe_neutral": 0,
             "safe_neutral_denominator": 0,
             "safe_neutral_ratio": 0.0,
+            "insufficient_input": None,
+            "insufficient_input_ratio": None,
             "available": False,
         }
     try:
@@ -108,6 +110,8 @@ def _score_fallback_metrics() -> dict:
     metrics["safe_neutral_ratio_2h"] = float(
         recent.get("safe_neutral_ratio") or 0.0
     )
+    metrics["insufficient_input_2h"] = recent.get("insufficient_input")
+    metrics["insufficient_input_ratio_2h"] = recent.get("insufficient_input_ratio")
     eligible = int(metrics.get("eligible") or 0)
     ratio = float(metrics.get("fallback_ratio") or 0.0)
     metrics.setdefault("available", True)
@@ -118,6 +122,30 @@ def _score_fallback_metrics() -> dict:
         and ratio >= _SCORE_FALLBACK_ALERT_RATIO
     )
     return metrics
+
+
+def _insufficient_input_prometheus(metrics: dict) -> list[str]:
+    """Omit gauges when the cache window did not provide an observation."""
+    lines = []
+    for hours in (2, 24):
+        suffix = "_2h" if hours == 2 else ""
+        insufficient = metrics.get("insufficient_input" + suffix)
+        if insufficient is not None:
+            name = f"ai_filter_score_insufficient_input_count_{hours}h"
+            lines.extend((
+                f"# HELP {name} Insufficient-input outcomes in {hours} hours",
+                f"# TYPE {name} gauge",
+                f"{name} {insufficient}",
+            ))
+        ratio = metrics.get("insufficient_input_ratio" + suffix)
+        if ratio is not None:
+            name = f"ai_filter_score_insufficient_input_ratio_{hours}h"
+            lines.extend((
+                f"# HELP {name} Insufficient-input share of observed model-resolution outcomes in {hours} hours",
+                f"# TYPE {name} gauge",
+                f"{name} {ratio:.6f}",
+            ))
+    return lines
 
 
 def _quality_strategy_version(cfg):
@@ -646,22 +674,22 @@ def metrics():
         "# HELP ai_filter_score_fallback_ratio_24h Local fallback share among model-eligible scores",
         "# TYPE ai_filter_score_fallback_ratio_24h gauge",
         f"ai_filter_score_fallback_ratio_24h {float(score_fallback.get('fallback_ratio') or 0.0):.6f}",
-        "# HELP ai_filter_score_safe_neutral_count_2h Non-substantive safe-neutral scoring outcomes in 2 hours",
+        "# HELP ai_filter_score_safe_neutral_count_2h Fixed safe-neutral outcomes in 2 hours",
         "# TYPE ai_filter_score_safe_neutral_count_2h gauge",
         f"ai_filter_score_safe_neutral_count_2h {int(score_fallback.get('safe_neutral_2h') or 0)}",
-        "# HELP ai_filter_score_safe_neutral_denominator_2h Direct model, local fallback, and safe-neutral outcomes in 2 hours",
+        "# HELP ai_filter_score_safe_neutral_denominator_2h Direct model, local fallback, and fixed safe-neutral outcomes in 2 hours",
         "# TYPE ai_filter_score_safe_neutral_denominator_2h gauge",
         f"ai_filter_score_safe_neutral_denominator_2h {int(score_fallback.get('safe_neutral_denominator_2h') or 0)}",
-        "# HELP ai_filter_score_safe_neutral_ratio_2h Safe-neutral share of observed model-resolution outcomes in 2 hours",
+        "# HELP ai_filter_score_safe_neutral_ratio_2h Fixed safe-neutral share excluding insufficient input in 2 hours",
         "# TYPE ai_filter_score_safe_neutral_ratio_2h gauge",
         f"ai_filter_score_safe_neutral_ratio_2h {float(score_fallback.get('safe_neutral_ratio_2h') or 0.0):.6f}",
-        "# HELP ai_filter_score_safe_neutral_count_24h Non-substantive safe-neutral scoring outcomes in 24 hours",
+        "# HELP ai_filter_score_safe_neutral_count_24h Fixed safe-neutral outcomes in 24 hours",
         "# TYPE ai_filter_score_safe_neutral_count_24h gauge",
         f"ai_filter_score_safe_neutral_count_24h {int(score_fallback.get('safe_neutral') or 0)}",
-        "# HELP ai_filter_score_safe_neutral_denominator_24h Direct model, local fallback, and safe-neutral outcomes in 24 hours",
+        "# HELP ai_filter_score_safe_neutral_denominator_24h Direct model, local fallback, and fixed safe-neutral outcomes in 24 hours",
         "# TYPE ai_filter_score_safe_neutral_denominator_24h gauge",
         f"ai_filter_score_safe_neutral_denominator_24h {int(score_fallback.get('safe_neutral_denominator') or 0)}",
-        "# HELP ai_filter_score_safe_neutral_ratio_24h Safe-neutral share of observed model-resolution outcomes in 24 hours",
+        "# HELP ai_filter_score_safe_neutral_ratio_24h Fixed safe-neutral share excluding insufficient input in 24 hours",
         "# TYPE ai_filter_score_safe_neutral_ratio_24h gauge",
         f"ai_filter_score_safe_neutral_ratio_24h {float(score_fallback.get('safe_neutral_ratio') or 0.0):.6f}",
         "# HELP ai_filter_score_fallback_alert Local fallback ratio crossed the alert threshold",
@@ -700,7 +728,7 @@ def metrics():
     ]
 
     response = Response(
-        "\n".join(lines + score_quality_prometheus(_quality_strategy_version(c))) + "\n", mimetype="text/plain; version=0.0.4"
+        "\n".join(lines + _insufficient_input_prometheus(score_fallback) + score_quality_prometheus(_quality_strategy_version(c))) + "\n", mimetype="text/plain; version=0.0.4"
     )
     response.headers["Cache-Control"] = "no-store"
     return response

@@ -1,5 +1,7 @@
 """Bounded scoring-resolution labels shared by scoring and persistence."""
 
+from decimal import Decimal, InvalidOperation
+
 SEMANTIC_RESOLUTION_SAFE_NEUTRAL_CONTRACT = "safe_neutral_contract"
 SEMANTIC_RESOLUTION_SAFE_NEUTRAL_GROUNDING = "safe_neutral_grounding"
 SEMANTIC_RESOLUTION_SAFE_NEUTRAL_INITIAL = "safe_neutral_initial"
@@ -23,15 +25,17 @@ def is_fixed_safe_neutral_fields(score, tag, logic, direction) -> bool:
 
 def is_insufficient_input_fields(score, tag, logic, direction) -> bool:
     """Semantic 'not enough input' is a sentinel, never a substantive score."""
-    if isinstance(score, bool):
-        return False
     try:
-        value = float(score)
-    except (TypeError, ValueError, OverflowError):
+        zero_score = Decimal(str(score)).is_zero()
+    except InvalidOperation:
         return False
+    # The explanation stays free text: requiring a fixed menu pushed the model
+    # to choose the sentinel far more often and cost relevant items.  What the
+    # contract needs is an exact zero, the reserved tag, a recorded reason and
+    # a neutral direction; the reserved tag is rejected otherwise.
     return (
-        value == 0.0
-        and str(tag or "").strip() == INSUFFICIENT_INPUT_TAG
+        zero_score
+        and tag == INSUFFICIENT_INPUT_TAG
         and bool(str(logic or "").strip())
         and str(direction or "").strip() in {"中性", "⚖️"}
     )

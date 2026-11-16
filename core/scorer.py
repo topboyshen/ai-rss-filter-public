@@ -36,6 +36,7 @@ from services.news_processing_trace import (
 )
 from scoring_provenance import (
     ALLOWED_SEMANTIC_RESOLUTIONS,
+    INSUFFICIENT_INPUT_TAG,
     SAFE_NEUTRAL_CONTRACT_VALUES,
     SEMANTIC_RESOLUTION_SAFE_NEUTRAL_CONTRACT,
     SEMANTIC_RESOLUTION_SAFE_NEUTRAL_GROUNDING,
@@ -416,7 +417,7 @@ class _DuplicateJSONKey(ValueError):
     pass
 
 
-def _strict_json_object(raw: str) -> Dict[str, Any]:
+def _strict_json_object(raw: str, *, parse_float=None) -> Dict[str, Any]:
     if not isinstance(raw, str) or len(raw) > 4096 or "\ufffd" in raw:
         raise ValueError("invalid JSON response text")
 
@@ -428,7 +429,7 @@ def _strict_json_object(raw: str) -> Dict[str, Any]:
             obj[key] = value
         return obj
 
-    parsed = json.loads(raw.strip(), object_pairs_hook=reject_duplicates)
+    parsed = json.loads(raw.strip(), object_pairs_hook=reject_duplicates, parse_float=parse_float)
     if not isinstance(parsed, dict):
         raise ValueError("JSON response must be an object")
     return parsed
@@ -1033,6 +1034,17 @@ def _is_insufficient_input_score(parsed: object) -> bool:
         and len(parsed) == 4
         and is_insufficient_input_fields(*parsed)
     )
+
+
+def _check_reserved_score(parsed, *, raw_fields=None):
+    """Check the reserved tag before legacy cleaning can hide added content."""
+    score, tag, logic, direction = parsed
+    if tag != INSUFFICIENT_INPUT_TAG:
+        return parsed, ""
+    original_score, original_tag, original_logic = raw_fields or (score, tag, logic)
+    if not is_insufficient_input_fields(original_score, original_tag, original_logic, direction):
+        return _INVALID_SCORE_RESULT, "invalid_insufficient_input"
+    return parsed, ""
 
 
 def _normalize_json_safe_neutral(
@@ -2259,9 +2271,11 @@ class Scorer:
         parsed = self._parse_score_result(raw)
         detail = ""
         contract_valid = parsed[0] >= 0
+        insufficient_input = _is_insufficient_input_score(parsed)
+        check_grounding = contract_valid and not insufficient_input
         grounding, failure_kind = (
             _score_grounding_verdict(parsed, title, summary)
-            if contract_valid
+            if check_grounding
             else ("", "")
         )
         if not contract_valid:
@@ -2304,9 +2318,13 @@ class Scorer:
             stage=stage or "score",
             attempt=attempt,
             contract_valid=contract_valid,
-            source_grounded=not grounding if contract_valid else None,
+            source_grounded=not grounding if check_grounding else None,
             accepted=not reason,
-            reason=reason + (":" + detail if detail else ""),
+            reason=(
+                SEMANTIC_RESOLUTION_INSUFFICIENT_INPUT
+                if insufficient_input and not reason
+                else reason + (":" + detail if detail else "")
+            ),
         )
         return parsed, reason, detail
 
@@ -2728,17 +2746,17 @@ class Scorer:
     def _parse_score_result_with_detail(
         result: str,
     ) -> Tuple[Tuple[float, str, str, str], str]:
-        """Parse exactly as before and return only a bounded rejection enum."""
+        """Return a parsed score or a bounded reason for rejection."""
         if not isinstance(result, str) or "\ufffd" in result:
             return _INVALID_SCORE_RESULT, "invalid_text"
 
         stripped = result.strip()
         if stripped.startswith("{"):
             try:
-                parsed_json = _strict_json_object(stripped)
+                parsed_json = _strict_json_object(stripped, parse_float=Decimal)
             except _DuplicateJSONKey:
                 return _INVALID_SCORE_RESULT, "duplicate_json_key"
-            except (TypeError, ValueError, json.JSONDecodeError):
+            except (TypeError, ValueError, InvalidOperation):
                 return _INVALID_SCORE_RESULT, "invalid_json"
             if set(parsed_json) != {"score", "tag", "logic", "sentiment"}:
                 return _INVALID_SCORE_RESULT, "wrong_keys"
@@ -2749,7 +2767,7 @@ class Scorer:
             json_sentiment = parsed_json.get("sentiment")
             if (
                 isinstance(json_score, bool)
-                or not isinstance(json_score, (int, float))
+                or not isinstance(json_score, (int, float, Decimal))
                 or not isinstance(json_tag, str)
                 or not isinstance(json_logic, str)
                 or not isinstance(json_sentiment, str)
@@ -2769,20 +2787,16 @@ class Scorer:
             ):
                 return _INVALID_SCORE_RESULT, "invalid_logic"
 
-            score_val = float(json_score)
-            if not math.isfinite(score_val) or not 0.0 <= score_val <= 10.0:
+            score_val = float(Decimal(json_score))
+            if not 0.0 <= score_val <= 10.0:
                 return _INVALID_SCORE_RESULT, "invalid_score"
             if not _has_valid_sentiment(json_sentiment):
                 return _INVALID_SCORE_RESULT, "invalid_sentiment"
-            return _normalize_json_safe_neutral(
-                score_val,
-                json_tag,
-                json_logic,
-                _sentiment_emoji(json_sentiment),
-            ), ""
+            parsed = _normalize_json_safe_neutral(
+                score_val, json_tag, json_logic, _sentiment_emoji(json_sentiment)
+            )
+            return _check_reserved_score(parsed, raw_fields=(json_score, json_tag, json_logic))
 
-        # Keep the two compatibility grammars unchanged. Their failure labels
-        # describe parser branches only and never include response field values.
         lines = [line.strip() for line in result.splitlines() if line.strip()]
         new_field_prefix = re.compile(r"^(分数|标签|逻辑|情绪)\s*[:：]")
         if any(new_field_prefix.match(line) for line in lines):
@@ -2811,7 +2825,7 @@ class Scorer:
                     )
                     if score_match is None:
                         return _INVALID_SCORE_RESULT, "named_format_invalid"
-                    parsed_fields[field_name] = float(score_match.group(1))
+                    parsed_fields[field_name] = score_match.group(1)
                 else:
                     value_match = re.fullmatch(
                         rf"{prefix_match.group(1)}\s*[:：]\s*(.*)",
@@ -2849,12 +2863,10 @@ class Scorer:
                 return _INVALID_SCORE_RESULT, "invalid_logic"
             if not _has_valid_sentiment(sentiment_val):
                 return _INVALID_SCORE_RESULT, "invalid_sentiment"
-            return (
-                score_val,
-                tag_val,
-                logic_val,
-                _sentiment_emoji(sentiment_val),
-            ), ""
+            return _check_reserved_score(
+                (score_val, tag_val, logic_val, _sentiment_emoji(sentiment_val)),
+                raw_fields=(parsed_fields["score"], raw_tag_val, raw_logic_val),
+            )
 
         legacy_lines = result.splitlines()
         if len(legacy_lines) != 4:
@@ -2901,7 +2913,10 @@ class Scorer:
             return _INVALID_SCORE_RESULT, "invalid_logic"
         if not _has_valid_sentiment(sentiment):
             return _INVALID_SCORE_RESULT, "invalid_sentiment"
-        return (score, tag, logic, _sentiment_emoji(sentiment)), ""
+        return _check_reserved_score(
+            (score, tag, logic, _sentiment_emoji(sentiment)),
+            raw_fields=(score_match.group("score"), raw_tag, raw_logic),
+        )
 
     @staticmethod
     def _parse_score_result(result: str) -> Tuple[float, str, str, str]:

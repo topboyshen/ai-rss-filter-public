@@ -1,7 +1,7 @@
 import time
 
 
-def test_persistent_score_stats_report_safe_neutral_without_changing_fallback(
+def test_persistent_score_stats_split_fixed_neutral_and_insufficient_input(
     tmp_path, monkeypatch
 ):
     import db.database as database
@@ -18,10 +18,13 @@ def test_persistent_score_stats_report_safe_neutral_without_changing_fallback(
         ("neutral-stage2", "stage2_safe_neutral_contract", now),
         ("grounding-stage1", "llm_safe_neutral_grounding", now),
         ("grounding-stage2", "stage2_safe_neutral_grounding", now),
+        ("insufficient-stage1", "insufficient_input", now),
+        ("insufficient-stage2", "stage2_insufficient_input", now - 3 * 3600),
         ("similarity-1", "similarity", now),
         ("fast-pass-1", "fast_pass", now),
         ("local-reject-1", "local_reject", now),
         ("old-fallback", "fallback_local", now - 25 * 3600),
+        ("old-insufficient", "insufficient_input", now - 25 * 3600),
     ]
     with database.get_connection() as conn:
         for link, score_path, created_at in rows:
@@ -34,7 +37,7 @@ def test_persistent_score_stats_report_safe_neutral_without_changing_fallback(
                     link,
                     link,
                     link,
-                    7.0,
+                    0.0 if "insufficient_input" in score_path else 4.0,
                     "test",
                     "test",
                     created_at,
@@ -57,7 +60,14 @@ def test_persistent_score_stats_report_safe_neutral_without_changing_fallback(
         "safe_neutral": 4,
         "safe_neutral_denominator": 8,
         "safe_neutral_ratio": 0.5,
+        "insufficient_input": 2,
+        "insufficient_input_ratio": 0.2,
     }
+    recent = database.get_score_fallback_stats(hours=2)
+    assert recent["safe_neutral_denominator"] == 8
+    assert recent["safe_neutral_ratio"] == 0.5
+    assert recent["insufficient_input"] == 1
+    assert recent["insufficient_input_ratio"] == 1 / 9
 
 
 def test_score_fallback_alert_has_minimum_sample_guard(monkeypatch):
@@ -136,6 +146,10 @@ def test_authenticated_metrics_export_fallback_health(monkeypatch):
             "safe_neutral_2h": 2,
             "safe_neutral_denominator_2h": 8,
             "safe_neutral_ratio_2h": 0.25,
+            "insufficient_input_2h": 2,
+            "insufficient_input_ratio_2h": 0.2,
+            "insufficient_input": 4,
+            "insufficient_input_ratio": 4 / 30,
             "alert": True,
         },
     )
@@ -154,7 +168,20 @@ def test_authenticated_metrics_export_fallback_health(monkeypatch):
     assert "ai_filter_score_safe_neutral_count_24h 6" in body
     assert "ai_filter_score_safe_neutral_denominator_24h 26" in body
     assert "ai_filter_score_safe_neutral_ratio_24h 0.230769" in body
+    assert "ai_filter_score_insufficient_input_count_2h 2" in body
+    assert "ai_filter_score_insufficient_input_ratio_2h 0.200000" in body
+    assert "ai_filter_score_insufficient_input_count_24h 4" in body
+    assert "ai_filter_score_insufficient_input_ratio_24h 0.133333" in body
     assert "ai_filter_score_fallback_alert 1" in body
+
+
+def test_unknown_insufficient_input_metrics_are_omitted():
+    from routes.admin_routes import _insufficient_input_prometheus
+
+    text = "\n".join(_insufficient_input_prometheus({"insufficient_input": 0}))
+    assert "ai_filter_score_insufficient_input_count_24h 0" in text
+    assert "ai_filter_score_insufficient_input_count_2h" not in text
+    assert "ai_filter_score_insufficient_input_ratio_24h" not in text
 
 
 def test_unauthenticated_process_local_metrics_route_is_removed(monkeypatch):

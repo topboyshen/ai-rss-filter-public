@@ -87,6 +87,7 @@ def test_mixed_paths_are_exclusive_and_keep_existing_formal_eligibility(
         "similarity": 1,
         "safe_contract": 2,
         "safe_grounding": 2,
+        "insufficient_input": 0,
         "model_failure": 1,
         "processing_error": 2,
         "other_excluded": 0,
@@ -338,6 +339,25 @@ def test_zero_output_reason_is_silent_when_something_passed(feed_metrics_db):
     _rows, details = dashboard._get_feed_health_snapshot()
 
     assert details[url]["zero_output_reason"] == ""
+
+
+def test_insufficient_input_is_visible_separately_from_fixed_neutral(feed_metrics_db):
+    database, dashboard, cfg = feed_metrics_db
+    url = _add_feed(cfg)
+    _insert_news(database, [
+        (url, 0, "insufficient_input", 60),
+        (url, 0, "stage2_insufficient_input", 60),
+        (url, 4, "llm_safe_neutral_grounding", 60),
+    ])
+
+    rows, details = dashboard._get_feed_health_snapshot()
+
+    assert rows[0][6:9] == (3, 0, None)
+    assert details[url]["counts"]["insufficient_input"] == 2
+    assert details[url]["counts"]["safe_grounding"] == 1
+    assert details[url]["counts"]["other_excluded"] == 0
+    assert "信息不足（0分） 2" in details[url]["breakdown_text"]
+    assert details[url]["zero_output_reason"] == "来源依据中性 1；信息不足（0分） 2"
 
 
 def test_other_scoring_contract_samples_are_excluded_and_reported(feed_metrics_db):

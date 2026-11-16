@@ -13,6 +13,7 @@ from core.scorer import (
     _score_grounding_verdict,
 )
 from db import database
+from db.score_quality import read_score_quality
 from scoring_provenance import (
     SEMANTIC_RESOLUTION_INSUFFICIENT_INPUT,
     is_insufficient_input_fields,
@@ -21,26 +22,122 @@ from utils.helpers import FeedEntry
 
 FEED = "https://feeds.example.test/insufficient"
 STRATEGY = "insufficient-input-test"
-SENTINEL = (0.0, "信息不足", "只有栏目名，缺少具体事件", "⚖️")
+SENTINEL = (0.0, "信息不足", "缺少可识别事件", "⚖️")
 
 
-def test_parser_accepts_insufficient_sentinel():
-    raw = json.dumps(
-        {
-            "score": 0,
-            "tag": "信息不足",
-            "logic": "只有栏目名，缺少具体事件",
-            "sentiment": "中性",
-        },
-        ensure_ascii=False,
-    )
-    parsed, detail = Scorer._parse_score_result_with_detail(raw)
-    assert parsed == SENTINEL
+def _score_text(fmt, *, score=0, tag="信息不足", logic=SENTINEL[2], sentiment="中性"):
+    if fmt == "named":
+        return f"分数: {score}\n标签: {tag}\n逻辑: {logic}\n情绪: {sentiment}"
+    if fmt == "brackets":
+        return f"[{score}]\n[{tag}]\n[{logic}]\n[{sentiment}]"
+    return json.dumps(dict(score=score, tag=tag, logic=logic, sentiment=sentiment), ensure_ascii=False)
+
+
+@pytest.mark.parametrize("fmt", ["json", "named", "brackets"])
+@pytest.mark.parametrize("logic", [
+    "缺少可识别事件",
+    "缺少可识别主体和事件",
+    "标题仅含节目名称和日期，无点名主体或具体事件",
+    "缺少点名的公司、机构、国家、政策或资产",
+])
+def test_parser_accepts_insufficient_sentinel(fmt, logic):
+    parsed, detail = Scorer._parse_score_result_with_detail(_score_text(fmt, logic=logic))
+    assert parsed == (0.0, "信息不足", logic, "⚖️")
     assert detail == ""
     assert is_insufficient_input_fields(*parsed)
 
 
+@pytest.mark.parametrize("fmt", ["json", "named", "brackets"])
+@pytest.mark.parametrize("fields", [
+    {"score": 4},
+    {"sentiment": "看空"},
+])
+def test_parser_rejects_malformed_reserved_result(fmt, fields):
+    parsed, detail = Scorer._parse_score_result_with_detail(_score_text(fmt, **fields))
+    assert parsed[0] == -1
+    assert detail == "invalid_insufficient_input"
+
+
+def test_ordinary_zero_score_keeps_existing_contract():
+    parsed, detail = Scorer._parse_score_result_with_detail(
+        _score_text("json", tag="常规行情", logic="仅有指数点位")
+    )
+    assert parsed == (0.0, "常规行情", "仅有指数点位", "⚖️")
+    assert detail == ""
+    assert not is_insufficient_input_fields(*parsed)
+
+
+@pytest.mark.parametrize("fmt", ["json", "named", "brackets"])
+def test_parser_requires_an_exact_zero_for_insufficient_input(fmt):
+    if fmt == "json":
+        payload = _score_text(fmt).replace('"score": 0', '"score": 1e-400')
+    else:
+        payload = _score_text(fmt, score="0." + "0" * 400 + "1")
+    parsed, detail = Scorer._parse_score_result_with_detail(payload)
+    assert parsed[0] == -1
+    assert detail == "invalid_insufficient_input"
+
+
+def test_json_parser_rejects_out_of_range_integer():
+    parsed, detail = Scorer._parse_score_result_with_detail(_score_text("json", score=10**400))
+    assert parsed[0] == -1
+    assert detail == "invalid_score"
+
+
+def _insufficient_signal(score, logic, link="https://example.test/freeform-insufficient"):
+    return {
+        "link": link,
+        "score_path": "insufficient_input",
+        "score": score,
+        "event_type": "信息不足",
+        "logic": logic,
+        "direction": "中性",
+        "selected": False,
+        "aggregation_threshold": 6,
+    }
+
+
+def test_writer_accepts_freeform_insufficient_explanation():
+    database.init_db()
+    logic = "缺少点名的公司、机构或具体事件"
+    database.set_cached_entry(
+        "https://example.test/freeform-insufficient", "栏目名", "栏目名", 0,
+        "信息不足", logic, score_path="insufficient_input",
+        model_name="fixture-model", stage1_score=0.0, stage1_model="fixture-model",
+        safe_neutral_reason="insufficient",
+        backtest_signal=_insufficient_signal(0, logic),
+    )
+
+
+def test_writer_rejects_scored_insufficient_tag():
+    database.init_db()
+    with pytest.raises(ValueError, match="insufficient-input tuple"):
+        database.set_cached_entry(
+            "https://example.test/invalid-insufficient", "栏目名", "栏目名", 3,
+            "信息不足", "缺少可识别事件", score_path="insufficient_input",
+            backtest_signal=_insufficient_signal(
+                3, "缺少可识别事件", "https://example.test/invalid-insufficient"
+            ),
+        )
+
+
+def test_ledger_rejects_an_underflowing_nonzero_score():
+    database.init_db()
+    with pytest.raises(ValueError, match="insufficient-input tuple"):
+        database.store_backtest_signal({
+            "link": "https://example.test/invalid-insufficient",
+            "score_path": "insufficient_input",
+            "score": "1e-400",
+            "aggregation_threshold": 6,
+            "event_type": SENTINEL[1],
+            "logic": SENTINEL[2],
+            "direction": "中性",
+            "selected": False,
+        })
+
+
 def test_scorer_marks_insufficient_sentinel_without_grounding(monkeypatch):
+    database.init_db()
     monkeypatch.setattr(Scorer, "_instance", None)
     backend = LLMBackend("fixture", "", "https://invalid.test", "fixture-model")
     monkeypatch.setattr(backend, "client", object())
@@ -48,21 +145,14 @@ def test_scorer_marks_insufficient_sentinel_without_grounding(monkeypatch):
     monkeypatch.setattr(
         Scorer,
         "_call_structured_llm",
-        lambda *_a, **_kw: json.dumps(
-            {
-                "score": 0,
-                "tag": "信息不足",
-                "logic": "只有栏目名，缺少具体事件",
-                "sentiment": "中性",
-            },
-            ensure_ascii=False,
-        ),
+        lambda *_a, **_kw: _score_text("json"),
     )
     result = Scorer().score_stage1_with_identity(
         "A股午评来了！",
         "",
         "prompt",
         {
+            "scoring_strategy_version": STRATEGY,
             "llm_score_cache": {"enabled": False},
             "llm_semantic_repair": {"enabled": False},
         },
@@ -71,6 +161,11 @@ def test_scorer_marks_insufficient_sentinel_without_grounding(monkeypatch):
     assert result.semantic_resolution == SEMANTIC_RESOLUTION_INSUFFICIENT_INPUT
     assert result.input_status == "insufficient"
     assert result.model_name == "fixture-model"
+    [observation] = read_score_quality(24, STRATEGY)["validation"]
+    assert observation["contract_valid"] == observation["accepted"] == 1
+    assert observation["reason"] == "insufficient_input"
+    assert observation["grounding_observed"] == 0
+    assert observation["source_grounded"] is None
 
 
 def test_insufficient_result_exposes_input_status():
@@ -102,12 +197,13 @@ def test_insufficient_sentinel_skips_theme_and_fact_grounding():
 
 
 class _InsufficientScorer:
-    def __init__(self):
+    def __init__(self, stage):
+        self.stage = stage
         self.calls = []
         self.summarize = Mock(side_effect=AssertionError("must not summarize"))
 
-    def score_stage1_with_identity(self, *_args, **_kwargs):
-        self.calls.append("stage1")
+    @staticmethod
+    def _insufficient_result():
         return ScoringResult(
             SENTINEL,
             "fake-model",
@@ -115,8 +211,16 @@ class _InsufficientScorer:
             "insufficient",
         )
 
+    def score_stage1_with_identity(self, *_args, **_kwargs):
+        self.calls.append("stage1")
+        if self.stage == 1:
+            return self._insufficient_result()
+        return ScoringResult((7.0, "公司公告", "新增订单", "📈"), "fake-model")
+
     def score_stage2_with_identity(self, *_args, **_kwargs):
-        raise AssertionError("insufficient stage1 must skip stage2")
+        assert self.stage == 2, "insufficient stage1 must skip stage2"
+        self.calls.append("stage2")
+        return self._insufficient_result()
 
 
 def _cfg():
@@ -135,20 +239,26 @@ def _cfg():
     }
 
 
-def test_processor_persists_insufficient_input_as_filtered_and_unselected(monkeypatch):
+@pytest.mark.parametrize(("stage", "score_path"), [
+    (1, "insufficient_input"),
+    (2, "stage2_insufficient_input"),
+])
+def test_processor_persists_insufficient_input_as_filtered_and_unselected(monkeypatch, stage, score_path):
     database.init_db()
     distribution = Mock()
     notify = Mock()
     monkeypatch.setattr(processor.DB, "record_score", distribution)
     monkeypatch.setattr(processor, "send_telegram_notification", notify)
-    scorer = _InsufficientScorer()
+    scorer = _InsufficientScorer(stage)
     entry = FeedEntry("A股午评来了！", "https://example.test/insufficient/1")
+    cfg = _cfg()
+    cfg["two_stage_scoring"]["enabled"] = True
 
     assert processor.process_entry(
-        entry, [], "prompt", _cfg(), scorer=scorer, feed_url=FEED
+        entry, [], "prompt", cfg, scorer=scorer, feed_url=FEED
     ) == (None, "filtered")
-    assert scorer.calls == ["stage1"]
-    assert entry.scoring_meta["score_path"] == "insufficient_input"
+    assert scorer.calls == (["stage1"] if stage == 1 else ["stage1", "stage2"])
+    assert entry.scoring_meta["score_path"] == score_path
     assert entry.scoring_meta["safe_neutral_reason"] == "insufficient"
     assert entry.scoring_meta["score_confidence"] == 0.0
     distribution.assert_not_called()
@@ -166,7 +276,7 @@ def test_processor_persists_insufficient_input_as_filtered_and_unselected(monkey
         assert cache["score"] == ledger["score"] == 0.0
         assert cache["tag"] == "信息不足"
         assert cache["logic"] == SENTINEL[2]
-        assert cache["score_path"] == ledger["score_path"] == "insufficient_input"
+        assert cache["score_path"] == ledger["score_path"] == score_path
         assert cache["score_confidence"] == ledger["score_confidence"] == 0.0
         assert ledger["selected"] == 0
         assert (
@@ -178,3 +288,14 @@ def test_processor_persists_insufficient_input_as_filtered_and_unselected(monkey
     assert (
         database.get_entries_for_cached_rss(_cfg(), feed_url=FEED, min_score=1.0) == []
     )
+
+
+def test_builtin_prompts_preserve_title_only_rule_and_insufficient_sentinel():
+    from core.prompts import BUILTIN_PROMPTS
+
+    for prompt in BUILTIN_PROMPTS.values():
+        assert 'logic 说明缺什么' in prompt
+        assert "只有“标题和摘要都无法识别主体或事件”时才用信息不足" in prompt
+        assert "“摘要为空”不等于信息不足" in prompt
+        assert "这些属于待核查" in prompt
+        assert "不要用“信息不足”" in prompt

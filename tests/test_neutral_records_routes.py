@@ -67,14 +67,15 @@ def _persist_facts_record():
     """Use the production writer with a matching non-selected signal contract."""
     from db import database
 
-    now = int(time.time()) - 120
+    scored_at = int(time.time())
+    source_time = scored_at - 120
     link = "https://example.test/persisted-facts"
     signal = {
         "link": link, "raw_title": "真实写入事实记录", "score": 4.0,
         "score_path": "llm_safe_neutral_grounding", "direction": "中性",
         "score_confidence": 0.0, "strategy_version": STRATEGY,
-        "mapping_version": "asset-map:route-test", "available_at": now,
-        "scored_at": now, "aggregation_threshold": 6, "tag": "其他",
+        "mapping_version": "asset-map:route-test", "available_at": scored_at,
+        "scored_at": scored_at, "aggregation_threshold": 6, "tag": "其他",
         "logic": "来源未显示明确投资催化", "selected": 0,
         "stage1_score": 4.0, "stage1_model": "qwen",
     }
@@ -84,9 +85,9 @@ def _persist_facts_record():
         score_path="llm_safe_neutral_grounding", strategy_version=STRATEGY,
         direction="中性", score_confidence=0.0, model_name="qwen",
         stage1_score=4.0, stage1_model="qwen", safe_neutral_reason="facts",
-        created_at=now, backtest_signal=signal,
+        created_at=source_time, backtest_signal=signal,
     )
-    return now
+    return source_time, scored_at
 
 
 def _article_for(body, title):
@@ -148,7 +149,7 @@ def test_real_cache_contract_reason_and_time_reach_authenticated_html(neutral_br
     client, _cfg, calls = neutral_browser
     from db import database
 
-    stamp = _persist_facts_record()
+    source_time, scored_at = _persist_facts_record()
     _cache_row("主题记录", reason="theme")
     _cache_row("格式记录", reason="contract", path="stage2_safe_neutral_contract")
     _cache_row("初次记录", reason="initial", path="llm_safe_neutral_initial")
@@ -164,7 +165,8 @@ def test_real_cache_contract_reason_and_time_reach_authenticated_html(neutral_br
     assert response.status_code == 200
     assert len(calls) == 1
     assert "本次显示 6 条" in body and STRATEGY in body
-    assert FACTS_TEXT in _article_for(body, "真实写入事实记录")
+    facts_record = _article_for(body, "真实写入事实记录")
+    assert FACTS_TEXT in facts_record
     assert "主题关联未通过现有来源校验" in _article_for(body, "主题记录")
     assert "输出格式或字段未通过校验" in _article_for(body, "格式记录")
     assert "初次输出为保守中性，具体原因未记录" in _article_for(body, "初次记录")
@@ -172,10 +174,14 @@ def test_real_cache_contract_reason_and_time_reach_authenticated_html(neutral_br
     assert UNKNOWN_TEXT in _article_for(body, "未知原因记录")
     assert all(title not in body for title in ("旧契约隐藏", "普通路径隐藏", "过期记录隐藏"))
     assert "unrecorded-diagnostic" not in body
-    time_label = datetime.fromtimestamp(stamp, ZoneInfo("Asia/Shanghai"))
-    assert f"收录 {time_label:%Y-%m-%d %H:%M}（北京时间）" in body
+    source_label = datetime.fromtimestamp(source_time, ZoneInfo("Asia/Shanghai"))
+    scoring_label = datetime.fromtimestamp(scored_at, ZoneInfo("Asia/Shanghai"))
+    assert f"缓存条目时间 {source_label:%Y-%m-%d %H:%M}（北京时间）" in facts_record
+    assert f"{scoring_label:%Y-%m-%d %H:%M}" not in facts_record
     assert "订阅来源：测试订阅源" in body
-    assert "收录时间不是发布时间或评分时间" in body
+    assert "按缓存条目时间查看近24小时" in body
+    assert "缓存条目时间优先使用来源发布时间，其次使用更新时间" in body
+    assert "缺少可用来源时间时使用写入时的本机时间" in body
     with database.get_read_only_connection() as conn:
         reasons = dict(conn.execute(
             "SELECT raw_title, safe_neutral_reason FROM news_cache"
@@ -256,6 +262,7 @@ def _assert_static_entry(body):
     assert match and "open" not in match.group(1).split()
     assert f'href="{PAGE_URL}"' in body
     assert "查看记录（需后台登录）" in body
+    assert "按缓存条目时间查看当前评分契约近24小时" in body
     assert "<script" not in body and "<iframe" not in body
     assert "?key=" not in body and "?token=" not in body
     assert "公共卡片不应读取这条私有记录" not in body

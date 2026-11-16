@@ -83,6 +83,7 @@ def test_aggregate_allowlist_and_separate_processing_categories(monkeypatch):
         validation=[{"observed": 7, "reason": "secret-reason", "accepted": 6}],
         final_paths={"llm": 2, "stage2": 1, "llm_safe_neutral_contract": 4,
                      "stage2_safe_neutral_grounding": 2, "fallback_local": 1,
+                     "insufficient_input": 5, "stage2_insufficient_input": 3,
                      "parse_error": 3, "quality_quarantine": 2, "local_reject": 8,
                      "fast_pass": 4, "secret-path": 500},
         title="secret-title", source="secret-source", link="https://secret.example/record",
@@ -96,8 +97,9 @@ def test_aggregate_allowlist_and_separate_processing_categories(monkeypatch):
     assert "secret" not in json.dumps(data)
     html = _render(data)
     assert "实质模型结果 3" in html and "保守中性 6" in html
+    assert "信息不足（0分）8" in html
     assert "本地兜底 1" in html and "处理异常 3" in html and "隔离待处理 2" in html
-    assert "其他已识别路径 12" in html and "基础评分记录 27 条" in html
+    assert "其他已识别路径 12" in html and "基础评分记录 35 条" in html
     assert "校验尝试 7 次" in html and "不是模型错误率" in html
     assert "secret" not in html
 
@@ -155,8 +157,8 @@ def test_pure_render_escapes_preserves_input_and_static_authenticated_link(monke
     assert "时间未知" in html and "<script" not in html
     assert "private" not in html and "<iframe" not in html
     assert 'href="https://dashboard.example.test/dashboard/neutral-records"' in html
-    assert "查看记录（需后台登录）" in html and "最新50条" in html
-    assert "不是上述数字的逐行明细" in html
+    assert "查看记录（需后台登录）" in html and "最多50条" in html
+    assert "两处查询的时间口径不同" in html
     assert "?token=" not in html and "?key=" not in html
 
 
