@@ -86,6 +86,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+          # The diff-coverage gate needs the PR base commit.
+          fetch-depth: 0
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v7
@@ -163,6 +165,23 @@ jobs:
             AI_FILTER_TEST_COVERAGE_OUTPUT="${RUNNER_TEMP}/ai-filter-coverage.xml" \
             AI_FILTER_CUTOVER_EVIDENCE_DIR="${RUNNER_TEMP}/ai-filter-synthetic-cutover-evidence" \
             ./scripts/run-release-tests.sh full
+
+      - name: Diff coverage gate (changed lines only)
+        # Gate only lines this PR adds or changes. The global --cov-fail-under
+        # above stays the floor for legacy code; this does not raise it.
+        # 80%: above the global baseline so new code never drags it down,
+        # while leaving room for defensive branches that are hard to reach.
+        if: github.event_name == 'pull_request'
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          python -m pip install 'diff-cover==10.6.0'
+          diff-cover "${RUNNER_TEMP}/ai-filter-coverage.xml" \
+            --compare-branch="${PR_BASE_SHA}" \
+            --fail-under=80 \
+            --markdown-report "${RUNNER_TEMP}/diff-coverage.md"
+          cat "${RUNNER_TEMP}/diff-coverage.md" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Prepare synthetic evidence without following links
         if: always()
