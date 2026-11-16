@@ -62,7 +62,7 @@
   "services/quant_market_context.py:_sanitize_daily_audit": 241,
   "services/quant_market_context.py:validate_market_context": 370,
   "services/security_history_query.py:_load_event_rows": 154,
-  "sse_engine.py:_load_from_db": 157,
+  "sse_engine.py:_load_from_db": 155,
   "tests/test_event_core_db.py:test_all_relation_upserts_are_idempotent_and_update_once": 204,
   "tests/test_event_core_migration.py:test_future_price_store_recovers_invalid_pointers_only_with_global_best": 206,
   "tests/test_event_core_migration.py:test_true_legacy_price_and_outbox_schema_is_upgraded_inside_migration": 121,

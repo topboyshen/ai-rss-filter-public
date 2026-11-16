@@ -452,6 +452,29 @@ def test_jin10_fetch_is_cached_and_outages_are_negative_cached(monkeypatch):
     assert failures == ["https://example.com/down"]
 
 
+def test_jin10_stale_cache_fallback_does_not_log_upstream_secret(monkeypatch, caplog):
+    import services.jin10_feed as jin10_feed
+
+    secret = "https://feed.example/private?token=do-not-leak"
+    with jin10_feed._JIN10_CACHE_LOCK:
+        jin10_feed._JIN10_CACHE.update(
+            source_url=secret, ts=0.0, items=[{"title": "stale"}]
+        )
+
+    def fail(_url):
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(jin10_feed, "_fetch_jin10_uncached", fail)
+    try:
+        with caplog.at_level("WARNING"):
+            assert jin10_feed.fetch_jin10_latest(secret) == [{"title": "stale"}]
+    finally:
+        with jin10_feed._JIN10_CACHE_LOCK:
+            jin10_feed._JIN10_CACHE.update(source_url="", ts=0.0, items=[])
+    assert secret not in caplog.text
+    assert "RuntimeError" in caplog.text
+
+
 def test_jin10_does_not_wait_for_inflight_upstream_fetch(monkeypatch):
     import services.jin10_feed as jin10_feed
 
@@ -467,6 +490,31 @@ def test_jin10_does_not_wait_for_inflight_upstream_fetch(monkeypatch):
         assert jin10_feed.fetch_jin10_latest("https://example.com/feed") == []
     finally:
         jin10_feed._JIN10_FETCH_LOCK.release()
+
+
+def test_public_jin10_route_hides_upstream_errors(monkeypatch, caplog):
+    import app as app_module
+    import routes.jin10_routes as jin10_routes
+    import routes.security as security
+
+    secret = "https://feed.example/private?token=do-not-leak"
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError(secret)
+
+    with security._rate_limit_lock:
+        security._rate_limit_store.clear()
+    monkeypatch.setattr(jin10_routes, "build_jin10_rss", fail)
+    with caplog.at_level("WARNING"):
+        with app_module.app.test_client() as client:
+            response = client.get("/jin10/rss")
+
+    assert response.status_code == 502
+    assert response.get_json() == {"error": "source_unavailable"}
+    body = response.get_data(as_text=True)
+    assert secret not in body
+    assert secret not in caplog.text
+    assert "RuntimeError" in caplog.text
 
 
 def test_public_jin10_route_clamps_limit(monkeypatch):

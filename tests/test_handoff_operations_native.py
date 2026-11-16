@@ -127,7 +127,10 @@ class OperationsFailureDiagnosticTests(unittest.TestCase):
     def test_source_validated_coordinates_omit_arbitrary_names_and_text(self):
         import tempfile
         with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory)
+            # macOS tempfile paths live under the /var -> /private/var symlink.
+            # The checker rejects any non-canonical path, so the fixture must
+            # already be resolved or every valid coordinate is dropped.
+            repo = Path(directory).resolve()
             (repo / "tests").mkdir()
             (repo / "tests/test_public.py").write_text("def test_public():\n    assert False, 'SECRET'\n")
             rows = [{"file": "tests/test_public.py", "line": 2},

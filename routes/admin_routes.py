@@ -10,6 +10,7 @@ from flask import Blueprint, Response, request
 from services.release_info import release_version
 from core.user_feedback import resolve_scoring_contract
 from services.score_quality import score_quality_prometheus, score_quality_snapshot
+from services.ingestion_status import public_refresh_attempt
 from utils.helpers import feed_data_health
 
 from routes.security import check_refresh_rate_limit
@@ -506,6 +507,10 @@ def readiness():
     """编排/探活用：strict 模式下陈旧或最近刷新降级时返回 503。"""
     c = _cfg()
     si = _staleness_info(c)
+    last_attempt = si["last_attempt"]
+    if not check_api_key():
+        # 匿名探活只保留计数；原始 error 可能含内网主机名或带凭据的 URL。
+        last_attempt = public_refresh_attempt(last_attempt)
     payload = {
         "ok": True,
         "timestamp": beijing_now().isoformat(),
@@ -515,7 +520,7 @@ def readiness():
         "staleness_threshold_seconds": si["staleness_threshold_seconds"],
         "stale": si["stale"],
         "degraded": si["degraded"],
-        "last_attempt": si["last_attempt"],
+        "last_attempt": last_attempt,
         "last_ingestion_at": si["last_ingestion_at"],
     }
     if (si["stale"] or si["degraded"]) and request.args.get(

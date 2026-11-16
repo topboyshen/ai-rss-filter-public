@@ -16,6 +16,7 @@ import urllib.request
 from dataclasses import dataclass
 from functools import wraps
 from flask import Response, request
+from utils.helpers import mark_feed_fetch_phase, mark_feed_fetch_status
 
 # SSRF 防护配置。默认策略是精确 feed allowlist；不要退回字符串黑名单。
 _ALLOWED_SCHEMES = {"http", "https"}
@@ -114,12 +115,17 @@ def _resolve_addresses(endpoint: _Endpoint) -> set[ipaddress.IPv4Address | ipadd
     except ValueError:
         pass
 
-    infos = socket.getaddrinfo(
-        endpoint.host,
-        endpoint.port,
-        type=socket.SOCK_STREAM,
-        proto=socket.IPPROTO_TCP,
-    )
+    mark_feed_fetch_phase("dns")
+    try:
+        infos = socket.getaddrinfo(
+            endpoint.host,
+            endpoint.port,
+            type=socket.SOCK_STREAM,
+            proto=socket.IPPROTO_TCP,
+        )
+    except OSError as exc:
+        mark_feed_fetch_phase("dns", dns_errno=exc.errno)
+        raise
     addresses = {
         ipaddress.ip_address(info[4][0])
         for info in infos
@@ -127,6 +133,7 @@ def _resolve_addresses(endpoint: _Endpoint) -> set[ipaddress.IPv4Address | ipadd
     }
     if not addresses:
         raise OSError("target hostname resolved to no addresses")
+    mark_feed_fetch_phase("policy")
     return addresses
 
 
@@ -308,6 +315,7 @@ def require_target_url(
     redirect_from: str | None = None,
 ) -> tuple[str, ...]:
     """Return the validated A/AAAA set or raise before any connection."""
+    mark_feed_fetch_phase("policy")
     ok, error, addresses = resolve_target_url(
         url, cfg, redirect_from=redirect_from
     )
@@ -357,6 +365,7 @@ def _connect_pinned_addresses(
     for address in addresses:
         parsed = ipaddress.ip_address(address)
         family = socket.AF_INET6 if parsed.version == 6 else socket.AF_INET
+        mark_feed_fetch_phase("connect", family=parsed.version)
         sock = None
         try:
             sock = socket.socket(family, socket.SOCK_STREAM)
@@ -394,6 +403,7 @@ class _PinnedHTTPConnection(http.client.HTTPConnection):
             self.timeout,
             self.source_address,
         )
+        mark_feed_fetch_phase("http")
 
 
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
@@ -413,6 +423,7 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
             self.timeout,
             self.source_address,
         )
+        mark_feed_fetch_phase("tls")
         try:
             self.sock = self._context.wrap_socket(
                 raw_socket,
@@ -421,6 +432,7 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         except Exception:
             raw_socket.close()
             raise
+        mark_feed_fetch_phase("http")
 
 
 class PinnedHTTPHandler(urllib.request.HTTPHandler):
@@ -430,6 +442,7 @@ class PinnedHTTPHandler(urllib.request.HTTPHandler):
 
     def http_open(self, req):  # type: ignore[override]
         addresses = _request_pinned_addresses(req, self._cfg)
+        mark_feed_fetch_phase("request")
 
         def connection(host, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, **kwargs):
             return _PinnedHTTPConnection(
@@ -449,6 +462,7 @@ class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
 
     def https_open(self, req):  # type: ignore[override]
         addresses = _request_pinned_addresses(req, self._cfg)
+        mark_feed_fetch_phase("request")
 
         def connection(host, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, **kwargs):
             return _PinnedHTTPSConnection(
@@ -470,9 +484,13 @@ class ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
         absolute_url = urllib.parse.urljoin(req.full_url, newurl)
-        addresses = require_target_url(
-            absolute_url, self._cfg, redirect_from=req.full_url
-        )
+        try:
+            addresses = require_target_url(
+                absolute_url, self._cfg, redirect_from=req.full_url
+            )
+        except PermissionError:
+            mark_feed_fetch_status(code)
+            raise
         redirected = super().redirect_request(
             req, fp, code, msg, headers, absolute_url
         )

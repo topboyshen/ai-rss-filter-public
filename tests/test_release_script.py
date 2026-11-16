@@ -2987,6 +2987,8 @@ def test_runtime_source_drift_fails_deploy_and_rolls_back(release_env):
     assert result.returncode != 0
     assert "Runtime source/config drift detected" in result.stderr
     assert (registry / "current.ref").read_text().strip() == old_ref
+    history = (registry / "history.tsv").read_text(encoding="utf-8")
+    assert "health_failed:source_immutable" in history
 
 
 def test_runtime_config_drift_fails_deploy_and_rolls_back(release_env):
@@ -2999,3 +3001,57 @@ def test_runtime_config_drift_fails_deploy_and_rolls_back(release_env):
     assert result.returncode != 0
     assert "Runtime source/config drift detected" in result.stderr
     assert (registry / "current.ref").read_text().strip() == old_ref
+    history = (registry / "history.tsv").read_text(encoding="utf-8")
+    assert "health_failed:source_immutable" in history
+
+
+def test_final_health_failure_records_the_wait_stage(release_env):
+    env, _log, registry, old_manifest = release_env
+    old_ref = _deploy_old(env, old_manifest)
+    env["RELEASE_COMPOSE_FILE"] = str(old_manifest)
+    env["RELEASE_HEALTH_SERVICES"] = OLD_HEALTH_SERVICES
+    env["FAKE_FAIL_SERVICE"] = "webhook-worker"
+    env["RELEASE_AUTO_ROLLBACK"] = "0"
+
+    result = _run_release(env, "deploy", "my-ai-filter:2026.07.12.1")
+
+    assert result.returncode == 4
+    assert (registry / "current.ref").read_text().strip() == old_ref
+    history = (registry / "history.tsv").read_text(encoding="utf-8")
+    assert "health_failed:wait_healthy" in history
+
+
+def _stub_verify_private_runtime(env):
+    """Make the copied release script fail only the private runtime stage.
+
+    A real private-contract failure needs a host-sealed contract and the
+    private evidence tree; the stage label is what this test exercises, so the
+    test-only copy of the script replaces that one function.
+    """
+    path = Path(env["RELEASE_TEST_SCRIPT"])
+    source = path.read_text(encoding="utf-8")
+    original = (
+        "verify_private_runtime() {\n"
+        '  local digest="$1"\n'
+        '  [[ -n "$PRIVATE_CONTRACT" ]] || return 0\n'
+        '  private_contract verify-runtime --image "$digest"\n'
+        "}\n"
+    )
+    assert source.count(original) == 1
+    path.write_text(
+        source.replace(original, "verify_private_runtime() {\n  return 1\n}\n"),
+        encoding="utf-8",
+    )
+
+
+def test_private_runtime_failure_records_the_private_stage(release_env):
+    env, _log, registry, old_manifest = release_env
+    old_ref = _deploy_old(env, old_manifest)
+    _stub_verify_private_runtime(env)
+
+    result = _run_release(env, "deploy", "my-ai-filter:2026.07.12.1")
+
+    assert result.returncode == 4
+    assert (registry / "current.ref").read_text().strip() == old_ref
+    history = (registry / "history.tsv").read_text(encoding="utf-8")
+    assert "health_failed:private_runtime" in history

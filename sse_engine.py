@@ -9,6 +9,7 @@ import time
 import logging
 import re as _re
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
@@ -927,6 +928,27 @@ def _realtime_candidate_rows(conn, query, params, *, cfg, feed_urls, min_score, 
     """, (*params, _cutoff_ts(REALTIME_PRIMARY_HOURS), max(0, int(limit)))).fetchall()
 
 
+def _allowed_feed_urls(conn, cfg: dict, feed_url: Optional[str], cutoff: str) -> list[str]:
+    """Return configured feed URLs present in the cache window."""
+    target_feed_cfg = _enabled_feed_config(cfg, feed_url) if feed_url else {}
+    if feed_url and not target_feed_cfg:
+        return []
+    target_config_url = str(target_feed_cfg.get("url") or "")
+    allowed: list[str] = []
+    for row in conn.execute(
+        "SELECT DISTINCT feed_url FROM news_cache WHERE created_at >= ?",
+        (cutoff,),
+    ).fetchall():
+        row_feed_url = str(row[0] or "")
+        row_feed_cfg = _enabled_feed_config(cfg, row_feed_url)
+        if not row_feed_cfg:
+            continue
+        if target_config_url and str(row_feed_cfg.get("url") or "") != target_config_url:
+            continue
+        allowed.append(row_feed_url)
+    return allowed
+
+
 def _load_from_db(
     limit: int = 10,
     min_score: Optional[float] = None,
@@ -940,28 +962,23 @@ def _load_from_db(
     conn = None
     try:
         import sqlite3
-        from db.database import DB_PATH, get_feed_thresholds
+        from db.database import (
+            DB_PATH,
+            SQLITE_BUSY_TIMEOUT_SECONDS,
+            get_feed_thresholds,
+        )
         cfg = load_config() if cfg is None else cfg
-        conn = sqlite3.connect(DB_PATH)
+        # Read-only URI: a missing/renamed DB must fail loudly instead of
+        # creating an empty file, and the connection itself cannot write.
+        conn = sqlite3.connect(
+            Path(DB_PATH).resolve().as_uri() + "?mode=ro",
+            uri=True,
+            timeout=SQLITE_BUSY_TIMEOUT_SECONDS,
+        )
         conn.row_factory = sqlite3.Row
         cutoff = _cutoff_ts(hours)
 
-        target_feed_cfg = _enabled_feed_config(cfg, feed_url) if feed_url else {}
-        if feed_url and not target_feed_cfg:
-            return []
-        target_config_url = str(target_feed_cfg.get("url") or "")
-        allowed_feed_urls = []
-        for row in conn.execute(
-            "SELECT DISTINCT feed_url FROM news_cache WHERE created_at >= ?",
-            (cutoff,),
-        ).fetchall():
-            row_feed_url = str(row[0] or "")
-            row_feed_cfg = _enabled_feed_config(cfg, row_feed_url)
-            if not row_feed_cfg:
-                continue
-            if target_config_url and str(row_feed_cfg.get("url") or "") != target_config_url:
-                continue
-            allowed_feed_urls.append(row_feed_url)
+        allowed_feed_urls = _allowed_feed_urls(conn, cfg, feed_url, cutoff)
         if not allowed_feed_urls:
             return []
 
@@ -1077,9 +1094,12 @@ def _load_from_db(
                 feed_url=row_feed_url, source=source,
             ))
         return attach_score_contract_labels(clean, cfg)
-    except Exception:
+    except Exception as exc:
         if strict:
             raise
+        # Keep the historical fail-neutral return, but make the failure
+        # observable without titles/URLs (exception type only).
+        logger.warning("Realtime DB load failed: %s", type(exc).__name__)
         return []
     finally:
         if conn is not None:

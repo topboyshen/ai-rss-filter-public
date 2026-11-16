@@ -156,13 +156,15 @@ def fetch_jin10_latest(source_url: str | None = None) -> list[dict[str, Any]]:
             )
         try:
             items = _fetch_jin10_uncached(url)
-        except Exception:
+        except Exception as exc:
             # Negative-cache an outage as well, so a public request burst cannot
             # turn one upstream failure into dozens of 10-second connections.
             with _JIN10_CACHE_LOCK:
                 _JIN10_CACHE.update(source_url=url, ts=now, items=stale)
             if stale:
-                logger.warning("金十源拉取失败，返回缓存数据", exc_info=True)
+                # The upstream exception may carry the configured source URL;
+                # keep its text and traceback out of this public-path log.
+                logger.warning("金十源拉取失败，返回缓存数据: %s", type(exc).__name__)
                 return stale
             raise
         with _JIN10_CACHE_LOCK:
