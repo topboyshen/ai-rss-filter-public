@@ -692,7 +692,7 @@ def _assert_host131_job(workflow):
     assert steps[0] == {"uses": "actions/checkout@v7", "with": {
         "ref": "${{ github.event.pull_request.head.sha || github.sha }}", "persist-credentials": "false"}}
     assert steps[1] == {"uses": "actions/setup-python@v7", "with": {"python-version": "3.11"}}
-    assert steps[2] == {"uses": "actions/setup-go@v6", "with": {"go-version": "1.26.4", "cache": "false"}}
+    assert steps[2] == {"uses": "actions/setup-go@v7", "with": {"go-version": "1.26.4", "cache": "false"}}
     proof, build, case = [_named_step(steps, name) for name in (HOST131_PROOF, HOST131_BUILD, HOST131_CASE)]
     assert steps.index(proof) < steps.index(build) < steps.index(case)
     for step in steps[:-2]:
