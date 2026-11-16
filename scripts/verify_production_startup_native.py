@@ -225,6 +225,17 @@ def _stdout_socket_diagnostic(raw):
     return socket_diagnostics.safe_summary(activation.get("failure_socket_listener"))
 
 
+def _stdout_anchor_diagnostic(raw):
+    from scripts import retained_gateway_diagnostics as socket_diagnostics
+    packet = _diagnostic_json(raw)
+    if type(packet) is not dict or packet.get("status") != "failed_or_evidence_insufficient":
+        return None
+    activation = packet.get("activation")
+    if type(activation) is not dict or activation.get("status") != "failed_or_evidence_insufficient":
+        return None
+    return socket_diagnostics.safe_anchor(activation.get("failure_archive_anchor"))
+
+
 def _stderr_diagnostic(raw):
     """Only a complete conventional traceback; arbitrary text is not a frame."""
     text = raw.decode("utf-8", errors="strict")
@@ -278,6 +289,9 @@ def _emit_archive_diagnostic(captured, complete):
             socket_summary = _stdout_socket_diagnostic(bytes(captured[0]))
             if socket_summary is not None:
                 record["socket_listener"] = socket_summary
+            anchor_summary = _stdout_anchor_diagnostic(bytes(captured[0]))
+            if anchor_summary is not None:
+                record["archive_anchor"] = anchor_summary
         except Exception:
             pass  # Optional typed diagnostics never displace the original failure.
     try:
@@ -285,6 +299,9 @@ def _emit_archive_diagnostic(captured, complete):
         if len(raw.encode()) > DIAGNOSTIC_BYTES:
             record.pop("nested_command", None)
             record.pop("host_command", None)
+            raw = json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+        if len(raw.encode()) > DIAGNOSTIC_BYTES:
+            record.pop("archive_anchor", None)
             raw = json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
         if len(raw.encode()) > DIAGNOSTIC_BYTES:
             record.pop("socket_listener", None)

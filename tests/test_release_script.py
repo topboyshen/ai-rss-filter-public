@@ -295,20 +295,19 @@ if [ "$1" = "inspect" ]; then
   for argument in "$@"; do
     case "$argument" in cid-*) container_id="$argument" ;; esac
   done
-  unhealthy=0
-  if [ -n "${FAKE_FAIL_REF:-}" ] && [ "${IMAGE_REF:-}" = "$FAKE_FAIL_REF" ]; then
-    unhealthy=1
-  elif [ -n "${FAKE_FAIL_SERVICE:-}" ] && \
-       [ "$container_id" = "cid-$FAKE_FAIL_SERVICE" ]; then
-    unhealthy=1
+  # Real docker gets one newline-joined argument and answers object-not-found.
+  case "$container_id" in *"
+"*) echo "Error: No such object" >&2; exit 1 ;; esac
+  unhealthy=0 stopped=0
+  if [ -n "${FAKE_FAIL_REF:-}" ] && [ "${IMAGE_REF:-}" = "$FAKE_FAIL_REF" ]; then unhealthy=1
+  elif [ -n "${FAKE_FAIL_SERVICE:-}" ] && [ "$container_id" = "cid-$FAKE_FAIL_SERVICE" ]; then unhealthy=1
+  elif [ -n "${FAKE_STOPPED_SERVICE:-}" ] && [ "$container_id" = "cid-$FAKE_STOPPED_SERVICE" ]; then stopped=1
   fi
   case "$*" in
     *"{{if .State.Health}}"*)
-      if [ "$unhealthy" = "1" ]; then
-        printf 'unhealthy\n'
-      else
-        printf 'healthy\n'
-      fi
+      if [ "$stopped" = "1" ]; then printf 'exited|healthy\n'
+      elif [ "$unhealthy" = "1" ]; then printf 'running|unhealthy\n'
+      else printf 'running|healthy\n'; fi
       ;;
     *)
       if [ "${FAKE_DIAGNOSTIC_INSPECT_FAIL:-0}" = "1" ]; then
@@ -324,8 +323,9 @@ if [ "$1" = "inspect" ]; then
         health="healthy"
         exit_code=0
       fi
-      printf '{"Id":"%s","Name":"/%s","RestartCount":0,"State":{"Status":"%s","Running":true,"ExitCode":%s,"OOMKilled":false,"Error":"","Health":{"Status":"%s","FailingStreak":3,"Log":[{"Start":"2026-09-02T01:00:00Z","End":"2026-09-02T01:00:01Z","ExitCode":1,"Output":"{\\"token\\":\\"json-health-secret\\"}"}]}}}\n' \
-        "$container_id" "$service" "$status" "$exit_code" "$health"
+      # printf rewrites \\" in its format string, so the inner JSON goes via %s.
+      printf '{"Id":"%s","Name":"/%s","RestartCount":0,"State":{"Status":"%s","Running":true,"ExitCode":%s,"OOMKilled":false,"Error":"","Health":{"Status":"%s","FailingStreak":3,"Log":[{"Start":"2026-09-02T01:00:00Z","End":"2026-09-02T01:00:01Z","ExitCode":1,"Output":"%s"}]}}}\n' \
+        "$container_id" "$service" "$status" "$exit_code" "$health" '{\\"token\\":\\"json-health-secret\\"}'
       ;;
   esac
   exit 0
@@ -387,15 +387,12 @@ if [ "$1" = "compose" ]; then
       exit 0
       ;;
     ps)
-      if [ "${1:-}" = "--all" ]; then
-        shift
-      fi
+      [ "${1:-}" = "--all" ] && shift
       [ "${1:-}" = "-q" ] || exit 93
       service="$2"
-      if [ -n "${FAKE_MISSING_SERVICE:-}" ] && [ "$service" = "$FAKE_MISSING_SERVICE" ]; then
-        exit 0
-      fi
+      [ "${FAKE_MISSING_SERVICE:-}" = "$service" ] && exit 0
       printf 'cid-%s\n' "$service"
+      [ "${FAKE_DUPLICATE_SERVICE:-}" = "$service" ] && printf 'cid-%s-2\n' "$service"
       exit 0
       ;;
     build)
@@ -513,6 +510,56 @@ def _run_release(env, *args, pass_fds=()):
         cwd=PROJECT_ROOT,
         env=env,
         pass_fds=pass_fds,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+
+def _release_shell_function(name):
+    source = RELEASE_SCRIPT.read_text(encoding="utf-8")
+    marker = f"{name}() {{"
+    start = source.index(marker)
+    end = source.index("\n}\n", start) + len("\n}\n")
+    return source[start:end]
+
+
+def _run_read_build_contract(
+    tmp_path, *, ref, contract_private_sha, active_private_sha, mode
+):
+    contracts = tmp_path / "build-contracts"
+    contracts.mkdir(exist_ok=True)
+    key = hashlib.sha256(ref.encode()).hexdigest()
+    lines = [
+        ref,
+        IMAGE_ID,
+        "a" * 64,
+        "b" * 64,
+        "c" * 40 + ":clean",
+        "event-mapping-store-v5-provider-attribution-v1",
+    ]
+    if contract_private_sha is not None:
+        lines.append(contract_private_sha)
+    (contracts / f"{key}.state").write_text(
+        "\n".join(lines) + "\n", encoding="utf-8"
+    )
+    harness = "\n".join([
+        "set -u",
+        f"BUILD_CONTRACT_DIR={shlex.quote(str(contracts))}",
+        f"PRIVATE_CONTRACT_SHA={shlex.quote(active_private_sha)}",
+        "EVENT_MAPPING_MIGRATION_GENERATION="
+        "event-mapping-store-v5-provider-attribution-v1",
+        _release_shell_function("build_contract_path"),
+        _release_shell_function("read_build_contract"),
+        f"if read_build_contract {shlex.quote(ref)} {shlex.quote(mode)}; then",
+        '  printf "OK %s\\n" "$CONTRACT_PRIVATE_SHA"',
+        "else",
+        "  exit $?",
+        "fi",
+    ])
+    return subprocess.run(
+        ["bash", "-c", harness],
         text=True,
         capture_output=True,
         timeout=10,
@@ -1370,6 +1417,29 @@ def test_deploy_archives_manifest_and_records_complete_state(release_env):
     assert ":latest" not in calls
 
 
+def test_deploy_refuses_to_guess_between_two_service_containers(release_env):
+    env, _log, _registry, _old_manifest = release_env
+    env["FAKE_DUPLICATE_SERVICE"] = "ai-filter-api"
+
+    result = _run_release(env, "deploy", "my-ai-filter:2026.07.12.1")
+
+    assert result.returncode != 0
+    assert "cannot identify a single container for ai-filter-api" in result.stderr
+    assert "found 2" in result.stderr
+    assert "Health timeout" not in result.stderr
+
+
+def test_deploy_rejects_a_stopped_service_with_stale_healthy_health(release_env):
+    env, _log, _registry, _old_manifest = release_env
+    env["FAKE_STOPPED_SERVICE"] = "ai-filter-api"
+
+    result = _run_release(env, "deploy", "my-ai-filter:2026.07.12.1")
+
+    assert result.returncode != 0
+    assert "Health timeout" in result.stderr
+    assert "exited|healthy" in result.stderr
+
+
 @pytest.mark.parametrize("preflight_failure", [False, True])
 def test_standard_redeploy_retires_forced_override_only_after_success(
     release_env, preflight_failure
@@ -1505,6 +1575,83 @@ def test_deploy_accepts_graphic_secret_without_trailing_lf(release_env):
     secret.chmod(0o400)
 
     result = _run_release(env, "deploy", "my-ai-filter:2026.07.12.12")
+
+    assert result.returncode == 0, result.stderr
+
+
+def _write_compact_json_compose_manifest(path):
+    secret_names = (
+        "dashboard_session_secret",
+        "ai_filter_integration_token",
+        "quant_market_context_token",
+    )
+    manifest = {
+        "services": {
+            "ai-filter-api": {
+                "image": "${IMAGE_REF}",
+                "secrets": list(secret_names),
+            },
+            "ai-filter-worker": {"image": "${IMAGE_REF}"},
+            "ai-filter-web": {"image": "${IMAGE_REF}"},
+            "redis": {"image": "redis:7"},
+            "rsshub": {"image": "rsshub:1"},
+        },
+        "secrets": {
+            name: {"file": f"./secrets/{name}"} for name in secret_names
+        },
+    }
+    # Compact JSON with no space after the colon: the exact key form the
+    # previous fixed-string YAML check ("name:") silently skipped.
+    path.write_text(
+        json.dumps(manifest, separators=(",", ":")), encoding="utf-8"
+    )
+
+
+def test_deploy_rejects_json_manifest_with_missing_runtime_secret(
+    release_env, tmp_path
+):
+    env, log, registry, _old_manifest = release_env
+    manifest = tmp_path / "json-compose.json"
+    _write_compact_json_compose_manifest(manifest)
+    env["RELEASE_COMPOSE_FILE"] = str(manifest)
+    (PROJECT_ROOT / "secrets" / "dashboard_session_secret").unlink()
+
+    result = _run_release(env, "deploy", "my-ai-filter:2026.07.12.13")
+
+    assert result.returncode != 0
+    assert "Runtime secret" in result.stderr
+    assert "dashboard_session_secret" in result.stderr
+    assert " up -d " not in log.read_text()
+    assert "preflight_failed" in (registry / "history.tsv").read_text()
+
+
+def test_deploy_rejects_json_manifest_with_insecure_runtime_secret_mode(
+    release_env, tmp_path
+):
+    env, log, _registry, _old_manifest = release_env
+    manifest = tmp_path / "json-compose.json"
+    _write_compact_json_compose_manifest(manifest)
+    env["RELEASE_COMPOSE_FILE"] = str(manifest)
+    secret = PROJECT_ROOT / "secrets" / "ai_filter_integration_token"
+    secret.chmod(0o644)
+
+    result = _run_release(env, "deploy", "my-ai-filter:2026.07.12.14")
+
+    assert result.returncode != 0
+    assert "mode 0400 or 0600" in result.stderr
+    assert "ai_filter_integration_token" in result.stderr
+    assert " up -d " not in log.read_text()
+
+
+def test_deploy_accepts_json_manifest_with_valid_runtime_secrets(
+    release_env, tmp_path
+):
+    env, _log, _registry, _old_manifest = release_env
+    manifest = tmp_path / "json-compose.json"
+    _write_compact_json_compose_manifest(manifest)
+    env["RELEASE_COMPOSE_FILE"] = str(manifest)
+
+    result = _run_release(env, "deploy", "my-ai-filter:2026.07.12.15")
 
     assert result.returncode == 0, result.stderr
 
@@ -2077,6 +2224,88 @@ def test_old_archived_manifest_skips_gateway_specific_preflight(release_env):
     assert " run --rm --no-deps " not in log.read_text()
 
 
+def _write_compact_json_manifest(path, *, gateway):
+    """Mirror private_release_contract.encoded() for an archived manifest."""
+    services = {
+        "ai-filter-api": {
+            "image": "${IMAGE_REF:?}",
+            "depends_on": {"redis": {"condition": "service_healthy"}},
+        },
+        "ai-filter-worker": {"image": "${IMAGE_REF:?}"},
+        "ai-filter-web": {
+            "image": "nginx:stable-alpine@sha256:" + "c" * 64,
+            "depends_on": {"ai-filter-api": {"condition": "service_healthy"}},
+        },
+        "redis": {"image": "redis:7-alpine"},
+        "rsshub": {"image": "rsshub:1"},
+    }
+    payload = {"services": services}
+    if gateway:
+        payload["configs"] = {
+            "ai-filter-gateway-nginx": {
+                "content": (
+                    "server {\n"
+                    "  listen 5000;\n"
+                    "  location /health { proxy_pass http://ai-filter-api:5000; }\n"
+                    "}\n"
+                )
+            }
+        }
+        services["ai-filter-web"]["configs"] = [
+            {
+                "source": "ai-filter-gateway-nginx",
+                "target": "/etc/nginx/nginx.conf",
+                "mode": "0444",
+            }
+        ]
+    path.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_compact_json_manifest_runs_gateway_preflight_and_ordered_convergence(
+    release_env, tmp_path
+):
+    env, log, _registry, _old_manifest = release_env
+    manifest = _write_compact_json_manifest(
+        tmp_path / "private-compose.json", gateway=True
+    )
+    env["RELEASE_COMPOSE_FILE"] = str(manifest)
+
+    result = _run_release(env, "deploy", "my-ai-filter:2026.11.08.130")
+
+    assert result.returncode == 0, result.stderr
+    calls = log.read_text()
+    assert "run --rm --no-deps ai-filter-web nginx -t" in calls
+    ordered = [
+        "up -d --no-build --pull never redis rsshub",
+        "up -d --no-build --pull never --no-deps --force-recreate ai-filter-api",
+        "up -d --no-build --pull never --no-deps --force-recreate ai-filter-web",
+        "up -d --no-build --pull never --no-deps --force-recreate ai-filter-worker",
+    ]
+    positions = [calls.index(fragment) for fragment in ordered]
+    assert positions == sorted(positions)
+
+
+def test_compact_json_manifest_without_gateway_config_skips_gateway_steps(
+    release_env, tmp_path
+):
+    env, log, _registry, _old_manifest = release_env
+    manifest = _write_compact_json_manifest(
+        tmp_path / "private-compose.json", gateway=False
+    )
+    env["RELEASE_COMPOSE_FILE"] = str(manifest)
+
+    result = _run_release(env, "deploy", "my-ai-filter:2026.11.08.130")
+
+    assert result.returncode == 0, result.stderr
+    calls = log.read_text()
+    assert " run --rm --no-deps " not in calls
+    assert "--force-recreate" not in calls
+
+
 def test_gateway_preflight_failure_blocks_build_before_image_build(release_env):
     env, log, _registry, _old_manifest = release_env
     env["FAKE_MISSING_UNTIL_BUILD"] = "1"
@@ -2640,6 +2869,89 @@ def test_private_build_contract_cannot_be_verified_as_public_release(release_env
     assert " up " not in log.read_text()
 
 
+def test_recorded_private_build_contract_survives_contract_rotation(tmp_path):
+    old_private_sha = "d" * 64
+    active_private_sha = "e" * 64
+
+    result = _run_read_build_contract(
+        tmp_path,
+        ref="my-ai-filter:2026.11.09.133",
+        contract_private_sha=old_private_sha,
+        active_private_sha=active_private_sha,
+        mode="recorded",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"OK {old_private_sha}" in result.stdout
+
+
+def test_recorded_private_build_contract_requires_a_private_release(tmp_path):
+    result = _run_read_build_contract(
+        tmp_path,
+        ref="my-ai-filter:2026.11.09.133",
+        contract_private_sha="d" * 64,
+        active_private_sha="",
+        mode="recorded",
+    )
+
+    assert result.returncode == 3
+    assert "Private build contract is missing or mismatched" in result.stderr
+
+
+def test_new_private_build_contract_requires_exact_active_contract(tmp_path):
+    result = _run_read_build_contract(
+        tmp_path,
+        ref="my-ai-filter:2026.11.10.134",
+        contract_private_sha="d" * 64,
+        active_private_sha="e" * 64,
+        mode="strict",
+    )
+
+    assert result.returncode == 3
+    assert "Private build contract is missing or mismatched" in result.stderr
+
+
+def test_new_private_build_contract_accepts_matching_active_contract(tmp_path):
+    private_sha = "e" * 64
+
+    result = _run_read_build_contract(
+        tmp_path,
+        ref="my-ai-filter:2026.11.10.134",
+        contract_private_sha=private_sha,
+        active_private_sha=private_sha,
+        mode="strict",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"OK {private_sha}" in result.stdout
+
+
+def test_recorded_private_build_contract_rejects_malformed_private_sha(tmp_path):
+    result = _run_read_build_contract(
+        tmp_path,
+        ref="my-ai-filter:2026.11.09.133",
+        contract_private_sha="not-a-sha",
+        active_private_sha="e" * 64,
+        mode="recorded",
+    )
+
+    assert result.returncode == 3
+    assert "Private build contract is missing or mismatched" in result.stderr
+
+
+def test_invalid_build_contract_read_mode_is_rejected(tmp_path):
+    result = _run_read_build_contract(
+        tmp_path,
+        ref="my-ai-filter:2026.11.09.133",
+        contract_private_sha="d" * 64,
+        active_private_sha="e" * 64,
+        mode="relaxed",
+    )
+
+    assert result.returncode == 2
+    assert "Invalid build contract read mode" in result.stderr
+
+
 def test_compose_and_ci_forbid_latest_and_target_master():
     compose = (PROJECT_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     workflow = (PROJECT_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
@@ -2675,6 +2987,8 @@ def test_runtime_source_drift_fails_deploy_and_rolls_back(release_env):
     assert result.returncode != 0
     assert "Runtime source/config drift detected" in result.stderr
     assert (registry / "current.ref").read_text().strip() == old_ref
+    history = (registry / "history.tsv").read_text(encoding="utf-8")
+    assert "health_failed:source_immutable" in history
 
 
 def test_runtime_config_drift_fails_deploy_and_rolls_back(release_env):
@@ -2687,3 +3001,57 @@ def test_runtime_config_drift_fails_deploy_and_rolls_back(release_env):
     assert result.returncode != 0
     assert "Runtime source/config drift detected" in result.stderr
     assert (registry / "current.ref").read_text().strip() == old_ref
+    history = (registry / "history.tsv").read_text(encoding="utf-8")
+    assert "health_failed:source_immutable" in history
+
+
+def test_final_health_failure_records_the_wait_stage(release_env):
+    env, _log, registry, old_manifest = release_env
+    old_ref = _deploy_old(env, old_manifest)
+    env["RELEASE_COMPOSE_FILE"] = str(old_manifest)
+    env["RELEASE_HEALTH_SERVICES"] = OLD_HEALTH_SERVICES
+    env["FAKE_FAIL_SERVICE"] = "webhook-worker"
+    env["RELEASE_AUTO_ROLLBACK"] = "0"
+
+    result = _run_release(env, "deploy", "my-ai-filter:2026.07.12.1")
+
+    assert result.returncode == 4
+    assert (registry / "current.ref").read_text().strip() == old_ref
+    history = (registry / "history.tsv").read_text(encoding="utf-8")
+    assert "health_failed:wait_healthy" in history
+
+
+def _stub_verify_private_runtime(env):
+    """Make the copied release script fail only the private runtime stage.
+
+    A real private-contract failure needs a host-sealed contract and the
+    private evidence tree; the stage label is what this test exercises, so the
+    test-only copy of the script replaces that one function.
+    """
+    path = Path(env["RELEASE_TEST_SCRIPT"])
+    source = path.read_text(encoding="utf-8")
+    original = (
+        "verify_private_runtime() {\n"
+        '  local digest="$1"\n'
+        '  [[ -n "$PRIVATE_CONTRACT" ]] || return 0\n'
+        '  private_contract verify-runtime --image "$digest"\n'
+        "}\n"
+    )
+    assert source.count(original) == 1
+    path.write_text(
+        source.replace(original, "verify_private_runtime() {\n  return 1\n}\n"),
+        encoding="utf-8",
+    )
+
+
+def test_private_runtime_failure_records_the_private_stage(release_env):
+    env, _log, registry, old_manifest = release_env
+    old_ref = _deploy_old(env, old_manifest)
+    _stub_verify_private_runtime(env)
+
+    result = _run_release(env, "deploy", "my-ai-filter:2026.07.12.1")
+
+    assert result.returncode == 4
+    assert (registry / "current.ref").read_text().strip() == old_ref
+    history = (registry / "history.tsv").read_text(encoding="utf-8")
+    assert "health_failed:private_runtime" in history

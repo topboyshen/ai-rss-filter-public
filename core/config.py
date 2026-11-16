@@ -89,6 +89,147 @@ DEFAULTS = {
 }
 
 
+class ConfigError(ValueError):
+    """配置结构非法：启动或热重载时立即失败，而不是在业务路径深处崩溃。"""
+
+
+# DEFAULTS 是形状的唯一定义来源；下列键在既有用法里接受多个形状。
+_SHAPE_EXCEPTIONS = {
+    # null 表示"不启用 CORS"，routes/shared.py 按 falsy 处理。
+    ("security", "cors_allowed_origins"): (str, list, type(None)),
+    # Telegram Bot API 的 chat_id 既接受字符串也接受整数。
+    ("telegram", "chat_id"): (str, int),
+    # 这两个列表只被 `if value:` 消费，null 等价于空列表。
+    ("blacklist",): (list, type(None)),
+    ("highlight_keywords",): (list, type(None)),
+}
+
+# 列表项必须是字符串的段；feeds / prompt_matchers 的项另按 mapping 校验。
+_STRING_LIST_KEYS = ("blacklist", "highlight_keywords")
+
+
+def _shape_name(value) -> str:
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "int"
+    if isinstance(value, float):
+        return "float"
+    if isinstance(value, str):
+        return "str"
+    if isinstance(value, dict):
+        return "mapping"
+    if isinstance(value, list):
+        return "list"
+    if value is None:
+        return "null"
+    return type(value).__name__
+
+
+def _type_shape_name(value: type) -> str:
+    return {
+        bool: "bool",
+        int: "int",
+        float: "float",
+        str: "str",
+        dict: "mapping",
+        list: "list",
+    }.get(value, value.__name__)
+
+
+def _matches_shape(expected, actual, allowed=None) -> bool:
+    for wanted in allowed or (expected,):
+        if isinstance(wanted, type):
+            if wanted is bool:
+                if isinstance(actual, bool):
+                    return True
+            elif wanted in (int, float):
+                if isinstance(actual, (int, float)) and not isinstance(actual, bool):
+                    return True
+            elif isinstance(actual, wanted):
+                return True
+        elif isinstance(wanted, bool):
+            if isinstance(actual, bool):
+                return True
+        elif isinstance(wanted, (int, float)):
+            # int 与 float 在阈值/间隔类配置里可互换，bool 不算数值。
+            if isinstance(actual, (int, float)) and not isinstance(actual, bool):
+                return True
+        elif isinstance(wanted, (dict, list, str)):
+            if isinstance(actual, type(wanted)):
+                return True
+        elif actual is wanted:
+            return True
+    return False
+
+
+def _shape_label(expected, allowed=None) -> str:
+    def label(value) -> str:
+        if isinstance(value, type):
+            return _type_shape_name(value)
+        return _shape_name(value)
+
+    if not allowed:
+        return label(expected)
+    return " 或 ".join(label(item) for item in allowed)
+
+
+def _collect_shape_errors(expected, actual, segments, errors, allowed=None) -> None:
+    path = ".".join(segments) or "<root>"
+    if not _matches_shape(expected, actual, allowed):
+        errors.append(
+            f"{path} 期望 {_shape_label(expected, allowed)}，实际 {_shape_name(actual)}"
+        )
+        return
+    if not isinstance(actual, dict):
+        return
+    for key, default_value in expected.items():
+        if key not in actual:
+            continue
+        child_segments = segments + (key,)
+        _collect_shape_errors(
+            default_value,
+            actual[key],
+            child_segments,
+            errors,
+            _SHAPE_EXCEPTIONS.get(child_segments),
+        )
+
+
+def _list_section(cfg: dict, key: str) -> list:
+    value = cfg.get(key)
+    return value if isinstance(value, list) else []
+
+
+def _collect_item_errors(cfg: dict, errors: list) -> None:
+    for key in _STRING_LIST_KEYS:
+        for index, item in enumerate(_list_section(cfg, key)):
+            if not isinstance(item, str):
+                errors.append(f"{key}[{index}] 期望 str，实际 {_shape_name(item)}")
+    for index, matcher in enumerate(_list_section(cfg, "prompt_matchers")):
+        if not isinstance(matcher, dict):
+            errors.append(
+                f"prompt_matchers[{index}] 期望 mapping，实际 {_shape_name(matcher)}"
+            )
+    for index, feed in enumerate(_list_section(cfg, "feeds")):
+        if not isinstance(feed, dict):
+            errors.append(f"feeds[{index}] 期望 mapping，实际 {_shape_name(feed)}")
+            continue
+        if "url" in feed and not isinstance(feed["url"], str):
+            errors.append(
+                f"feeds[{index}].url 期望 str，实际 {_shape_name(feed['url'])}"
+            )
+
+
+def _validate_config_shape(cfg: dict) -> None:
+    """一次性列出所有形状错误，避免修一个报一个。"""
+    errors: list = []
+    _collect_shape_errors(DEFAULTS, cfg, (), errors)
+    _collect_item_errors(cfg, errors)
+    if errors:
+        raise ConfigError("配置结构非法：" + "；".join(errors))
+
+
 def _merge(base, override):
     for k, v in override.items():
         if isinstance(v, dict) and k in base and isinstance(base[k], dict):
@@ -166,7 +307,13 @@ def load_config():
         if not isinstance(user_cfg, dict):
             raise TypeError("配置文件顶层必须是 YAML mapping")
         _merge(cfg, user_cfg)
+    # 留空的字符串占位（如 ``api_key:``）先归一为空值：它们的空态就是 DEFAULTS
+    # 里的空字符串，直接交给校验会把一直合法的部署判死。
+    _normalize_null_placeholders(cfg)
+    # 环境变量先行：YAML 里的空占位由 env 补上后才是最终生效值。env 派生值由
+    # 本模块保证类型。
     _apply_secrets_from_env(cfg)
+    _validate_config_shape(cfg)
     manual_version = str(cfg.get("scoring_strategy_version") or "").strip()
     # Runtime-only host rewrites must not change the strategy identity. Compute
     # from the canonical YAML URLs first, then expose container-reachable URLs.
@@ -220,9 +367,37 @@ def _apply_rsshub_base_url_from_env(cfg: dict) -> None:
     )
 
 
+# YAML 里留空的字符串占位等同于"未配置"，DEFAULTS 中的空字符串就是它们的合法
+# 空值：消费方只在真值分支使用这些字段，``scoring_strategy_version`` 本身也按
+# ``or ""`` 归一。数字/布尔字段不在此列——写 null 从来不是有效配置。
+_NULL_AS_EMPTY = (
+    ("security", "api_key"),
+    ("telegram", "bot_token"),
+    ("telegram", "chat_id"),
+    ("scoring_strategy_version",),
+)
+
+
+def _normalize_null_placeholders(cfg: dict) -> None:
+    """把留空的字符串占位归一为空串，避免形状校验把它们判成非法形状。"""
+    for path in _NULL_AS_EMPTY:
+        section = cfg
+        for key in path[:-1]:
+            section = section.get(key)
+            if not isinstance(section, dict):
+                section = None
+                break
+        if isinstance(section, dict) and section.get(path[-1]) is None:
+            section[path[-1]] = ""
+
+
 def _apply_secrets_from_env(cfg: dict) -> None:
     """环境变量覆盖敏感项（不写入文件，优先于 config.yaml）。"""
-    se = cfg.setdefault("security", {})
+    # env 在校验之前应用，形状错误的整段不能被这里当成 mapping 使用；
+    # 直接跳过，交给 _validate_config_shape 报出准确路径。
+    se = cfg.get("security")
+    if not isinstance(se, dict):
+        se = {}
     for env_name in ("AI_FILTER_API_KEY", "API_KEY"):
         v = (os.environ.get(env_name) or "").strip()
         if v:
@@ -237,7 +412,9 @@ def _apply_secrets_from_env(cfg: dict) -> None:
     v = (os.environ.get("AI_FILTER_CORS_ALLOWED_ORIGINS") or "").strip()
     if v:
         se["cors_allowed_origins"] = "*" if v == "*" else [x.strip() for x in v.split(",") if x.strip()]
-    tg = cfg.setdefault("telegram", {})
+    tg = cfg.get("telegram")
+    if not isinstance(tg, dict):
+        tg = {}
     if (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip():
         tg["bot_token"] = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if (os.environ.get("TELEGRAM_CHAT_ID") or "").strip():
@@ -258,10 +435,12 @@ class ConfigHolder:
     def blacklist_re(self):
         return self._blacklist_re
 
-    def reload(self):
+    def reload(self, new_cfg=None):
         # Publish the configuration and its derived regex as one validated pair.
-        # An exception leaves the previous runtime state untouched.
-        new_cfg = load_config()
+        # An exception leaves the previous runtime state untouched.  Callers may
+        # pass an already validated candidate so the published config is exactly
+        # the one that was gated (e.g. against undrained scoring work).
+        new_cfg = load_config() if new_cfg is None else new_cfg
         new_regex = re.compile("|".join(new_cfg["blacklist"])) if new_cfg["blacklist"] else re.compile("$^")
         self._cfg, self._blacklist_re = new_cfg, new_regex
         return new_cfg

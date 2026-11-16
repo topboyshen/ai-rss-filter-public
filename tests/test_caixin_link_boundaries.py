@@ -16,7 +16,8 @@ ARTICLE = "https://finance.caixin.com/2026-09-28/102489393.html"
 TOPIC = "https://key.caixin.com/topic/BQ02.000008077"
 COLUMN = "https://finance.caixin.com/column/macro.news"
 MEDIA = "https://video.caixin.com/2026-09-28/123.html"
-LINK_KINDS = (ARTICLE, TOPIC, COLUMN, MEDIA)
+DEEPVIEW_TOPIC = "https://deepview.caixin.com/topic/BQ02.000002479.html?cxapp_link=true"
+LINK_KINDS = (ARTICLE, TOPIC, COLUMN, MEDIA, DEEPVIEW_TOPIC)
 
 
 def row(url=ARTICLE, **updates):
@@ -127,6 +128,8 @@ def test_existing_https_article_identity_is_preserved_without_canonicalization(m
 
 @pytest.mark.parametrize("url, kind", [
     (TOPIC, "topic"), ("https://KEY.CAIXIN.COM:443/topic/BQ02.000008077", "topic"),
+    (DEEPVIEW_TOPIC, "topic"),
+    ("https://deepview.caixin.com/topic/BQ02.000002479.html", "topic"),
     (COLUMN, "column"), ("https://www.caixin.com/special/budget-2026", "column"),
     (MEDIA, "media"), ("https://fm.caixin.com/2026-09-28/123.html", "media"),
     ("https://datanews.caixin.com/2026-09-28/123.html", "media"),
@@ -143,11 +146,23 @@ def test_named_non_article_can_lack_article_metadata_but_does_not_use_article_qu
     }
 
 
-@pytest.mark.parametrize("url", [TOPIC, COLUMN, MEDIA])
+@pytest.mark.parametrize("url", [TOPIC, COLUMN, MEDIA, DEEPVIEW_TOPIC])
 def test_only_non_articles_fail_even_without_article_metadata(monkeypatch, url, caplog):
     with caplog.at_level(logging.WARNING), pytest.raises(ValueError, match="no eligible articles"):
         load(monkeypatch, [{"url": url}], limit=1)
     assert "Caixin skipped 1" in caplog.text
+
+
+@pytest.mark.parametrize("url", [
+    "https://deepview.caixin.com/topic/BQ02.000002479.html?other=1",
+    "https://deepview.caixin.com/topic/BQ02.000002479.html?cxapp_link=false",
+    "https://deepview.caixin.com/topic/BQ02.000002479.html?cxapp_link=true&x=1",
+    "https://deepview.caixin.com/2026-11-13/102504468.html?cxapp_link=true",
+    "https://evil.caixin.com/topic/BQ02.000002479.html?cxapp_link=true",
+])
+def test_deepview_topic_query_is_narrowly_scoped(monkeypatch, url):
+    with pytest.raises(ValueError, match="Caixin article URL identity invalid"):
+        load(monkeypatch, [row(), row(url)])
 
 
 def test_skip_count_only_covers_rows_traversed_before_article_limit(monkeypatch, caplog):

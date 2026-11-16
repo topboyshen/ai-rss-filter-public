@@ -322,6 +322,29 @@ def test_native_failure_and_safe_profile_export_no_private_bytes(monkeypatch, pr
     assert not any(p.suffix == ".raw" for p in output.rglob("*"))
 
 
+def test_anchor_packet_reaches_public_export_as_counts_only(monkeypatch, capsys, tmp_path):
+    from scripts import production_activation_host_native as host
+    from scripts import verify_production_activation_native as native
+    from scripts import verify_production_startup_native as startup
+    from test_retained_gateway_configuration import anchor_environment
+    authority = anchor_environment(monkeypatch, ["/dev/null", "socket:[999]"])
+    with pytest.raises(gate.AdmissionError) as caught:
+        authority._anchor(321)
+    output = tmp_path / "public-anchor-root"
+    output.mkdir()
+    failure = native.record_failure(caught.value, Path(__file__).resolve().parents[1], output,
+                                    "actual_fixed_network_namespace_transport")
+    assert failure["archive_anchor"] == caught.value.gateway_anchor_diagnostic
+    public = host.safe_activation({"status": "failed_or_evidence_insufficient", "failure": failure})
+    assert public["failure_archive_anchor"] == failure["archive_anchor"]
+    packet = {"status": "failed_or_evidence_insufficient", "activation": {
+        "status": "failed_or_evidence_insufficient", "failure_archive_anchor": public["failure_archive_anchor"]}}
+    startup._emit_archive_diagnostic([bytearray(diagnostic.encoded(packet)), bytearray()], True)
+    emitted = capsys.readouterr().err
+    assert json.loads(emitted)["archive_anchor"] == failure["archive_anchor"]
+    assert b"/" not in diagnostic.encoded(json.loads(emitted)) and "socket:[" not in emitted
+
+
 @pytest.mark.parametrize("bad", [b" 0 ", b" -1 ", b" 0124 "])
 def test_invalid_accepted_inode_remains_rejected(monkeypatch, private_store, bad):
     row = HEADER + LISTENER + ACCEPTED.replace(b" 124 ", bad)

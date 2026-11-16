@@ -900,6 +900,9 @@ def safe_activation(value):
         socket_summary = socket_diagnostics.safe_summary(failure.get("socket_listener"))
         if socket_summary is not None:
             result["failure_socket_listener"] = socket_summary
+        anchor_summary = socket_diagnostics.safe_anchor(failure.get("archive_anchor"))
+        if anchor_summary is not None:
+            result["failure_archive_anchor"] = anchor_summary
         for key, limit in (("message_literal", 200), ("namespace_helper", 800), ("guardian_handoff", 1600)):
             item = failure.get(key)
             result["failure_" + key] = (item if isinstance(item, str) and 0 < len(item) <= limit
@@ -1426,6 +1429,8 @@ def _main(argv=None, *, _cli_started=None):
                "elapsed_seconds": time.monotonic() - started, "production_access": False, "real_models": 0, "existing_126_modified": False}
     if len(host.encoded(summary)) > 512 * 1024 and type(summary.get("activation")) is dict:
         summary["activation"].pop("failure_native_command", None)
+    if len(host.encoded(summary)) > 512 * 1024 and type(summary.get("activation")) is dict:
+        summary["activation"].pop("failure_archive_anchor", None)
     if len(host.encoded(summary)) > 512 * 1024 and type(summary.get("activation")) is dict:
         summary["activation"].pop("failure_socket_listener", None)
     gate._require(len(host.encoded(summary)) <= 512 * 1024, "full-host summary encoding bound")

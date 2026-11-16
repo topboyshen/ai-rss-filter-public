@@ -6,6 +6,7 @@ readiness receipts and failures are retained in the separate writable state.
 from __future__ import annotations
 
 import fcntl
+import logging
 import os
 from pathlib import Path
 import threading
@@ -14,9 +15,15 @@ import time
 from services import admission_fence as gate
 from services import production_startup as startup
 
+logger = logging.getLogger(__name__)
+
 SCHEMA = "production-business-activation-v1"
 PULSE_SECONDS = 2
 MAX_PULSE_AGE = 8
+# 闭窗期的连续失败上限；超过即留下回执并停止，等人工介入，绝不猜测重来。
+MONITOR_ATTEMPTS = 5
+# 每次重试前的退避（秒），长度 = MONITOR_ATTEMPTS - 1。
+MONITOR_BACKOFF_SECONDS = (1, 2, 4, 8)
 _MONITOR = None
 
 
@@ -176,6 +183,28 @@ def resumed(root, descriptor):
     return read_confirmed(Path(descriptor["freeze"]["root"]) / "operations" / (arm["operation_id"] + ".json"))
 
 
+def observed_state(root, descriptor):
+    """Classify retained activation state without writing or waiting on anything.
+
+    ``readiness`` is the exact check admission applies.  When it fails but the
+    fence still reports a confirmed open generation the result must stay
+    unknown: business is closed and the reason is not one of the reviewed
+    phases, so claiming open would be worse than saying nothing.
+    """
+    if not gate._present(Path(root) / "activation.arm.json"):
+        # No activation was ever attempted; the retained initial-closed fence
+        # is the reason business stays closed.
+        return "closed-by-intent", "pre-activation"
+    try:
+        readiness(root, descriptor)
+    except Exception:
+        phase = resume_phase(root, descriptor)
+        if phase == "open":
+            raise
+        return ("resuming" if phase == "resuming" else "closing"), phase
+    return "open", "open"
+
+
 def require_business_ready():
     """Additional admission condition for production-startup processes only."""
     if not startup.enabled():
@@ -250,21 +279,70 @@ def permission_present():
     return gate._present(root / "activation.prepare.json")
 
 
+def _record_monitor_failure(error):
+    """Leave the reason business stays closed where the host can read it.
+
+    Written next to ``activation.arm.json``/``activation.prepare.json``: before
+    an activation exists there is no slot directory to hold a failure receipt.
+    Class name only — the message can carry paths and must not be exported.
+    """
+    record = {
+        "schema": SCHEMA,
+        "phase": "web-monitor",
+        "error_type": type(error).__name__,
+        "attempts": MONITOR_ATTEMPTS,
+        "retry": False,
+        "wall": time.time(),
+    }
+    try:
+        gate._write(Path(os.environ.get(startup.ENV_ROOT, "")) / "activation.web-monitor.failed.json", record)
+    except Exception as write_error:  # noqa: BLE001 - the log line below is the last evidence
+        logger.warning("production activation monitor could not record its failure: %s",
+                       type(write_error).__name__)
+
+
+def _start_activation():
+    """Wait for permission, then publish the one-shot start intent.
+
+    Only consecutive failures are retried: a transient owner handover or file
+    race must not kill the sole pulse owner.  ``prepared()`` stays outside —
+    once the start intent is published the activation is attempted and must
+    never be rerun.
+    """
+    failures = 0
+    while True:
+        try:
+            while not permission_present():
+                startup.check_owner(next(iter(startup._OWNERS)))
+                failures = 0
+                time.sleep(PULSE_SECONDS)
+            return RuntimeActivation()
+        except Exception as error:
+            failures += 1
+            logger.warning("production activation monitor attempt %d/%d failed: %s",
+                           failures, MONITOR_ATTEMPTS, type(error).__name__)
+            if failures >= MONITOR_ATTEMPTS:
+                raise
+            time.sleep(MONITOR_BACKOFF_SECONDS[failures - 1])
+
+
 def start_web_monitor():
     global _MONITOR
     gate._require(_MONITOR is None, "web activation monitor already started")
     def observe():
         active = None
         try:
-            while not permission_present():
-                startup.check_owner(next(iter(startup._OWNERS)))
-                time.sleep(PULSE_SECONDS)
-            active = RuntimeActivation()
+            active = _start_activation()
             active.prepared({}, {})
             while not active.stop.wait(PULSE_SECONDS):
                 active.pulse()
         except Exception as error:
+            # A pulse failure is terminal evidence (owner or subsystem changed,
+            # and a restart is forbidden), so it is recorded rather than retried.
+            logger.warning("production activation monitor stopped: %s", type(error).__name__)
             if active is not None:
                 active.fail(error)
+            else:
+                _record_monitor_failure(error)
     _MONITOR = threading.Thread(target=observe, name="production-activation", daemon=True)
     _MONITOR.start()

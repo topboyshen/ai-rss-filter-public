@@ -1378,9 +1378,15 @@ def _summarize_feed_score_rows(rows, cfg):
         bucket = stats_map.setdefault(canonical_url, {
             "articles_total": 0, "articles_passed": 0,
             "other_contract_total": 0,
-            "score_sum": 0.0, "score_count": 0, "last_check": 0,
+            "score_sum": 0.0, "score_count": 0, "latest_article_at": 0,
             "counts": dict.fromkeys(dict(_FEED_SCORE_REASON_LABELS), 0),
         })
+        # ``news_cache.created_at`` is the article's publish/update time, not
+        # the time this source was checked.  Keep it as a separate signal and
+        # never promote it to ``last_check``.
+        bucket["latest_article_at"] = max(
+            bucket["latest_article_at"], int(created_at or 0)
+        )
         version = str(strategy_version or "").strip()
         if current_version and version != current_version:
             bucket["other_contract_total"] += 1
@@ -1396,7 +1402,6 @@ def _summarize_feed_score_rows(rows, cfg):
             bucket["score_sum"] += float(score)
             bucket["score_count"] += 1
         bucket["articles_passed"] = bucket["counts"]["passed"]
-        bucket["last_check"] = max(bucket["last_check"], int(created_at or 0))
     for bucket in stats_map.values():
         count = bucket.pop("score_count")
         score_sum = bucket.pop("score_sum")
@@ -1459,6 +1464,7 @@ def _feed_metric_detail(row, bucket, threshold, health=None):
         "counts": counts,
         "rate_text": f"{round(passed / total * 100, 1)}%" if total else "暂无24h样本",
         "other_contract_total": int(bucket.get("other_contract_total") or 0),
+        "latest_article_at": int(bucket.get("latest_article_at") or 0),
         "zero_output_reason": _feed_zero_output_reason(bucket, health),
         "breakdown_text": " · ".join(
             f"{label} {counts[key]}" for key, label in _FEED_SCORE_REASON_LABELS
@@ -1473,6 +1479,9 @@ def _get_feed_health_snapshot():
     (url, name, last_check, response_time_ms, success, fail, articles_total,
      articles_passed, avg_score, last_error, consecutive_empty_checks,
      last_nonempty_at)
+
+    ``last_check`` 只取 feed_health 记录的拉源检查时间；文章发布时间只通过
+    第二项的 ``latest_article_at`` 暴露，二者不得混用。
     """
     from db.database import db_lock, get_connection
     from core.config import config as _cfg
@@ -1541,7 +1550,11 @@ def _get_feed_health_snapshot():
         h = health_map.get(url, {})
         avg_score = s.get("avg_score", None)
         articles_total = s.get("articles_total", 0)
-        last_check = max(s.get("last_check", 0), h.get("last_check", 0))
+        # A source's "last checked" is the actual fetch-check time recorded by
+        # feed_health.  Article publish times live in news_cache and are exposed
+        # separately as ``latest_article_at``; mixing them made a future-dated
+        # article render a future "last check".
+        last_check = h.get("last_check", 0)
         success = h.get("success", 0) or (1 if articles_total else 0)
         results.append((
             url,
@@ -2060,6 +2073,7 @@ def dashboard():
         staleness_threshold_seconds=si.get("staleness_threshold_seconds", 0),
         refresh_running=refresh_running,
         datetime=datetime,
+        beijing_fromtimestamp=beijing_fromtimestamp,
         feed_data_health=feed_data_health,
         format_article_display_title=format_article_display_title,
         safe_http_url=safe_http_url,
@@ -2203,6 +2217,22 @@ def _feed_health_badge(last_error, age, data_health, total, success):
     return state, color, bg
 
 
+def _dashboard_back_link_html() -> str:
+    """Return a back link only when a browser is reading the HTML page.
+
+    The same fragments are also served as Glance widgets, where a relative
+    ``/dashboard`` link would point at the widget host instead of the backend.
+    """
+    if not request_prefers_html():
+        return ""
+    return (
+        '<div style="max-width:960px;margin:0 auto 10px;padding:0 2px;font-size:12px;'
+        'font-family:system-ui,-apple-system,sans-serif;">'
+        '<a href="/dashboard" rel="noreferrer" style="color:#4dabf7;'
+        'text-decoration:none;">← 返回后台</a></div>'
+    )
+
+
 @dash_bp.route("/ops-feeds")
 def ops_feeds_widget():
     """Glance 运维面板 Feed 源明细小组件。"""
@@ -2285,7 +2315,7 @@ def ops_feeds_widget():
         )
 
     empty = '<div style="padding:24px;text-align:center;color:var(--color-text-subdue,inherit);border:1px dashed rgba(148,163,184,.45);border-radius:16px;">暂无 Feed 统计数据</div>'
-    html = OPS_FEED_LAYOUT_STYLE + (
+    html = OPS_FEED_LAYOUT_STYLE + _dashboard_back_link_html() + (
         '<div class="ops-feeds" style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;padding:4px 2px 8px;">'
         '<div style="display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:12px;gap:12px;">'
         '<div><div style="font-size:18px;font-weight:850;letter-spacing:-.03em;color:var(--color-text-base,inherit);">Feed 源健康明细</div>'
@@ -2495,6 +2525,14 @@ def score_backtest_widget():
     return rsp
 
 
+def _render_briefing_content(result, format_type, hours):
+    """Render a briefing and add the browser return link outside the route."""
+    content, mimetype = render_digest(result, format_type, hours)
+    if format_type == "html":
+        content = _dashboard_back_link_html() + content
+    return content, mimetype
+
+
 @dash_bp.route("/briefing", methods=["GET", "POST"])
 def briefing():
     """跨文章主题聚合情报简报
@@ -2533,7 +2571,7 @@ def briefing():
             "generated_at": beijing_now().isoformat()
         }
         empty_result = attach_quant_market_context(empty_result)
-        content, mimetype = render_digest(empty_result, format_type, hours)
+        content, mimetype = _render_briefing_content(empty_result, format_type, hours)
         return Response(content, mimetype=mimetype)
 
     articles_info = []
@@ -2607,7 +2645,7 @@ def briefing():
         response.headers["Retry-After"] = "30" if status == 503 else "10"
         return response
 
-    content, mimetype = render_digest(aggregation, format_type, hours)
+    content, mimetype = _render_briefing_content(aggregation, format_type, hours)
 
     if push_requested:
         if not _push_digest_to_telegram(aggregation, _cfg()):

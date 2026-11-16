@@ -545,6 +545,74 @@ def test_inherited_listener_fd_does_not_authorize_different_process_netns(monkey
         authority._anchor(pid)
 
 
+class FakeScandir:
+    def __init__(self, names):
+        self.names = names
+
+    def __enter__(self):
+        return iter([SimpleNamespace(name=name) for name in self.names])
+
+    def __exit__(self, *_args):
+        return False
+
+
+def anchor_environment(monkeypatch, targets, *, directory_change=False):
+    """Synthetic /proc/<pid>/fd whose link targets never touch the real filesystem."""
+    states = {"lstat": 0}
+    def info(inode):
+        return SimpleNamespace(st_dev=1, st_ino=inode, st_mode=stat.S_IFDIR | 0o500,
+                               st_uid=0, st_gid=0, st_nlink=1, st_size=0)
+    def lstat(_path):
+        states["lstat"] += 1
+        return info(3) if directory_change and states["lstat"] > 1 else info(2)
+    # Replace only this module's `os` reference: the real filesystem, pytest
+    # capture and every other module keep the actual os module.
+    monkeypatch.setattr(subject, "os", SimpleNamespace(
+        O_RDONLY=os.O_RDONLY, O_DIRECTORY=os.O_DIRECTORY, O_NOFOLLOW=os.O_NOFOLLOW, O_CLOEXEC=os.O_CLOEXEC,
+        pidfd_open=lambda *_args: 99, open=lambda *_args: 77, close=lambda _fd: None,
+        fstat=lambda _fd: info(2), lstat=lstat,
+        scandir=lambda _fd: FakeScandir([str(index) for index in range(len(targets))])))
+    monkeypatch.setattr(subject, "_alive", lambda _fd: None)
+    monkeypatch.setattr(subject, "_process", lambda *_args, **_kw: {"namespace_identity": (3, 789)})
+    monkeypatch.setattr(subject, "_procfs", lambda _fd: None)
+    monkeypatch.setattr(subject, "_link_identity", lambda path: ("synthetic_link", targets[int(path.rsplit("/", 1)[1])]))
+    authority = subject._ArchiveAuthority(time.monotonic() + 3)
+    authority.namespace, authority.listener = (3, 789), 123
+    return authority
+
+
+def test_anchor_failure_reports_bounded_facts_without_any_path(monkeypatch):
+    authority = anchor_environment(monkeypatch, ["/dev/null", "socket:[999]", "socket:[1000]"])
+    with pytest.raises(gate.AdmissionError, match="listener FD ownership unconfirmed") as caught:
+        authority._anchor(321)
+    value = caught.value.gateway_anchor_diagnostic
+    assert value["reason"] == "fd_ownership" and value["pid"] == 321 and value["stage"] == "anchor"
+    assert (value["fd_entries"], value["socket_entries"], value["listener_entries"]) == (3, 2, 0)
+    assert value["directory_stable"] is True and value["execution_proof"] is False
+    assert value == subject.socket_diagnostics.safe_anchor(value)
+    raw = subject.socket_diagnostics.encoded(value)
+    assert len(raw) <= subject.socket_diagnostics.PUBLIC_BYTES and b"/" not in raw and b"socket:[" not in raw
+
+
+def test_anchor_failure_distinguishes_a_moved_fd_directory(monkeypatch):
+    authority = anchor_environment(monkeypatch, ["socket:[123]"], directory_change=True)
+    with pytest.raises(gate.AdmissionError, match="listener FD ownership unconfirmed") as caught:
+        authority._anchor(321)
+    value = caught.value.gateway_anchor_diagnostic
+    assert value["listener_entries"] == 1 and value["directory_stable"] is False
+
+
+@pytest.mark.parametrize("change", [("reason", "SECRET-PATH"), ("directory_stable", 1),
+                                    ("fd_entries", 257), ("link_set_sha256", "0" * 63), ("extra", True)])
+def test_anchor_packet_rejects_unbounded_or_unknown_values(monkeypatch, change):
+    authority = anchor_environment(monkeypatch, ["socket:[999]"])
+    with pytest.raises(gate.AdmissionError) as caught:
+        authority._anchor(321)
+    value = dict(caught.value.gateway_anchor_diagnostic)
+    value[change[0]] = change[1]
+    assert subject.socket_diagnostics.safe_anchor(value) is None
+
+
 def fixed_image(identifier=None):
     return {"Id": identifier or subject.IMAGE_ID, "Architecture": "amd64", "Os": "linux",
             "RepoDigests": ["nginx@" + subject.IMAGE_ID],

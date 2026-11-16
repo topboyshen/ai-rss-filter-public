@@ -166,7 +166,9 @@ def _reservation(record):
 
 
 def _head(path):
-    with os.fdopen(_open_private(path), "rb") as stream:
+    # Buffer at the header cap: the default 8 KiB buffer would read far more
+    # than the reservation line on a cold scan.
+    with os.fdopen(_open_private(path), "rb", buffering=1024) as stream:
         line = stream.readline(1024)
         size = os.fstat(stream.fileno()).st_size
     if not line.endswith(b",\n"):
@@ -592,6 +594,24 @@ class ReceiptStore:
         self._barrier(path)
         return {key: original[key] for key in _HEAD_KEYS}
 
+    def _validated_head(self, path, delivery_id):
+        data = _read(path)
+        try:
+            stored = _validate(_decode(data), delivery_id)
+        except ReceiptMalformedJSON:
+            return self._held_header(path, delivery_id, data)
+        head = _head(path)
+        if stored.get("alias_intent_schema") == 1 and self._alias_intent(delivery_id) != stored:
+            raise ReceiptConflict("alias receipt differs from immutable intent")
+        if path.name.endswith(".pending"):
+            original = self._read_record(self.directory / (delivery_id + ".json"), delivery_id)
+            self._check_transition(original, stored)
+        if head != {key: stored[key] for key in _HEAD_KEYS}:
+            raise ReceiptCorrupt("reservation header disagrees with receipt")
+        if head["delivery_id"] != delivery_id:
+            raise ReceiptConflict("receipt filename mismatch")
+        return head
+
     def _headers(self):
         headers = self._intent_headers()
         for path in self.directory.iterdir():
@@ -601,29 +621,36 @@ class ReceiptStore:
             if not name.endswith(".json"):
                 raise ReceiptCorrupt("unknown receipt entry")
             delivery_id = _identifier(name[:-5])
-            data = _read(path)
-            try:
-                stored = _validate(_decode(data), delivery_id)
-            except ReceiptMalformedJSON:
-                head = self._held_header(path, delivery_id, data)
-                stored = None
+            head = self._validated_head(path, delivery_id)
+            old = headers.get(delivery_id)
+            if old is not None and old != head:
+                raise ReceiptConflict("pending receipt identity mismatch")
+            headers[delivery_id] = head
+        return headers
+
+    def _header_index(self):
+        """Bounded identity/capacity view; final bodies are not read.
+
+        Final receipts contribute only _head(path) (1 KiB cap, including the
+        size-versus-reservation bound). Pending files still take the full
+        validated path because a truncated write can only be held or rejected
+        with its original/intent context. Full body validation stays in
+        load(), duplicate confirmation, and _headers().
+        """
+        headers = self._intent_headers()
+        for path in self.directory.iterdir():
+            if path.name in {"tasks", "alias-intents"}:
+                continue
+            name = path.name.removesuffix(".pending")
+            if not name.endswith(".json"):
+                raise ReceiptCorrupt("unknown receipt entry")
+            delivery_id = _identifier(name[:-5])
+            if path.name.endswith(".pending"):
+                head = self._validated_head(path, delivery_id)
             else:
                 head = _head(path)
-                if stored.get("alias_intent_schema") == 1 and self._alias_intent(delivery_id) != stored:
-                    raise ReceiptConflict("alias receipt differs from immutable intent")
-                if path.name.endswith(".pending"):
-                    original = self._read_record(self.directory / (delivery_id + ".json"), delivery_id)
-                    self._check_transition(original, stored)
-            if stored is None:
-                old = headers.get(delivery_id)
-                if old is not None and old != head:
-                    raise ReceiptConflict("partial receipt identity mismatch")
-                headers[delivery_id] = head
-                continue
-            if head != {key: stored[key] for key in _HEAD_KEYS}:
-                raise ReceiptCorrupt("reservation header disagrees with receipt")
-            if head["delivery_id"] != delivery_id:
-                raise ReceiptConflict("receipt filename mismatch")
+                if head["delivery_id"] != delivery_id:
+                    raise ReceiptConflict("receipt filename mismatch")
             old = headers.get(delivery_id)
             if old is not None and old != head:
                 raise ReceiptConflict("pending receipt identity mismatch")
@@ -740,7 +767,7 @@ class ReceiptStore:
         try:
             index = _decode(_read(path))
         except FileNotFoundError:
-            matches = [head["delivery_id"] for head in self._headers().values()
+            matches = [head["delivery_id"] for head in self._header_index().values()
                        if head["task_digest"] == task_digest and head["primary_delivery_id"] == head["delivery_id"]]
             if len(matches) > 1:
                 raise ReceiptConflict("multiple primary receipts")
@@ -762,7 +789,7 @@ class ReceiptStore:
 
     def _reserve(self, record, *, reserve_bytes=None):
         record["_reserved_bytes"] = _reservation(record)
-        headers = self._headers()
+        headers = self._header_index()
         requested = record["_reserved_bytes"] if reserve_bytes is None else reserve_bytes
         if len(headers) >= min(self.max_records, MAX_RECORDS) or sum(item["_reserved_bytes"] for item in headers.values()) + requested > min(self.max_bytes, MAX_BYTES):
             raise ReceiptCapacityError("receipt capacity exhausted; existing evidence retained")

@@ -29,7 +29,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, time as datetime_time, timedelta
+from datetime import date, datetime, time as datetime_time, timedelta
 from pathlib import Path
 from typing import Callable, Iterable
 from zoneinfo import ZoneInfo
@@ -65,7 +65,16 @@ _POLICY_DISABLED_CHECKS = {
     "check_offsite": "offsite_upload",
 }
 _MARKET_TZ = ZoneInfo("Asia/Shanghai")
+_DB_MAINTENANCE_LOG_PATH = Path("/var/log/ai-filter-db-maintenance.log")
+_DB_MAINTENANCE_TASK = "db_maintenance"
+_DB_MAINTENANCE_PHASES = ("integrity_check", "vacuum", "close")
+_DB_MAINTENANCE_MAX_AGE_SECONDS = 8 * 86400
+_DB_MAINTENANCE_RUNNING_GRACE_SECONDS = 70 * 60
+_DB_MAINTENANCE_LOG_TAIL_BYTES = 256 * 1024
 _MARKET_REQUIRED_SYMBOLS = {"sh000001", "sh000300", "sz399001", "sz399006"}
+# This host script is installed separately from the image and cannot import
+# db/database.py, so the holiday table is a hand-kept copy of that module's
+# CHINA_HOLIDAYS_BY_YEAR. Edit both, or tests/test_ops_monitor.py fails.
 _CHINA_HOLIDAYS_BY_YEAR = {
     2026: {
         "2026-01-01", "2026-01-02", "2026-01-03",
@@ -78,6 +87,8 @@ _CHINA_HOLIDAYS_BY_YEAR = {
         "2026-10-06", "2026-10-07",
     }
 }
+# 提前量：官方次年休市安排通常在年前公布，留一个月处理窗口。
+_CALENDAR_HORIZON_DAYS = 30
 
 
 @dataclasses.dataclass(frozen=True)
@@ -87,6 +98,10 @@ class CheckResult:
     detail: str
     warning: bool = False
     skipped: bool = False
+    # Set by checks whose result proves a durable receipt exists. The run state
+    # keeps the first such sighting so a later disappearance is a failure, not
+    # "not yet reported".
+    evidence_present: bool | None = None
 
     def public(self) -> dict[str, object]:
         return {
@@ -127,6 +142,7 @@ class Settings:
     restore_drill_max_age_seconds: int = 691200
     restore_drill_running_grace_seconds: int = 3000
     enrichment_state_file: Path | None = None
+    db_maintenance_log: Path = _DB_MAINTENANCE_LOG_PATH
     enrichment_max_age_seconds: int = 4500
     enrichment_running_grace_seconds: int = 900
     database_path: Path | None = None
@@ -913,6 +929,123 @@ def check_event_enrichment(settings: Settings, now: int) -> CheckResult:
         return CheckResult("event_enrichment", False, _safe_detail(detail))
 
 
+def _db_maintenance_records(path: Path) -> list[dict[str, object]]:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - _DB_MAINTENANCE_LOG_TAIL_BYTES))
+            payload = handle.read()
+    except OSError:
+        return []
+    records = []
+    for line in payload.decode("utf-8", errors="replace").splitlines():
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict) and record.get("task") == _DB_MAINTENANCE_TASK:
+            records.append(record)
+    return records
+
+
+def _db_maintenance_evidence(
+    path: Path,
+) -> tuple[dict[str, object], dict[str, object] | None] | None:
+    """Newest host start/finish, plus the first failure that run recorded."""
+    records = _db_maintenance_records(path)
+    for index in range(len(records) - 1, -1, -1):
+        record = records[index]
+        if record.get("scope") != "host":
+            continue
+        if record.get("event") not in {"start", "finish"}:
+            continue
+        failure = None
+        if record.get("event") == "finish":
+            for prior in reversed(records[:index]):
+                if prior.get("run_id") != record.get("run_id"):
+                    continue
+                if prior.get("scope") == "host" and prior.get("event") == "start":
+                    break
+                if prior.get("event") == "error" or (
+                    prior.get("event") == "phase_end"
+                    and prior.get("status") == "failed"
+                ):
+                    failure = prior
+                    break
+        return record, failure
+    return None
+
+
+def _db_maintenance_recorded_at(record: dict[str, object], now: int) -> int:
+    value = record.get("utc")
+    if not isinstance(value, str):
+        raise ValueError("maintenance timestamp is missing")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError("maintenance timestamp is invalid") from exc
+    if parsed.tzinfo is None:
+        raise ValueError("maintenance timestamp has no timezone")
+    if int(parsed.timestamp()) > now + 300:
+        raise ValueError("maintenance timestamp is in the future")
+    return int(parsed.timestamp())
+
+
+def check_db_maintenance(settings: Settings, now: int) -> CheckResult:
+    """The weekly VACUUM only writes a host log; nothing else reads that log."""
+    evidence = _db_maintenance_evidence(settings.db_maintenance_log)
+    if evidence is None:
+        return CheckResult(
+            "db_maintenance", True, "no maintenance result recorded yet", warning=True
+        )
+    record, failure = evidence
+    try:
+        recorded_at = _db_maintenance_recorded_at(record, now)
+    except ValueError as exc:
+        return CheckResult("db_maintenance", False, str(exc))
+    age = now - recorded_at
+    if record.get("event") == "start":
+        if age <= _DB_MAINTENANCE_RUNNING_GRACE_SECONDS:
+            return CheckResult(
+                "db_maintenance",
+                True,
+                f"in progress age_seconds={max(0, age)}",
+                warning=True,
+            )
+        return CheckResult(
+            "db_maintenance", False, f"run did not finish age_seconds={age}"
+        )
+    rc = record.get("rc")
+    phases = {phase: record.get(phase) for phase in _DB_MAINTENANCE_PHASES}
+    if (
+        type(rc) is not int
+        or rc != 0
+        or record.get("outcome") != "success"
+        or set(phases.values()) != {"success"}
+    ):
+        detail = (
+            f"rc={rc} outcome={record.get('outcome') or 'unknown'} "
+            + " ".join(f"{phase}={status}" for phase, status in phases.items())
+        )
+        if failure is not None:
+            detail += f" phase={failure.get('phase') or 'unknown'}"
+            if failure.get("error"):
+                detail += f" error={failure['error']}"
+        return CheckResult("db_maintenance", False, _safe_detail(detail))
+    if age > _DB_MAINTENANCE_MAX_AGE_SECONDS:
+        return CheckResult("db_maintenance", False, f"stale age_seconds={age}")
+    return CheckResult(
+        "db_maintenance", True, f"vacuum complete age_seconds={max(0, age)}"
+    )
+
+
+def _is_trading_day(day: date) -> bool:
+    holidays = _CHINA_HOLIDAYS_BY_YEAR.get(day.year)
+    if holidays is None:
+        raise ValueError("A-share trading calendar is not configured")
+    return day.weekday() < 5 and day.isoformat() not in holidays
+
+
 def _expected_market_trade_date(
     now: int, *, ready_at: datetime_time = datetime_time(16, 0)
 ) -> str:
@@ -923,10 +1056,7 @@ def _expected_market_trade_date(
     if current.time() < ready_at:
         candidate -= timedelta(days=1)
     for _ in range(15):
-        holidays = _CHINA_HOLIDAYS_BY_YEAR.get(candidate.year)
-        if holidays is None:
-            raise ValueError("A-share trading calendar is not configured")
-        if candidate.weekday() < 5 and candidate.isoformat() not in holidays:
+        if _is_trading_day(candidate):
             return candidate.isoformat()
         candidate -= timedelta(days=1)
     raise ValueError("A-share trading date cannot be determined")
@@ -1000,10 +1130,53 @@ def _collector_is_coverage_replay(payload: dict[str, object]) -> bool:
 
 
 def _market_timer_from_results(
-    settings: Settings, expected_date: str, row_count: int
+    settings: Settings, expected_date: str, row_count: int, *, now: int
 ) -> CheckResult:
     collector = _load_market_result(settings, "collector")
     status = str(collector.get("status") or "")
+    if status == "skipped_nontrading":
+        # persist_host_fallback writes this status without a trade_date when the
+        # host has no previous collector receipt, and every later holiday run
+        # rewrites the same receipt. Judge the receipt's own day, not today's:
+        # the receipt stays on disk until the next 15:10 run, so asking whether
+        # *today* is a trading day fails every trading morning after a holiday.
+        try:
+            _skip_started, skip_completed = _market_result_times(collector)
+        except ValueError as exc:
+            return CheckResult("market_timer", False, _safe_detail(exc))
+        receipt_day = datetime.fromtimestamp(skip_completed, _MARKET_TZ).date()
+        today = datetime.fromtimestamp(now, _MARKET_TZ).date()
+        if receipt_day == today:
+            if _is_trading_day(today):
+                return CheckResult(
+                    "market_timer",
+                    False,
+                    "collector skipped a trading day; calendar disagrees; "
+                    f"database_trade_date={expected_date} benchmark_rows={row_count}",
+                )
+            return CheckResult(
+                "market_timer",
+                True,
+                f"collector skipped non-trading day on {receipt_day.isoformat()}; "
+                f"database_trade_date={expected_date} benchmark_rows={row_count}",
+            )
+        # An older skip says nothing about today. A close is only due once the
+        # expected trade date has reached today, and that path is also covered by
+        # the benchmark database check that runs before this one.
+        if expected_date == today.isoformat():
+            return CheckResult(
+                "market_timer",
+                False,
+                f"collector receipt is from {receipt_day.isoformat()}; "
+                f"no receipt for {expected_date}; benchmark_rows={row_count}",
+            )
+        return CheckResult(
+            "market_timer",
+            True,
+            f"collector skipped non-trading day on {receipt_day.isoformat()}; "
+            "no close due yet; "
+            f"database_trade_date={expected_date} benchmark_rows={row_count}",
+        )
     if status == "skipped_maintenance":
         return CheckResult(
             "market_timer",
@@ -1068,6 +1241,32 @@ def _market_timer_from_results(
     )
 
 
+def check_trading_calendar(_settings: Settings, now: int) -> CheckResult:
+    """Fail while the A-share calendar can still be extended.
+
+    ``_is_trading_day_local`` refuses to guess for an unconfigured year, so the
+    first trading day of that year turns close collection, event outcomes and
+    backtests into errors.  The official schedule is published late in the
+    preceding year, so a check that only fails on 1 January leaves no window to
+    act.  This looks one horizon ahead instead: it starts failing while the
+    missing year is still a month away.
+    """
+    horizon = (
+        datetime.fromtimestamp(now, _MARKET_TZ).date()
+        + timedelta(days=_CALENDAR_HORIZON_DAYS)
+    )
+    if horizon.year in _CHINA_HOLIDAYS_BY_YEAR:
+        return CheckResult(
+            "trading_calendar", True, f"covers through {horizon.isoformat()}"
+        )
+    return CheckResult(
+        "trading_calendar",
+        False,
+        f"calendar missing for {horizon.year}; "
+        f"trading-day decisions fail from {horizon.year}-01-01",
+    )
+
+
 def check_market_timer(settings: Settings, now: int) -> CheckResult:
     service_unit = settings.market_service_unit or settings.timer_unit.removesuffix(".timer") + ".service"
     if not _SAFE_NAME_RE.fullmatch(settings.timer_unit) or not _SAFE_NAME_RE.fullmatch(service_unit):
@@ -1126,7 +1325,7 @@ def check_market_timer(settings: Settings, now: int) -> CheckResult:
         if not last_exit or last_exit == "n/a":
             return CheckResult("market_timer", False, "market service has no last completion")
         expected_date, row_count = _check_market_database(settings, now)
-        return _market_timer_from_results(settings, expected_date, row_count)
+        return _market_timer_from_results(settings, expected_date, row_count, now=now)
     except (
         OSError,
         sqlite3.Error,
@@ -1144,6 +1343,13 @@ def check_market_history(settings: Settings, now: int) -> CheckResult:
         payload = _load_market_result(settings, "history")
     except ValueError as exc:
         if "missing" in str(exc):
+            if _read_state(settings.state_file).get("market_history_seen") is True:
+                return CheckResult(
+                    "market_history",
+                    False,
+                    "history result missing after a previous run reported one; "
+                    "cause not determined (removed, moved, or not written)",
+                )
             return CheckResult(
                 "market_history",
                 True,
@@ -1157,6 +1363,7 @@ def check_market_history(settings: Settings, now: int) -> CheckResult:
             "market_history",
             False,
             f"history repair error detail={payload.get('detail') or 'unknown'}",
+            evidence_present=True,
         )
     try:
         started, completed = _market_result_times(payload)
@@ -1169,13 +1376,34 @@ def check_market_history(settings: Settings, now: int) -> CheckResult:
         if started < scheduled or completed > now:
             raise ValueError(f"history result stale or future; expected_run_date={expected}")
     except (ValueError, TypeError, OverflowError, OSError) as exc:
-        return CheckResult("market_history", False, _safe_detail(exc))
+        return CheckResult("market_history", False, _safe_detail(exc), evidence_present=True)
     remaining = payload.get("remaining_total", payload.get("due_total"))
+    # The history scope reports remaining backlog as incomplete with exit 0 and
+    # a failed run as incomplete with exit 1, so status alone cannot tell a
+    # healthy backlog from a repair that could not write prices or outcomes.
+    exit_code = payload.get("exit_code", 0)
+    if type(exit_code) is not int:
+        return CheckResult(
+            "market_history",
+            False,
+            "history result exit_code is not an integer",
+            evidence_present=True,
+        )
+    if exit_code != 0:
+        return CheckResult(
+            "market_history",
+            False,
+            f"history repair exited nonzero exit_code={exit_code} "
+            f"trade_date={payload.get('trade_date')} "
+            f"total={remaining} unresolved={payload.get('unresolved')}",
+            evidence_present=True,
+        )
     if status == "complete":
         return CheckResult(
             "market_history",
             True,
             f"historical pending complete trade_date={payload.get('trade_date')}",
+            evidence_present=True,
         )
     return CheckResult(
         "market_history",
@@ -1185,6 +1413,7 @@ def check_market_history(settings: Settings, now: int) -> CheckResult:
         f"unresolved={payload.get('unresolved')} "
         f"trade_date={payload.get('trade_date')}",
         warning=True,
+        evidence_present=True,
     )
 
 
@@ -1426,6 +1655,8 @@ CHECKS: tuple[Callable[[Settings, int], CheckResult], ...] = (
     check_restore_drill,
     check_offsite,
     check_event_enrichment,
+    check_db_maintenance,
+    check_trading_calendar,
     check_market_timer,
     check_market_history,
     check_root_disk,
@@ -1470,6 +1701,7 @@ def evaluate(settings: Settings, now: int) -> list[CheckResult]:
                 _safe_detail(result.detail),
                 bool(result.warning),
                 bool(result.skipped),
+                result.evidence_present,
             )
         )
     return results
@@ -1626,8 +1858,8 @@ def _write_state(path: Path, payload: dict[str, object]) -> None:
 
 _DASHBOARD_CHECK_NAMES = frozenset({
     "metrics", "notification_transport", "backup", "restore_drill",
-    "offsite_upload", "event_enrichment", "market_timer", "market_history",
-    "root_disk", "release_containers",
+    "offsite_upload", "event_enrichment", "db_maintenance", "market_timer",
+    "market_history", "trading_calendar", "root_disk", "release_containers",
 })
 _DASHBOARD_CHECK_ALIASES = {
     "check_offsite": "offsite_upload",
@@ -1829,6 +2061,13 @@ def main(argv: list[str] | None = None) -> int:
             if notice_attempted and not notice_sent
             else "",
             "warnings": sorted(item.name for item in results if item.warning),
+            # Sticky: once a history receipt exists, its absence is a failure rather
+            # than "not yet reported", so the sighting has to survive later runs.
+            "market_history_seen": previous.get("market_history_seen") is True
+            or any(
+                item.name == "market_history" and item.evidence_present is True
+                for item in results
+            ),
         }
         _write_state(settings.state_file, state)
         _render(results, as_json=args.json, quiet=args.quiet)

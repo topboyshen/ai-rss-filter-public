@@ -131,6 +131,28 @@ sender 与应用夹具保持 768 MiB / 256 PID；不以抬高上限使失败变�
 必须保留真实状态并停止本次发布判断，另行审查有界关闭操作，不能宣称它已经自动关闭。
 本协议没有无限期续期、自动替换或自动清理能力；不得重置代次或原窗口伪装后续操作仍获授权。
 
+### 只读状态探针 `GET /activation/state`
+
+`/health` 只是存活探针，对 activation/fence 全盲；`/readiness` 只报告 feed 陈旧度，而且自身
+会先取准入租约，业务关闭时先被 503 挡下。两者合起来无法把「按意图关闭」与「状态读不出来」
+分开，发布因此可能显示 healthy 而业务持续 503。`GET /activation/state`（需要 `X-API-Key`）
+是为此新增的唯一一对精确只读豁免：仅 GET/HEAD，带 `llm` 或 `push` 参数仍按业务请求走准入。
+
+返回 200 且 `state` 为下列之一：
+
+- `not_applicable`：未启用 production startup，本机没有 activation。
+- `closed-by-intent`（`phase: pre-activation`）：已启用 startup，尚无 activation arm；保留的
+  initial-closed fence 就是业务关闭的原因。
+- `resuming` / `closing`：activation 正在恢复，或 fence 处于 draining/frozen。
+- `open`：与准入使用同一个 `readiness` 检查并通过，业务已打开。
+
+读取失败，或 fence 已确认 open 但 readiness 通不过时，返回 503
+`{"state": "unknown", "reason": "<异常类名>"}`，只记录类名。发布 verify 不把
+`closed-by-intent` 当作失败，但 `unknown` 继续阻断。
+
+该探针不写 pulse、回执或 clock，不取 owner 锁；它执行与准入相同的耐久确认（对既有文件与
+父目录 fsync、以非阻塞方式探测 owner 锁），但不改任何内容，也不推进 activation 状态。
+
 ## T0、历史缺口与验证范围
 
 合并代码、构建镜像、初始化 CLOSED、准备线程或计划中的时间都不是 T0。

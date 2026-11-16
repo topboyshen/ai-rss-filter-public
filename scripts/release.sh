@@ -909,9 +909,21 @@ write_build_contract() {
   chmod 0600 "$target"
 }
 
+# MODE is "strict" for the release being deployed or explicitly verified, and
+# "recorded" for an already-registered release state. A recorded private build
+# may have been produced under an earlier sealed contract; rotation is allowed
+# there because its immutable digest and contract stay recorded, while the
+# newly deployed ref remains strictly matched below.
 read_build_contract() {
-  local ref="$1" target value
+  local ref="$1" mode="${2:-strict}" target value
   local -a values=()
+  case "$mode" in
+    strict|recorded) ;;
+    *)
+      echo "Invalid build contract read mode" >&2
+      return 2
+      ;;
+  esac
   target="$(build_contract_path "$ref")"
   if [[ ! -f "$target" || ! -r "$target" || -L "$target" ]]; then
     echo "No trusted build contract is recorded for $ref; run release.sh build first" >&2
@@ -936,10 +948,19 @@ read_build_contract() {
   CONTRACT_SOURCE_ID="${values[4]}"
   CONTRACT_MAPPING_GENERATION="${values[5]:-}"
   CONTRACT_PRIVATE_SHA="${values[6]:-}"
-  if [[ -n "$CONTRACT_PRIVATE_SHA" &&
-        ( ! "$CONTRACT_PRIVATE_SHA" =~ ^[0-9a-f]{64}$ || "$CONTRACT_PRIVATE_SHA" != "$PRIVATE_CONTRACT_SHA" ) ]]; then
-    echo "Private build contract is missing or mismatched" >&2
-    return 3
+  if [[ -n "$CONTRACT_PRIVATE_SHA" ]]; then
+    if [[ ! "$CONTRACT_PRIVATE_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+      echo "Private build contract is missing or mismatched" >&2
+      return 3
+    fi
+    if [[ "$mode" == "strict" && "$CONTRACT_PRIVATE_SHA" != "$PRIVATE_CONTRACT_SHA" ]]; then
+      echo "Private build contract is missing or mismatched" >&2
+      return 3
+    fi
+    if [[ "$mode" == "recorded" && -z "$PRIVATE_CONTRACT_SHA" ]]; then
+      echo "Private build contract is missing or mismatched" >&2
+      return 3
+    fi
   fi
   if [[ -n "$CONTRACT_MAPPING_GENERATION" && \
         "$CONTRACT_MAPPING_GENERATION" != "$EVENT_MAPPING_MIGRATION_GENERATION" ]]; then
@@ -1330,7 +1351,7 @@ validate_recorded_image_contract_if_present() {
   local ref="$1" digest="$2" manifest="${3:-}" target
   target="$(build_contract_path "$ref")"
   [[ -e "$target" || -L "$target" ]] || return 0
-  read_build_contract "$ref"
+  read_build_contract "$ref" recorded
   if [[ "$CONTRACT_DIGEST" != "$digest" ]] || \
      [[ -n "$manifest" && "$CONTRACT_MANIFEST" != "$manifest" ]]; then
     echo "Recorded release does not match its build contract: $ref" >&2
@@ -1613,6 +1634,17 @@ seal_legacy_config_manifest() {
   printf '%s\n' "$sealed"
 }
 
+# Archived manifests are either the historical YAML documents or the compact
+# JSON emitted by private_release_contract.encoded() (sorted keys, ',' and ':'
+# separators, one trailing newline). Match the versioned gateway *config key*
+# in either serialization; the quoted form only occurs for a mapping key, so a
+# service reference ("source":"ai-filter-gateway-nginx") does not match.
+manifest_declares_gateway_config() {
+  local file="$1"
+  grep -Fq 'ai-filter-gateway-nginx:' "$file" ||
+    grep -Fq '"ai-filter-gateway-nginx":' "$file"
+}
+
 compose_validate() {
   local ref="$1" manifest="$2" file
   file="$(manifest_path "$manifest")"
@@ -1621,10 +1653,10 @@ compose_validate() {
 
   # Compose may return success after warning about an interpolated Nginx
   # variable and silently render it as an empty string.  For manifests that
-  # contain the versioned gateway, validate the *mounted* config with the
+  # declare the versioned gateway, validate the *mounted* config with the
   # pinned Nginx image.  Older archived manifests do not have this config and
   # remain valid rollback targets.
-  if grep -Fq 'ai-filter-gateway-nginx:' "$file"; then
+  if manifest_declares_gateway_config "$file"; then
     IMAGE_REF="$ref" release_compose -f "$file" \
       run --rm --no-deps ai-filter-web nginx -t || return $?
   fi
@@ -1642,7 +1674,12 @@ validate_runtime_secrets_for_manifest() {
     ai_filter_integration_token \
     quant_market_context_token
   do
-    if ! grep -Fq "${secret_name}:" "$file"; then
+    # The archived manifest may be YAML (`name:`) or JSON (`"name":`), and
+    # YAML keys may be single- or double-quoted. Match the key with an
+    # optional quote and optional whitespace before the colon. This pattern
+    # is a strict superset of the previous fixed-string check, so a manifest
+    # that mentions the name at all is still validated (fail closed).
+    if ! grep -Eq "${secret_name}[\"']?[[:space:]]*:" "$file"; then
       continue
     fi
     secret_file="${ROOT}/secrets/${secret_name}"
@@ -1696,7 +1733,7 @@ compose_up() {
   # health check turn unhealthy, which causes Compose to abandon the worker.
   # Each command has an explicit return because this function is called from
   # an `if ! compose_up` condition, where Bash suppresses errexit semantics.
-  if grep -Fq 'ai-filter-gateway-nginx:' "$file"; then
+  if manifest_declares_gateway_config "$file"; then
     IMAGE_REF="$ref" release_compose -f "$file" \
       up -d --no-build --pull never redis rsshub || return $?
     wait_healthy "$ref" "$manifest" "redis rsshub" "infra" || return $?
@@ -1718,16 +1755,27 @@ compose_up() {
 }
 
 service_state() {
-  local ref="$1" manifest="$2" service="$3" file container_id
+  local ref="$1" manifest="$2" service="$3" file container_ids container_id count
   validate_runtime_digest "$ref"
   file="$(manifest_path "$manifest")"
-  container_id="$(IMAGE_REF="$ref" release_compose -f "$file" ps --all -q "$service")"
-  if [[ -z "$container_id" ]]; then
+  container_ids="$(IMAGE_REF="$ref" release_compose -f "$file" ps --all -q "$service")"
+  if [[ -z "$container_ids" ]]; then
     printf '%s\n' "missing"
     return
   fi
+  count="$(grep -c . <<<"$container_ids")"
+  if (( count != 1 )); then
+    # Inspecting a newline-joined argument fails, so the health gate would only
+    # time out without saying why. The host check refuses to guess as well.
+    printf 'ambiguous|%s\n' "$count"
+    return
+  fi
+  container_id="$container_ids"
+  # Docker keeps the last health result after a container exits, so the health
+  # value alone can call a stopped service "healthy". Report both fields and
+  # require State.Status=running before accepting a service.
   IMAGE_REF="$ref" docker inspect "$container_id" \
-    --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}'
+    --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}'
 }
 
 capture_health_timeout_diagnostics() {
@@ -1775,7 +1823,11 @@ wait_healthy() {
     all_healthy=1
     for service in $services; do
       state="$(service_state "$ref" "$manifest" "$service" 2>/dev/null || true)"
-      if [[ "$state" != "healthy" && "$state" != "running" ]]; then
+      if [[ "$state" == ambiguous\|* ]]; then
+        echo "Health check cannot identify a single container for $service in $ref (found ${state#ambiguous|}); refusing to guess" >&2
+        return 1
+      fi
+      if [[ "$state" != "running|healthy" && "$state" != "running|none" ]]; then
         all_healthy=0
         break
       fi
@@ -1968,18 +2020,29 @@ record_current() {
 }
 
 restore_previous() {
-  local ref="$1" digest="$2" manifest="$3" services="$4" actual
+  local action="$1" ref="$2" digest="$3" manifest="$4" services="$5" actual
   if [[ -z "$ref" ]]; then
     echo "No previous release state is recorded" >&2
     return 1
   fi
-  echo "Restoring previous release $ref with manifest $manifest" >&2
+  # During a rollback "previous" is the release being rolled away from, so the
+  # same sentence would read as a successful rollback while the rejected
+  # release is actually being put back.
+  if [[ "$action" == "rollback" ]]; then
+    echo "Rollback target failed; restoring recorded current release $ref with manifest $manifest" >&2
+  else
+    echo "Restoring previous release $ref with manifest $manifest" >&2
+  fi
   validate_recorded_state "$ref" "$digest" "$manifest" "$services"
   validate_event_mapping_release_target \
     "auto-rollback" "$ref" "$digest" "$manifest" "" "" "" || return $?
   compose_up "$digest" "$manifest"
   if ! wait_healthy "$digest" "$manifest" "$services" "rollback-final"; then
-    echo "Automatic rollback also failed health checks" >&2
+    if [[ "$action" == "rollback" ]]; then
+      echo "The recorded current release also failed health checks" >&2
+    else
+      echo "Automatic rollback also failed health checks" >&2
+    fi
     return 1
   fi
   actual="$(resolved_image_id "$ref")"
@@ -1989,7 +2052,7 @@ restore_previous() {
 deploy_ref() {
   local action="$1" ref="$2" manifest="$3" services="$4"
   local previous_ref="" previous_digest="" previous_manifest="" previous_services=""
-  local digest sealed_manifest
+  local digest sealed_manifest verification_stage=""
   validate_image_ref "$ref"
   services="$(normalize_health_services "$services")"
   bootstrap_or_validate_registry
@@ -2050,27 +2113,32 @@ deploy_ref() {
     if [[ -n "$previous_ref" ]] && \
        [[ "$previous_ref|$previous_manifest" != "$ref|$manifest" ]]; then
       if [[ "$AUTO_ROLLBACK" == "1" ]]; then
-        restore_previous "$previous_ref" "$previous_digest" "$previous_manifest" "$previous_services" || return 5
+        restore_previous "$action" "$previous_ref" "$previous_digest" "$previous_manifest" "$previous_services" || return 5
       else
         echo "Automatic image rollback is disabled; leaving recovery to the maintenance caller" >&2
       fi
     fi
     return 4
   fi
-  if wait_healthy "$digest" "$manifest" "$services" "release-final" && \
-     verify_runtime_source_immutable "$digest" "$manifest" && \
-     verify_private_runtime "$digest"; then
+  if ! wait_healthy "$digest" "$manifest" "$services" "release-final"; then
+    verification_stage="health_failed:wait_healthy"
+  elif ! verify_runtime_source_immutable "$digest" "$manifest"; then
+    verification_stage="health_failed:source_immutable"
+  elif ! verify_private_runtime "$digest"; then
+    verification_stage="health_failed:private_runtime"
+  fi
+  if [[ -z "$verification_stage" ]]; then
     record_current "$action" "$ref" "$digest" "$manifest" "$services" \
       "$previous_ref" "$previous_digest" "$previous_manifest" "$previous_services"
     echo "${action}: ${ref} (${digest}), manifest ${manifest}"
     return 0
   fi
 
-  record_history "$action" "$ref" "$digest" "health_failed" "$manifest" "$services"
+  record_history "$action" "$ref" "$digest" "$verification_stage" "$manifest" "$services"
   if [[ -n "$previous_ref" ]] && \
      [[ "$previous_ref|$previous_manifest" != "$ref|$manifest" ]]; then
     if [[ "$AUTO_ROLLBACK" == "1" ]]; then
-      restore_previous "$previous_ref" "$previous_digest" "$previous_manifest" "$previous_services" || return 5
+      restore_previous "$action" "$previous_ref" "$previous_digest" "$previous_manifest" "$previous_services" || return 5
     else
       echo "Automatic image rollback is disabled; leaving recovery to the maintenance caller" >&2
     fi

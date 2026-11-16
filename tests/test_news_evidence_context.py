@@ -41,9 +41,9 @@ def test_card_title_state_never_claims_source_storage_or_body_availability(readi
     entry = _entry(raw_title=raw_title, summary="不应展示的历史正文", content="不应展示的正文内容")
     html = _render_cards([entry], reading=reading)
     context, = _contexts(html)
-    expected = "本卡片提供原始标题" if provided else "本卡片未提供原始标题"
+    expected = "本卡片提供原始标题" if provided else "标题缺失"
     assert expected in context
-    assert "无法从本卡片确认评分时使用的正文范围" in context
+    assert "评分时使用的正文范围：未记录，无法从本卡片确认" in context
     assert "不应展示" not in html
     for unsupported_claim in ("缺原文无法判断", "原文缺失", "正文不存在", "正文为空", "原始标题已记录"):
         assert unsupported_claim not in context
@@ -52,7 +52,7 @@ def test_card_title_state_never_claims_source_storage_or_body_availability(readi
 @pytest.mark.parametrize("value", [None, "", " \t", [], {}, 0, 7, False, True])
 def test_unavailable_or_malformed_raw_title_does_not_become_source_evidence(value):
     html = render_evidence_context(_entry(raw_title=value))
-    assert "本卡片未提供原始标题" in html
+    assert "标题缺失" in html
     assert "本卡片提供原始标题" not in html
 
 
@@ -62,7 +62,7 @@ def test_missing_legacy_title_metadata_does_not_infer_from_display_title(reading
     del entry["raw_title"]
     html = _render_cards([entry], reading=reading)
     context, = _contexts(html)
-    assert "本卡片未提供原始标题" in context
+    assert "标题缺失" in context
     assert "本卡片提供原始标题" not in context
 
 
@@ -85,9 +85,9 @@ def test_all_safe_neutral_paths_keep_recorded_reason_separate(reading, path, rea
     # assert that the unchanged public selection admits safe-neutral entries.
     html = _render_cards([_entry(score_path=path, safe_neutral_reason=reason)], reading=reading)
     context, = _contexts(html)
-    assert "缓存处理记录：保守中性" in context
-    assert "缓存处理记录：系统兜底" not in context
-    assert "缓存处理记录：模型评分" not in context
+    assert "缓存处理路径：保守中性" in context
+    assert "缓存处理路径：系统兜底" not in context
+    assert "缓存处理路径：模型评分" not in context
     assert "保守中性是处理结果，不表示新闻不重要" in context
     assert expected in html and expected not in context
     assert "private-rejection-detail" not in html
@@ -99,11 +99,11 @@ def test_all_safe_neutral_paths_keep_recorded_reason_separate(reading, path, rea
     ("fallback_local", "系统兜底"), ("similarity", "相似结果复用"),
     ("radar", "雷达路径"), ("parse_error", "处理异常（解析失败）"),
     ("quality_quarantine", "质量隔离"),
-    ("unexpected-private-path", "未知"), ("", "未知"), (None, "未知"),
+    ("unexpected-private-path", "未知路径"), ("", "未知路径"), (None, "未知路径"),
 ])
 def test_cached_path_has_bounded_labels_not_per_field_model_attribution(path, label):
     html = render_evidence_context(_entry(score_path=path))
-    assert f"缓存处理记录：{label}" in html
+    assert f"缓存处理路径：{label}" in html
     assert "unexpected-private-path" not in html
     assert "当前展示分数与方向的逐项生成来源未确认" in html
     assert "分数仅为阅读优先级" in html
@@ -116,20 +116,20 @@ def test_cached_path_has_bounded_labels_not_per_field_model_attribution(path, la
     ("fallback_local", "系统兜底"), ("parse_error", "处理异常（解析失败）"),
     ("radar", "雷达路径"), ("quality_quarantine", "质量隔离"),
     ("llm", "模型评分"), ("stage2", "模型二阶段评分"),
-    ("unrecognized", "未知"),
+    ("unrecognized", "未知路径"),
 ])
 def test_layouts_preserve_distinct_cached_treatment_without_rewriting_values(reading, path, label):
     entry = _entry(score_path=path, raw_title="", direction="看空", score=6.8, importance_score=6.8)
     before = deepcopy(entry)
     html = _render_cards([entry], reading=reading)
     context, = _contexts(html)
-    assert f"缓存处理记录：{label}<br>" in context
+    assert f"缓存处理路径：{label}<br>" in context
     assert "系统兜底（保守中性）" not in context
-    assert "本卡片未提供原始标题" in context
+    assert "标题缺失" in context
     assert "当前展示分数与方向的逐项生成来源未确认" in context
     assert "6.8/10" in html and "看空" in html and entry == before
-    if label in {"保守中性", "系统兜底", "处理异常（解析失败）", "未知"}:
-        assert "缓存处理记录：模型" not in context
+    if label in {"保守中性", "系统兜底", "处理异常（解析失败）", "未知路径"}:
+        assert "缓存处理路径：模型" not in context
 
 
 def test_snapshot_preserves_distinct_treatment_labels_without_runtime_reinterpretation(mention_snapshot_env, monkeypatch):
@@ -155,16 +155,16 @@ def test_snapshot_preserves_distinct_treatment_labels_without_runtime_reinterpre
     contexts = _contexts(html)
     assert len(contexts) == 3
     for context, label in zip(contexts, ("保守中性", "系统兜底", "处理异常（解析失败）")):
-        assert f"缓存处理记录：{label}<br>" in context
+        assert f"缓存处理路径：{label}<br>" in context
         assert "当前展示分数与方向的逐项生成来源未确认" in context
     assert "系统兜底（保守中性）" not in html
 
 
 def test_legacy_entry_without_metadata_keeps_unknowns():
     html = render_evidence_context({"title": "旧快照标题"})
-    assert "本卡片未提供原始标题" in html
-    assert "无法从本卡片确认评分时使用的正文范围" in html
-    assert "缓存处理记录：未知" in html
+    assert "标题缺失" in html
+    assert "评分时使用的正文范围：未记录，无法从本卡片确认" in html
+    assert "缓存处理路径：未知路径" in html
 
 
 def test_both_layouts_share_context_without_changing_card_facts_or_inputs():
@@ -278,7 +278,7 @@ def test_old_published_snapshot_is_not_reinterpreted_or_augmented(mention_snapsh
 def test_untrusted_persisted_path_is_bounded_and_escaped():
     html = render_evidence_context(_entry(score_path='<script>alert(1)</script>', raw_title='<b>x</b>'))
     assert "<script>" not in html and "<b>x</b>" not in html
-    assert "缓存处理记录：未知" in html
+    assert "缓存处理路径：未知路径" in html
 
 
 @pytest.mark.parametrize("reading", [False, True])
@@ -292,7 +292,7 @@ def test_real_event_score_does_not_turn_cached_path_into_its_field_provenance(tm
     assert entries[0]["score_path"] == "llm"
     html = _render_cards(entries, reading=reading)
     context, = _contexts(html)
-    assert "缓存处理记录：模型评分" in context
+    assert "缓存处理路径：模型评分" in context
     assert "当前展示分数与方向的逐项生成来源未确认" in context
     assert "9.0/10" in html and "看空" in html
     assert "当前分数来自模型" not in context and "当前方向来自模型" not in context
@@ -314,6 +314,6 @@ def test_fresh_source_link_and_scoring_owner_are_not_claimed_to_be_the_same(monk
     assert high_title in html and low_title not in html
     assert 'href="https://news.example/fresh-copy"' in html
     assert "阅读优先级 7.5/10" in html
-    assert "本卡片未提供原始标题" in context
-    assert "无法从本卡片确认评分时使用的正文范围" in context
+    assert "标题缺失" in context
+    assert "评分时使用的正文范围：未记录，无法从本卡片确认" in context
     assert "当前展示分数与方向的逐项生成来源未确认" in context
