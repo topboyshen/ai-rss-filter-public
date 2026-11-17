@@ -136,6 +136,7 @@ def test_merge_stock_mapping_aggregates_conflicts_and_evidence():
     [
         ("sh000300", 30, 30, "complete_close_only", True),
         (None, 0, 0, "missing_asset_close", False),
+        (None, 0, 0, "missing_benchmark_close", False),
     ],
 )
 def test_materialized_outcome_view_contract(
