@@ -536,3 +536,57 @@ def test_cached_feed_route_separates_observation_stream_from_high_score(monkeypa
     assert capped_title not in high_score.get_data(as_text=True)
     assert high_title in observation.get_data(as_text=True)
     assert high_title in high_score.get_data(as_text=True)
+
+
+# ---------------------------------------------------------------------------
+# P2: the selection decision must not depend on every feed keeping its
+# aggregation floor above the 5.0 cap.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "case,title,raw_score,time_bonus",
+    [
+        ("guard-capped", "2026年中国资本市场学术年会在沪开幕", 6.0, None),
+        ("guard-time-capped", "佳士得上海拍卖落槌，总成交额1.18亿元人民币", 4.0, 2.0),
+    ],
+)
+def test_capped_item_stays_unselected_even_when_the_floor_allows_it(
+    case, title, raw_score, time_bonus
+):
+    """A future aggregation floor of 5.0 must not turn capped content into a highlight."""
+    record, entry = _run(
+        case,
+        title=title,
+        raw_score=raw_score,
+        tag="艺术",
+        logic="低价值会议或拍卖",
+        pass_threshold=4.5,
+        aggregation_threshold=5.0,
+        time_bonus=time_bonus,
+    )
+    cfg = _cfg(4.5, 5.0, time_bonus=time_bonus)
+
+    assert record["adjusted_score"] == 5.0
+    assert record["selected"] is False
+    assert _preview_row(cfg, entry.link) is not None
+    outbox = _outbox_row(entry.link)
+    assert outbox is not None and outbox["selected"] == 0
+
+
+def test_uncapped_five_is_still_selected_at_a_five_floor():
+    """The guard must only cover capped results, not every 5.0 score."""
+    record, entry = _run(
+        "guard-control",
+        title="某公司公告获得2.3亿元订单",
+        raw_score=5.0,
+        tag="公司公告",
+        logic="新增订单",
+        pass_threshold=4.5,
+        aggregation_threshold=5.0,
+    )
+    cfg = _cfg(4.5, 5.0)
+
+    assert record["adjusted_score"] == 5.0
+    assert record["selected"] is True
+    assert _briefing_row(cfg, entry.link) is not None

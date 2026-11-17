@@ -33,7 +33,16 @@ def test_does_not_raise_low_scores():
 
 
 def test_apply_score_adjustments_caps_after_time_weight():
-    score, _, _ = _apply_score_adjustments(
+    score, _, _, capped = _apply_score_adjustments(
         6.0, "艺术", "低价值", {}, "", "佳士得上海拍卖落槌", False
     )
     assert score == 5.0
+    assert capped is True
+
+
+def test_apply_score_adjustments_does_not_report_an_untouched_score_as_capped():
+    score, _, _, capped = _apply_score_adjustments(
+        5.0, "公司公告", "具体事实", {}, "", "某公司公告获得2.3亿元订单", False
+    )
+    assert score == 5.0
+    assert capped is False
