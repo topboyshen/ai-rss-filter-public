@@ -342,3 +342,197 @@ def test_insufficient_input_and_fixed_neutral_are_counted_separately(monkeypatch
     assert insufficient["score_reason"] == neutral["score_reason"] == "non_substantive"
     # Only the substantive score enters the distribution.
     assert recorded == [7.1]
+
+
+# ---------------------------------------------------------------------------
+# P1: the same chain, continued into the surfaces a reader actually sees.
+# These are the queries the dashboard calls: the per-feed observation stream
+# (no score floor), the briefing (feed aggregation floor) and the integration
+# outbox that feeds Quant.
+# ---------------------------------------------------------------------------
+
+
+def _preview_row(cfg, link):
+    rows = database.get_recent_entries_for_feed_preview(
+        cfg, hours=24 * 7, limit=20, feed_url=FEED, order_by="recent"
+    )
+    return next((row for row in rows if row[0] == link), None)
+
+
+def _briefing_row(cfg, link):
+    from services.intelligence_query import query_briefing_tuples
+
+    rows = query_briefing_tuples(cfg, limit=20, hours=24 * 7)
+    return next((row for row in rows if row[0] == link), None)
+
+
+def _outbox_row(link):
+    with database.get_connection() as conn:
+        return conn.execute(
+            "SELECT outbox.score, outbox.selected, outbox.score_path "
+            "FROM integration_signal_outbox AS outbox "
+            "JOIN backtest_signals AS ledger ON ledger.id = outbox.ledger_signal_id "
+            "WHERE ledger.link = ? ORDER BY outbox.seq DESC LIMIT 1",
+            (link,),
+        ).fetchone()
+
+
+def test_capped_item_is_browsable_but_absent_from_the_briefing():
+    """5.0 on a 4.8-pass source: observation stream yes, highlighted entry no."""
+    record, entry = _run(
+        "outlet-capped",
+        title="2026年中国资本市场学术年会在沪开幕",
+        raw_score=6.0,
+        tag="资本市场政策",
+        logic="会议开幕",
+        pass_threshold=4.8,
+        aggregation_threshold=6.0,
+    )
+    cfg = _cfg(4.8, 6.0)
+
+    preview = _preview_row(cfg, entry.link)
+    outbox = _outbox_row(entry.link)
+
+    assert record["adjusted_score"] == 5.0
+    assert preview is not None and preview[3] == 5.0
+    assert _briefing_row(cfg, entry.link) is None
+    # The outbox carries the row so Quant can audit it; it is not highlighted.
+    assert outbox is not None and outbox["selected"] == 0 and outbox["score"] == 5.0
+
+
+def test_item_at_the_aggregation_threshold_is_browsable_and_highlighted():
+    record, entry = _run(
+        "outlet-high",
+        title="某公司公告获得2.3亿元订单",
+        raw_score=7.1,
+        tag="公司公告",
+        logic="新增订单",
+        pass_threshold=4.8,
+        aggregation_threshold=6.0,
+    )
+    cfg = _cfg(4.8, 6.0)
+
+    preview = _preview_row(cfg, entry.link)
+    briefing = _briefing_row(cfg, entry.link)
+    outbox = _outbox_row(entry.link)
+
+    assert record["selected"] is True
+    assert preview is not None and preview[3] == 7.1
+    assert briefing is not None and briefing[3] == 7.1
+    assert outbox is not None and outbox["selected"] == 1
+
+
+def test_non_substantive_states_reach_no_outlet_and_keep_distinct_labels():
+    """Insufficient input and fixed neutral are absent from every reader surface."""
+    insufficient, insufficient_entry = _run(
+        "outlet-insufficient",
+        title="A股午评来了！",
+        raw_score=0.0,
+        tag="信息不足",
+        logic="只有栏目名，缺少具体事件",
+        pass_threshold=4.5,
+        aggregation_threshold=6.0,
+        resolution=SEMANTIC_RESOLUTION_INSUFFICIENT_INPUT,
+    )
+    neutral, neutral_entry = _run(
+        "outlet-fixed-neutral",
+        title="某地举办春季花卉展览",
+        raw_score=4.0,
+        tag="其他",
+        logic="来源未显示明确投资催化",
+        pass_threshold=4.5,
+        aggregation_threshold=6.0,
+        resolution=SEMANTIC_RESOLUTION_SAFE_NEUTRAL_CONTRACT,
+    )
+    cfg = _cfg(4.5, 6.0)
+
+    for entry in (insufficient_entry, neutral_entry):
+        assert _preview_row(cfg, entry.link) is None
+        assert _briefing_row(cfg, entry.link) is None
+        assert _outbox_row(entry.link) is None
+
+    from routes.dashboard_routes import _feed_score_category
+    from scoring_provenance import score_path_reading_label
+
+    assert insufficient["score_path"] == "insufficient_input"
+    assert neutral["score_path"] == "llm_safe_neutral_contract"
+    # The source page counts the two states in different buckets and labels.
+    assert _feed_score_category("insufficient_input", 0.0, 6.0) == "insufficient_input"
+    assert _feed_score_category("llm_safe_neutral_contract", 4.0, 6.0) == "safe_contract"
+    assert score_path_reading_label("insufficient_input") == "信息不足（0分）"
+    assert score_path_reading_label("llm_safe_neutral_contract") == "保守中性"
+
+
+def test_time_bonus_cap_keeps_the_displayed_score_and_explanation_consistent():
+    """After the time bonus is capped away, the page shows 5.0 with the same tag/logic."""
+    record, entry = _run(
+        "outlet-time-cap",
+        title="佳士得上海拍卖落槌，总成交额1.18亿元人民币",
+        raw_score=4.0,
+        tag="艺术",
+        logic="拍卖结果",
+        pass_threshold=4.9,
+        aggregation_threshold=6.0,
+        time_bonus=2.0,
+    )
+    cfg = _cfg(4.9, 6.0, time_bonus=2.0)
+
+    preview = _preview_row(cfg, entry.link)
+    with database.get_connection() as conn:
+        cache = conn.execute(
+            "SELECT score, tag, logic, score_path FROM news_cache WHERE link = ?",
+            (entry.link,),
+        ).fetchone()
+
+    from scoring_provenance import score_path_reading_label
+
+    assert record["score_reason"] == "capped_to_5.0_after_time_bonus"
+    assert preview is not None
+    assert preview[3] == cache["score"] == 5.0
+    assert (preview[4], preview[5]) == (cache["tag"], cache["logic"]) == ("艺术", "拍卖结果")
+    assert score_path_reading_label(cache["score_path"]) == "模型评分"
+
+
+def test_cached_feed_route_separates_observation_stream_from_high_score(monkeypatch):
+    """HTTP acceptance: the same source exposes the capped item only in preview."""
+    from urllib.parse import quote
+
+    import app as app_module
+    import routes.feed_routes as feed_routes
+
+    capped_title = "2026年中国资本市场学术年会在沪开幕"
+    high_title = "某公司公告获得2.3亿元订单"
+    _run(
+        "route-capped",
+        title=capped_title,
+        raw_score=6.0,
+        tag="资本市场政策",
+        logic="会议开幕",
+        pass_threshold=4.8,
+        aggregation_threshold=6.0,
+    )
+    _run(
+        "route-high",
+        title=high_title,
+        raw_score=7.1,
+        tag="公司公告",
+        logic="新增订单",
+        pass_threshold=4.8,
+        aggregation_threshold=6.0,
+    )
+    cfg = _cfg(4.8, 6.0)
+    monkeypatch.setattr(feed_routes, "_cfg", lambda: cfg)
+    # DNS for a synthetic host is out of scope here; the allowlist match is
+    # already exercised by the route's own tests.
+    monkeypatch.setattr(feed_routes, "validate_target_url", lambda url, cfg: (True, ""))
+
+    with app_module.app.test_client() as client:
+        observation = client.get(f"/cached_feed?url={quote(FEED)}&preview=true&limit=20")
+        high_score = client.get(f"/cached_feed?url={quote(FEED)}&limit=20")
+
+    assert observation.status_code == 200
+    assert high_score.status_code == 200
+    assert capped_title in observation.get_data(as_text=True)
+    assert capped_title not in high_score.get_data(as_text=True)
+    assert high_title in observation.get_data(as_text=True)
+    assert high_title in high_score.get_data(as_text=True)
