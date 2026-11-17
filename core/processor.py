@@ -777,17 +777,26 @@ _LOW_VALUE_COMPANY = re.compile(
     r"[\u4e00-\u9fffA-Za-z0-9]{2,}(?:公司|集团|银行|证券|基金|科技|医药|半导体|"
     r"能源|汽车|电子|控股|股份)"
 )
+# A meeting/forum title can still carry a checkable fact in its summary.  Only
+# a quantified action lifts the cap; a plain meeting note, a stance or a date
+# does not.  Entity recognition stays title-only.
+_LOW_VALUE_SUBSTANTIVE_SUMMARY = re.compile(
+    r"(?:降准|降息|加息|上调|下调|印发|出台|投放|发行|回购|增持|减持|中标|签约|订单|"
+    r"投资|融资|补贴|减税|降费|涨价|降价|扩产|投产|开工|交付|获批|批准|收购|并购|重组)"
+    r"[^。；\n]{0,24}\d+(?:\.\d+)?(?:%|％|个百分点|亿元|万元|亿|万|吨|台|辆|架|座|项)"
+)
 _LOW_VALUE_TAGS = {"艺术", "拍卖"}
 _LOW_VALUE_CAP = 5.0
 
 
-def _cap_low_value_announcement(score: float, tag: str, logic: str, raw_title: str) -> Tuple[float, str, str]:
+def _cap_low_value_announcement(score: float, tag: str, logic: str, raw_title: str, raw_summary: str = "") -> Tuple[float, str, str]:
     """Cap routine meetings, speeches, auctions and principle-only research.
 
     The contract puts these in 3-4, but the model sometimes scores them 6.0 and
     the aggregation threshold then selects them.  The cap only applies when the
     title names no company and states no concrete action, so a conference with
-    an order, launch or filing keeps its score.
+    an order, launch or filing keeps its score.  A summary carrying a quantified
+    action also keeps it; a plain meeting note or stance does not.
     """
     if score <= _LOW_VALUE_CAP:
         return score, tag, logic
@@ -802,10 +811,13 @@ def _cap_low_value_announcement(score: float, tag: str, logic: str, raw_title: s
         return score, tag, logic
     if _LOW_VALUE_CONCRETE_ACTION.search(title) or _LOW_VALUE_COMPANY.search(title):
         return score, tag, logic
+    summary = re.sub(r"\s+", "", raw_summary or "")
+    if _LOW_VALUE_SUBSTANTIVE_SUMMARY.search(summary):
+        return score, tag, logic
     return _LOW_VALUE_CAP, tag, logic
 
 
-def _apply_score_adjustments(score, tag, logic, cfg, feed_url, raw_title, non_substantive):
+def _apply_score_adjustments(score, tag, logic, cfg, feed_url, raw_title, non_substantive, raw_summary=""):
     """Apply the existing cap and time weight without changing their order."""
     if non_substantive:
         return score, tag, logic, False
@@ -816,7 +828,7 @@ def _apply_score_adjustments(score, tag, logic, cfg, feed_url, raw_title, non_su
         score = min(10.0, max(0.0, score + time_bonus))
         logger.info("[TimeWeight] '%s' %s bonus %+.1f -> %.1f", raw_title[:40], time_label, time_bonus, score)
     before_low_value_cap = score
-    score, tag, logic = _cap_low_value_announcement(score, tag, logic, raw_title)
+    score, tag, logic = _cap_low_value_announcement(score, tag, logic, raw_title, raw_summary)
     # The low-value cap only lowers a score to _LOW_VALUE_CAP.  Report that it
     # fired so selection can be decided explicitly instead of relying on every
     # feed keeping its aggregation floor above 5.0.
@@ -2004,6 +2016,7 @@ def _process_entry_phases(
         feed_url,
         ctx.raw_title,
         non_substantive,
+        raw_summary,
     )
     if not _entry_quality_repair_is_usable(ctx, result):
         return None, "quality_quarantine"
