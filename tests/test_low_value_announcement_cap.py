@@ -50,15 +50,42 @@ def test_apply_score_adjustments_does_not_report_an_untouched_score_as_capped():
     assert capped is False
 
 
-def test_summary_with_a_quantified_action_lifts_the_cap():
+@pytest.mark.parametrize(
+    "summary",
+    [
+        "中国人民银行宣布全面降准0.5个百分点，释放长期资金约1万亿元。",
+        "会议签约3个项目，总投资50亿元。",
+        "会议出台10项措施支持科创。",
+    ],
+)
+def test_summary_with_a_quantified_action_lifts_the_cap(summary):
     score, _, _ = _cap_low_value_announcement(
         7.0,
         "资本市场政策",
         "会议开幕",
         "2026年中国资本市场学术年会在沪开幕",
-        "中国人民银行宣布全面降准0.5个百分点，释放长期资金约1万亿元。",
+        summary,
     )
     assert score == 7.0
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        "会议讨论投资环境，共设置10项议程。",
+        "会议讨论投资环境共设置10项议程。",
+    ],
+)
+def test_meeting_counts_near_an_action_word_do_not_lift_the_cap(summary):
+    """A count of agenda items is not a quantified action by the investment word."""
+    score, _, _ = _cap_low_value_announcement(
+        7.0,
+        "资本市场政策",
+        "会议开幕",
+        "2026年中国资本市场学术年会在沪开幕",
+        summary,
+    )
+    assert score == 5.0
 
 
 @pytest.mark.parametrize(
