@@ -1,0 +1,115 @@
+fast_pass:
+  enabled: true
+  tiers:
+  - name: watchlist
+    score: 8.5
+    tag: 持仓命中
+    logic: 持仓股代码命中，仅作关注提示，不代表利好或利空
+    skip_llm: false
+    # Synthetic example codes only; these are not a personal holdings list.
+    keywords:
+    - '990001'
+    - '990002'
+    - '990003'
+  - name: macro_policy
+    score: 8.2
+    tag: 宏观政策
+    logic: A股宏观政策命中
+    skip_llm: false
+    keywords:
+    - 中国央行
+    - 人民银行
+    - 央行今日
+    - 央行开展
+    - 降准
+    - 北向资金
+    - 社融
+    - MLF
+    - A股
+    require_any:
+    - A股
+    - 中国央行
+    - 人民银行
+    - 央行今日
+    - 央行开展
+    - 北向资金
+    - 社融
+    - M2
+    - 沪深
+    - 证监会
+    exclude_keywords:
+    - 美联储
+    - 美债
+    - 美国
+    - 欧洲央行
+    - 加拿大央行
+    - RRP
+    - 隔夜逆回购协议
+    - 固定利率逆回购
+    - 交易对手
+  - name: tech_theme
+    score: 8.2
+    tag: 科技主线
+    logic: 科技主线上下文命中
+    skip_llm: false
+    keywords:
+    - AI
+    - 半导体
+    - 芯片
+    - 算力
+    - AI大模型
+    - 人工智能
+    require_any:
+    - 产业
+    - 订单
+    - 算力
+    - 芯片
+    - 半导体
+    - 大模型
+    - 国产替代
+    - 资本开支
+    - 供应链
+    exclude_keywords:
+    - 广告
+    - 营销
+    - 直播
+    - 招聘
+    - 培训
+    - 课程
+  - name: capital_event
+    score: 7.6
+    tag: 资本事件
+    logic: 资本事件待模型复核
+    skip_llm: false
+    keywords:
+    - 重组
+    - 并购
+    - 借壳
+    - 定增
+    - 入主
+    - 重大合同
+    - 重大订单
+    - 产品认证
+    - 药品批文
+    exclude_keywords:
+    - 进展公告
+    - 提示性公告
+    - 补充公告
+    - 问询函
+  - name: market_extreme
+    score: 7.1
+    tag: 市场异动
+    logic: 市场异动待模型复核
+    skip_llm: false
+    keywords:
+    - 涨停
+    - 跌停
+    - 高送转
+    require_any:
+    - 板块
+    - A股
+    - 沪深
+    - 三市
+    - 千股
+    - 指数
+  skip_summary: true

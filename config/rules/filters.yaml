@@ -1,0 +1,149 @@
+blacklist:
+- 新股申购
+- 中签结果
+- 分红派息
+- 股权登记
+- 限售解禁
+- 股东减持
+- 减持
+- 风险警示
+- 简称变更为
+- 回购进度
+- 业绩快报
+- 业绩预告
+- 中报预告
+- 年报预告
+- 季报预告
+- 股票期权
+- 股票激励
+- 增发上市
+- IPO
+- 转债申购
+- 可转债
+- 配股配息
+- 除权除息
+- 停牌复牌
+- 风险提示
+- 交易异动
+highlight_keywords:
+- 降息
+- 降准
+- 央行
+- 北向
+- 芯片
+- 半导体
+- AI
+- 量子
+- 鸿蒙
+- 千股涨跌停
+- 社融
+- 流动性
+local_reject_rules:
+  enabled: true
+  protect_keywords:
+  - 订单
+  - 资本开支
+  - 产业链
+  - 景气
+  - 涨价
+  - AI
+  - 半导体
+  - 芯片
+  - 算力
+  - 机器人
+  - 出海
+  - 国产替代
+  - 申万
+  - 一级行业
+  - 二级行业
+  - 板块
+  - 指数
+  - 成交额
+  - 放量
+  - 缩量
+  - 北向资金
+  - 主力资金
+  - 央行
+  - 降准
+  - 降息
+  rules:
+  - pattern: 新股申购|中签结果|转债申购|可转债申购
+    score: 1
+    tag: 发行噪音
+    logic: 发行申购类噪音
+  - pattern: 股东减持|减持计划|减持股份|被动减持
+    score: 2
+    tag: 减持噪音
+    logic: 个股减持公告
+  - pattern: 业绩快报|业绩预告|中报预告|半年报|中报披露|半年报披露|年报摘要|季报披露|年报披露|预约披露
+    score: 2
+    tag: 财报噪音
+    logic: 常规财报公告
+  - pattern: 停牌|复牌|风险警示|简称变更|回购进展
+    score: 2
+    tag: 公告噪音
+    logic: 个股公告噪音
+  - pattern: 投资者关系活动|调研纪要|权益分派|股权登记|除权除息
+    score: 2
+    tag: 个股噪音
+    logic: 常规个股事项
+  - pattern: 业绩暴增|业绩暴雷|业绩大增|业绩变脸|业绩大幅下滑|业绩亏损|扭亏为盈|净利润暴增|净利润大增|净利润预增|净利润预减|利润同比|营收同比
+    score: 2
+    tag: 财报噪音
+    logic: 单一个股财报噪音
+  - pattern: 重大合同|重大订单|签订合同|中标项目|产品认证|药品批文
+    score: 2.5
+    tag: 个股噪音
+    logic: 单一个股经营事项
+  - pattern: 回购股份|回购方案|增持计划|股东增持|诉讼仲裁|收到问询函|监管函|澄清公告|内幕交易|立案调查|被起诉
+    score: 2
+    tag: 公告噪音
+    logic: 单一个股公告噪音
+  - pattern: 市场传闻|小作文|网传|据传|借壳|概念炒作|热门概念|题材炒作|社交平台热议
+    score: 1.5
+    tag: 题材噪音
+    logic: 小题材传闻噪音
+local_scoring:
+  default_score: 5
+  default_tag: 未知
+  enabled: false
+  rules:
+  - pattern: 降息|降准|MLF|逆回购
+    score: 8
+    tag: 货币政策
+  - pattern: 北向资金.*流入|北向资金.*净买入
+    score: 8
+    tag: 外资动向
+  - pattern: 千股涨停|千股跌停|成交量破
+    score: 9
+    tag: 情绪极值
+  - pattern: 芯片|半导体|AI大模型|人工智能|量子计算|可控核聚变
+    score: 8
+    tag: 科技突破
+  - pattern: 国家级.*政策|国常会|政治局|证监会.*改革
+    score: 9
+    tag: 顶层政策
+  - pattern: 社融|M2|信贷数据
+    score: 7
+    tag: 流动性数据
+  - pattern: 新股申购|中签|分红|股权登记|限售解禁|股东减持
+    score: 2
+    tag: 个股噪音
+  - pattern: 业绩快报|业绩预告|年报|季报
+    score: 2
+    tag: 财务噪音
+  - pattern: rate cut|reserve requirement|monetary easing|PBOC|Fed|central bank
+    score: 8
+    tag: 货币政策
+  - pattern: China stock|Chinese stock|CSI 300|Shanghai Composite|Hang Seng|MSCI China
+    score: 7
+    tag: 中股市场
+  - pattern: trade war|tariff|sanction|US-China|bilateral relation
+    score: 7
+    tag: 贸易紧张
+  - pattern: Goldman|JPMorgan|Morgan Stanley|UBS|Citi|BlackRock
+    score: 6
+    tag: 机构观点
+  - pattern: bull run|rally|surge|plunge|correction|volatility
+    score: 6
+    tag: 市场波动

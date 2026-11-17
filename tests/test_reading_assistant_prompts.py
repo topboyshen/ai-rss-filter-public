@@ -1,9 +1,8 @@
 from copy import deepcopy
 
-import yaml
 from pathlib import Path
 
-from core.config import _strategy_fingerprint, load_config
+from core.config import _strategy_fingerprint, load_config, load_config_file
 from core.prompts import BUILTIN_PROMPTS, get_prompt, get_prompt_for_url
 
 
@@ -35,11 +34,7 @@ def test_prompt_text_change_updates_scoring_contract_fingerprint():
 
 
 def test_36kr_feed_still_selects_industry_prompt_after_reading_assistant_rewrite():
-    cfg = yaml.safe_load(
-        (Path(__file__).resolve().parents[1] / "config.yaml").read_text(
-            encoding="utf-8"
-        )
-    )
+    cfg = load_config_file(Path(__file__).resolve().parents[1] / "config.yaml")
     selected = get_prompt_for_url("http://rsshub:1200/36kr/newsflashes", cfg)
     assert selected == BUILTIN_PROMPTS["industry"]
     assert "多行业频道" in selected

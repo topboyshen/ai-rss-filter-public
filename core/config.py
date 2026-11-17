@@ -3,6 +3,7 @@ import json
 import os
 import re
 from copy import deepcopy
+from pathlib import Path
 
 import yaml
 
@@ -238,6 +239,69 @@ def _merge(base, override):
             base[k] = v
 
 
+_INCLUDE_KEY = "include"
+_MAX_INCLUDE_DEPTH = 8
+
+
+def _read_yaml_mapping(path: Path) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise TypeError("配置文件顶层必须是 YAML mapping")
+    return data
+
+
+def _include_target(base_dir: Path, value) -> Path:
+    """Resolve one include, refusing absolute paths, traversal and symlink escapes."""
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"include 必须是非空相对路径，实际 {_shape_name(value)}")
+    relative = Path(value)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ConfigError(f"include 必须是配置目录内的相对路径：{value}")
+    target = (base_dir / relative).resolve()
+    try:
+        target.relative_to(base_dir)
+    except ValueError as exc:
+        raise ConfigError(f"include 越出配置目录：{value}") from exc
+    if not target.is_file():
+        raise ConfigError(f"include 文件不存在：{value}")
+    return target
+
+
+def _merge_config_file(path: Path, stack: tuple[Path, ...]) -> dict:
+    resolved = path.resolve()
+    if resolved in stack:
+        raise ConfigError(f"include 循环引用：{resolved}")
+    if len(stack) >= _MAX_INCLUDE_DEPTH:
+        raise ConfigError(f"include 嵌套超过 {_MAX_INCLUDE_DEPTH} 层")
+    data = _read_yaml_mapping(resolved)
+    includes = data.pop(_INCLUDE_KEY, [])
+    if includes is None:
+        includes = []
+    if not isinstance(includes, list):
+        raise ConfigError("include 必须是字符串列表")
+    merged: dict = {}
+    for item in includes:
+        included = _merge_config_file(_include_target(resolved.parent, item), stack + (resolved,))
+        _merge(merged, included)
+    # The including file always wins over what it includes.
+    _merge(merged, data)
+    return merged
+
+
+def load_config_file(path) -> dict:
+    """读取配置并展开 include，返回未补默认值、未应用环境变量的原始 mapping。
+
+    Include paths are relative to the including file's directory. Later entries
+    override earlier ones; the including file overrides every include. The
+    directive itself never reaches the runtime config or the strategy
+    fingerprint.
+    """
+    return _merge_config_file(Path(path), ())
+
+
 def _strategy_code_fingerprint() -> str:
     """把核心评分代码纳入指纹，防止代码改了但配置没变时复用旧分数。"""
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -300,13 +364,7 @@ def load_config():
     # YAML overrides mutate DEFAULTS and makes removed keys survive reloads.
     cfg = deepcopy(DEFAULTS)
     if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            user_cfg = yaml.safe_load(f)
-        if user_cfg is None:
-            user_cfg = {}
-        if not isinstance(user_cfg, dict):
-            raise TypeError("配置文件顶层必须是 YAML mapping")
-        _merge(cfg, user_cfg)
+        _merge(cfg, load_config_file(CONFIG_PATH))
     # 留空的字符串占位（如 ``api_key:``）先归一为空值：它们的空态就是 DEFAULTS
     # 里的空字符串，直接交给校验会把一直合法的部署判死。
     _normalize_null_placeholders(cfg)

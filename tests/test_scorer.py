@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 
 import pytest
-import yaml
+from core.config import load_config_file
 from core.prompts import BUILTIN_PROMPTS, get_prompt_for_url
 from core.scorer import (
     _SCORE_COMPACT_JSON_OUTPUT_INSTRUCTION,
@@ -87,11 +87,7 @@ def _test_backend(name: str) -> LLMBackend:
 
 
 def test_36kr_uses_cross_industry_prompt_in_feed_and_url_routing():
-    cfg = yaml.safe_load(
-        (Path(__file__).resolve().parents[1] / "config.yaml").read_text(
-            encoding="utf-8"
-        )
-    )
+    cfg = load_config_file(Path(__file__).resolve().parents[1] / "config.yaml")
     feed = next(
         item for item in cfg["feeds"]
         if "36kr" in str(item.get("url") or "").lower()

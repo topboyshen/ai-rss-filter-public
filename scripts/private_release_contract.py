@@ -582,6 +582,9 @@ def seal(root, config, manifest, environment, review, output):
     require(project_dir.is_dir(), "project directory does not exist")
     cfg = yaml.safe_load(data["runtime.yaml"])
     require(isinstance(cfg, dict), "runtime config must be a mapping")
+    # The sealed review hashes this file only.  Letting it include image-baked
+    # rule tables would make the effective rules depend on unreviewed bytes.
+    require("include" not in cfg, "runtime config must be self-contained")
     reject_inline_credentials(cfg)
     require(cfg != yaml.safe_load((Path(root) / "config.yaml").read_bytes()),
             "runtime config must not reuse the public example")

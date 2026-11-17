@@ -5,13 +5,14 @@ from pathlib import Path
 import subprocess
 
 import pytest
-import yaml
+
+from core.config import load_config_file
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_public_config_does_not_distribute_personal_holdings_or_capture_identity():
-    cfg = yaml.safe_load((ROOT / "config.yaml").read_text())
+    cfg = load_config_file(ROOT / "config.yaml")
     tier = next(row for row in cfg["fast_pass"]["tiers"] if row["name"] == "watchlist")
     assert tier["keywords"] == ["990001", "990002", "990003"]
     assert tier["score"] == 8.5 and tier["skip_llm"] is False

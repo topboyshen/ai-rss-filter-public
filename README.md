@@ -216,7 +216,7 @@ AI ↔ Quant 的双向边界、游标和恢复语义见 [Quant 集成契约](doc
 ## 配置分工
 
 - [`.env.example`](.env.example)：环境变量参考；生产 Compose 只投影所需凭据，行为参数见 `config.yaml` 与 `docker-compose.yml`。不要提交真实 `.env`。
-- [`config.yaml`](config.yaml)：信息源、来源门槛、模型路由、Briefing 主题与本地规则。
+- [`config.yaml`](config.yaml)：运行参数与模型路由；通过 `include` 合并 [`config/rules/`](config/rules/) 下的信息源、快筛、本地规则、主题与提示词表。包含路径必须是配置目录内的相对路径，主文件覆盖被包含文件。
 - `secrets/`：Dashboard Session、AI → Quant、Quant → AI 三个独立服务凭据；不要复用。
 - [`docker-compose.yml`](docker-compose.yml)：生产服务拓扑、健康检查和资源边界。
 

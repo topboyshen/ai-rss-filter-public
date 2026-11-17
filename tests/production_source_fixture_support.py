@@ -12,6 +12,7 @@ def isolated_git_source(destination, origin, *, files=None):
                  for path in (origin / directory).rglob("*.py") if "__pycache__" not in path.parts}
         files.update(("app.py", "worker_main.py", "sse_engine.py", "logging_bootstrap.py", "scoring_provenance.py",
                       "scoring_explanation.py", "gunicorn.conf.py", "config.yaml", "docker-compose.yml"))
+        files.update(str(path.relative_to(origin)) for path in (origin / "config").rglob("*.yaml"))
         files.update(str(path.relative_to(origin)) for path in (origin / "ops/miniflux").iterdir()
                      if path.is_file() and path.suffix in {".json", ".patch"})
     for name in sorted(files):
