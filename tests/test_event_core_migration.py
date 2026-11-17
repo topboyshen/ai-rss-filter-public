@@ -1564,7 +1564,12 @@ def test_signal_mapping_snapshot_rejects_and_validates_cross_event_binding():
     [
         ("future-prices-v2:not-four-revisions", "invalid price data_version"),
         (
-            "future-prices-v2:" + ":".join(str(uuid.uuid4()) for _ in range(4)),
+            # Collection-time UUIDs differ per xdist worker; keep the fixture
+            # deterministic so every worker sees the same test IDs.
+            "future-prices-v2:" + ":".join(
+                f"00000000-0000-4000-8000-00000000000{index}"
+                for index in range(1, 5)
+            ),
             "missing future price revision",
         ),
     ],

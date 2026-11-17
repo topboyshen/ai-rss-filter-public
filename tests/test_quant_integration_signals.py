@@ -1204,7 +1204,8 @@ def test_v3_v4_page_fails_closed_on_nonexportable_or_copy(
         ("score", 1.25),
         ("direction", "看空"),
         ("mapped_theme", "tampered-theme"),
-        ("domain_event_id", str(uuid.uuid4())),
+        # Fixed at collection time so xdist workers collect identical IDs.
+        ("domain_event_id", "00000000-0000-4000-8000-000000000010"),
         ("mapping_confidence", 0.5),
     ],
 )
