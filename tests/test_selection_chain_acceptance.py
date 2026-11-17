@@ -642,6 +642,8 @@ def test_meeting_title_with_a_quantified_summary_is_not_capped():
          "会议于2026年11月17日召开。"),
         ("p3-auction-count", "佳士得上海拍卖落槌，总成交额1.18亿元人民币", "艺术",
          "本场拍卖共上拍200件拍品。"),
+        ("p3-meeting-agenda", "2026年中国资本市场学术年会在沪开幕", "资本市场政策",
+         "会议讨论投资环境，共设置10项议程。"),
     ],
 )
 def test_meeting_or_auction_title_without_a_quantified_summary_stays_capped(
