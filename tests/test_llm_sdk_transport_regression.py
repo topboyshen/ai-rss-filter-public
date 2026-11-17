@@ -18,10 +18,12 @@ import struct
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
 
 import openai
 import pytest
 
+import core.scorer as scorer_module
 from core.scorer import LLMBackend, Scorer
 
 
@@ -150,6 +152,28 @@ def _closed_port() -> int:
     return port
 
 
+_PROCESS_COOLDOWNS = scorer_module._REMOTE_BACKEND_COOLDOWNS
+
+
+@pytest.fixture(autouse=True)
+def isolate_shared_llm_cooldowns(monkeypatch):
+    """Start every case with an empty process-wide throttle registry.
+
+    ``_REMOTE_BACKEND_COOLDOWNS`` is deliberately process-wide and keyed by
+    endpoint plus credential, so a 429 observed by one case leaves a live
+    deadline behind.  When the kernel hands the next mock server the same
+    loopback port, the fresh "kimi" backend has that stale identity,
+    ``rate_limit_wait()`` raises before dispatch and the case records only the
+    fallback call.  Isolating the singleton keeps the production behaviour under
+    test without letting cases leak throttle state into each other.
+    """
+    monkeypatch.setattr(
+        scorer_module,
+        "_REMOTE_BACKEND_COOLDOWNS",
+        scorer_module._RemoteBackendCooldowns(),
+    )
+
+
 @pytest.fixture
 def mock_llm(monkeypatch):
     for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
@@ -203,6 +227,19 @@ def scorer_env(monkeypatch, mock_llm):
 
     yield scorer, make, logged, backoffs
     scorer.clear_runtime_cache()
+
+
+def test_every_case_gets_an_isolated_process_wide_cooldown_registry():
+    """Regression: a stale 429 deadline on a recycled loopback port skipped kimi.
+
+    Production keeps one registry per process, so this module must swap it per
+    case; otherwise ``test_all_backends_failing_uses_uncached_local_fallback``
+    can inherit a 30s Retry-After deadline left by an earlier case whose mock
+    server happened to reuse the same port.
+    """
+    registry = scorer_module._REMOTE_BACKEND_COOLDOWNS
+    assert registry is not _PROCESS_COOLDOWNS
+    assert registry.deadlines == {}
 
 
 # scenario -> (SDK exception class name, primary counted as backend failure)
@@ -317,6 +354,31 @@ def test_all_backends_failing_uses_uncached_local_fallback(scenario, scorer_env,
     assert [entry[:2] for entry in logged] == [("kimi", False), ("siliconflow", False)]
     assert scorer._score_cache == {}
     assert mock_llm.hits == {"kimi": 1, "sf": 1}
+
+
+def test_stale_process_cooldown_for_a_recycled_port_cannot_skip_the_primary(scorer_env, mock_llm):
+    """The exact CI failure: a leaked 30s deadline must not gate this case.
+
+    Before the registry was isolated per case, this reproduced
+    ``test_all_backends_failing_uses_uncached_local_fallback[reset]`` recording
+    only the fallback call: kimi raised ``RateLimitTimeoutException`` before
+    dispatch because an earlier case had rate-limited the same endpoint string.
+    """
+    scorer, make, logged, _ = scorer_env
+    mock_llm.scenarios["kimi"] = "ok"
+    mock_llm.scenarios["sf"] = "ok"
+    kimi, _ = make(mock_llm.url("kimi"), mock_llm.url("sf"))
+
+    leaked = SimpleNamespace(response=SimpleNamespace(headers={"retry-after": "30"}))
+    _PROCESS_COOLDOWNS.defer(kimi, leaked)
+    try:
+        result = scorer.score_stage1_with_identity(TITLE, SUMMARY, "跨行业 A 股产业提示词", CFG)
+    finally:
+        _PROCESS_COOLDOWNS.deadlines.clear()
+
+    assert result.model_name == "kimi-model"
+    assert [entry[:2] for entry in logged] == [("kimi", True)]
+    assert mock_llm.hits == {"kimi": 1}
 
 
 def test_environment_proxy_and_no_proxy_are_honoured(monkeypatch, mock_llm, scorer_env):
