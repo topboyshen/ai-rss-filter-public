@@ -1,3 +1,5 @@
+import pytest
+
 from core.processor import _apply_score_adjustments, _cap_low_value_announcement
 
 
@@ -45,4 +47,52 @@ def test_apply_score_adjustments_does_not_report_an_untouched_score_as_capped():
         5.0, "公司公告", "具体事实", {}, "", "某公司公告获得2.3亿元订单", False
     )
     assert score == 5.0
+    assert capped is False
+
+
+def test_summary_with_a_quantified_action_lifts_the_cap():
+    score, _, _ = _cap_low_value_announcement(
+        7.0,
+        "资本市场政策",
+        "会议开幕",
+        "2026年中国资本市场学术年会在沪开幕",
+        "中国人民银行宣布全面降准0.5个百分点，释放长期资金约1万亿元。",
+    )
+    assert score == 7.0
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        "",
+        "会议围绕资本市场改革展开讨论。",
+        "会议强调要扩大有效投资。",
+        "会议于2026年11月17日召开。",
+        "本场拍卖共上拍200件拍品。",
+        "与会嘉宾表示看好行业发展前景。",
+    ],
+)
+def test_summary_without_a_quantified_action_keeps_the_cap(summary):
+    score, _, _ = _cap_low_value_announcement(
+        7.0,
+        "资本市场政策",
+        "会议开幕",
+        "2026年中国资本市场学术年会在沪开幕",
+        summary,
+    )
+    assert score == 5.0
+
+
+def test_apply_score_adjustments_passes_the_summary_to_the_cap():
+    score, _, _, capped = _apply_score_adjustments(
+        7.0,
+        "资本市场政策",
+        "会议开幕",
+        {},
+        "",
+        "2026年中国资本市场学术年会在沪开幕",
+        False,
+        "中国人民银行宣布全面降准0.5个百分点，释放长期资金约1万亿元。",
+    )
+    assert score == 7.0
     assert capped is False

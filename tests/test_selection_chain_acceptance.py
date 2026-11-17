@@ -34,6 +34,19 @@ FEED = "https://feeds.example.test/selection-chain"
 STRATEGY = "selection-chain-acceptance"
 
 
+class _SummaryFeedEntry(FeedEntry):
+    """Expose the source summary the way real feedparser entries do.
+
+    ``FeedEntry`` stores the constructor summary in ``ai_summary`` and only
+    ``getattr`` backs ``get``, so ``entry.get("summary")`` would be empty and
+    the cap would never see the source text.
+    """
+
+    def __init__(self, title, link, summary=""):
+        super().__init__(title, link, summary)
+        self.summary = summary
+
+
 class _FixedScorer:
     """One bound scoring result; no second stage, no summarisation."""
 
@@ -98,7 +111,7 @@ def _run(
     """Drive one synthetic entry through the real selection path."""
     database.init_db()
     link = f"https://example.test/selection-chain/{case}"
-    entry = FeedEntry(title, link, summary=summary)
+    entry = _SummaryFeedEntry(title, link, summary=summary)
     scorer = _FixedScorer((raw_score, tag, logic, "⚖️"), resolution)
     outcome = processor.process_entry(
         entry,
@@ -251,8 +264,10 @@ def test_below_pass_above_aggregation_is_still_recorded_selected():
     assert record["selection_reason"] == "5.4 >= aggregation 5.0"
 
 
-def test_title_only_cap_suppresses_a_substantive_summary():
-    """Risk: the cap reads the title only and ignores substantive body text."""
+def test_meeting_title_with_a_substantive_summary_keeps_its_score():
+    """P3: the title still looks like a meeting, but the summary states a
+    quantified policy action, so the cap no longer fires.  The item is still
+    below this source's 7.5 aggregation floor and stays unselected."""
     record, _ = _run(
         "meeting-title-substantive-summary",
         title="2026年中国资本市场学术年会在沪开幕",
@@ -263,8 +278,8 @@ def test_title_only_cap_suppresses_a_substantive_summary():
         aggregation_threshold=7.5,
         summary="中国人民银行宣布全面降准0.5个百分点，释放长期资金约1万亿元。",
     )
-    assert record["adjusted_score"] == 5.0
-    assert record["article_status"] == "filtered"
+    assert record["adjusted_score"] == 7.0
+    assert record["article_status"] == "scored"
     assert record["selected"] is False
 
 
@@ -590,3 +605,61 @@ def test_uncapped_five_is_still_selected_at_a_five_floor():
     assert record["adjusted_score"] == 5.0
     assert record["selected"] is True
     assert _briefing_row(cfg, entry.link) is not None
+
+
+# ---------------------------------------------------------------------------
+# P3: a meeting title with a quantified fact in the summary is not routine.
+# ---------------------------------------------------------------------------
+
+
+def test_meeting_title_with_a_quantified_summary_is_not_capped():
+    record, entry = _run(
+        "p3-meeting-substantive",
+        title="2026年中国资本市场学术年会在沪开幕",
+        raw_score=7.0,
+        tag="资本市场政策",
+        logic="会议开幕",
+        pass_threshold=6.5,
+        aggregation_threshold=6.5,
+        summary="中国人民银行宣布全面降准0.5个百分点，释放长期资金约1万亿元。",
+    )
+    cfg = _cfg(6.5, 6.5)
+
+    assert record["adjusted_score"] == 7.0
+    assert record["article_status"] == "scored"
+    assert record["selected"] is True
+    assert _briefing_row(cfg, entry.link) is not None
+
+
+@pytest.mark.parametrize(
+    "case,title,tag,summary",
+    [
+        ("p3-meeting-discussion", "2026年中国资本市场学术年会在沪开幕", "资本市场政策",
+         "会议围绕资本市场改革展开讨论。"),
+        ("p3-meeting-investment", "2026年中国资本市场学术年会在沪开幕", "资本市场政策",
+         "会议强调要扩大有效投资。"),
+        ("p3-meeting-date", "2026年中国资本市场学术年会在沪开幕", "资本市场政策",
+         "会议于2026年11月17日召开。"),
+        ("p3-auction-count", "佳士得上海拍卖落槌，总成交额1.18亿元人民币", "艺术",
+         "本场拍卖共上拍200件拍品。"),
+    ],
+)
+def test_meeting_or_auction_title_without_a_quantified_summary_stays_capped(
+    case, title, tag, summary
+):
+    record, entry = _run(
+        case,
+        title=title,
+        raw_score=7.0,
+        tag=tag,
+        logic="会议或拍卖",
+        pass_threshold=4.9,
+        aggregation_threshold=6.0,
+        summary=summary,
+    )
+    cfg = _cfg(4.9, 6.0)
+
+    assert record["adjusted_score"] == 5.0
+    assert record["article_status"] == "scored"
+    assert record["selected"] is False
+    assert _preview_row(cfg, entry.link) is not None
