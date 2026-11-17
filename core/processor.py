@@ -578,6 +578,13 @@ def _map_publisher_title_assets(article: dict) -> dict:
     return map_article_to_assets({**article, "tag": "", "logic": "", "summary": ""})
 
 
+def _signal_selected(score, aggregation_threshold, non_substantive, content_capped) -> bool:
+    """Capped and non-substantive results stay readable but are never highlighted."""
+    if non_substantive or content_capped:
+        return False
+    return float(score) >= float(aggregation_threshold)
+
+
 def _build_backtest_signal_snapshot(
     *,
     entry,
@@ -594,6 +601,7 @@ def _build_backtest_signal_snapshot(
     scored_at: int,
     cfg: dict,
     is_similarity_copy: bool = False,
+    content_capped: bool = False,
     revision_key: str = "base",
     signal_stage: str = "base",
     auto_revision: bool = False,
@@ -706,11 +714,7 @@ def _build_backtest_signal_snapshot(
             or ""
         ),
         "aggregation_threshold": float(aggregation_threshold),
-        "selected": (
-            False
-            if non_substantive
-            else float(score) >= float(aggregation_threshold)
-        ),
+        "selected": _signal_selected(score, aggregation_threshold, non_substantive, content_capped),
         "is_similarity_copy": bool(is_similarity_copy),
     }
     if auto_revision:
@@ -804,15 +808,19 @@ def _cap_low_value_announcement(score: float, tag: str, logic: str, raw_title: s
 def _apply_score_adjustments(score, tag, logic, cfg, feed_url, raw_title, non_substantive):
     """Apply the existing cap and time weight without changing their order."""
     if non_substantive:
-        return score, tag, logic
+        return score, tag, logic, False
     score, tag, logic = _cap_irrelevant_high_score(score, tag, logic, cfg, feed_url)
     # 时间窗口动态权重
     time_bonus, time_label = _get_time_bonus(cfg)
     if score >= 0 and time_bonus != 0:
         score = min(10.0, max(0.0, score + time_bonus))
         logger.info("[TimeWeight] '%s' %s bonus %+.1f -> %.1f", raw_title[:40], time_label, time_bonus, score)
+    before_low_value_cap = score
     score, tag, logic = _cap_low_value_announcement(score, tag, logic, raw_title)
-    return score, tag, logic
+    # The low-value cap only lowers a score to _LOW_VALUE_CAP.  Report that it
+    # fired so selection can be decided explicitly instead of relying on every
+    # feed keeping its aggregation floor above 5.0.
+    return score, tag, logic, score < before_low_value_cap
 
 
 def _effective_notify_threshold(cfg, feed_url, notify_threshold, raw_title):
@@ -1561,6 +1569,7 @@ def _entry_signal_snapshot(ctx, result, meta, scored_at, summary):
         feed_url=ctx.feed_url,
         scored_at=scored_at,
         cfg=ctx.cfg,
+        content_capped=bool(getattr(result, "content_capped", False)),
         **_quality_snapshot_options(ctx),
     )
     snapshot.update(meta["score_explanation"])
@@ -1987,7 +1996,7 @@ def _process_entry_phases(
     _defer_unverdicted_safe_neutral(ctx, result)
     non_substantive = result.score_path in NON_SUBSTANTIVE_SCORE_PATHS
     result.raw_score = result.score
-    result.score, result.tag, result.logic = _apply_score_adjustments(
+    result.score, result.tag, result.logic, result.content_capped = _apply_score_adjustments(
         result.score,
         result.tag,
         result.logic,
