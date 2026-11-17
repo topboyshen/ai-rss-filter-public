@@ -178,6 +178,18 @@ def test_sealed_contract_keeps_public_source_and_private_runtime_distinct(fixtur
     assert not list(fixture["root"].glob("**/runtime.yaml"))
 
 
+def test_runtime_config_must_not_include_image_baked_rules(fixture):
+    save(
+        fixture["config"],
+        b"include:\n  - config/rules/feeds.yaml\nthreshold:\n  pass: 7\nscoring_strategy_version: fixture\n",
+    )
+    fixture["review_data"]["runtime_config_sha256"] = private.sha(fixture["config"].read_bytes())
+    save(fixture["review"], fixture["review_data"])
+
+    with pytest.raises(private.ContractError, match="self-contained"):
+        seal(fixture)
+
+
 @pytest.mark.parametrize("name", ["config", "manifest", "environment", "review", "secret"])
 def test_original_input_drift_after_seal_is_rejected(fixture, name):
     path = seal(fixture)

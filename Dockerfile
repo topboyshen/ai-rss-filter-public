@@ -38,6 +38,9 @@ LABEL io.ai-filter.private-release.sha256=${AI_FILTER_PRIVATE_RELEASE_SHA}
 LABEL io.ai-filter.runtime-config.sha256=${AI_FILTER_RUNTIME_CONFIG_SHA}
 LABEL io.ai-filter.event-mapping-generation=${AI_FILTER_MAPPING_MIGRATION_GENERATION}
 COPY config.yaml .
+# Rule tables referenced by config.yaml's include list. The private runtime YAML
+# stays self-contained and does not use these files.
+COPY config/ ./config/
 COPY app.py .
 COPY logging_bootstrap.py .
 COPY sse_engine.py .

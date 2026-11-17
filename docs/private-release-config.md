@@ -54,8 +54,10 @@ only for a pinned official Nginx gateway at `/etc/nginx/nginx.conf` or
 Secret and config names must be safe basenames. Volume, config and secret
 targets cannot overlap or repeat within a service.
 
-Runtime YAML must be distinct from the public example; example.invalid and
-inline credentials in recognized sensitive fields are rejected. Credentials
+Runtime YAML must be distinct from the public example, self-contained (no
+`include` directive: the review hashes this file only, so image-baked rule
+tables must not contribute), and free of example.invalid endpoints and
+inline credentials in recognized sensitive fields. Credentials
 belong in file-backed Compose secrets or a private environment input. That input
 uses unique plain `NAME=value` records, with no quotes, escapes, dollar expansion,
 Docker/Compose control names, host loader/executable controls such as PATH,
@@ -87,6 +89,14 @@ An independently reviewed, private JSON receipt must contain:
   roles whose writable data mounts it may reuse. This supports a reviewed
   old-web → new-api role split without permitting a cross-role data-path swap.
   The full project data/network/port set must still be preserved.
+
+The public `config.yaml` merges `config/rules/*.yaml` through `include`. Render a
+self-contained private input before review; sealing rejects any remaining
+`include` directive:
+
+```sh
+python3.11 -c 'import sys, yaml; sys.path.insert(0, "."); from core.config import load_config_file; yaml.safe_dump(load_config_file("config.yaml"), sys.stdout, sort_keys=False, allow_unicode=True)'
+```
 
 The `seal` command validates and consumes this receipt; it does not approve it:
 

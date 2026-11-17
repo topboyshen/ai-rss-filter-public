@@ -1,16 +1,11 @@
 from pathlib import Path
 
-import yaml
-
+from core.config import load_config_file
 from core.prompts import BUILTIN_PROMPTS
 
 
 def _production_config():
-    return yaml.safe_load(
-        (Path(__file__).resolve().parents[1] / "config.yaml").read_text(
-            encoding="utf-8"
-        )
-    )
+    return load_config_file(Path(__file__).resolve().parents[1] / "config.yaml")
 
 
 def test_production_scoring_routes_have_ordered_cold_backup():

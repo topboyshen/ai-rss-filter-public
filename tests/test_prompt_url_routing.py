@@ -1,8 +1,8 @@
 from copy import deepcopy
 
-import yaml
 from pathlib import Path
 
+from core.config import load_config_file
 from core.prompts import (
     BUILTIN_PROMPTS,
     get_prompt,
@@ -12,11 +12,7 @@ from core.prompts import (
 
 
 def _cfg():
-    return yaml.safe_load(
-        (Path(__file__).resolve().parents[1] / "config.yaml").read_text(
-            encoding="utf-8"
-        )
-    )
+    return load_config_file(Path(__file__).resolve().parents[1] / "config.yaml")
 
 
 def _key_for(url: str, cfg: dict) -> str:

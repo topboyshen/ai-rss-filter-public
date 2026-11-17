@@ -7,9 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import yaml
-
-from core.config import _strategy_fingerprint
+from core.config import _strategy_fingerprint, load_config_file
 from services.score_evidence_capture import _CAPTURE, _publish_capture, capture_article_score
 from services.score_gold import blank_labels
 from utils.score_artifacts import canonical_json
@@ -110,7 +108,7 @@ def test_full_cohort_skips_collection_but_not_scoring(tmp_path):
 
 
 def test_enabled_config_is_bounded_and_does_not_change_score_contract(tmp_path):
-    cfg = yaml.safe_load((ROOT / "config.yaml").read_text())
+    cfg = load_config_file(ROOT / "config.yaml")
     options = cfg.pop("score_evidence_capture")
     assert options == {"enabled": True, "directory": "/app/data/score_evidence/example-cohort",
                        "max_records": 500, "max_record_bytes": 262144}

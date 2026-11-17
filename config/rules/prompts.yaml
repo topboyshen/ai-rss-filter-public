@@ -1,0 +1,11 @@
+prompts: {}
+prompt_matchers:
+- key: macro
+  pattern: wallstreetcn|cls[/.\\-]|财联社|宏观|流动性|央行|降息|降准|北向
+- key: industry
+  pattern: 36kr
+- key: tech
+  # Bound latin AI so hostnames like yicai.com and ai-filter-web are not tech.
+  pattern: 'leiphone|ithome|科技|芯片|(?<![a-z0-9-])ai(?![a-z0-9-])|人工智能|半导体|量子|鸿蒙'
+- key: reddit
+  pattern: reddit|ChinaStocks

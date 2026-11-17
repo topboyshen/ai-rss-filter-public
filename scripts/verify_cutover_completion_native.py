@@ -580,7 +580,7 @@ TEST_GROUPS = (("foundation", TESTS[:22]),
                ("adapters", TESTS[34:39] + TESTS[40:59] + TESTS[60:63] + TESTS[64:71]))
 MOUNTS = ("scripts", "tests", "services", "routes", "core", "db", "utils", "workers", "modules",
           "templates", "app.py", "worker_main.py", "sse_engine.py", "logging_bootstrap.py",
-          "scoring_provenance.py", "scoring_explanation.py", "config.yaml", "docker-compose.yml",
+          "scoring_provenance.py", "scoring_explanation.py", "config.yaml", "config", "docker-compose.yml",
           "ops/isolation", "ops/miniflux", ".github/workflows", "gunicorn.conf.py",
           "Dockerfile", "requirements-prod.txt", "start.sh", "pytest.ini")
 SOURCE_SUPPORT_FILES = ("scripts/run-release-gate.sh", "scripts/check-shell-syntax.sh", "pytest.ini")
@@ -735,6 +735,7 @@ def run(repo, output):
         raise ValueError("clean source required")
     files = sorted({str(path.relative_to(repo)) for name in MOUNTS for path in
                     ([repo / name] if (repo / name).is_file() else (repo / name).rglob("*.py"))}
+                   | {str(path.relative_to(repo)) for path in (repo / "config").rglob("*.yaml")}
                    | {str(path.relative_to(repo)) for path in (repo / "ops/miniflux").iterdir()
                       if path.is_file() and path.suffix in {".json", ".patch"}}
                    | set(TESTS) | set(SOURCE_SUPPORT_FILES) | {"Dockerfile", "requirements.txt", "requirements-prod.txt", "requirements-ops.txt",

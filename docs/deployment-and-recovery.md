@@ -41,7 +41,9 @@ inspect 权限的主体读取；三个服务间凭据继续使用 Docker secret 
 
 发布脚本拒绝 `latest`、`main` 等浮动引用，并记录镜像 digest、Compose manifest、
 `config.yaml` 哈希、源码身份和健康服务集合。应用配置在构建时写入镜像；生产 Compose
-不再从宿主机覆盖挂载 `config.yaml`，因此镜像与实际配置属于同一个不可变发布单元：
+不再从宿主机覆盖挂载 `config.yaml`，因此镜像与实际配置属于同一个不可变发布单元。
+`config.yaml` 通过 `include` 合并的 `config/rules/` 规则表同样写入镜像，由源码身份与
+镜像 digest 固定；配置哈希 label 只覆盖入口 `config.yaml` 本身。
 
 首次发布前创建独立的 Python 3.11 测试环境：
 
