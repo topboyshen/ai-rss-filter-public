@@ -199,6 +199,46 @@ def _source_label(source: dict[str, Any], feed_names: dict[str, str]) -> str:
     return "来源"
 
 
+_EVIDENCE_PLANNED_MARKERS = ("拟", "计划", "接近", "寻求", "考虑", "筹备")
+_EVIDENCE_COMPLETED_MARKERS = (
+    "已完成", "已签署", "已获批", "已交付", "已并网", "已上市", "已纳入",
+    "已实现", "已达成", "已超", "完成", "获批", "并网发电", "纳入国家医保", "签署", "交付",
+)
+_EVIDENCE_OPINION_MARKERS = ("认为", "建议", "观点", "展望", "预计", "判断", "指出", "表示")
+_EVIDENCE_PHASE_LABELS = {
+    "planned": "计划（未完成）",
+    "completed": "已完成表述",
+    "neither": "观点/背景",
+    "unknown": "",
+}
+
+
+def _evidence_phase(claim: object) -> str:
+    """Classify the claim's phase from its frozen text; never from model output."""
+    text = str(claim or "")
+    if not text:
+        return "unknown"
+    if any(marker in text for marker in _EVIDENCE_PLANNED_MARKERS):
+        return "planned"
+    if any(marker in text for marker in _EVIDENCE_COMPLETED_MARKERS):
+        return "completed"
+    if any(marker in text for marker in _EVIDENCE_OPINION_MARKERS):
+        return "neither"
+    return "unknown"
+
+
+def _evidence_stance_label(stance: object, claim: object) -> str:
+    base = {
+        "supports": "支持记录", "contradicts": "否认记录", "context": "背景记录",
+    }.get(stance, "立场未记录")
+    if stance != "supports":
+        return base
+    phase = _evidence_phase(claim)
+    if phase in {"planned", "neither"}:
+        return _EVIDENCE_PHASE_LABELS[phase]
+    return base
+
+
 def _source_view(raw: dict[str, Any], feed_names: dict[str, str]) -> dict[str, Any]:
     source = dict(raw)
     source["publisher"] = _source_label(source, feed_names)
@@ -225,11 +265,18 @@ def _source_view(raw: dict[str, Any], feed_names: dict[str, str]) -> dict[str, A
         observed = _time_view(observation.get("observed_at"))
         observation["observed_at_label"] = observed["label"]
         observation["observed_at_iso"] = observed["iso"]
-        observation["stance_label"] = {
-            "supports": "支持记录", "contradicts": "否认记录", "context": "背景记录",
-        }.get(observation.get("stance"), "立场未记录")
+        observation["phase"] = _evidence_phase(observation.get("claim_text"))
+        observation["phase_label"] = _EVIDENCE_PHASE_LABELS[observation["phase"]]
+        observation["stance_label"] = _evidence_stance_label(
+            observation.get("stance"), observation.get("claim_text")
+        )
         observations.append(observation)
     source["observations"] = observations
+    source["phase"] = _evidence_phase(source.get("claim_text"))
+    source["phase_label"] = _EVIDENCE_PHASE_LABELS[source["phase"]]
+    source["stance_label"] = _evidence_stance_label(
+        source.get("stance"), source.get("claim_text")
+    )
     return source
 
 
