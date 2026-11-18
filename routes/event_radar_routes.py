@@ -740,6 +740,8 @@ def _render_model(model: dict[str, Any], auth: Any) -> Response:
         market_references=market_references,
         mentions_unspecified_etf=mentions_unspecified_etf,
         outcomes=outcomes,
+        outcome_contract_note=detail.get("outcome_contract_note") or "",
+        outcome_contract_state=detail.get("outcome_contract_state") or "",
         investment_views=_investment_horizon_views(outcomes),
         news_kind=_news_kind_view(detail),
         similarities=similarities,

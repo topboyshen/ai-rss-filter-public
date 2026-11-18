@@ -2130,6 +2130,59 @@ def _load_outcomes(
     return combined[:MAX_OUTCOMES], truncated or len(combined) > MAX_OUTCOMES
 
 
+_OUTCOME_CONTRACT_NOTES = {
+    "no_selected_signal": (
+        "该事件没有选中的正式信号，未进入冻结结果契约；"
+        "T+1/T+3/T+5/T+20 不生成结果。"
+    ),
+    "contract_mismatch": (
+        "冻结信号与当前映射契约不一致（映射已修订或版本不同），"
+        "历史结果不再生成；不估算补齐。"
+    ),
+    "no_direct_contract": (
+        "该事件只有概念/基准或无直接映射，未进入冻结结果契约；"
+        "结果区不生成记录。"
+    ),
+}
+
+
+def _outcome_contract_state(
+    conn: sqlite3.Connection, root_event_id: str, read_at: int
+) -> tuple[str, str]:
+    """Explain why an empty market tab has no per-horizon rows."""
+    formal_paths = tuple(sorted(FORMAL_SIGNAL_SCORE_PATHS))
+    placeholders = ",".join("?" for _ in formal_paths)
+    selected = conn.execute(
+        _event_group_cte()
+        + " SELECT signal.id FROM event_group CROSS JOIN backtest_signals AS signal "
+        "ON event_group.event_id = signal.event_id "
+        "WHERE signal.selected = 1 AND signal.available_at > 0 AND signal.available_at <= ? "
+        f"AND LOWER(TRIM(COALESCE(signal.score_path, ''))) IN ({placeholders}) LIMIT 1",
+        (root_event_id, read_at, *formal_paths),
+    ).fetchone()
+    if selected is None:
+        state = "no_selected_signal"
+        return state, _OUTCOME_CONTRACT_NOTES[state]
+    frozen = conn.execute(
+        _event_group_cte()
+        + " SELECT 1 FROM event_group CROSS JOIN backtest_signals AS signal "
+        "ON event_group.event_id = signal.event_id "
+        "JOIN backtest_signal_securities AS frozen ON frozen.ledger_signal_id = signal.id "
+        "JOIN event_securities AS mapping ON mapping.mapping_id = frozen.mapping_id "
+        "AND mapping.event_id = frozen.event_id "
+        "AND mapping.security_id = frozen.security_id "
+        "AND mapping.revision = frozen.mapping_revision "
+        "WHERE signal.selected = 1 AND signal.available_at > 0 AND signal.available_at <= ? "
+        f"AND LOWER(TRIM(COALESCE(signal.score_path, ''))) IN ({placeholders}) "
+        "AND LOWER(mapping.relation_type) IN "
+        "('direct', 'direct_impact', 'affected', 'upstream', 'downstream', 'ecosystem') "
+        "LIMIT 1",
+        (root_event_id, read_at, *formal_paths),
+    ).fetchone()
+    state = "contract_mismatch" if frozen is None else "no_direct_contract"
+    return state, _OUTCOME_CONTRACT_NOTES[state]
+
+
 def _pending_outcome_view(
     mapping: dict[str, Any],
     *,
@@ -2689,10 +2742,16 @@ def _load_detail(
     market_references = _load_market_references(conn, root_event_id, read_at)
     outcomes: list[dict[str, Any]] = []
     outcomes_truncated = False
+    outcome_contract_state = ""
+    outcome_contract_note = ""
     similar_events: list[dict[str, Any]] = []
     similarities_truncated = False
     if tab == "market":
         outcomes, outcomes_truncated = _load_outcomes(conn, root_event_id, read_at)
+        if not outcomes:
+            outcome_contract_state, outcome_contract_note = _outcome_contract_state(
+                conn, root_event_id, read_at
+            )
     elif tab == "similar":
         similar_events, similarities_truncated = _load_similar_events(
             conn,
@@ -2735,6 +2794,8 @@ def _load_detail(
         "mentions_unspecified_etf": "ETF" in str(row["title"] or "").upper(),
         "outcomes": outcomes,
         "outcomes_truncated": outcomes_truncated,
+        "outcome_contract_state": outcome_contract_state,
+        "outcome_contract_note": outcome_contract_note,
         "similar_events": similar_events,
         "similarities_truncated": similarities_truncated,
     }
