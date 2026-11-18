@@ -1285,7 +1285,7 @@
                     </time>
                   </div>
                 </div>
-                <div class="mapping-note">{{ source.source_contract_label or '历史来源记录 · 来源契约未知' }}；{{ source.stance_record_label or '历史立场字段未核验' }}</div>
+                <div class="mapping-note">{{ source.source_contract_label or '历史来源记录 · 来源契约未知' }}；{{ source.stance_record_label or '历史立场字段未核验' }}{% if source.phase_label %} · {{ source.phase_label }}{% endif %}</div>
                 <div class="source-claim">{{ source.claim_label or '存档标题（来源契约未核验）' }}：{{ source.claim_text or source.title or '查看原始来源' }}</div>
                 {% if source.excerpt %}<div class="source-excerpt">存档摘录（不作为原文证据）：{{ source.excerpt }}</div>{% endif %}
                 {% if source.has_stance_conflict %}<div class="source-excerpt">同一链接存在不同立场记录（不等于同一声明已被证伪），请对照留存观察。</div>{% endif %}
