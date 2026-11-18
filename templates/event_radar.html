@@ -1167,7 +1167,7 @@
             <div>
               <div class="empty-mark">T+</div>
               <div class="empty-title">尚无市场反应数据</div>
-              <div class="empty-copy">T+1 / T+3 / T+5 / T+20 可能尚未到期，或该事件没有可验证的证券映射、事件后基准收盘价与沪深300收盘价。空缺不会用估算值补齐。</div>
+              <div class="empty-copy">{{ outcome_contract_note or 'T+1 / T+3 / T+5 / T+20 可能尚未到期，或该事件没有可验证的证券映射、事件后基准收盘价与沪深300收盘价。空缺不会用估算值补齐。' }}</div>
             </div>
           </div>
           {% endif %}
