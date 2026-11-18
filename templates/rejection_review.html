@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>被拒文章复核 · AI Filter</title>
+    <style>
+        body { margin: 0; background: #101820; color: #e2e8f0; font: 16px/1.7 system-ui, sans-serif; }
+        main { max-width: 900px; margin: auto; padding: 24px 18px 48px; }
+        h1 { font-size: 25px; margin-bottom: 8px; }
+        a { color: #93c5fd; }
+        .muted { color: #b2becd; font-size: 14px; }
+        .scope, .summary, .filters, .item, .status, .paging { border: 1px solid #465362; padding: 16px; border-radius: 10px; margin: 16px 0; overflow-wrap: anywhere; }
+        h2 { font-size: 18px; margin: 0 0 8px; }
+        p { margin: 8px 0; }
+        .facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 10px 0 0; }
+        .facts div { border: 1px solid #37424f; border-radius: 8px; padding: 10px 12px; }
+        .facts dt { color: #b2becd; font-size: 13px; }
+        .facts dd { margin: 4px 0 0; font-size: 22px; font-weight: 650; }
+        .filters a, .chip { display: inline-block; border: 1px solid #465362; border-radius: 999px; padding: 2px 10px; margin: 2px 4px 2px 0; font-size: 13px; text-decoration: none; color: #cbd5e1; }
+        .filters a.active { border-color: #93c5fd; color: #101820; background: #93c5fd; }
+        .facts a.active { color: #101820; background: #93c5fd; border-radius: 6px; padding: 0 6px; }
+        .scoreline { font-size: 14px; }
+        .score { font-weight: 700; font-size: 17px; color: #fbbf24; }
+        .reasons .chip { color: #fcd34d; border-color: #6b5a2a; }
+        .logic { font-size: 14px; color: #d7dee8; border-left: 3px solid #465362; padding-left: 10px; }
+        form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 12px; }
+        input[name="note"] { flex: 1 1 220px; min-width: 0; background: #0b1218; color: #e2e8f0; border: 1px solid #465362; border-radius: 8px; padding: 8px 10px; font: inherit; font-size: 14px; }
+        button { background: #1d4ed8; color: #fff; border: 0; border-radius: 8px; padding: 9px 14px; font: inherit; font-size: 14px; cursor: pointer; min-height: 44px; }
+        button.secondary { background: #374151; }
+        button.danger { background: #7f1d1d; }
+        .paging { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; font-size: 14px; }
+        @media (max-width: 600px) {
+            main { padding: 16px 12px 36px; }
+            .facts { grid-template-columns: 1fr 1fr; }
+        }
+    </style>
+</head>
+<body>
+<main>
+    <nav>
+        {% if news_home_origin %}<a href="{{ news_home_origin }}/">返回新闻首页</a> · {% endif %}
+        <a href="/dashboard">后台首页</a> ·
+        <a href="/dashboard/neutral-records">保守处理记录</a>
+    </nav>
+    <h1>被拒文章复核</h1>
+    <section class="scope" aria-label="查看范围">
+        <p>仅当前缓存 · 近{{ snapshot.window_hours }}小时 · 按收录时间倒序 · 每页25条</p>
+        <p class="muted">“被拒”指分数低于该来源的达标阈值。恢复或确认只写入人工复核台账，不改写分数、评分路径、评分契约，也不影响通知与已发布的摘要。</p>
+        <p class="muted">72 小时后低分缓存会被清理，所以可复核窗口与缓存保留期一致；已经写下的判断不会随缓存清理消失。</p>
+        <p class="muted">“规则理由”来自评分流程当时记录的代码；“模型自述”是模型当时写的解释，用于理解，不是评分依据，也不保证准确。</p>
+    </section>
+
+    {% if view.decided_text %}<p class="status" role="status">{{ view.decided_text }}</p>{% endif %}
+
+    {% if not snapshot.available %}
+        <p class="status" role="status">复核数据暂不可读取，无法判断是否存在被拒记录。请稍后重新打开。</p>
+    {% else %}
+        <section class="summary" aria-label="近72小时概况">
+            <p>近{{ snapshot.window_hours }}小时收录 {{ snapshot.window_total }} 条，其中低于来源达标阈值 {{ view.summary.rejected }} 条{% if snapshot.truncated %}（已达到读取上限，以下统计为下限）{% endif %}。</p>
+            <dl class="facts">
+                <div><dt>有规则理由</dt><dd>{{ view.summary.with_rule_reason }}</dd></div>
+                <div><dt><a class="{{ 'active' if view.restored_active }}" href="{{ view.restored_href }}">已恢复</a></dt><dd>{{ view.summary.restored }}</dd></div>
+                <div><dt><a class="{{ 'active' if view.confirmed_active }}" href="{{ view.confirmed_href }}">已确认拒绝</a></dt><dd>{{ view.summary.confirmed }}</dd></div>
+            </dl>
+            {% if view.restored_active or view.confirmed_active %}
+            <p class="muted">正在只看已做判断的记录；<a href="{{ view.all_href }}">查看全部</a>。</p>
+            {% endif %}
+        </section>
+
+        <section class="filters" aria-label="筛选">
+            <p>范围：
+                <a class="{{ 'active' if view.all_active }}" href="{{ view.all_href }}">全部</a>
+                <a class="{{ 'active' if view.rule_active }}" href="{{ view.rule_href }}">仅规则理由</a>
+                <a class="{{ 'active' if view.none_active }}" href="{{ view.none_href }}">无规则理由</a>
+            </p>
+            {% if view.summary.by_path %}
+            <p class="muted">决策层：
+                {% for entry in view.summary.by_path %}
+                <a class="{{ 'active' if entry.active }}" href="{{ entry.href }}">{{ entry.label }} · {{ entry.count }}</a>
+                {% endfor %}
+            </p>
+            {% endif %}
+            {% if view.summary.by_reason %}
+            <p class="muted">规则理由：
+                {% for entry in view.summary.by_reason %}
+                <a class="{{ 'active' if entry.active }}" href="{{ entry.href }}">{{ entry.label }} · {{ entry.count }}</a>
+                {% endfor %}
+            </p>
+            {% endif %}
+        </section>
+
+        {% if not view.records %}
+            <p class="status" role="status">当前筛选下没有可复核的被拒记录；这不代表没有新文章，也不代表筛选质量已通过。</p>
+        {% else %}
+            <p class="muted">当前筛选 {{ snapshot.matches }} 条，本页显示 {{ view.records|length }} 条。{% if snapshot.capped %}结果超过 {{ snapshot.page_capacity }} 条，仅可翻到较新的部分；请用筛选缩小范围。{% endif %}</p>
+            {% for item in view.records %}
+            <article class="item">
+                <h2>{% if item.link %}<a href="{{ item.link }}" target="_blank" rel="noopener noreferrer">{{ item.title }}</a>{% else %}{{ item.title }}{% endif %}</h2>
+                <p class="muted">{{ item.source }} · {{ item.ingested_at }}</p>
+                <p class="scoreline"><span class="score">{{ item.score_text }}</span> / 达标阈值 {{ item.threshold_text }} · {{ item.path_label }}{% if item.decision_label %} · <strong>{{ item.decision_label }}</strong>{% endif %}</p>
+                {% if item.reasons %}
+                <p class="reasons">规则理由：{% for reason in item.reasons %}<span class="chip">{{ reason.text }}</span>{% endfor %}</p>
+                {% else %}
+                <p class="muted">规则理由：未记录</p>
+                {% endif %}
+                {% if item.logic %}<p class="logic"><span class="muted">模型自述：</span>{{ item.logic }}</p>{% endif %}
+                {% if item.decision_note %}<p class="muted">复核备注：{{ item.decision_note }}</p>{% endif %}
+                <form method="post" action="{{ url_for('rejection_review.rejection_decision') }}">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <input type="hidden" name="link" value="{{ item.link }}">
+                    {% if not item.decision %}
+                    <input type="text" name="note" maxlength="500" placeholder="备注（可选，记录判断依据）" aria-label="复核备注">
+                    <button type="submit" name="action" value="restore">恢复（误判）</button>
+                    <button class="secondary" type="submit" name="action" value="confirm">确认该拒</button>
+                    {% else %}
+                    <button class="danger" type="submit" name="action" value="revoke">撤销判断</button>
+                    {% endif %}
+                </form>
+            </article>
+            {% endfor %}
+
+            <nav class="paging" aria-label="翻页">
+                {% if snapshot.has_prev %}<a href="{{ view.prev_href }}">上一页</a>{% else %}<span class="muted">上一页</span>{% endif %}
+                <span class="muted">第 {{ snapshot.page }} / {{ snapshot.pages }} 页</span>
+                {% if snapshot.has_next %}<a href="{{ view.next_href }}">下一页</a>{% else %}<span class="muted">下一页</span>{% endif %}
+            </nav>
+        {% endif %}
+    {% endif %}
+</main>
+</body>
+</html>

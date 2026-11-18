@@ -13,6 +13,7 @@ from routes.integration_routes import integration_bp
 from routes.webhook_routes import webhook_bp
 from routes.jin10_routes import jin10_bp
 from routes.neutral_records_routes import neutral_records_bp
+from routes.rejection_review_routes import rejection_review_bp
 from routes.shared import (
     init_db as _init_db,
     _allowed_cors_origin,
@@ -134,6 +135,7 @@ app.register_blueprint(integration_bp)
 app.register_blueprint(webhook_bp)
 app.register_blueprint(jin10_bp)
 app.register_blueprint(neutral_records_bp)
+app.register_blueprint(rejection_review_bp)
 
 # Glance polls this short-lived, SQLite-backed HTML endpoint every 30 seconds.
 app.add_url_rule("/glance-sse", "glance_sse", glance_sse_widget, methods=["GET"])
