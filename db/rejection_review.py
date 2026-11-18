@@ -278,8 +278,9 @@ def record_decision(item: dict, decision: str, note: str = "") -> None:
                 conn.execute(
                     "INSERT INTO article_review_decisions "
                     "(link, decision, note, raw_title, feed_url, score, "
-                    "score_path, review_reason, logic, strategy_version, "
-                    "decided_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "pass_threshold, score_path, review_reason, logic, "
+                    "strategy_version, decided_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         item["link"],
                         decision,
@@ -287,6 +288,7 @@ def record_decision(item: dict, decision: str, note: str = "") -> None:
                         str(item["raw_title"] or item["title"] or ""),
                         item["feed_url"],
                         item["score"],
+                        item["threshold"],
                         item["score_path"],
                         item["review_reason"],
                         item["logic"],

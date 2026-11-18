@@ -282,6 +282,7 @@ def test_restore_writes_snapshot_and_never_rewrites_score(review_browser):
     assert rows[0]["decision"] == "restored"
     assert rows[0]["note"] == "有新增订单"
     assert rows[0]["score"] == 4.0
+    assert rows[0]["pass_threshold"] == 6.5
     assert rows[0]["score_path"] == "stage2"
     assert rows[0]["review_reason"] == "fast_pass_hint"
     assert rows[0]["raw_title"] == "应被恢复的文章"
