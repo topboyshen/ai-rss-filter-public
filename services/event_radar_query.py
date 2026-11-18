@@ -1033,6 +1033,20 @@ def _event_group_has_public_evidence(
     )
 
 
+def _claim_mentions_security(
+    claim: object, name: object, ticker: object, aliases: list[str]
+) -> bool:
+    """Return whether the frozen claim text actually names this security."""
+    text = str(claim or "").casefold()
+    if not text:
+        return False
+    for value in (name, ticker, *aliases):
+        candidate = str(value or "").strip().casefold()
+        if len(candidate) >= 2 and candidate in text:
+            return True
+    return False
+
+
 def _merge_stock_mapping(
     stocks_by_id: dict[str, dict[str, Any]],
     row: sqlite3.Row | dict[str, Any],
@@ -1083,12 +1097,24 @@ def _merge_stock_mapping(
     stock["has_direction_conflict"] = bool(
         stock["has_direction_conflict"] or direction_conflict
     )
+    evidence = evidence_by_mapping.get(mapping_id, [])
+    name_evidence = True
+    relation_label = _RELATION_LABELS[relation_type]
+    if relation_type == "concept":
+        name_evidence = any(
+            _claim_mentions_security(
+                item.get("claim_text"), stock["name"], stock["ticker"], stock["aliases"]
+            )
+            for item in evidence
+        )
+        relation_label = "概念（原文点名）" if name_evidence else "概念（来源未点名）"
     stock["relations"].append(
         {
             "mapping_id": mapping_id,
             "event_id": str(row["mapping_event_id"]),
             "relation_type": relation_type,
-            "relation_label": _RELATION_LABELS[relation_type],
+            "relation_label": relation_label,
+            "name_evidence": name_evidence,
             "direction": _bounded_text(row["direction"], 64),
             "expected_gap": _finite_float(row["expected_gap"]),
             "confidence": float(row["confidence"]),
@@ -1108,8 +1134,14 @@ def _merge_stock_mapping(
             "candidate_event_count": int(row["candidate_event_count"]),
             "direction_variant_count": direction_variant_count,
             "direction_conflict": direction_conflict,
-            "evidence": evidence_by_mapping.get(mapping_id, []),
+            "evidence": evidence,
         }
+    )
+    concept_relations = [
+        relation for relation in stock["relations"] if relation["relation_type"] == "concept"
+    ]
+    stock["concept_unbacked_all"] = bool(concept_relations) and all(
+        not relation["name_evidence"] for relation in concept_relations
     )
 
 

@@ -55,7 +55,7 @@
       </div>
       <div class="event-radar-summary-title">{{ event.title or '未命名事件' }}</div>
       <div class="event-radar-summary-stocks" aria-label="相关股票前三名">
-        {% for stock in event.stocks[:3] %}<span class="event-radar-summary-stock">{{ stock.name or stock.ticker or '未命名股票' }}<span class="event-radar-summary-relation">·{% if stock.relation_type in ['direct', 'direct_impact', 'affected'] %}直接{% elif stock.relation_type == 'upstream' %}上游{% elif stock.relation_type == 'downstream' %}下游{% elif stock.relation_type == 'ecosystem' %}生态{% else %}关联{% endif %} · {{ stock.mapping_contract_label or '历史映射 · 写入契约未知' }}</span></span>{% endfor %}
+        {% for stock in event.stocks[:3] %}<span class="event-radar-summary-stock">{{ stock.name or stock.ticker or '未命名股票' }}<span class="event-radar-summary-relation">·{% if stock.relation_type in ['direct', 'direct_impact', 'affected'] %}直接{% elif stock.relation_type == 'upstream' %}上游{% elif stock.relation_type == 'downstream' %}下游{% elif stock.relation_type == 'ecosystem' %}生态{% else %}关联{% endif %} · {{ stock.mapping_contract_label or '历史映射 · 写入契约未知' }}{% if stock.concept_unbacked_all %} · 来源未点名{% endif %}</span></span>{% endfor %}
       </div>
       <div class="event-radar-summary-bottom">
         <span class="event-radar-summary-direction{% if direction in ['看多','利多','bullish','positive','up'] %} is-bull{% elif direction in ['看空','利空','bearish','negative','down'] %} is-bear{% endif %}">{{ direction }}</span>

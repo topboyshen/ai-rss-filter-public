@@ -979,7 +979,7 @@
               {% if event.stocks %}
               <div class="event-stock-chips" aria-label="相关股票前三名">
                 {% for stock in event.stocks[:3] %}
-                <span class="event-stock-chip{% if stock.relation_type == 'concept' %} is-concept{% endif %}"{% if stock.relation_type == 'concept' %} title="来自主题概念股票池，证据强度弱于直接关系"{% endif %}>{{ stock.name or stock.ticker or '未命名股票' }} · {{ stock.mapping_contract_label or '历史映射 · 写入契约未知' }}</span>
+                <span class="event-stock-chip{% if stock.relation_type == 'concept' %} is-concept{% endif %}"{% if stock.relation_type == 'concept' %} title="来自主题概念股票池，证据强度弱于直接关系"{% endif %}>{{ stock.name or stock.ticker or '未命名股票' }} · {{ stock.mapping_contract_label or '历史映射 · 写入契约未知' }}{% if stock.concept_unbacked_all %} · 来源未点名{% endif %}</span>
                 {% endfor %}
               </div>
               {% endif %}
@@ -1342,6 +1342,9 @@
                     <span class="relation-badge">{{ relation.relation_label or relation.relation_type or '关系待确认' }}</span>
                     <span class="direction-badge {{ direction_class(relation.direction or '中性') }}">{{ relation.direction or '中性' }}</span>
                   </div>
+                  {% if relation.relation_type == 'concept' and not relation.name_evidence %}
+                  <div class="mapping-note">来源未点名该公司，仅为主题池映射；不构成公司事件关系。</div>
+                  {% endif %}
                   <div class="mapping-note">{{ relation.mapping_contract_label or '历史映射 · 写入契约未知' }}。{% if not relation.mapping_contract_current %}历史数值仅保留，不作为当前契约复核结论。{% else %}仅核对写入来源与规则身份，不代表事实已核验。{% endif %}</div>
                   <div class="mapping-note">映射契约：{{ relation.mapping_version or '未记录' }}</div>
                   {% if relation.direction_conflict %}
