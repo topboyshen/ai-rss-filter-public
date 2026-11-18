@@ -677,6 +677,9 @@
       border: 1px solid var(--border);
       background: rgba(148, 163, 184, .05);
       color: var(--muted);
+      /* Contract ids are long unbroken tokens; keep them inside the card. */
+      overflow-wrap: anywhere;
+      word-break: break-word;
     }
     .conflict-note {
       border: 1px solid rgba(242, 198, 109, .28);
