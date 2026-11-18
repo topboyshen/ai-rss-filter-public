@@ -45,7 +45,8 @@ _LOGIN_RATE_MAX_ATTEMPTS = 5
 _SESSION_STORE_PREFIX = "ai-filter:dashboard-session"
 _ALLOWED_NEXT_PATHS = frozenset(
     {"/dashboard", "/dashboard/events", "/dashboard/events/daily",
-     "/dashboard/events/weekly", "/dashboard/neutral-records"}
+     "/dashboard/events/weekly", "/dashboard/neutral-records",
+     "/dashboard/rejections"}
 )
 _STOCK_NEXT_PATH_RE = re.compile(
     r"/dashboard/stocks/(?:SSE|SZSE|BSE)/[0-9]{6}\Z"

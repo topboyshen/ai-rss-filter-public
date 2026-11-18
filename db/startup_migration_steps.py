@@ -147,6 +147,7 @@ def _operational_tables(conn):
                         db._init_feed_health, db._init_llm_call_logs, db.init_news_processing_storage,
                         db.init_score_quality_storage, db.init_first_rejection_storage,
                         db._init_article_feedback, db._init_feedback_example_snapshots,
+                        db._init_article_review_decisions,
                         db._init_scoring_contract_snapshots):
         initializer(cursor)
     db._ensure_news_cache_indexes(conn)

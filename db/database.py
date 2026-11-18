@@ -536,6 +536,7 @@ def init_db() -> None:
             _sync_feed_health_from_config(cursor)  # 启动时同步 config → feed_health
             _init_article_feedback(cursor)
             _init_feedback_example_snapshots(cursor)
+            _init_article_review_decisions(cursor)
             _init_scoring_contract_snapshots(cursor)
             _ensure_news_cache_indexes(conn)
             if initialize_event_core_markers:
@@ -2388,6 +2389,61 @@ def _init_article_feedback(cursor) -> None:
         "CREATE INDEX IF NOT EXISTS idx_article_feedback_link_created_id "
         "ON article_feedback(link, created_at DESC, id DESC)"
     )
+
+
+def _init_article_review_decisions(cursor) -> None:
+    """Human review of rejected records: append-only, snapshot-bearing ledger."""
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS article_review_decisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            link TEXT NOT NULL,
+            decision TEXT NOT NULL CHECK (decision IN ('restored', 'confirmed')),
+            note TEXT NOT NULL DEFAULT '',
+            raw_title TEXT NOT NULL DEFAULT '',
+            feed_url TEXT NOT NULL DEFAULT '',
+            score REAL,
+            pass_threshold REAL,
+            score_path TEXT NOT NULL DEFAULT '',
+            review_reason TEXT NOT NULL DEFAULT '',
+            logic TEXT NOT NULL DEFAULT '',
+            strategy_version TEXT NOT NULL DEFAULT '',
+            decided_at INTEGER NOT NULL,
+            revoked_at INTEGER,
+            CHECK (revoked_at IS NULL OR revoked_at >= decided_at)
+        )
+    """)
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_article_review_decision_active "
+        "ON article_review_decisions(link) WHERE revoked_at IS NULL"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_article_review_decision_decided "
+        "ON article_review_decisions(decided_at DESC)"
+    )
+    cursor.execute("""
+        CREATE TRIGGER IF NOT EXISTS trg_article_review_decision_append_only
+        BEFORE UPDATE ON article_review_decisions
+        WHEN NOT (
+            OLD.revoked_at IS NULL AND NEW.revoked_at IS NOT NULL
+            AND NEW.id IS OLD.id AND NEW.link IS OLD.link
+            AND NEW.decision IS OLD.decision AND NEW.note IS OLD.note
+            AND NEW.raw_title IS OLD.raw_title AND NEW.feed_url IS OLD.feed_url
+            AND NEW.score IS OLD.score AND NEW.score_path IS OLD.score_path
+            AND NEW.review_reason IS OLD.review_reason AND NEW.logic IS OLD.logic
+            AND NEW.strategy_version IS OLD.strategy_version
+            AND NEW.decided_at IS OLD.decided_at
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'article review decisions are append-only');
+        END
+    """)
+    cursor.execute("""
+        CREATE TRIGGER IF NOT EXISTS trg_article_review_decision_no_delete
+        BEFORE DELETE ON article_review_decisions
+        BEGIN
+            SELECT RAISE(ABORT, 'article review decisions are append-only');
+        END
+    """)
 
 
 def _init_feedback_example_snapshots(cursor) -> None:
