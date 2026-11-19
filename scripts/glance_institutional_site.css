@@ -342,6 +342,8 @@ body:has(.ai-site-shell) footer.footer > div > div:has(> a[href*="beian.miit.gov
 body:has(.ai-site-shell) footer.footer > div > div:has(> a[href*="beian.miit.gov.cn"]):has(> a[href*="beian.mps.gov.cn"]) > a { color: #d8e0e4 !important; }
 body:has(.ai-site-shell) .mobile-navigation { color: var(--ai-ink); background: var(--ai-paper); }
 body:has(.ai-site-shell) .mobile-navigation-page-links { flex-wrap: wrap; }
+/* One fixed editorial palette; Glance's theme picker cannot change it. */
+body:has(.ai-site-shell) .theme-picker { display: none; }
 
 @media (max-width: 1190px) {
   html:root:has(.ai-site-shell) { --ai-inset: 32px; --ai-column-gap: 30px; }

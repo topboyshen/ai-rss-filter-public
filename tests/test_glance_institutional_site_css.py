@@ -75,9 +75,15 @@ def test_all_inner_columns_remain_available_and_navigation_remains_accessible():
     # One full-width navy footer on every page, home included.
     assert "width: 100%" in css and "box-sizing: border-box" in css
     assert "background: transparent !important" in css
+    # The editorial skin is single-theme; do not leave an inert picker.
+    assert ".theme-picker" in css and "display: none" in css
     for selector, declarations in _rules():
         if re.search(r"display\s*:\s*none", declarations):
-            assert ".header-container" in selector or ".mobile-navigation-label:has(> .mobile-navigation-input)" in selector
+            assert (
+                ".header-container" in selector
+                or ".mobile-navigation-label:has(> .mobile-navigation-input)" in selector
+                or ".theme-picker" in selector
+            )
         assert not (".ai-institutional-disclaimer" in selector and "visibility: hidden" in declarations)
 
 
