@@ -105,12 +105,19 @@ def readiness(root, descriptor, *, fresh=True, state=None):
         if fresh:
             gate._require(0 <= gate._elapsed() - pulse["elapsed"] <= MAX_PULSE_AGE
                           and 0 <= time.time() - pulse["wall"] <= MAX_PULSE_AGE, "activation readiness expired")
-        expected = {"quotes", "dispatcher", "quant_context"} if receipt["role"] == "worker" else set()
+        expected = (
+            {"quotes", "dispatcher", "quant_context", "score_continuations"}
+            if receipt["role"] == "worker" else set()
+        )
         gate._require(set(ready["threads"]) == expected
                       and ready["dependencies"] == ({"redis": True} if expected else {}), "activation subsystems differ")
         if expected:
-            gate._require(ready["threads"]["quotes"] is not None and ready["threads"]["dispatcher"] is not None,
-                          "required business thread absent")
+            gate._require(
+                ready["threads"]["quotes"] is not None
+                and ready["threads"]["dispatcher"] is not None
+                and ready["threads"]["score_continuations"] is not None,
+                "required business thread absent",
+            )
         result[slot] = {"receipt": receipt, "ready": ready, "pulse": pulse}
     return result
 
