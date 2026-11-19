@@ -344,8 +344,9 @@ body:has(.ai-site-shell) .mobile-navigation-page-links { flex-wrap: wrap; }
     animation: none;
   }
   body:has(.ai-site-shell):not(:has(.ai-home-institutional-masthead)) .mobile-navigation-label:has(> .mobile-navigation-input) { display: none; }
-  body:has(.ai-site-shell) footer.footer > div:has(> div > a[href*="beian.miit.gov.cn"]):has(> div > a[href*="beian.mps.gov.cn"]) {
+  body:has(.ai-site-shell) footer.footer > div > div:has(> a[href*="beian.miit.gov.cn"]):has(> a[href*="beian.mps.gov.cn"]) {
     position: static !important;
+    z-index: auto !important;
     width: auto !important;
     transform: none !important;
   }

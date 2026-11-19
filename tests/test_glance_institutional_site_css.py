@@ -70,6 +70,8 @@ def test_all_inner_columns_remain_available_and_navigation_remains_accessible():
     assert "grid-template-columns: minmax(0, 1fr)" in css
     assert "minmax(min(100%, 200px), 1fr)" in css
     assert "footer.footer" in css and "position: static !important" in css
+    # The proxy-injected ICP wrapper is the inner div with position:fixed.
+    assert 'footer.footer > div > div:has(> a[href*="beian.miit.gov.cn"])' in css
     for selector, declarations in _rules():
         if re.search(r"display\s*:\s*none", declarations):
             assert ".header-container" in selector or ".mobile-navigation-label:has(> .mobile-navigation-input)" in selector
