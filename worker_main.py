@@ -124,6 +124,7 @@ def run_business(*, activation=None) -> int:
         start_quant_market_context_poller,
         stop_quant_market_context_poller,
     )
+    from services.score_continuation_worker import start_score_continuation_worker
 
     stop = threading.Event()
 
@@ -137,8 +138,14 @@ def run_business(*, activation=None) -> int:
     quotes_thread = _ensure_quotes_refresher()
     dispatcher_thread = start_webhook_dispatcher()
     quant_context_thread = start_quant_market_context_poller()
+    score_continuation_thread = start_score_continuation_worker(stop)
 
-    business_threads = {"quotes": quotes_thread, "dispatcher": dispatcher_thread, "quant_context": quant_context_thread}
+    business_threads = {
+        "quotes": quotes_thread,
+        "dispatcher": dispatcher_thread,
+        "quant_context": quant_context_thread,
+        "score_continuations": score_continuation_thread,
+    }
     if activation is not None:
         activation.prepared(business_threads, {"redis": True})
         while not activation.opened():
@@ -189,6 +196,9 @@ def run_business(*, activation=None) -> int:
         logger.exception("[Worker] failed to write shutdown health snapshot")
     stop_quotes_refresher(timeout=15.0)
     stop_quant_market_context_poller(timeout=12.0)
+    score_continuation_thread.join(timeout=15.0)
+    if score_continuation_thread.is_alive():
+        logger.warning("[Worker] score continuation timer did not stop within 15s")
     drained = stop_webhook_dispatcher(timeout=60.0)
     if not drained:
         logger.error("[Worker] shutdown deadline reached; claimed tasks remain leased")
@@ -202,6 +212,7 @@ def _worker_subsystems(threads, activation):
     from routes.webhook_routes import start_webhook_dispatcher
     from services.quant_market_context import (quant_context_enabled, start_quant_market_context_poller, stop_quant_market_context_poller)
     quotes_thread, dispatcher_thread, quant_context_thread = (threads[key] for key in ("quotes", "dispatcher", "quant_context"))
+    score_continuation_thread = threads.get("score_continuations")
 
     if activation is not None:
         activation.pulse()
@@ -211,6 +222,8 @@ def _worker_subsystems(threads, activation):
         required = {"quotes", "dispatcher"}
         if quant_context_enabled():
             required.add("quant_context")
+        if score_continuation_thread is not None:
+            required.add("score_continuations")
         if any(threads[name] is not activation.threads[name] or threads[name] is None
                or not threads[name].is_alive() for name in required):
             raise RuntimeError("activated business subsystem died or changed; restart forbidden")
@@ -239,7 +252,14 @@ def _worker_subsystems(threads, activation):
         subsystems["quant_context"] = bool(
             quant_context_thread is not None and quant_context_thread.is_alive()
         )
-    threads.update(quotes=quotes_thread, dispatcher=dispatcher_thread, quant_context=quant_context_thread)
+    if score_continuation_thread is not None:
+        subsystems["score_continuations"] = bool(score_continuation_thread.is_alive())
+    threads.update(
+        quotes=quotes_thread,
+        dispatcher=dispatcher_thread,
+        quant_context=quant_context_thread,
+        score_continuations=score_continuation_thread,
+    )
     return subsystems
 
 if __name__ == "__main__":
