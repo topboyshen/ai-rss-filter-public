@@ -322,14 +322,23 @@ body:has(.ai-site-shell) .ops-summary-status[style*="color:#d97706"],
 body:has(.ai-site-shell) .ops-summary-card:first-child .ops-summary-value[style*="color:#d97706"] { color: #935000 !important; }
 
 body:has(.ai-site-shell) footer.footer {
+  width: 100%;
   max-width: 1440px;
+  box-sizing: border-box;
   margin-inline: auto;
   padding: 24px var(--ai-inset);
   background: var(--ai-navy);
   color: #d8e0e4;
 }
 body:has(.ai-site-shell) footer.footer a { color: #edf0f1; }
-body:has(.ai-site-shell) footer.footer > div > div:has(> a[href*="beian.miit.gov.cn"]):has(> a[href*="beian.mps.gov.cn"]),
+body:has(.ai-site-shell) footer.footer > div > div:has(> a[href*="beian.miit.gov.cn"]):has(> a[href*="beian.mps.gov.cn"]) {
+  position: static !important;
+  z-index: auto !important;
+  padding: 10px 0 !important;
+  background: transparent !important;
+  border: 0 !important;
+  color: #d8e0e4 !important;
+}
 body:has(.ai-site-shell) footer.footer > div > div:has(> a[href*="beian.miit.gov.cn"]):has(> a[href*="beian.mps.gov.cn"]) > a { color: #d8e0e4 !important; }
 body:has(.ai-site-shell) .mobile-navigation { color: var(--ai-ink); background: var(--ai-paper); }
 body:has(.ai-site-shell) .mobile-navigation-page-links { flex-wrap: wrap; }
