@@ -99,6 +99,21 @@ def _record_remaining(cfg, continuations):
         continuations["errors"] = continuations.get("errors", 0) + 1
 
 
+def run_continuations_batch(cfg, *, refresh_id=None):
+    """Run one bounded continuation batch and account for its LLM calls.
+
+    Refresh uses this before fetching sources.  The worker timer uses the same
+    entry point so a deferral created near the end of a round does not have to
+    wait for the next full refresh.
+    """
+    batch_id = refresh_id or uuid.uuid4().hex
+    with capture_llm_calls() as continuation_calls:
+        with processing_origin("natural_continuation", batch_id):
+            continuations = resume_continuations(cfg, run_entry=process_entry)
+    continuations["api_calls"] = continuation_calls.total
+    return continuations
+
+
 def _refresh_one_feed(feed, cfg, name):
     feed_start = time.time()
     url = feed["url"]
@@ -148,10 +163,7 @@ def _execute_feed_refresh():
     logger.info("[Refresh] 后台刷新开始，共 %d 个启用 feeds", len(enabled_feeds))
     logger.info("[Refresh] refresh_id=%s", refresh_id)
     try:
-        with capture_llm_calls() as continuation_calls:
-            with processing_origin("natural_continuation", refresh_id):
-                continuations = resume_continuations(cfg, run_entry=process_entry)
-        continuations["api_calls"] = continuation_calls.total
+        continuations = run_continuations_batch(cfg, refresh_id=refresh_id)
         for feed in enabled_feeds:
             name = str(feed.get("name") or feed.get("url") or "invalid-feed")
             try:

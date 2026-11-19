@@ -86,7 +86,7 @@ def prepare_runtime(p):
         handle = runtime.RuntimeActivation()
         services = {}
         if slot == "worker-1":
-            for name in ("quotes", "dispatcher"):
+            for name in ("quotes", "dispatcher", "score_continuations"):
                 thread = threading.Thread(target=stop.wait, daemon=True)
                 thread.start()
                 services[name] = thread
