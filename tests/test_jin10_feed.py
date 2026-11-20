@@ -1,6 +1,8 @@
+import gzip
 import html
 import xml.etree.ElementTree as ET
 
+import httpx
 import pytest
 
 
@@ -28,6 +30,112 @@ ASIA_PLAIN_TITLE = (
     "亚股 1. 中国上证综指8月4日（周二）收盘上涨12.62点，涨幅：0.33%，"
     "报3822.28点；"
 )
+
+
+class Jin10ResponseStream(httpx.SyncByteStream):
+    def __init__(self, chunks):
+        self.chunks = chunks
+        self.closed = False
+
+    def __iter__(self):
+        yield from self.chunks
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.fixture
+def jin10_upstream(monkeypatch):
+    import services.jin10_feed as jin10_feed
+
+    cache = {"source_url": "", "ts": 0.0, "items": []}
+    requests = []
+    original_client = httpx.Client
+    monkeypatch.setattr(jin10_feed, "_JIN10_CACHE", cache)
+    monkeypatch.setattr(jin10_feed, "_JIN10_MAX_RESPONSE_BYTES", 128, raising=False)
+
+    def respond(*, headers, chunks):
+        stream = Jin10ResponseStream(chunks)
+
+        def handle(request):
+            requests.append(request)
+            return httpx.Response(200, headers=headers, stream=stream)
+
+        transport = httpx.MockTransport(handle)
+        monkeypatch.setattr(jin10_feed.httpx, "Client", lambda **kwargs: original_client(transport=transport, **kwargs))
+        return stream
+
+    return jin10_feed, cache, requests, respond
+
+
+@pytest.mark.parametrize("encoding", ["identity", "gzip"])
+def test_jin10_reads_feed_at_exact_decoded_limit_without_content_length(jin10_upstream, encoding):
+    jin10_feed, _, requests, respond = jin10_upstream
+    body = b'[{"title":"ok"}]'.ljust(128)
+    wire = gzip.compress(body) if encoding == "gzip" else body
+    stream = respond(
+        headers={"Content-Type": "application/json", "Content-Encoding": encoding},
+        chunks=(wire[:9], wire[9:]),
+    )
+    assert jin10_feed.fetch_jin10_latest("https://example.test/jin10") == [{"title": "ok"}]
+    assert requests[0].headers["accept-encoding"] == "gzip, identity"
+    assert stream.closed
+
+
+def test_jin10_stops_reading_at_the_limit_without_content_length(jin10_upstream):
+    jin10_feed, _, _, respond = jin10_upstream
+
+    def chunks():
+        yield b" " * 128
+        yield b" "
+        pytest.fail("upstream must be closed before reading another chunk")
+
+    stream = respond(headers={}, chunks=chunks())
+    with pytest.raises(ValueError, match="Jin10 response exceeds 128 bytes"):
+        jin10_feed.fetch_jin10_latest("https://example.test/jin10")
+    assert stream.closed
+
+
+def test_jin10_gzip_over_limit_uses_same_source_stale_cache(jin10_upstream, caplog):
+    jin10_feed, cache, requests, respond = jin10_upstream
+    url = "https://example.test/jin10"
+    stale = [{"title": "previous feed"}]
+    cache.update(source_url=url, ts=0.0, items=stale)
+    wire = gzip.compress(b'[{"title":"new feed"}]') + gzip.compress(b" " * 128)
+    assert len(wire) < 128
+    stream = respond(
+        headers={"Content-Encoding": "gzip", "Content-Length": str(len(wire))},
+        chunks=(wire,),
+    )
+    assert jin10_feed.fetch_jin10_latest(url) == stale
+    assert jin10_feed.fetch_jin10_latest(url) == stale
+    assert "Jin10ResponseTooLarge" in caplog.text
+    assert len(requests) == 1
+    assert stream.closed
+
+
+def test_jin10_parses_compressed_rss_after_reading_the_bounded_body(jin10_upstream):
+    jin10_feed, _, _, respond = jin10_upstream
+    wire = gzip.compress(b"<rss><channel><item><title>OK</title></item></channel></rss>")
+    respond(headers={"Content-Type": "application/rss+xml", "Content-Encoding": "gzip"}, chunks=(wire,))
+    items = jin10_feed.fetch_jin10_latest("https://example.test/jin10")
+    assert [item["title"] for item in items] == ["OK"]
+
+
+@pytest.mark.parametrize(
+    ("encoding", "body", "error"),
+    [
+        ("gzip", b"not gzip", "Invalid Jin10 gzip response"),
+        ("gzip", gzip.compress(b'[{"title":"ok"}]')[:-1], "Incomplete Jin10 gzip response"),
+        ("br", b"not advertised", "Unsupported Jin10 content encoding"),
+    ],
+)
+def test_jin10_closes_invalid_encoded_responses(jin10_upstream, encoding, body, error):
+    jin10_feed, _, _, respond = jin10_upstream
+    stream = respond(headers={"Content-Encoding": encoding}, chunks=(body,))
+    with pytest.raises(httpx.DecodingError, match=error):
+        jin10_feed.fetch_jin10_latest("https://example.test/jin10")
+    assert stream.closed
 
 
 def test_normalize_item_maps_exact_rsshub_index_id_to_public_detail_url():
