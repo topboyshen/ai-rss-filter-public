@@ -1,10 +1,12 @@
 import hashlib
+import json
 import logging
 import os
 import re
 import threading
 import time
 import xml.etree.ElementTree as ET
+import zlib
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -23,6 +25,11 @@ _JIN10_CACHE_LOCK = threading.Lock()
 _JIN10_FETCH_LOCK = threading.Lock()
 _JIN10_CACHE: dict[str, Any] = {"source_url": "", "ts": 0.0, "items": []}
 _JIN10_INDEX_LINK_RE = re.compile(r"jin10:index:([0-9]{20})\Z")
+_JIN10_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+
+
+class Jin10ResponseTooLarge(ValueError):
+    pass
 
 
 def _source_url() -> str:
@@ -84,19 +91,52 @@ def _items_from_rss_xml(xml_text: str) -> list[dict[str, Any]]:
     return items
 
 
+def _read_jin10_body(response: httpx.Response) -> bytearray:
+    encoding = response.headers.get("content-encoding", "identity").strip().lower()
+    if encoding not in {"identity", "gzip", "x-gzip"}:
+        raise httpx.DecodingError("Unsupported Jin10 content encoding")
+    decoder = zlib.decompressobj(16 + zlib.MAX_WBITS) if encoding != "identity" else None
+    body = bytearray()
+    limit = _JIN10_MAX_RESPONSE_BYTES
+
+    try:
+        for chunk in response.iter_raw():
+            while chunk:
+                remaining = limit - len(body)
+                if decoder is None:
+                    decoded, chunk = chunk, b""
+                else:
+                    # Bound each expansion before allocating its output. A gzip
+                    # response can contain multiple consecutive members.
+                    if decoder.eof:
+                        decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                    decoded = decoder.decompress(chunk, remaining + 1)
+                    chunk = decoder.unused_data if decoder.eof else decoder.unconsumed_tail
+                if len(decoded) > remaining:
+                    raise Jin10ResponseTooLarge(f"Jin10 response exceeds {limit} bytes")
+                body.extend(decoded)
+    except zlib.error as exc:
+        raise httpx.DecodingError("Invalid Jin10 gzip response") from exc
+    if decoder is not None and not decoder.eof:
+        raise httpx.DecodingError("Incomplete Jin10 gzip response")
+    return body
+
+
 def _fetch_jin10_uncached(url: str) -> list[dict[str, Any]]:
-    with httpx.Client(timeout=10.0, trust_env=False, headers={"User-Agent": "Mozilla/5.0"}) as client:
-        response = client.get(url)
-        response.raise_for_status()
-        content_type = response.headers.get("content-type", "").lower()
-        text = response.text
+    headers = {"User-Agent": "Mozilla/5.0", "Accept-Encoding": "gzip, identity"}
+    with httpx.Client(timeout=10.0, trust_env=False, headers=headers) as client:
+        with client.stream("GET", url) as response:
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "").lower()
+            body = _read_jin10_body(response)
+            text = body.decode(response.encoding or "utf-8", errors="replace")
 
     looks_like_xml = "xml" in content_type or text.lstrip().startswith("<?xml") or text.lstrip().startswith("<rss")
     if looks_like_xml:
         return _items_from_rss_xml(text)
 
     try:
-        payload = response.json()
+        payload = json.loads(body)
     except ValueError:
         logger.warning("金十源既不是 RSS XML 也不是 JSON: content-type=%s", content_type)
         return []
