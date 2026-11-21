@@ -477,6 +477,7 @@ def test_feed_rss_exposes_read_only_topic_slice(topic_feed_client, monkeypatch):
         "feed_url": None,
         "min_score": 8.5,
         "theme_terms": ("芯片国产化", "国产芯片", "半导体", "芯片"),
+        "include_event_identity": True,
     }
     body = response.get_data(as_text=True)
     assert "AI-Filter · 芯片国产化 · ≥8.5" in body
@@ -834,7 +835,13 @@ def test_feed_rss_defaults_to_pass_threshold(topic_feed_client, monkeypatch):
 
     assert response.status_code == 200
     assert calls == [
-        {"hours": 48, "limit": 30, "feed_url": None, "min_score": 7.0}
+        {
+            "hours": 48,
+            "limit": 30,
+            "feed_url": None,
+            "min_score": 7.0,
+            "include_event_identity": True,
+        }
     ]
     assert "AI-Filter · 全部主题 · ≥7.0" in response.get_data(as_text=True)
 
@@ -966,7 +973,7 @@ def test_build_json_feed_keeps_legacy_title_score_fallback():
 
 
 @pytest.mark.parametrize("format_type", ["rss", "html"])
-def test_non_json_feeds_keep_legacy_query_contract(
+def test_all_feed_formats_request_event_identity(
     topic_feed_client, monkeypatch, format_type
 ):
     client, feed_routes = topic_feed_client
@@ -986,8 +993,78 @@ def test_non_json_feeds_keep_legacy_query_contract(
             "limit": 30,
             "feed_url": None,
             **({"min_score": 7.0} if format_type == "rss" else {}),
+            "include_event_identity": True,
         }
     ]
+
+
+def _canonical_feed_row(link, title, event_id, score):
+    return (
+        link,
+        title,
+        title,
+        score,
+        "宏观",
+        "逻辑",
+        "摘要",
+        int(time.time()),
+        event_id,
+        1,
+    )
+
+
+@pytest.mark.parametrize("format_type", ["rss", "html", "json"])
+def test_aggregate_feed_collapses_only_the_same_canonical_event(
+    topic_feed_client, monkeypatch, format_type
+):
+    client, feed_routes = topic_feed_client
+    rows = [
+        _canonical_feed_row("https://example.com/a", "同一事件", "event-a", 8.0),
+        _canonical_feed_row("https://example.com/b", "同一事件", "event-b", 7.0),
+    ]
+    monkeypatch.setattr(
+        feed_routes,
+        "_multi_source_event_references",
+        lambda entries: {"event-a": "canonical", "event-b": "canonical"},
+    )
+    monkeypatch.setattr(feed_routes.DB, "get_entries_for_cached_rss", lambda *a, **k: rows)
+
+    response = client.get(f"/feed/{format_type}")
+
+    assert response.status_code == 200
+    if format_type == "json":
+        assert len(response.get_json()["items"]) == 1
+    elif format_type == "rss":
+        assert response.data.count(b"<item>") == 1
+    else:
+        assert response.get_data(as_text=True).count("同一事件") == 1
+
+
+@pytest.mark.parametrize("format_type", ["rss", "html", "json"])
+def test_aggregate_feed_keeps_distinct_canonical_events_with_equal_titles(
+    topic_feed_client, monkeypatch, format_type
+):
+    client, feed_routes = topic_feed_client
+    rows = [
+        _canonical_feed_row("https://example.com/a", "同一事件", "event-a", 8.0),
+        _canonical_feed_row("https://example.com/b", "同一事件", "event-b", 7.0),
+    ]
+    monkeypatch.setattr(
+        feed_routes,
+        "_multi_source_event_references",
+        lambda entries: {"event-a": "event-a", "event-b": "event-b"},
+    )
+    monkeypatch.setattr(feed_routes.DB, "get_entries_for_cached_rss", lambda *a, **k: rows)
+
+    response = client.get(f"/feed/{format_type}")
+
+    assert response.status_code == 200
+    if format_type == "json":
+        assert len(response.get_json()["items"]) == 2
+    elif format_type == "rss":
+        assert response.data.count(b"<item>") == 2
+    else:
+        assert response.get_data(as_text=True).count("同一事件") == 2
 
 
 def test_unknown_theme_is_a_valid_empty_feed_without_db_or_fallback(
