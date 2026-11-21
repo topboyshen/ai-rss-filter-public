@@ -487,8 +487,7 @@ def _feed_from_cache(format_type: str, *, default_min_score: bool = False):
         query_kwargs["min_score"] = min_score
     if theme is not None:
         query_kwargs["theme_terms"] = theme.terms
-    if format_type == "json":
-        query_kwargs["include_event_identity"] = True
+    query_kwargs["include_event_identity"] = True
     rows = (
         []
         if unknown_theme
@@ -496,6 +495,10 @@ def _feed_from_cache(format_type: str, *, default_min_score: bool = False):
     )
     rows = _safe_public_rows(rows, context=f"/feed/{format_type}")
     entries = [_feed_entry_from_cached_row(row) for row in rows]
+    if target_url == "all":
+        # The aggregate slice must use the persisted event identity. Different
+        # links stay separate; only a canonical event collapse is applied.
+        entries = _dedupe_multi_source_entries(entries)
     filtered_slice = default_min_score or min_score is not None or bool(requested_theme)
     if filtered_slice:
         channel_title, channel_description = _slice_channel_metadata(
