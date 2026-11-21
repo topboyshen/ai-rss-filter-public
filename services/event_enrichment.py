@@ -1784,6 +1784,20 @@ def _merge_anchor_maps(
     return confirmation_anchors, replay_anchors
 
 
+def _merge_anchor_context(
+    events: list[dict[str, Any]],
+) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+    """Compute identity keys and both fixed-window anchor maps once."""
+    identity_keys = {
+        str(item["event_id"]): normalize_event_identity_key(
+            str(item["title"] or "")
+        )
+        for item in events
+    }
+    confirmation, replay = _merge_anchor_maps(events, identity_keys)
+    return identity_keys, confirmation, replay
+
+
 def _automatic_merge_decision(
     left: dict[str, Any],
     right: dict[str, Any],
@@ -1889,6 +1903,31 @@ def _anchor_qualified_exact_pairs(
             if decision is not None and decision[0] == target_id:
                 pairs.add(tuple(sorted((event_id, target_id))))
     return pairs
+
+
+def _merge_candidate_pairs(
+    events: list[dict[str, Any]],
+    *,
+    identity_keys: dict[str, str],
+    confirmation_anchors: dict[str, str],
+    replay_anchors: dict[str, str],
+    allow_short: bool = False,
+) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
+    """Build exact-title and shared-security candidate pairs for the graph."""
+    exact_pairs, security_pairs = _candidate_pairs(
+        events,
+        include_short=allow_short,
+    )
+    exact_pairs.update(
+        _anchor_qualified_exact_pairs(
+            events,
+            identity_keys=identity_keys,
+            confirmation_anchors=confirmation_anchors,
+            replay_anchors=replay_anchors,
+            allow_short=allow_short,
+        )
+    )
+    return exact_pairs, security_pairs
 
 
 def _similarity_output_signature(item: dict[str, Any]) -> tuple[object, ...]:
@@ -2288,27 +2327,16 @@ def resolve_event_graph(
         raise EventCoreConflictError(
             "event graph cannot load a pending similarity reconciliation root"
         )
-    identity_keys = {
-        event_id: normalize_event_identity_key(str(item["title"] or ""))
-        for event_id, item in by_id.items()
-    }
-    confirmation_anchors, replay_anchors = _merge_anchor_maps(
-        events,
-        identity_keys,
+    identity_keys, confirmation_anchors, replay_anchors = _merge_anchor_context(
+        events
     )
     short_title_merge = _short_title_merge_enabled()
-    exact_pairs, security_pairs = _candidate_pairs(
+    exact_pairs, security_pairs = _merge_candidate_pairs(
         events,
-        include_short=short_title_merge,
-    )
-    exact_pairs.update(
-        _anchor_qualified_exact_pairs(
-            events,
-            identity_keys=identity_keys,
-            confirmation_anchors=confirmation_anchors,
-            replay_anchors=replay_anchors,
-            allow_short=short_title_merge,
-        )
+        identity_keys=identity_keys,
+        confirmation_anchors=confirmation_anchors,
+        replay_anchors=replay_anchors,
+        allow_short=short_title_merge,
     )
     merge_candidates: dict[tuple[str, str], tuple[str, int]] = {}
     non_merge_exact_pairs: set[tuple[str, str]] = set()
@@ -2751,26 +2779,15 @@ def list_short_title_merge_candidates(
     with database.get_read_only_connection() as conn:
         events = _event_graph_rows(conn, cutoff)
         by_id = {str(item["event_id"]): item for item in events}
-        identity_keys = {
-            event_id: normalize_event_identity_key(str(item["title"] or ""))
-            for event_id, item in by_id.items()
-        }
-        confirmation_anchors, replay_anchors = _merge_anchor_maps(
-            events,
-            identity_keys,
+        identity_keys, confirmation_anchors, replay_anchors = _merge_anchor_context(
+            events
         )
-        exact_pairs, _security_pairs = _candidate_pairs(
+        exact_pairs, _security_pairs = _merge_candidate_pairs(
             events,
-            include_short=True,
-        )
-        exact_pairs.update(
-            _anchor_qualified_exact_pairs(
-                events,
-                identity_keys=identity_keys,
-                confirmation_anchors=confirmation_anchors,
-                replay_anchors=replay_anchors,
-                allow_short=True,
-            )
+            identity_keys=identity_keys,
+            confirmation_anchors=confirmation_anchors,
+            replay_anchors=replay_anchors,
+            allow_short=True,
         )
         candidates: list[dict[str, Any]] = []
         for left_id, right_id in sorted(exact_pairs):
