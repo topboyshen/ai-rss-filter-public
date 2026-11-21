@@ -58,6 +58,7 @@ COPY templates/ ./templates/
 COPY workers/ ./workers/
 COPY modules/ ./modules/
 COPY scripts/run_event_enrichment.py ./scripts/run_event_enrichment.py
+COPY scripts/report_short_title_merge_candidates.py ./scripts/report_short_title_merge_candidates.py
 COPY scripts/run_provenance_shadow.py ./scripts/run_provenance_shadow.py
 COPY scripts/export_score_gold_candidates.py ./scripts/export_score_gold_candidates.py
 COPY scripts/import_score_gold_labels.py ./scripts/import_score_gold_labels.py
@@ -77,7 +78,7 @@ COPY scripts/retained_gateway_configuration.py ./scripts/retained_gateway_config
 COPY scripts/retained_gateway_diagnostics.py ./scripts/retained_gateway_diagnostics.py
 COPY scripts/retained_gateway_custody.py ./scripts/retained_gateway_custody.py
 RUN chmod +x /app/start.sh && python -m py_compile app.py sse_engine.py worker_main.py gunicorn.conf.py scoring_provenance.py scoring_explanation.py core/*.py db/*.py utils/*.py routes/*.py services/*.py workers/*.py modules/*.py scripts/run_event_enrichment.py scripts/run_provenance_shadow.py scripts/export_score_gold_candidates.py scripts/import_score_gold_labels.py scripts/score_gold_metrics.py \
-    && python -m py_compile scripts/run_controlled_startup.py \
+    && python -m py_compile scripts/run_controlled_startup.py scripts/report_short_title_merge_candidates.py \
     && python -c "import scoring_explanation; import scripts.retained_gateway_configuration; import scripts.retained_gateway_custody"
 HEALTHCHECK --interval=60s --timeout=5s --start-period=20s --retries=3 \
   CMD python -c "from urllib.request import urlopen; urlopen('http://127.0.0.1:5000/health', timeout=3).read()"
