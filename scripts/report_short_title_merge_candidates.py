@@ -9,9 +9,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
+from pathlib import Path
 
-from services.event_enrichment import list_short_title_merge_candidates
+# The script is copied into /app/scripts without /app on sys.path when invoked
+# as `python /app/scripts/...`; bootstrap the repository root.
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from services.event_enrichment import list_short_title_merge_candidates  # noqa: E402
 
 
 def main() -> int:
