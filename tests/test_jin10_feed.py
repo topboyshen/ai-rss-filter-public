@@ -126,7 +126,11 @@ def test_jin10_parses_compressed_rss_after_reading_the_bounded_body(jin10_upstre
     ("encoding", "body", "error"),
     [
         ("gzip", b"not gzip", "Invalid Jin10 gzip response"),
-        ("gzip", gzip.compress(b'[{"title":"ok"}]')[:-1], "Incomplete Jin10 gzip response"),
+        (
+            "gzip",
+            gzip.compress(b'[{"title":"ok"}]', mtime=0)[:-1],
+            "Incomplete Jin10 gzip response",
+        ),
         ("br", b"not advertised", "Unsupported Jin10 content encoding"),
     ],
 )
