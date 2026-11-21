@@ -16,6 +16,7 @@ import itertools
 import ipaddress
 import json
 import logging
+import os
 import re
 import sqlite3
 import time
@@ -61,6 +62,64 @@ _CANDIDATE_BUCKET_LIMIT = 80
 _SIMILARITY_METHOD = "event-graph-v1"
 _SIMILARITY_MODEL_VERSION = "deterministic-title-security-v1"
 _SIMILARITY_QUERY_BATCH = 400
+_SHORT_TITLE_MERGE_ENV = "AI_FILTER_SHORT_TITLE_MERGE"
+_SHORT_TITLE_MIN_LENGTH = 8
+_SHORT_TITLE_MAX_LENGTH = 11
+_SHORT_TITLE_MERGE_REASON = (
+    "短标题精确快照与独立发布方一致，且位于固定36小时窗口"
+)
+_SHORT_TITLE_GENERIC_LABELS = frozenset(
+    {
+        "午间公告",
+        "早间公告",
+        "今日午间公告汇总",
+        "收盘快讯",
+        "盘中快讯",
+        "早盘快讯",
+        "午盘快讯",
+        "今日要闻",
+        "财经快讯",
+        "收盘播报",
+        "开盘播报",
+        "市场快讯",
+    }
+)
+_SHORT_TITLE_GENERIC_WORDS = (
+    "今日",
+    "昨日",
+    "早间",
+    "午间",
+    "晚间",
+    "早盘",
+    "午盘",
+    "盘中",
+    "盘前",
+    "盘后",
+    "上午",
+    "下午",
+    "周末",
+    "公告",
+    "快讯",
+    "要闻",
+    "复盘",
+    "周报",
+    "日报",
+    "数据",
+    "开盘",
+    "收盘",
+    "涨停",
+    "跌停",
+    "异动",
+    "调研",
+    "播报",
+    "汇总",
+    "一览",
+    "盘点",
+    "速递",
+    "聚焦",
+    "消息",
+    "新闻",
+)
 
 # This explicit identity is a new generation relative to the dynamic AST/hash
 # contract used by the d359 release. This is the store/migration generation,
@@ -157,6 +216,32 @@ def _publisher_set(event: dict[str, Any]) -> frozenset[str]:
     }
     publishers.discard("")
     return frozenset(publishers)
+
+
+def _short_title_merge_enabled() -> bool:
+    """The short-title rule is opt-in; historical merges remain immutable."""
+    return os.environ.get(_SHORT_TITLE_MERGE_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _short_title_is_specific(key: str) -> bool:
+    """Reject short titles that are only generic section labels.
+
+    The check is deliberately lexical and offline. It is not a semantic
+    classifier; ambiguous cases stay unmerged.
+    """
+    compact = "".join(char for char in key.casefold() if char.isalnum())
+    if not compact or compact in _SHORT_TITLE_GENERIC_LABELS:
+        return False
+    remainder = compact
+    for word in _SHORT_TITLE_GENERIC_WORDS:
+        remainder = remainder.replace(word, "")
+    remainder = re.sub(r"[0-9]+", "", remainder)
+    return len(remainder) >= 3
 
 
 def _security_master_fingerprint(conn) -> tuple[str, int]:
@@ -1599,6 +1684,8 @@ def _event_graph_rows(
 
 def _candidate_pairs(
     events: list[dict[str, Any]],
+    *,
+    include_short: bool = False,
 ) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
     """Return (exact-title pairs, shared-security pairs), kept separate.
 
@@ -1612,7 +1699,12 @@ def _candidate_pairs(
     by_security: dict[str, list[str]] = defaultdict(list)
     for event in events:
         key = normalize_event_identity_key(str(event["title"] or ""))
-        if len(key) >= 12:
+        length = len(key)
+        if length >= 12 or (
+            include_short
+            and _SHORT_TITLE_MIN_LENGTH <= length <= _SHORT_TITLE_MAX_LENGTH
+            and _short_title_is_specific(key)
+        ):
             exact[key].append(str(event["event_id"]))
         for security_id in event["mappings"]:
             by_security[security_id].append(str(event["event_id"]))
@@ -1699,14 +1791,24 @@ def _automatic_merge_decision(
     identity_keys: dict[str, str],
     confirmation_anchors: dict[str, str],
     replay_anchors: dict[str, str],
+    allow_short: bool = False,
 ) -> tuple[str, str, int] | None:
     """Return the audited target/reason only for a fully qualified hard merge."""
     left_id = str(left["event_id"])
     right_id = str(right["event_id"])
     left_key = identity_keys[left_id]
     right_key = identity_keys[right_id]
-    if len(left_key) < 12 or left_key != right_key:
+    if left_key != right_key:
         return None
+    short_title = len(left_key) < 12
+    if short_title:
+        if (
+            not allow_short
+            or len(left_key) < _SHORT_TITLE_MIN_LENGTH
+            or len(left_key) > _SHORT_TITLE_MAX_LENGTH
+            or not _short_title_is_specific(left_key)
+        ):
+            return None
 
     # Frozen snapshots are the fact boundary.  Intersection is deliberately
     # insufficient: {old, contradictory} and {old} must not be merged merely
@@ -1732,9 +1834,14 @@ def _automatic_merge_decision(
     if independently_confirmed:
         return (
             confirmation_anchors[left_id],
-            "跨独立来源发布方的完整规范化标题与冻结快照均一致，且位于固定36小时窗口",
+            _SHORT_TITLE_MERGE_REASON
+            if short_title
+            else "跨独立来源发布方的完整规范化标题与冻结快照均一致，且位于固定36小时窗口",
             1,
         )
+    if short_title:
+        # Same-publisher short-title replay stays on the conservative side.
+        return None
     if same_publisher_replay:
         return (
             replay_anchors[left_id],
@@ -1750,6 +1857,7 @@ def _anchor_qualified_exact_pairs(
     identity_keys: dict[str, str],
     confirmation_anchors: dict[str, str],
     replay_anchors: dict[str, str],
+    allow_short: bool = False,
 ) -> set[tuple[str, str]]:
     """Return every hard-qualified source-to-anchor edge in linear space.
 
@@ -1776,6 +1884,7 @@ def _anchor_qualified_exact_pairs(
                 identity_keys=identity_keys,
                 confirmation_anchors=confirmation_anchors,
                 replay_anchors=replay_anchors,
+                allow_short=allow_short,
             )
             if decision is not None and decision[0] == target_id:
                 pairs.add(tuple(sorted((event_id, target_id))))
@@ -2187,13 +2296,18 @@ def resolve_event_graph(
         events,
         identity_keys,
     )
-    exact_pairs, security_pairs = _candidate_pairs(events)
+    short_title_merge = _short_title_merge_enabled()
+    exact_pairs, security_pairs = _candidate_pairs(
+        events,
+        include_short=short_title_merge,
+    )
     exact_pairs.update(
         _anchor_qualified_exact_pairs(
             events,
             identity_keys=identity_keys,
             confirmation_anchors=confirmation_anchors,
             replay_anchors=replay_anchors,
+            allow_short=short_title_merge,
         )
     )
     merge_candidates: dict[tuple[str, str], tuple[str, int]] = {}
@@ -2208,6 +2322,7 @@ def resolve_event_graph(
             identity_keys=identity_keys,
             confirmation_anchors=confirmation_anchors,
             replay_anchors=replay_anchors,
+            allow_short=short_title_merge,
         )
         if decision is None:
             non_merge_exact_pairs.add((left_id, right_id))
@@ -2227,6 +2342,7 @@ def resolve_event_graph(
                 identity_keys=identity_keys,
                 confirmation_anchors=confirmation_anchors,
                 replay_anchors=replay_anchors,
+                allow_short=short_title_merge,
             )
             if edge_decision is None or edge_decision[0] != target_id:
                 continue
@@ -2358,6 +2474,7 @@ def resolve_event_graph(
                             identity_keys=fresh_identity_keys,
                             confirmation_anchors=fresh_confirmation,
                             replay_anchors=fresh_replay,
+                            allow_short=short_title_merge,
                         )
                         if decision is None or decision[0] != target_root:
                             skipped += 1
@@ -2618,6 +2735,79 @@ def resolve_event_graph(
     }
 
 
+def list_short_title_merge_candidates(
+    *,
+    since: int | None = None,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    """Return read-only short-title merge candidates; never write a merge.
+
+    The operator reviews this report before enabling
+    ``AI_FILTER_SHORT_TITLE_MERGE``. Returned fields are enough to audit the
+    title length, frozen snapshot identity, publisher split and time window.
+    """
+    cutoff = int(time.time() - 30 * 86400) if since is None else int(since)
+    bounded_limit = max(1, min(1_000, int(limit)))
+    with database.get_read_only_connection() as conn:
+        events = _event_graph_rows(conn, cutoff)
+        by_id = {str(item["event_id"]): item for item in events}
+        identity_keys = {
+            event_id: normalize_event_identity_key(str(item["title"] or ""))
+            for event_id, item in by_id.items()
+        }
+        confirmation_anchors, replay_anchors = _merge_anchor_maps(
+            events,
+            identity_keys,
+        )
+        exact_pairs, _security_pairs = _candidate_pairs(
+            events,
+            include_short=True,
+        )
+        exact_pairs.update(
+            _anchor_qualified_exact_pairs(
+                events,
+                identity_keys=identity_keys,
+                confirmation_anchors=confirmation_anchors,
+                replay_anchors=replay_anchors,
+                allow_short=True,
+            )
+        )
+        candidates: list[dict[str, Any]] = []
+        for left_id, right_id in sorted(exact_pairs):
+            decision = _automatic_merge_decision(
+                by_id[left_id],
+                by_id[right_id],
+                identity_keys=identity_keys,
+                confirmation_anchors=confirmation_anchors,
+                replay_anchors=replay_anchors,
+                allow_short=True,
+            )
+            if decision is None or decision[1] != _SHORT_TITLE_MERGE_REASON:
+                continue
+            target_id = decision[0]
+            source_id = right_id if target_id == left_id else left_id
+            left = by_id[left_id]
+            right = by_id[right_id]
+            candidates.append(
+                {
+                    "source_event_id": source_id,
+                    "target_event_id": target_id,
+                    "title": str(left["title"]),
+                    "title_key_length": len(identity_keys[left_id]),
+                    "source_publishers": sorted(_publisher_set(left)),
+                    "target_publishers": sorted(_publisher_set(right)),
+                    "source_snapshots": sorted(str(v) for v in left["snapshots"]),
+                    "target_snapshots": sorted(str(v) for v in right["snapshots"]),
+                    "source_occurred_at": int(left["occurred_at"]),
+                    "target_occurred_at": int(right["occurred_at"]),
+                    "reason": decision[1],
+                }
+            )
+            if len(candidates) >= bounded_limit:
+                break
+        return candidates
+
+
 def run_event_enrichment_lanes(
     *,
     since: int,
@@ -2720,6 +2910,7 @@ __all__ = [
     "enrich_event_security_mappings",
     "event_mapping_migration_audit_status",
     "event_mapping_migration_status",
+    "list_short_title_merge_candidates",
     "resolve_event_graph",
     "run_event_enrichment_lanes",
 ]

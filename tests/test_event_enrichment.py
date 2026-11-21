@@ -5041,3 +5041,178 @@ def test_all_history_runner_exits_nonzero_until_mapping_migration_is_complete(
     payload = json.loads(capsys.readouterr().out)
     assert payload["migration_complete"] is False
     assert payload["mapping_migration"][blocking_field] == 1
+
+
+SHORT_TITLE = "天下没有免费的加息"
+
+
+def _seed_short_pair(
+    conn,
+    *,
+    title=SHORT_TITLE,
+    first_source="https://alpha.example/short",
+    second_source="https://beta.example/short",
+    first_at=1_000,
+    second_at=1_600,
+    second_snapshot=None,
+):
+    first = _seed_event(conn, "short-first", title, first_source, first_at)
+    second = _seed_event(
+        conn,
+        "short-second",
+        title,
+        second_source,
+        second_at,
+        snapshot_text=second_snapshot,
+    )
+    conn.commit()
+    return first, second
+
+
+def test_short_specific_title_merges_only_when_flag_enabled(monkeypatch):
+    from db import database
+    from db.event_core import canonical_event_id
+    from services.event_enrichment import _SHORT_TITLE_MERGE_REASON
+
+    database.init_db()
+    with database.get_connection() as conn:
+        first, second = _seed_short_pair(conn)
+
+    assert len(SHORT_TITLE) == 9
+    monkeypatch.delenv("AI_FILTER_SHORT_TITLE_MERGE", raising=False)
+    assert resolve_event_graph(since=0)["merged"] == 0
+
+    monkeypatch.setenv("AI_FILTER_SHORT_TITLE_MERGE", "1")
+    result = resolve_event_graph(since=0)
+
+    assert result["merged"] == 1
+    with database.get_connection() as conn:
+        assert canonical_event_id(conn, second) == first
+        reasons = [
+            row[0]
+            for row in conn.execute(
+                "SELECT reason FROM event_merge_history WHERE source_event_id = ?",
+                (second,),
+            )
+        ]
+        assert reasons == [_SHORT_TITLE_MERGE_REASON]
+
+
+def test_short_generic_title_is_not_merged(monkeypatch):
+    from db import database
+
+    database.init_db()
+    monkeypatch.setenv("AI_FILTER_SHORT_TITLE_MERGE", "1")
+    generic = "今日午间公告汇总"
+    assert len(generic) == 8
+    with database.get_connection() as conn:
+        _seed_short_pair(
+            conn,
+            title=generic,
+            first_source="https://alpha.example/generic",
+            second_source="https://beta.example/generic",
+        )
+    assert resolve_event_graph(since=0)["merged"] == 0
+
+
+def test_short_title_requires_identical_snapshot(monkeypatch):
+    from db import database
+
+    database.init_db()
+    monkeypatch.setenv("AI_FILTER_SHORT_TITLE_MERGE", "1")
+    with database.get_connection() as conn:
+        _seed_short_pair(conn, second_snapshot="不同的冻结快照")
+    assert resolve_event_graph(since=0)["merged"] == 0
+
+
+def test_short_title_same_publisher_is_not_merged(monkeypatch):
+    from db import database
+
+    database.init_db()
+    monkeypatch.setenv("AI_FILTER_SHORT_TITLE_MERGE", "1")
+    with database.get_connection() as conn:
+        _seed_short_pair(
+            conn,
+            first_source="https://wire.example/first",
+            second_source="https://wire.example/second",
+        )
+    assert resolve_event_graph(since=0)["merged"] == 0
+
+
+def test_short_title_outside_confirmation_window_is_not_merged(monkeypatch):
+    from db import database
+
+    database.init_db()
+    monkeypatch.setenv("AI_FILTER_SHORT_TITLE_MERGE", "1")
+    with database.get_connection() as conn:
+        _seed_short_pair(
+            conn,
+            first_at=1_000,
+            second_at=1_000 + 37 * 3_600,
+        )
+    assert resolve_event_graph(since=0)["merged"] == 0
+
+
+def test_short_title_below_minimum_length_is_not_merged(monkeypatch):
+    from db import database
+
+    database.init_db()
+    monkeypatch.setenv("AI_FILTER_SHORT_TITLE_MERGE", "1")
+    short = "短标题测试用例"
+    assert len(short) == 7
+    with database.get_connection() as conn:
+        _seed_short_pair(
+            conn,
+            title=short,
+            first_source="https://alpha.example/short-seven",
+            second_source="https://beta.example/short-seven",
+        )
+    assert resolve_event_graph(since=0)["merged"] == 0
+
+
+def test_short_title_at_upper_bound_merges(monkeypatch):
+    from db import database
+    from db.event_core import canonical_event_id
+
+    database.init_db()
+    monkeypatch.setenv("AI_FILTER_SHORT_TITLE_MERGE", "1")
+    title = "短标题合并规则边界测试"
+    assert len(title) == 11
+    with database.get_connection() as conn:
+        first, second = _seed_short_pair(
+            conn,
+            title=title,
+            first_source="https://alpha.example/short-eleven",
+            second_source="https://beta.example/short-eleven",
+        )
+    assert resolve_event_graph(since=0)["merged"] == 1
+    with database.get_connection() as conn:
+        assert canonical_event_id(conn, second) == first
+
+
+def test_short_title_candidate_report_is_read_only(monkeypatch):
+    from db import database
+    from services.event_enrichment import list_short_title_merge_candidates
+
+    database.init_db()
+    monkeypatch.delenv("AI_FILTER_SHORT_TITLE_MERGE", raising=False)
+    with database.get_connection() as conn:
+        first, second = _seed_short_pair(conn)
+        before_merges = conn.execute(
+            "SELECT COUNT(*) FROM event_merge_history"
+        ).fetchone()[0]
+
+    candidates = list_short_title_merge_candidates(since=0)
+
+    assert len(candidates) == 1
+    assert candidates[0]["title"] == SHORT_TITLE
+    assert candidates[0]["title_key_length"] == 9
+    assert {candidates[0]["source_event_id"], candidates[0]["target_event_id"]} == {
+        first,
+        second,
+    }
+    with database.get_connection() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM event_merge_history").fetchone()[0] == before_merges
+        assert conn.execute(
+            "SELECT merge_state FROM events WHERE event_id = ?", (second,)
+        ).fetchone()[0] == "active"
