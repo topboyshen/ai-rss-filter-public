@@ -5139,7 +5139,7 @@ def test_short_title_same_publisher_is_not_merged(monkeypatch):
     assert resolve_event_graph(since=0)["merged"] == 0
 
 
-def test_short_title_outside_confirmation_window_is_not_merged(monkeypatch):
+def test_short_title_outside_six_hour_window_is_not_merged(monkeypatch):
     from db import database
 
     database.init_db()
@@ -5148,7 +5148,7 @@ def test_short_title_outside_confirmation_window_is_not_merged(monkeypatch):
         _seed_short_pair(
             conn,
             first_at=1_000,
-            second_at=1_000 + 37 * 3_600,
+            second_at=1_000 + 7 * 3_600,
         )
     assert resolve_event_graph(since=0)["merged"] == 0
 
