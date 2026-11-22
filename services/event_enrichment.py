@@ -65,6 +65,7 @@ _SIMILARITY_QUERY_BATCH = 400
 _SHORT_TITLE_MERGE_ENV = "AI_FILTER_SHORT_TITLE_MERGE"
 _SHORT_TITLE_MIN_LENGTH = 8
 _SHORT_TITLE_MAX_LENGTH = 11
+_SHORT_TITLE_WINDOW_SECONDS = 6 * 3600
 _SHORT_TITLE_MERGE_REASON = (
     "短标题精确快照与独立发布方一致，且位于固定36小时窗口"
 )
@@ -1821,6 +1822,8 @@ def _automatic_merge_decision(
             or len(left_key) < _SHORT_TITLE_MIN_LENGTH
             or len(left_key) > _SHORT_TITLE_MAX_LENGTH
             or not _short_title_is_specific(left_key)
+            or abs(int(left["occurred_at"]) - int(right["occurred_at"]))
+            > _SHORT_TITLE_WINDOW_SECONDS
         ):
             return None
 
