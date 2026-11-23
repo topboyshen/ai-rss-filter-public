@@ -2165,7 +2165,11 @@ def _outcome_contract_state(
         return state, _OUTCOME_CONTRACT_NOTES[state]
     frozen = conn.execute(
         _event_group_cte()
-        + " SELECT 1 FROM event_group CROSS JOIN backtest_signals AS signal "
+        + " SELECT COUNT(*) AS frozen_count, "
+        "COALESCE(SUM(CASE WHEN LOWER(mapping.relation_type) IN "
+        "('direct', 'direct_impact', 'affected', 'upstream', 'downstream', 'ecosystem') "
+        "THEN 1 ELSE 0 END), 0) AS direct_count "
+        "FROM event_group CROSS JOIN backtest_signals AS signal "
         "ON event_group.event_id = signal.event_id "
         "JOIN backtest_signal_securities AS frozen ON frozen.ledger_signal_id = signal.id "
         "JOIN event_securities AS mapping ON mapping.mapping_id = frozen.mapping_id "
@@ -2173,13 +2177,15 @@ def _outcome_contract_state(
         "AND mapping.security_id = frozen.security_id "
         "AND mapping.revision = frozen.mapping_revision "
         "WHERE signal.selected = 1 AND signal.available_at > 0 AND signal.available_at <= ? "
-        f"AND LOWER(TRIM(COALESCE(signal.score_path, ''))) IN ({placeholders}) "
-        "AND LOWER(mapping.relation_type) IN "
-        "('direct', 'direct_impact', 'affected', 'upstream', 'downstream', 'ecosystem') "
-        "LIMIT 1",
+        f"AND LOWER(TRIM(COALESCE(signal.score_path, ''))) IN ({placeholders})",
         (root_event_id, read_at, *formal_paths),
     ).fetchone()
-    state = "contract_mismatch" if frozen is None else "no_direct_contract"
+    frozen_count = int(frozen["frozen_count"] or 0) if frozen else 0
+    direct_count = int(frozen["direct_count"] or 0) if frozen else 0
+    # A selected signal whose frozen mappings are all concept/benchmark is
+    # "no direct contract", even when those concept mappings were revised.
+    # Only count a missing/direct-but-empty contract as a mismatch.
+    state = "no_direct_contract" if frozen_count and not direct_count else "contract_mismatch"
     return state, _OUTCOME_CONTRACT_NOTES[state]
 
 
