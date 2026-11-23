@@ -39,8 +39,24 @@ from routes.event_radar_routes import (
         # Keep contrast and future wording from creating false negation.
         ("公司未来计划收购", "planned"),
         ("公司不排除收购计划", "planned"),
+        # Remaining P1 diagnostic vocabulary.
+        ("美国加州正式起诉OpenAI，指控其模型测试疏于管控、危害公共安全", "completed"),
+        ("光启技术：子公司签17.9亿元超材料航空结构产品采购框架合同", "completed"),
+        ("公司签订框架协议", "completed"),
+        ("复星医药：控股子公司多款药品新纳入2026年国家医保目录", "completed"),
+        ("因算力不足，DeepSeek对App/网页版限额使用", "completed"),
+        ("云南锗业：高品质磷化铟单晶片项目投资额增至2.7亿元", "completed"),
+        ("2026年APEC工商界活动形成14份成果文件", "completed"),
+        ("摩根大通：CUDA护城河正在瓦解，英伟达面临的真正挑战不止于CEO离职", "neither"),
+        # Future forms outrank the completed marker they contain.
+        ("项目将完成", "planned"),
+        ("公司将纳入国家医保目录", "planned"),
+        ("摩根大通：获批设立新分行", "completed"),
+        ("摩根大通：拟设立新分行", "planned"),
+        # "签" is a completion only in a signing context, not in "标签".
+        ("公司未签合同", "not_completed"),
+        ("欧盟发布AI标签规则", "unknown"),
         # No explicit phase or opinion marker: stay unknown rather than guess.
-        ("摩根大通：CUDA护城河正在瓦解", "unknown"),
         ("某公司发布新产品", "unknown"),
         ("", "unknown"),
     ],
