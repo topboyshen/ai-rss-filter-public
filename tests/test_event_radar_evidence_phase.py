@@ -1,4 +1,4 @@
-"""P4: keep planned and opinion claims out of the "supports" label."""
+"""P4: keep planned, opinion, negated, and mixed claims out of ``supports``."""
 
 from pathlib import Path
 
@@ -20,6 +20,25 @@ from routes.event_radar_routes import (
         ("药明康德：获美国国防部从1260H名单移除，共同撤诉约定已获批", "completed"),
         ("世界首个300兆瓦压缩空气储能电站并网发电", "completed"),
         ("中信建投：物理AI是人工智能下一波浪潮 建议聚焦优质环节", "neither"),
+        # Negation must not turn a denied plan into a planned event.
+        ("包钢股份：暂无对钢铁资产进行剥离或分拆的计划", "negated"),
+        ("公司没有收购计划", "negated"),
+        ("公司不计划收购", "negated"),
+        ("公司否认收购计划", "negated"),
+        ("公司不予考虑收购", "negated"),
+        # Negated completion is not completion.
+        ("项目尚未完成", "not_completed"),
+        ("公司未签署协议", "not_completed"),
+        # The main clause wins in a mixed headline.
+        ("企业法庭就追加临时措施申请作出裁定，公司拟上诉", "completed"),
+        ("公司拟收购成都奥捷通信股权，交易已获批", "planned"),
+        ("公司已签署框架协议，拟后续投资", "completed"),
+        # A contrast clause starts a new assertion; negation must not cross it.
+        ("公司暂无计划但拟投资", "planned"),
+        ("公司尚未完成但已签署部分协议", "completed"),
+        # Keep contrast and future wording from creating false negation.
+        ("公司未来计划收购", "planned"),
+        ("公司不排除收购计划", "planned"),
         # No explicit phase or opinion marker: stay unknown rather than guess.
         ("摩根大通：CUDA护城河正在瓦解", "unknown"),
         ("某公司发布新产品", "unknown"),
@@ -37,6 +56,11 @@ def test_planned_claim_is_not_labelled_as_support():
 
 def test_completed_claim_keeps_the_support_label():
     assert _evidence_stance_label("supports", "公司已获批生产许可") == "支持记录"
+
+
+def test_negated_claim_is_not_labelled_as_planned_or_completed():
+    assert _evidence_stance_label("supports", "公司暂无收购计划") == "否认/澄清"
+    assert _evidence_stance_label("supports", "项目尚未完成") == "未完成/未发生"
 
 
 def test_denial_is_never_relabelled_by_phase():
@@ -61,6 +85,26 @@ def test_source_view_exposes_phase_and_labels_each_observation():
     assert [item["stance_label"] for item in source["observations"]] == [
         "计划（未完成）",
         "支持记录",
+    ]
+
+
+def test_source_view_marks_negated_and_mixed_observations():
+    raw = {
+        "claim_text": "企业法庭就追加临时措施申请作出裁定，公司拟上诉",
+        "stance": "supports",
+        "observations": [
+            {"claim_text": "公司暂无收购计划", "stance": "supports"},
+            {"claim_text": "项目尚未完成", "stance": "supports"},
+        ],
+    }
+
+    source = _source_view(raw, {})
+
+    assert source["phase"] == "completed"
+    assert source["phase_label"] == "已完成表述"
+    assert [item["phase_label"] for item in source["observations"]] == [
+        "否认/澄清",
+        "未完成/未发生",
     ]
 
 
