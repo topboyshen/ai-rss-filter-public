@@ -199,13 +199,28 @@ def _source_label(source: dict[str, Any], feed_names: dict[str, str]) -> str:
     return "来源"
 
 
-_EVIDENCE_PLANNED_MARKERS = ("拟", "计划", "接近", "寻求", "考虑", "筹备")
+_EVIDENCE_PLANNED_MARKERS = (
+    "拟", "计划", "接近", "寻求", "考虑", "筹备",
+    "将纳入", "将形成", "将增至", "将起诉", "将限额", "将签",
+    "将完成", "将获批", "将交付", "将并网",
+)
 _EVIDENCE_COMPLETED_MARKERS = (
     "已完成", "已签署", "已获批", "已交付", "已并网", "已上市", "已纳入",
     "已实现", "已达成", "已超", "完成", "获批", "并网发电", "纳入国家医保", "签署", "交付",
-    "裁定", "判决", "裁决", "宣判", "驳回",
+    "裁定", "判决", "裁决", "宣判", "驳回", "起诉", "纳入", "限额", "增至", "形成",
+)
+_EVIDENCE_COMPLETED_PATTERNS = (
+    re.compile(r"签(?:署|订|约|下)"),
+    re.compile(r"签[^，。；]{0,30}(?:合同|协议)"),
 )
 _EVIDENCE_OPINION_MARKERS = ("认为", "建议", "观点", "展望", "预计", "判断", "指出", "表示")
+_EVIDENCE_OPINION_SPEAKERS = (
+    "摩根大通", "摩根士丹利", "高盛", "中信建投", "中信证券", "中金",
+    "瑞银", "野村", "花旗", "巴克莱", "汇丰", "德意志银行",
+)
+_EVIDENCE_OPINION_SPEAKER_RE = re.compile(
+    r"(?:" + "|".join(re.escape(name) for name in _EVIDENCE_OPINION_SPEAKERS) + r")\s*[：:]"
+)
 _EVIDENCE_NEGATION_PHRASES = (
     "暂无", "没有", "尚无", "并无", "未有", "从未", "未曾", "尚未", "并未",
     "暂未", "仍未", "未能", "无法", "不能", "未按", "未如期", "不予", "未予",
@@ -243,6 +258,11 @@ def _marker_is_negated(clause: str, marker: str) -> bool:
 def _clause_phase(clause: str) -> str | None:
     planned = [marker for marker in _EVIDENCE_PLANNED_MARKERS if marker in clause]
     completed = [marker for marker in _EVIDENCE_COMPLETED_MARKERS if marker in clause]
+    completed.extend(
+        match.group(0)
+        for pattern in _EVIDENCE_COMPLETED_PATTERNS
+        for match in pattern.finditer(clause)
+    )
     opinion = [marker for marker in _EVIDENCE_OPINION_MARKERS if marker in clause]
     if planned and any(not _marker_is_negated(clause, marker) for marker in planned):
         return "planned"
@@ -262,6 +282,7 @@ def _evidence_phase(claim: object) -> str:
     text = str(claim or "")
     if not text:
         return "unknown"
+    speaker_opinion = bool(_EVIDENCE_OPINION_SPEAKER_RE.search(text))
     saw_negated = False
     saw_not_completed = False
     for raw_clause in _EVIDENCE_CLAUSE_SPLIT.split(text):
@@ -279,6 +300,8 @@ def _evidence_phase(claim: object) -> str:
         return "not_completed"
     if saw_negated:
         return "negated"
+    if speaker_opinion:
+        return "neither"
     return "unknown"
 
 
