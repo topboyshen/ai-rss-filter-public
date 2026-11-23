@@ -203,14 +203,58 @@ _EVIDENCE_PLANNED_MARKERS = ("拟", "计划", "接近", "寻求", "考虑", "筹
 _EVIDENCE_COMPLETED_MARKERS = (
     "已完成", "已签署", "已获批", "已交付", "已并网", "已上市", "已纳入",
     "已实现", "已达成", "已超", "完成", "获批", "并网发电", "纳入国家医保", "签署", "交付",
+    "裁定", "判决", "裁决", "宣判", "驳回",
 )
 _EVIDENCE_OPINION_MARKERS = ("认为", "建议", "观点", "展望", "预计", "判断", "指出", "表示")
+_EVIDENCE_NEGATION_PHRASES = (
+    "暂无", "没有", "尚无", "并无", "未有", "从未", "未曾", "尚未", "并未",
+    "暂未", "仍未", "未能", "无法", "不能", "未按", "未如期", "不予", "未予",
+    "否认", "辟谣", "不属实", "无意", "不打算", "未提及",
+)
+_EVIDENCE_NEGATION_PREFIXES = ("不", "未", "无", "非")
+_EVIDENCE_CLAUSE_SPLIT = re.compile(
+    r"[，。；;!?！？：:\n]+|(?<![不非])但(?:是)?|然而|不过(?!度)"
+)
 _EVIDENCE_PHASE_LABELS = {
     "planned": "计划（未完成）",
     "completed": "已完成表述",
     "neither": "观点/背景",
+    "negated": "否认/澄清",
+    "not_completed": "未完成/未发生",
     "unknown": "",
 }
+
+
+def _marker_is_negated(clause: str, marker: str) -> bool:
+    """Return true only when every occurrence of the marker has a negation scope."""
+    starts = [match.start() for match in re.finditer(re.escape(marker), clause)]
+    if not starts:
+        return False
+    for start in starts:
+        prefix = clause[:start].rstrip()
+        if prefix.endswith(_EVIDENCE_NEGATION_PREFIXES):
+            continue
+        if any(phrase in prefix for phrase in _EVIDENCE_NEGATION_PHRASES):
+            continue
+        return False
+    return True
+
+
+def _clause_phase(clause: str) -> str | None:
+    planned = [marker for marker in _EVIDENCE_PLANNED_MARKERS if marker in clause]
+    completed = [marker for marker in _EVIDENCE_COMPLETED_MARKERS if marker in clause]
+    opinion = [marker for marker in _EVIDENCE_OPINION_MARKERS if marker in clause]
+    if planned and any(not _marker_is_negated(clause, marker) for marker in planned):
+        return "planned"
+    if completed and any(not _marker_is_negated(clause, marker) for marker in completed):
+        return "completed"
+    if opinion and any(not _marker_is_negated(clause, marker) for marker in opinion):
+        return "neither"
+    if completed and all(_marker_is_negated(clause, marker) for marker in completed):
+        return "not_completed"
+    if planned and all(_marker_is_negated(clause, marker) for marker in planned):
+        return "negated"
+    return None
 
 
 def _evidence_phase(claim: object) -> str:
@@ -218,12 +262,23 @@ def _evidence_phase(claim: object) -> str:
     text = str(claim or "")
     if not text:
         return "unknown"
-    if any(marker in text for marker in _EVIDENCE_PLANNED_MARKERS):
-        return "planned"
-    if any(marker in text for marker in _EVIDENCE_COMPLETED_MARKERS):
-        return "completed"
-    if any(marker in text for marker in _EVIDENCE_OPINION_MARKERS):
-        return "neither"
+    saw_negated = False
+    saw_not_completed = False
+    for raw_clause in _EVIDENCE_CLAUSE_SPLIT.split(text):
+        clause = raw_clause.strip()
+        if not clause:
+            continue
+        phase = _clause_phase(clause)
+        if phase in {"planned", "completed", "neither"}:
+            return phase
+        if phase == "negated":
+            saw_negated = True
+        elif phase == "not_completed":
+            saw_not_completed = True
+    if saw_not_completed:
+        return "not_completed"
+    if saw_negated:
+        return "negated"
     return "unknown"
 
 
@@ -234,7 +289,7 @@ def _evidence_stance_label(stance: object, claim: object) -> str:
     if stance != "supports":
         return base
     phase = _evidence_phase(claim)
-    if phase in {"planned", "neither"}:
+    if phase in {"planned", "neither", "negated", "not_completed"}:
         return _EVIDENCE_PHASE_LABELS[phase]
     return base
 
