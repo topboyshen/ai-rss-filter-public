@@ -236,6 +236,55 @@ python scripts/run_event_enrichment.py \
 epoch 旋转命令见 [Quant 集成契约](quant-integration.md#恢复与-epoch)。不要静默推进旧
 Quant 游标，也不要把清空 retained Outbox 当作普通恢复步骤。
 
+### 5.1 Restore Drill Log
+
+本表只记录**经单独授权的真实恢复演练**。它不改变
+[NO_BACKUP 策略](../ops/README.md#jd-policy-no_backup-2026-09-10)，也不授权创建备份、
+恢复生产库或启用演练调度。没有授权的条目不能写成 PASS。
+
+历史证据：
+
+| 检查时间（CST） | 类型 | 归档 / 数据库 | SHA256 | 数据库大小 | 结果 | RTO | 说明 |
+|---|---|---|---|---|---:|---|---|
+| 2026-08-13 11:21:06 | 隔离恢复演练 | `system_backup_2026-08-13T111935.tar.gz` | `ea392bbffd8e23d76fb827f78c1649dac0e0c3fadece737663c3dd6b192d4607` | 362,565,632 B | `ok` | 未记录 | 归档已清理；只保留 attestation，不能据此声称当前可恢复 |
+| 2026-09-06 04:30:02 | 隔离恢复演练 | `system_backup_2026-09-06T033001.tar.gz` | `59b908d588f47f8df3c1699262b5e69016be48c1a7f28990dc63b1b38e405b4e` | 772,075,520 B | `ok` | 未记录 | 归档已清理；attestation 只证明当时校验通过 |
+| 2026-09-10 04:00:02 | 备份校验（非恢复演练） | `system_backup_2026-09-10T033001.tar.gz` | `28065b789e11a8b94642b7f3df8a5db9b12033a862115ad0dd81efb2bd71d740` | 311,447,510 B（归档） | `canonical_database=true` | 不适用 | 归档仍在；未执行恢复，不能算 RTO |
+
+当前状态：
+
+- 2026-09-10 起执行 NO_BACKUP；之后的自动备份与周日恢复演练均已停用。
+- 上表没有 2026-09-10 之后的恢复演练，也没有可引用的 RTO。
+- `checked_at`/文件 mtime 不是恢复耗时；RTO 必须有明确的 restore start/end 记录。
+- 历史归档多数已清理；保留的 2026-09-10 归档可用于未来获授权的隔离演练，但本次未运行。
+
+未来经授权的条目至少记录：
+
+```text
+date:
+authorization:
+release/ref:
+archive path:
+archive SHA256:
+database size:
+restore start:
+restore end:
+RTO:
+quick_check:
+foreign_key_check:
+required tables / row-count checks:
+Redis snapshot or AOF scope:
+integration outbox epoch rotation:
+read-only API checks:
+application/Compose rollback boundary:
+result:
+operator:
+notes:
+```
+
+一次完整的授权演练至少应覆盖：在隔离目录解包、校验归档 SHA256、`PRAGMA quick_check` 为 `ok`、
+外键违规为 `0`、关键表存在且行数非零、只读 API 能打开隔离库、必要的 outbox epoch 检查，
+以及明确记录开始/结束时间。仅校验归档、仅启动镜像或仅看到容器 healthy 都不算恢复演练。
+
 ## 6. 主机资产与备份边界
 
 `ops/install.sh --apply` 会以 root 权限修改 systemd/cron/主机资产。先审阅差异并运行

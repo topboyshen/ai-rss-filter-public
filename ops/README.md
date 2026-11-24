@@ -29,6 +29,9 @@ configure/upload offsite storage, or enable a backup schedule without separate
 explicit authorization. The general installer is NOT the scoped policy migration:
 it also enables market timers and is not to be run as part of this change.
 
+历史恢复演练证据与未来条目的记录格式见
+[docs/deployment-and-recovery.md](../docs/deployment-and-recovery.md#51-restore-drill-log)。
+
 ## Dashboard host-check snapshot
 
 The existing hourly checker also writes `data/ops/host_status.json` next to the
