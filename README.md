@@ -178,7 +178,7 @@ python3.11 -m venv .venv-release-gate
 `verify`；该页集中维护完整命令和基于 `current`/`previous` 的回退步骤。
 
 `run-release-gate.sh` 会在隔离的 clean-HEAD worktree 中，以项目的 Python 3.11
-环境执行完整测试和 75% 覆盖率门槛。只有成功才会在 `/run` 写入短期、本机、
+环境执行完整测试和 80% 覆盖率门槛。只有成功才会在 `/run` 写入短期、本机、
 owner-only 的发布测试收据；`build` 在收据缺失、过期、源码/runner/Python 不匹配时
 于调用 Docker 前拒绝。该收据用于防止漏跑或误用旧测试结果，不是抵抗 root 的密码学签名。
 dirty build 与外部 Compose build 均不被收据授权；部署和回滚不重新运行测试。

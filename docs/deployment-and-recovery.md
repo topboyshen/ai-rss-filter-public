@@ -64,7 +64,7 @@ distinct previous 时不能假定脚本可以自动恢复。
 「服务必须唯一匹配」的口径一致。
 
 `run-release-gate.sh` 先在隔离的 clean-HEAD worktree 中固定执行 shell 语法检查、完整 pytest
-和 75% 覆盖率门槛。成功后才会在 `/run/ai-filter-release-gate/attestations` 原子写入权限
+和 80% 覆盖率门槛。成功后才会在 `/run/ai-filter-release-gate/attestations` 原子写入权限
 `0600`、最长有效 6 小时且绑定 HEAD、runner、Python 与测试日志的本机收据。新一轮测试开始
 会先撤销同 HEAD 的旧收据；失败或中断不会留下 PASS。收据是防漏跑的本地发布控制，不是抵抗
 root 的密码学签名。

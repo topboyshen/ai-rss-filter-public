@@ -257,7 +257,7 @@ else
     --cov-config=.coveragerc
     --cov-report=xml
     --cov-report=term
-    --cov-fail-under=75
+    --cov-fail-under=80
   )
 fi
 
