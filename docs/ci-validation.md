@@ -46,6 +46,19 @@ Only a successful lightweight job can skip the full job. Failed or missing
 classification/check results select full validation unless the run itself has
 been cancelled.
 
+## Function-length baseline
+
+`ops/function_length_allowlist.baseline.json` is the frozen ceiling for legacy
+long functions. The function-length gate rejects:
+
+- a new allowlist key;
+- an allowance above the frozen ceiling;
+- any change to the baseline file itself.
+
+The live `ops/function_length_allowlist.json` may only tighten a value or remove
+an entry after the function fits the 120-line budget. Keys absent from the frozen
+baseline are rejected as new exceptions.
+
 ## Superseded runs
 
 Only runs for the same PR share a concurrency group and may replace a run

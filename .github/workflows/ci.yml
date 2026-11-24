@@ -152,8 +152,27 @@ jobs:
         run: |
           bash scripts/check-shell-syntax.sh
 
+      - name: Guard immutable function-length baseline
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          base="${PR_BASE_SHA:-$PUSH_BEFORE_SHA}"
+          case "$base" in
+            ""|0000000000000000000000000000000000000000)
+              echo "No comparison base; skipping immutable baseline check."
+              exit 0
+              ;;
+          esac
+          if git cat-file -e "${base}:ops/function_length_allowlist.baseline.json" 2>/dev/null; then
+            git diff --exit-code "$base" -- ops/function_length_allowlist.baseline.json
+          else
+            echo "Baseline file is introduced in this revision; future changes are immutable."
+          fi
+
       - name: Function length gate
-        run: python3 scripts/check_function_length.py --max 120 --allowlist ops/function_length_allowlist.json
+        run: python3 scripts/check_function_length.py --max 120 --allowlist ops/function_length_allowlist.json --baseline ops/function_length_allowlist.baseline.json
 
       - name: Run isolated full test suite with coverage
         run: |

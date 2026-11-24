@@ -65,6 +65,24 @@ def load_allowlist(path: Path) -> dict[str, int]:
     return {str(k): int(v) for k, v in payload.items()}
 
 
+def evaluate_baseline(
+    allowlist: dict[str, int], baseline: dict[str, int]
+) -> list[str]:
+    """Reject new exceptions and increases against an immutable ceiling."""
+    errors: list[str] = []
+    for key, value in sorted(allowlist.items()):
+        ceiling = baseline.get(key)
+        if ceiling is None:
+            errors.append(
+                f"ALLOWLIST_NEW_ENTRY {key}: {value}; new exceptions require refactoring"
+            )
+        elif value > ceiling:
+            errors.append(
+                f"ALLOWLIST_GREW {key}: {value} > frozen ceiling {ceiling}"
+            )
+    return errors
+
+
 def evaluate(
     lengths: list[FunctionLength], *, max_lines: int, allowlist: dict[str, int]
 ) -> list[str]:
@@ -102,6 +120,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", default=".")
     parser.add_argument("--max", type=int, default=120, dest="max_lines")
     parser.add_argument("--allowlist", default="ops/function_length_allowlist.json")
+    parser.add_argument("--baseline", default="")
     parser.add_argument("--write-baseline", default="")
     args = parser.parse_args(argv)
 
@@ -127,6 +146,11 @@ def main(argv: list[str] | None = None) -> int:
 
     allowlist = load_allowlist((root / args.allowlist).resolve())
     errors = evaluate(lengths, max_lines=args.max_lines, allowlist=allowlist)
+    if args.baseline:
+        baseline_path = (root / args.baseline).resolve()
+        if not baseline_path.exists():
+            raise SystemExit(f"function length baseline is missing: {baseline_path}")
+        errors.extend(evaluate_baseline(allowlist, load_allowlist(baseline_path)))
     if errors:
         for error in errors:
             print(error)

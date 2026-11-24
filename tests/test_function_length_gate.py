@@ -65,6 +65,30 @@ def test_shrinking_legacy_requires_tightening_before_future_growth():
     assert errors[0].startswith("LONG_FUNCTION_GREW ")
 
 
+def test_baseline_rejects_new_exception():
+    gate = _load_gate()
+    errors = gate.evaluate_baseline(
+        {"core/x.py:new_big": 130}, {"core/x.py:legacy_big": 130}
+    )
+    assert any("ALLOWLIST_NEW_ENTRY" in error for error in errors)
+
+
+def test_baseline_rejects_increased_allowance():
+    gate = _load_gate()
+    errors = gate.evaluate_baseline(
+        {"core/x.py:legacy_big": 140}, {"core/x.py:legacy_big": 130}
+    )
+    assert any("ALLOWLIST_GREW" in error for error in errors)
+
+
+def test_baseline_allows_tightening_and_retirement():
+    gate = _load_gate()
+    assert gate.evaluate_baseline(
+        {"core/x.py:legacy_big": 120}, {"core/x.py:legacy_big": 130}
+    ) == []
+    assert gate.evaluate_baseline({}, {"core/x.py:legacy_big": 130}) == []
+
+
 def test_iter_function_lengths_uses_end_lineno(tmp_path):
     gate = _load_gate()
     path = tmp_path / "sample.py"
@@ -145,6 +169,35 @@ def test_main_default_limit_has_exact_120_line_boundary(
         )
     else:
         assert "function length gate OK: max=120" in result.stdout
+
+
+def test_main_checks_immutable_allowlist_baseline(tmp_path, capsys):
+    gate = _load_gate()
+    root = _checkout(tmp_path / "checkout", allowlist={"core/example.py:legacy_big": 123})
+    baseline = root / "ops" / "function_length_allowlist.baseline.json"
+    baseline.write_text(
+        json.dumps({"core/example.py:legacy_big": 123}), encoding="utf-8"
+    )
+    accepted = gate.main(
+        ["--root", str(root), "--baseline", "ops/function_length_allowlist.baseline.json"]
+    )
+    assert accepted == 0
+    assert "function length gate OK" in capsys.readouterr().out
+
+    baseline.write_text(
+        json.dumps({"core/example.py:legacy_big": 122}), encoding="utf-8"
+    )
+    rejected = gate.main(
+        ["--root", str(root), "--baseline", "ops/function_length_allowlist.baseline.json"]
+    )
+    assert rejected == 1
+    assert "ALLOWLIST_GREW" in capsys.readouterr().out
+
+    baseline.unlink()
+    with pytest.raises(SystemExit, match="baseline is missing"):
+        gate.main(
+            ["--root", str(root), "--baseline", "ops/function_length_allowlist.baseline.json"]
+        )
 
 
 def test_write_baseline_uses_relative_keys_and_is_accepted_by_main(tmp_path):
