@@ -55,9 +55,25 @@ from routes.event_radar_routes import (
         ("摩根大通：拟设立新分行", "planned"),
         # "签" is a completion only in a signing context, not in "标签".
         ("公司未签合同", "not_completed"),
-        ("欧盟发布AI标签规则", "unknown"),
+        ("欧盟讨论AI标签规则", "unknown"),
+        # Q-sample action completions, with scope guards.
+        ("英伟达(NVDA.O)官方社媒账号发布黄仁勋回归照片。", "completed"),
+        ("华兴资本控股：任命葛小波为首席执行官", "completed"),
+        ("金石资本集团：短暂停牌，以待刊发内幕消息公告", "completed"),
+        ("国机精工：金刚石散热产品向GPU类客户送样验证工作已开展", "completed"),
+        ("丁薛祥会见新加坡国务资政李显龙", "completed"),
+        ("友邦吊顶：拟将集成吊顶业务相关资产划转至全资子公司", "planned"),
+        ("利好刷屏！A股公司，密集发布", "unknown"),
+        ("A股停牌提示：5股今日停牌", "unknown"),
+        # Future forms outrank the completion word they contain.
+        ("公司将发布业绩预告", "planned"),
+        ("公司将任命新首席执行官", "planned"),
+        ("公司将短暂停牌", "planned"),
+        ("公司将开展送样验证", "planned"),
+        ("公司将会见客户", "planned"),
+        ("公司未发布公告", "not_completed"),
         # No explicit phase or opinion marker: stay unknown rather than guess.
-        ("某公司发布新产品", "unknown"),
+        ("某公司新产品", "unknown"),
         ("", "unknown"),
     ],
 )
