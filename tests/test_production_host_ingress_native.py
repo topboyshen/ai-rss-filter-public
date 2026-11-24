@@ -1275,6 +1275,61 @@ def test_log_thread_creation_failure_registers_live_daemon_before_outermost_hold
             os.close(write_fd)
 
 
+def _info_timeout():
+    error = native.ProofError("command deadline; outcome unknown")
+    error.native_host_command = {"operation": "docker_info"}
+    return error
+
+
+def test_read_daemon_info_retries_only_transient_info_timeout(monkeypatch):
+    calls = []
+
+    class Commands:
+        deadline = time.monotonic() + 10
+
+        def docker(self, args):
+            calls.append(args)
+            if len(calls) == 1:
+                raise _info_timeout()
+            return '{"ServerVersion":"ok"}'
+
+    monkeypatch.setattr(native.time, "sleep", lambda _: None)
+    assert native.read_daemon_info(Commands()) == {"ServerVersion": "ok"}
+    assert len(calls) == 2
+
+
+def test_read_daemon_info_stops_after_bounded_attempts(monkeypatch):
+    calls = []
+
+    class Commands:
+        deadline = time.monotonic() + 10
+
+        def docker(self, args):
+            calls.append(args)
+            raise _info_timeout()
+
+    monkeypatch.setattr(native.time, "sleep", lambda _: None)
+    with pytest.raises(native.ProofError, match="command deadline"):
+        native.read_daemon_info(Commands())
+    assert len(calls) == 3
+
+
+def test_read_daemon_info_does_not_retry_non_info_failure(monkeypatch):
+    calls = []
+
+    class Commands:
+        deadline = time.monotonic() + 10
+
+        def docker(self, args):
+            calls.append(args)
+            raise native.ProofError("different failure")
+
+    monkeypatch.setattr(native.time, "sleep", lambda _: None)
+    with pytest.raises(native.ProofError, match="different failure"):
+        native.read_daemon_info(Commands())
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize("field,value", [("operation", "SECRET"), ("error", "SECRET"),
     ("execution_proof", True), ("sequence", True), ("returncode", True),
     ("elapsed_seconds", float("inf")), ("elapsed_seconds", 10**400), ("budget_seconds", -1), ("extra", "SECRET")])

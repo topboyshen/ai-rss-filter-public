@@ -891,6 +891,28 @@ def wait_until(check, deadline):
     raise TimeoutError("bounded observation expired")
 
 
+def read_daemon_info(commands, *, attempts=3, wait_seconds=10):
+    """Retry only the fixed, read-only Docker-info readiness probe.
+
+    A just-started daemon can accept its socket before ``docker info`` returns
+    within one three-second command budget. The probe is read-only, so a
+    bounded retry is safe; all failed receipts remain in the evidence tree.
+    """
+    end = min(commands.deadline, time.monotonic() + wait_seconds)
+    for attempt in range(attempts):
+        try:
+            return json.loads(commands.docker(["info", "--format", "{{json .}}"]))
+        except Exception as error:
+            command = getattr(error, "native_host_command", None)
+            if (not isinstance(command, dict)
+                    or command.get("operation") != "docker_info"
+                    or attempt == attempts - 1
+                    or time.monotonic() >= end):
+                raise
+            time.sleep(min(0.2, max(0.0, end - time.monotonic())))
+    raise ProofError("daemon info retry budget exhausted")
+
+
 def start_daemon(commands, root, plan):
     resolver = resolver_target()
     commands.run([str(TOOLS["mount"]), "--make-rprivate", "/"])
@@ -932,7 +954,7 @@ def start_daemon(commands, root, plan):
         require(retainer_confirmed(process), "live daemon pipe retainer disappeared")
         check_peer(process.pid, actual)
     commands.peer = peer
-    durable(root / "DAEMON_INFO.json", json.loads(commands.docker(["info", "--format", "{{json .}}"])))
+    durable(root / "DAEMON_INFO.json", read_daemon_info(commands))
     return process, actual, logs
 
 
