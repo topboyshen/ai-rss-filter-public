@@ -7,6 +7,7 @@ export const BASE_IMAGE = 'diygod/rsshub@sha256:e7cd1bd8838b91f89c2ed56b0889f375
 export const BASE_REVISION = 'f23ada8a636fbbb5f92d8e91558cf4e8ffaca66a';
 export const MODULES = Object.freeze({
   'wallstreetcn-news-BKjmaYn2.mjs': '80539407f40be2ed181c6e5853a7c3e26247a1ecedb372d5b0e7ab0ccea0fee7',
+  'wallstreetcn-live-Dn6YC-py.mjs': '5601de068e2c74be984fb99171e3350d03500842a9a70b33083f3a1a76aaff9a',
   'cls-telegraph-DFOzEo9d.mjs': '06d7f8eed8704604c0848084a1f595ce1dc0c2926c5444b6f1fc38eefcd604de',
 });
 export const DEPENDENCIES = Object.freeze({
@@ -39,10 +40,15 @@ export function patchModule(name, bytes) {
     source = replaceExactlyOnce(source,
       'channel=${a}&accept=article',
       'channel=${a===`global`?`global-channel`:a}&accept=article');
-  } else {
+  } else if (name === 'cls-telegraph-DFOzEo9d.mjs') {
     source = replaceExactlyOnce(source,
       'link:e.shareurl||`https://www.cls.cn/detail/${e.id}`,',
       'link:s===void 0?e.shareurl:e.shareurl||`https://www.cls.cn/detail/${e.id}`,');
+  }
+  if (name === 'wallstreetcn-news-BKjmaYn2.mjs' || name === 'wallstreetcn-live-Dn6YC-py.mjs') {
+    source = replaceExactlyOnce(source,
+      'https://api-one.wallstcn.com',
+      'https://api-one-wscn.awtmt.com');
   }
   return Buffer.from(source, 'utf8');
 }

@@ -9,6 +9,10 @@ from services import publisher_feeds as feeds
 ROUTE = "http://rsshub:1200/wallstreetcn/news/global"
 
 
+def test_native_wallstreet_api_uses_current_host():
+    assert feeds.WALLSTREET_API == "https://api-one-wscn.awtmt.com/apiv1/content/"
+
+
 def config(limit=2):
     return {"feeds": [{"url": ROUTE, "max_entries": limit}]}
 
