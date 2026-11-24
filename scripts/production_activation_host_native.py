@@ -519,7 +519,7 @@ def start_daemon(commands, root, plan, mirror):
                                     final=commands.deadline == plan["deadline"])
 
     commands.peer = peer
-    record(root / "DAEMON_INFO.json", json.loads(commands.docker(["info", "--format", "{{json .}}"])))
+    record(root / "DAEMON_INFO.json", host.read_daemon_info(commands))
     return process, actual, logs
 
 
