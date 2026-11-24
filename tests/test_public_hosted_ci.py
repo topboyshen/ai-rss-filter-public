@@ -382,7 +382,7 @@ def test_host_postgres_driver_is_pinned_without_changing_application_dependencie
     root = WORKFLOWS.parents[1]
     pins = {line for line in (root / "requirements-ops.txt").read_text().splitlines()
             if line and not line.startswith("#")}
-    assert pins == {"psycopg==3.3.6", "psycopg-binary==3.3.6"}
+    assert pins == {"psycopg==3.3.9", "psycopg-binary==3.3.9"}
     for name in ("requirements-prod.txt", "requirements.txt", "Dockerfile"):
         text = (root / name).read_text()
         assert "requirements-ops" not in text and "psycopg" not in text

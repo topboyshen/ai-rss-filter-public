@@ -490,7 +490,7 @@ def check_dependency_image_postgres(source, probe):
     tree = ast.parse(probe)
     imports = {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
     assert "psycopg" in imports
-    assert "psycopg.__version__ == '3.3.6' and psycopg.pq.__impl__ == 'binary'" in probe
+    assert "psycopg.__version__ == '3.3.9' and psycopg.pq.__impl__ == 'binary'" in probe
     assert probe.index("psycopg.__version__") < probe.index("pytest.main(")
 
 
@@ -505,7 +505,7 @@ def test_disposable_native_image_installs_and_checks_actual_pinned_postgres_driv
     elif drift == "import":
         probe = probe.replace(", pytest, psycopg", ", pytest")
     elif drift == "version":
-        probe = probe.replace("psycopg.__version__ == '3.3.6'", "True")
+        probe = probe.replace("psycopg.__version__ == '3.3.9'", "True")
     elif drift == "implementation":
         probe = probe.replace("psycopg.pq.__impl__ == 'binary'", "True")
     if drift is None:

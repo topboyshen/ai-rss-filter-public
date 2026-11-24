@@ -886,7 +886,7 @@ def test_retained_listener_link_value_change_is_still_rejected_by_live_confirm(m
     authority.pidfds, authority.processes = {123: 99}, {123: {"fixed": True}}
     authority.held = {123: {"/fixed-private-fd": held}}
     monkeypatch.setattr(subject, "_small", lambda *_a: (b"123", ()))
-    monkeypatch.setattr(subject.os, "stat", lambda _p: info)
+    monkeypatch.setattr(subject.os, "stat", lambda _p, **_k: info)
     monkeypatch.setattr(subject.os, "fstat", lambda _fd: info)
     monkeypatch.setattr(subject, "_current_listener", lambda: authority.listener_row)
     monkeypatch.setattr(subject, "_alive", lambda _fd: None)
@@ -1045,23 +1045,33 @@ def peer_static_case(monkeypatch):
     authority = subject._ArchiveAuthority(time.monotonic() + 3)
     authority.pid = 123
     authority.socket, authority.pid_raw, authority.pid_metadata = info, b"123", ()
-    authority.namespace_fd, authority.namespace = 19, (3, 2)
+    # Use fake, high-numbered descriptors so pytest/xdist's own low fds are
+    # never shadowed by the synthetic fstat result.
+    namespace_fd, pidfd = 10_000_019, 10_000_099
+    authority.namespace_fd, authority.namespace = namespace_fd, (3, 2)
     authority.listener_row = {"inode": 123}
-    authority.pidfds, authority.processes = {123: 99}, {123: {"fixed": True}}
+    authority.pidfds, authority.processes = {123: pidfd}, {123: {"fixed": True}}
     authority.held = {123: {"/fixed-private-fd": ("socket:[123]",)}}
     state, events = {"fault": None}, []
-    def file_stat(_path):
+    real_lstat, real_stat = os.lstat, os.stat
+    def file_stat(path):
+        if path != subject.SOCKET_PATH:
+            return real_lstat(path)
         return SimpleNamespace(**{**vars(info), "st_ino": 999}) if state["fault"] == "socket" else info
     def alive(fd):
         events.append(("alive", fd))
         if state["fault"] == "pidfd_before" or (state["fault"] == "pidfd_after" and len(events) > 1):
             raise gate.AdmissionUncertain("pidfd no longer alive")
+    def namespace_stat(path, *, follow_symlinks=True):
+        if path != "/proc/self/ns/net":
+            return real_stat(path, follow_symlinks=follow_symlinks)
+        return SimpleNamespace(**{**vars(info), "st_ino": 99}) if state["fault"] == "namespace" else info
+    def fd_stat(_fd):
+        return SimpleNamespace(**{**vars(info), "st_ino": 99}) if state["fault"] == "held_namespace" else info
     monkeypatch.setattr(subject.os, "lstat", file_stat)
     monkeypatch.setattr(subject, "_small", lambda *_a: (b"999" if state["fault"] == "pid" else b"123", ()))
-    monkeypatch.setattr(subject.os, "stat", lambda _p: SimpleNamespace(st_dev=3, st_ino=99)
-                        if state["fault"] == "namespace" else info)
-    monkeypatch.setattr(subject.os, "fstat", lambda _fd: SimpleNamespace(st_dev=3, st_ino=99)
-                        if state["fault"] == "held_namespace" else info)
+    monkeypatch.setattr(subject.os, "stat", namespace_stat)
+    monkeypatch.setattr(subject.os, "fstat", fd_stat)
     monkeypatch.setattr(subject, "_current_listener", lambda: pytest.fail("peer must not inspect its pending connection"))
     monkeypatch.setattr(subject, "_alive", alive)
     monkeypatch.setattr(subject, "_process", lambda *_a, **_k: {"fixed": False}
@@ -1074,7 +1084,7 @@ def peer_static_case(monkeypatch):
 def test_recognized_peer_keeps_all_static_identity_checks_without_reading_pending_table(monkeypatch):
     authority, _state, events = peer_static_case(monkeypatch)
     authority.peer((123, 0, 0))
-    assert events == [("alive", 99), ("alive", 99)]
+    assert events == [("alive", 10_000_099), ("alive", 10_000_099)]
 
 
 @pytest.mark.parametrize("fault", ["deadline", "socket", "pid", "namespace", "held_namespace",
@@ -1093,12 +1103,13 @@ def test_inherited_peer_adds_systemd_anchor_and_rechecks_both_processes(monkeypa
     def anchor(pid):
         assert pid == 1
         events.append(("anchor", pid))
-        authority.pidfds[pid] = 88
+        authority.pidfds[pid] = 10_000_088
         authority.processes[pid] = {"fixed": True}
         authority.held[pid] = {"/second-private-fd": ("socket:[123]",)}
     monkeypatch.setattr(authority, "_anchor", anchor)
     authority.peer((1, 0, 0))
-    assert events == [("anchor", 1), ("alive", 99), ("alive", 99), ("alive", 88), ("alive", 88)]
+    assert events == [("anchor", 1), ("alive", 10_000_099), ("alive", 10_000_099),
+                      ("alive", 10_000_088), ("alive", 10_000_088)]
 
 
 def test_archive_authority_retains_initial_response_and_final_full_checks(monkeypatch):
