@@ -17,7 +17,7 @@ FIXED_PYTEST_ARGV = [
     "--cov",
     "--cov-config=.coveragerc",
     "--cov-report=term",
-    "--cov-fail-under=75",
+    "--cov-fail-under=80",
 ]
 
 

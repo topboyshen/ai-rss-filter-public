@@ -560,7 +560,7 @@ set +e
     ACTIVE=1 \
     "${ACTIVE_VAR}=1" \
     "${PYTHON_PATH}" -I -m pytest \
-      --cov --cov-config=.coveragerc --cov-report=term --cov-fail-under=75
+      --cov --cov-config=.coveragerc --cov-report=term --cov-fail-under=80
 ) 2>&1 | tee "${RUN_LOG}"
 PIPE_STATUSES=("${PIPESTATUS[@]}")
 set -e

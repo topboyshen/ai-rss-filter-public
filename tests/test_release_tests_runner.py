@@ -144,7 +144,7 @@ def test_runner_rejects_missing_mode_and_arbitrary_pytest_arguments(
                 "--cov-config=.coveragerc",
                 "--cov-report=xml",
                 "--cov-report=term",
-                "--cov-fail-under=75",
+                "--cov-fail-under=80",
             ],
             2,
         ),

@@ -157,8 +157,8 @@ jobs:
 
       - name: Run isolated full test suite with coverage
         run: |
-          # LF-native Linux baseline on 2026-08-04: 75.81% combined
-          # statement/branch coverage. Keep a small platform/version margin.
+          # Current LF-native coverage baseline is 83.99%; the global gate is
+          # 80% with a small platform/version margin.
           install -d -m 0700 "${RUNNER_TEMP}/ai-filter-synthetic-cutover-evidence"
           AI_FILTER_TEST_PYTHON="$(command -v python)" \
             AI_FILTER_TEST_NODE="${{ steps.isolated_node.outputs.path }}" \
