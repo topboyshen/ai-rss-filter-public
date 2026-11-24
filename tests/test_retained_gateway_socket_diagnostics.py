@@ -415,13 +415,21 @@ def test_confirm_identity_drift_still_rejects_with_diagnostics_enabled(monkeypat
                            st_uid=0, st_gid=0, st_nlink=1, st_size=0, st_mtime_ns=0, st_ctime_ns=0)
     current = subject._ArchiveAuthority(time.monotonic() + 1)
     current.socket, current.pid_raw, current.pid_metadata = info, b"456", ()
-    current.namespace_fd, current.namespace = 19, (3, 2)
+    namespace_fd = 10_000_019
+    current.namespace_fd, current.namespace = namespace_fd, (3, 2)
     current.listener_row = {"inode": 123}
+    real_stat = os.stat
     monkeypatch.setattr(subject.os, "lstat", lambda _p: info)
     monkeypatch.setattr(subject, "_small", lambda *_a: (b"456", ()))
-    drift = SimpleNamespace(st_dev=3, st_ino=99)
-    monkeypatch.setattr(subject.os, "stat", lambda _p: drift if changed == "namespace" else info)
-    monkeypatch.setattr(subject.os, "fstat", lambda _fd: drift if changed == "held_namespace" else info)
+    drift = SimpleNamespace(**{**vars(info), "st_ino": 99})
+    def drifted_stat(path, *, follow_symlinks=True):
+        if path == "/proc/self/ns/net":
+            return drift if changed == "namespace" else info
+        return real_stat(path, follow_symlinks=follow_symlinks)
+    def drifted_fstat(fd):
+        return drift if changed == "held_namespace" and fd == namespace_fd else info
+    monkeypatch.setattr(subject.os, "stat", drifted_stat)
+    monkeypatch.setattr(subject.os, "fstat", drifted_fstat)
     calls = []
     def listener():
         calls.append(1)
