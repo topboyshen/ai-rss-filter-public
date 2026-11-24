@@ -47,12 +47,48 @@
 | `neither` | 观点/背景 | 观点、建议、预测、判断，或“摩根大通：/高盛：”等具名机构观点前缀 |
 | `negated` | 否认/澄清 | 计划或拟议被“暂无/没有/否认/尚未”等否定 |
 | `not_completed` | 未完成/未发生 | 完成、签署、获批等被“尚未/未/未能/无法”等否定 |
-| `unknown` | 空 | 没有明确阶段标记，不猜测 |
+| `unknown` | 空 | 没有明确阶段标记，或 claim 不属于阶段适用范围；不猜测 |
 
 判定按子句顺序进行：先看每个子句中的未否定标记；同一子句的计划与完成同时出现时，保留
 “计划（未完成）”；混合标题由第一个含未否定阶段的子句决定。例如“法庭作出裁定，公司拟上诉”
 归为 `completed`，不因后面的“拟”改判为计划。否定范围只限当前子句，不跨标点或“但/然而/不过”
 等转折连接词吞掉后续断言。
+
+#### 2.2 阶段标签适用范围（v1）
+
+阶段标签只描述**可发生/未发生的事件动作**当前处于什么阶段；它不描述行情方向、数据读数、
+观点强度或新闻价值。标注和验收先分 `scope`，再谈 `phase`。
+
+| `scope` | 含义 | 页面期望 |
+|---|---|---|
+| `event_action` | 有明确主体和可计划/完成/否认的事件动作 | 显示 planned / completed / negated / not_completed |
+| `event_opinion` | 明确针对事件/公司的观点、预测、背景、目标价/评级 | 显示 neither |
+| `out_of_scope` | 行情、价格、数据、摘要、无事件动作的泛评论 | 不显示阶段；空白/unknown 为正确 |
+| `undecidable` | 主体/动作不清或信息不足 | 不显示阶段；空白/unknown 为正确 |
+
+关键区别：
+
+- 对 `out_of_scope` 和 `undecidable`，系统显示空白是**正确**，不是阶段覆盖失败。
+- 对 `event_action` 和 `event_opinion`，系统显示空白才是覆盖失败。
+- 对 `out_of_scope`，系统强行显示 planned/completed/neither 是误标。
+- 行情、价格、指数、收益率、汇率、商品、拍卖/持仓/概率/数据、早报/盘前/汇总/直播/日历
+  均不属于 `event_action`；分析师目标价/评级调整属于 `event_opinion`，不按 `completed`。
+- 标题同时包含行情和事件动作时，按事件动作判定，行情分句忽略。
+
+`scope` 目前是标注/验收字段，尚未进入页面 API；页面仍只显示 `phase`/`phase_label`。
+不要为 `out_of_scope` 或 `undecidable` 造阶段标签。
+
+报告必须分开给：
+
+| 指标 | 分母 |
+|---|---|
+| `event_action` 阶段覆盖/准确 | 所有 `event_action` |
+| `event_opinion` 的 `neither` 覆盖 | 所有 `event_opinion` |
+| `out_of_scope` 的“无阶段”正确率 | 所有 `out_of_scope` |
+| `undecidable` 的“无阶段”正确率 | 所有 `undecidable` |
+
+R01–R20 和早期 H/P 样本的冻结标签不回头改写；新样本先标 `scope`，再标 `phase`。四类不得
+混成一个准确率。
 
 ### 3. 公司映射（mapping）
 
