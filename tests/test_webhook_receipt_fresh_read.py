@@ -262,8 +262,22 @@ def test_exception_before_stream_ownership_closes_descriptor(tmp_path, monkeypat
     def fail(*_args):
         raise error_type("synthetic exception before stream ownership")
 
-    monkeypatch.setattr(os, "open", observed_open)
-    monkeypatch.setattr(os, "fstat" if stage == "open-stat" else "fdopen", fail)
+    real_os = receipts.os
+
+    class Proxy:
+        def __getattr__(self, name):
+            return getattr(real_os, name)
+
+        def open(self, *args):
+            return observed_open(*args)
+
+        def fstat(self, *args):
+            return fail(*args) if stage == "open-stat" else real_os.fstat(*args)
+
+        def fdopen(self, *args):
+            return fail(*args) if stage == "fdopen" else real_os.fdopen(*args)
+
+    monkeypatch.setattr(receipts, "os", Proxy())
     with pytest.raises(error_type):
         receipts._read(path)
     assert len(opened) == 1

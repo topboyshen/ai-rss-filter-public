@@ -33,19 +33,10 @@ def case(monkeypatch):
     )
     monkeypatch.setattr(subject, "_process_identity", lambda pid: deepcopy(row.owner))
     monkeypatch.setattr(
-        subject.os,
-        "pidfd_open",
-        lambda pid, flags: calls.append(("pidfd", pid, flags)) or 702,
-        raising=False,
-    )
-    monkeypatch.setattr(
         subject,
         "_duplicate_process_fd",
         lambda pidfd, fd: calls.append(("duplicate", pidfd, fd)) or 800,
     )
-    monkeypatch.setattr(subject.os, "close", closed.append)
-    monkeypatch.setattr(subject.os, "fstat", lambda fd: SimpleNamespace(st_ino=123))
-    monkeypatch.setattr(subject.os, "readlink", lambda path: row.links[Path(path).name])
 
     @contextmanager
     def entries(path):
@@ -54,7 +45,28 @@ def case(monkeypatch):
             SimpleNamespace(name=name, path=path + "/" + name) for name in row.entries
         ]
 
-    monkeypatch.setattr(subject.os, "scandir", entries)
+    real_os = subject.os
+
+    class OsProxy:
+        def __getattr__(self, name):
+            return getattr(real_os, name)
+
+        def pidfd_open(self, pid, flags):
+            return calls.append(("pidfd", pid, flags)) or 702
+
+        def close(self, fd):
+            closed.append(fd)
+
+        def fstat(self, fd):
+            return SimpleNamespace(st_ino=123, st_size=0)
+
+        def readlink(self, path):
+            return row.links[Path(path).name]
+
+        def scandir(self, path):
+            return entries(path)
+
+    monkeypatch.setattr(subject, "os", OsProxy())
 
     def table(guard, family):
         calls.append(("table", family))
@@ -286,21 +298,32 @@ def proc_case(monkeypatch):
         opens=[],
     )
     monkeypatch.setattr(subject, "_process_identity", lambda pid: deepcopy(OWNER))
-    monkeypatch.setattr(subject.os, "lstat", lambda path: p.before)
-    fstats = iter([p.opened, p.after])
-    monkeypatch.setattr(subject.os, "fstat", lambda fd: next(fstats))
-    monkeypatch.setattr(
-        subject.os, "open", lambda path, flags: p.opens.append((path, flags)) or 7
-    )
-    monkeypatch.setattr(subject.os, "close", p.closes.append)
     monkeypatch.setattr(subject, "_filesystem_type", lambda fd: p.fs)
+    fstats = iter([p.opened, p.after])
+    real_os = subject.os
 
-    def read(fd, size):
-        assert fd == 7 and 0 < size <= 4096
-        part, p.raw = p.raw[:size], p.raw[size:]
-        return part
+    class OsProxy:
+        def __getattr__(self, name):
+            return getattr(real_os, name)
 
-    monkeypatch.setattr(subject.os, "read", read)
+        def lstat(self, path):
+            return p.before
+
+        def fstat(self, fd):
+            return next(fstats)
+
+        def open(self, path, flags):
+            return p.opens.append((path, flags)) or 7
+
+        def close(self, fd):
+            p.closes.append(fd)
+
+        def read(self, fd, size):
+            assert fd == 7 and 0 < size <= 4096
+            part, p.raw = p.raw[:size], p.raw[size:]
+            return part
+
+    monkeypatch.setattr(subject, "os", OsProxy())
     p.guard = subject._listener_owner(deepcopy(OWNER), 8910, time.monotonic() + 2)
     return p
 

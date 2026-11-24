@@ -15,6 +15,17 @@ import pytest
 from scripts import production_host_ingress_native as native
 
 
+class OsProxy:
+    """Patch one module's os reference without changing pytest's global os."""
+
+    def __init__(self, real, **overrides):
+        self._real = real
+        self._overrides = overrides
+
+    def __getattr__(self, name):
+        return self._overrides.get(name, getattr(self._real, name))
+
+
 @pytest.fixture
 def plan():
     return {"owner": "a" * 32, "cgroup": "/ai-filter-host-" + "a" * 32,
@@ -209,7 +220,12 @@ def test_no_external_interfaces_or_routes(fault, namespace_stat):
 
 
 def test_namespace_local_bridge_only(monkeypatch):
-    monkeypatch.setattr(native.os, "stat", lambda path: SimpleNamespace(st_ino=123))
+    real_os = native.os
+    monkeypatch.setattr(
+        native,
+        "os",
+        OsProxy(real_os, stat=lambda path, *args, **kwargs: SimpleNamespace(st_ino=123)),
+    )
     result = native.namespace_snapshot(NetworkCommands([{"ifname": "lo"}], [{"dst": "127.0.0.0/8", "dev": "lo"}]))
     assert result["netns"] == 123
 
@@ -231,7 +247,7 @@ def namespace_stat(monkeypatch):
     original = native.os.stat
     def actual(path, *args, **kwargs):
         return SimpleNamespace(st_ino=123) if str(path) == "/proc/self/ns/net" else original(path, *args, **kwargs)
-    monkeypatch.setattr(native.os, "stat", actual)
+    monkeypatch.setattr(native, "os", OsProxy(native.os, stat=actual))
 
 
 def namespace_fixture_links():
@@ -416,8 +432,15 @@ def proc_sysctl_file(tmp_path, monkeypatch):
         calls.append((str(path), flags))
         assert str(path) in {"/proc/sys/net/ipv6/conf/" + n + "/disable_ipv6" for n in ("all", "default", "lo")}
         return original_open(target, flags)
-    monkeypatch.setattr(native.os, "open", opened)
-    monkeypatch.setattr(native.os, "fstat", lambda fd: SimpleNamespace(st_mode=original_fstat(fd).st_mode, st_uid=0))
+    monkeypatch.setattr(
+        native,
+        "os",
+        OsProxy(
+            native.os,
+            open=opened,
+            fstat=lambda fd: SimpleNamespace(st_mode=original_fstat(fd).st_mode, st_uid=0),
+        ),
+    )
     return target, calls
 
 

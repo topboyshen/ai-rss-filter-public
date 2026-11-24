@@ -163,10 +163,19 @@ def test_opened_descriptor_owns_its_safety_checks(
     actual = lock.stat()
     descriptor = SimpleNamespace(
         st_mode=actual.st_mode, st_uid=actual.st_uid,
-        st_dev=actual.st_dev, st_ino=actual.st_ino,
+        st_dev=actual.st_dev, st_ino=actual.st_ino, st_size=0,
     )
     setattr(descriptor, field, value)
-    monkeypatch.setattr(VALIDATOR.os, "fstat", lambda _fd: descriptor)
+    real_os = VALIDATOR.os
+
+    class Proxy:
+        def __getattr__(self, name):
+            return getattr(real_os, name)
+
+        def fstat(self, fd):
+            return descriptor if fd == 8 else real_os.fstat(fd)
+
+    monkeypatch.setattr(VALIDATOR, "os", Proxy())
     with pytest.raises(SystemExit, match=message):
         VALIDATOR.validate_lock_path(str(lock), "8")
 
