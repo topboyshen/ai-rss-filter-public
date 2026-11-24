@@ -48,6 +48,10 @@ from routes.event_radar_routes import (
         ("云南锗业：高品质磷化铟单晶片项目投资额增至2.7亿元", "completed"),
         ("2026年APEC工商界活动形成14份成果文件", "completed"),
         ("摩根大通：CUDA护城河正在瓦解，英伟达面临的真正挑战不止于CEO离职", "neither"),
+        # Q03 and named/analyst commentary.
+        ("因爆黑料被群嘲！《纽约时报》点评“黄仁勋回归”：震惊！为何特朗普如此重视他？", "neither"),
+        ("分析师：英伟达需设置更多公司治理风险缓冲垫", "neither"),
+        ("市场观察：资金面边际收紧", "neither"),
         # Future forms outrank the completed marker they contain.
         ("项目将完成", "planned"),
         ("公司将纳入国家医保目录", "planned"),

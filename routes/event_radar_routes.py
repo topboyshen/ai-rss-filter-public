@@ -216,10 +216,10 @@ _EVIDENCE_COMPLETED_PATTERNS = (
     re.compile(r"签[^，。；]{0,30}(?:合同|协议)"),
     re.compile(r"发布[^，。；]{1,}"),
 )
-_EVIDENCE_OPINION_MARKERS = ("认为", "建议", "观点", "展望", "预计", "判断", "指出", "表示")
+_EVIDENCE_OPINION_MARKERS = ("认为", "建议", "观点", "展望", "预计", "判断", "指出", "表示", "点评", "评论", "解读", "观察")
 _EVIDENCE_OPINION_SPEAKERS = (
     "摩根大通", "摩根士丹利", "高盛", "中信建投", "中信证券", "中金",
-    "瑞银", "野村", "花旗", "巴克莱", "汇丰", "德意志银行",
+    "瑞银", "野村", "花旗", "巴克莱", "汇丰", "德意志银行", "分析师",
 )
 _EVIDENCE_OPINION_SPEAKER_RE = re.compile(
     r"(?:" + "|".join(re.escape(name) for name in _EVIDENCE_OPINION_SPEAKERS) + r")\s*[：:]"
