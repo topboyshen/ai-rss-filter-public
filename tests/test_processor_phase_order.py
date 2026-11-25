@@ -330,7 +330,9 @@ def test_two_stage_keeps_review_reason_hint_order_and_stage_latencies(
         lambda: SimpleNamespace(record_fast_pass=lambda _tag: None),
     )
     clock = Mock(side_effect=[100.0, 100.25, 101.0, 101.5, 102.0, 103.0])
-    monkeypatch.setattr(processor, "time", SimpleNamespace(time=clock))
+    monkeypatch.setattr(
+        processor, "time", SimpleNamespace(time=clock, monotonic=lambda: 0.0)
+    )
 
     result, reason = run(phases)
 
