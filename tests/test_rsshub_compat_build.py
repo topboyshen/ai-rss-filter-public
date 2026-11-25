@@ -15,10 +15,12 @@ CONTEXT = ROOT / "deploy" / "rsshub-compat"
 PATCH = CONTEXT / "patch.mjs"
 FIXTURES = json.loads((CONTEXT / "fixtures" / "candidate-modules.json").read_text())
 NEWS = "wallstreetcn-news-BKjmaYn2.mjs"
+LIVE = "wallstreetcn-live-Dn6YC-py.mjs"
 CLS = "cls-telegraph-DFOzEo9d.mjs"
 ERROR = "not-found-CaYyolkS.mjs"
 AFTER = {
-    NEWS: "8c1746c1a921de7d2e6e7d49e650fb49d058eab08166bba9a02b396bd93b62ce",
+    NEWS: "81465413a6be812cfa16a45002bf39abf1c5ae8cb484611d7bd113da66c6fde1",
+    LIVE: "cac09bd189c96257c08b3feb3aabfb3c83004920ee8262867564ca16dec8289a",
     CLS: "c69222247c422099080f835c222a9a7f58053ef238b23a88df597b79ce25c9ce",
 }
 
@@ -109,7 +111,7 @@ def test_exact_modules_and_manifest(tmp_path):
     }]
 
 
-@pytest.mark.parametrize("name", [NEWS, CLS, ERROR])
+@pytest.mark.parametrize("name", [NEWS, LIVE, CLS, ERROR])
 @pytest.mark.parametrize("mode", ["changed", "missing", "symlink"])
 def test_any_input_drift_fails_before_module_write(tmp_path, name, mode):
     dist = _tree(tmp_path)
@@ -266,6 +268,25 @@ def test_mixed_items_keep_candidate_details_dates_and_filtering():
     assert items[0]["pubDate"] != items[1]["pubDate"]
     assert any("/lives/22" in url for url in result["calls"])
     assert not any("/33" in url for url in result["calls"])
+
+
+def test_wallstreetcn_live_uses_the_current_api_host():
+    result = _handler(
+        LIVE,
+        category="a-stock",
+        items=[{
+            "score": 1,
+            "uri": "https://wallstreetcn.com/livenews/1",
+            "title": "标题",
+            "content_text": "正文",
+            "display_time": 1792100000,
+        }],
+    )
+    assert result["ok"], result
+    assert result["calls"][0].startswith(
+        "https://api-one-wscn.awtmt.com/apiv1/content/lives?channel=a-stock-channel"
+    )
+    assert result["result"]["title"] == "华尔街见闻 - 实时快讯 - A股"
 
 
 @pytest.mark.parametrize("title,content", [("标题", "正文"), ("", "没有标题的正文")])

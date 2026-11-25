@@ -17,6 +17,7 @@ function render(node) {
 async function got(options) {
   calls.push(options.url);
   if (options.url.includes('/information-flow?')) return { data: { data: { items: input.items ?? [] } } };
+  if (options.url.includes('/lives?')) return { data: { data: { items: input.items ?? [] } } };
   const id = options.url.match(/\/(?:articles|lives)\/([^?]+)/)?.[1];
   const detail = input.details?.[id];
   if (!detail) return { data: { code: 404, data: {} } };
@@ -36,6 +37,7 @@ const dependencies = {
   './cls-utils-YYIXZzci.mjs': { n: 'https://www.cls.cn', t: (value) => value },
   'hono/jsx/jsx-runtime': { Fragment: Symbol('Fragment'), jsx, jsxs: jsx },
   'hono/jsx/dom/server': { renderToString: render },
+  'hono/html': { raw: (value) => value },
 };
 const compiled = Buffer.from(fixtures[input.name]);
 const source = input.unpatched ? compiled : patchModule(input.name, compiled);

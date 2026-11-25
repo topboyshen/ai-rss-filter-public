@@ -20,7 +20,7 @@ from utils.helpers import capture_feed_fetch_trace, fetch_feed, plain_text_from_
 
 CSRC_INDEX = "https://www.csrc.gov.cn/csrc/xwfb/index.shtml"
 CAIXIN_INDEX = "https://gateway.caixin.com/api/dataplatform/scroll/index"
-WALLSTREET_API = "https://api-one.wallstcn.com/apiv1/content/"
+WALLSTREET_API = "https://api-one-wscn.awtmt.com/apiv1/content/"
 _LOGGER = logging.getLogger(__name__)
 _ROUTES = {"/gov/csrc/news": "csrc", "/caixin/latest": "caixin",
            "/wallstreetcn/news/global": "wallstreet"}
