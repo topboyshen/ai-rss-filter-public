@@ -42,7 +42,7 @@ def test_compose_pins_the_validated_derived_artifact_without_runtime_patch_or_re
     service = yaml.safe_load((ROOT / "docker-compose.yml").read_text())["services"]["rsshub"]
     assert service["image"] == (
         "ghcr.io/topboyshen/ai-rss-filter-rsshub-compat@sha256:"
-        "9554a2cbf77ea112b51072ad7a9fd65f3540444542b60abc5e67ff9ec7d43a2b"
+        "75e83ea300ba883de3d2d0877071c4bd54c46eabbd82c6a4cba30526ef795610"
     )
     assert service["mem_limit"] == "768m" and service["pids_limit"] == 256
     assert not any(key in service for key in ("entrypoint", "command", "volumes", "build"))
