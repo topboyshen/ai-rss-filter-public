@@ -38,7 +38,9 @@ MEDIA_TYPES = INDEX_TYPES | MANIFEST_TYPES
 MAX_BLOB, MAX_TOTAL, MAX_OBJECTS, MAX_MANIFEST = 256 * 1024**2, 1024**3, 256, 2 * 1024**2
 REGISTRY = "registry-1.docker.io"
 CDN_HOSTS = {"production.cloudflare.docker.com", "production.cloudfront.docker.com",
-             "docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com"}
+             "docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com",
+             # Docker Hub answers AWS us-east-1 clients directly from this regional S3 origin.
+             "docker-images-prod.s3.dualstack.us-east-1.amazonaws.com"}
 SHA = re.compile(r"sha256:[0-9a-f]{64}")
 
 
