@@ -336,10 +336,10 @@ def test_prefetched_batch_cache_is_refreshed_after_same_link_wait(cfg):
     assert processor._entry_link_slots == {}
 
 
-def test_same_link_wait_timeout_proceeds_while_holder_still_holds(
+def test_same_link_wait_timeout_defers_while_holder_still_holds(
     cfg, monkeypatch, caplog
 ):
-    """The wait is bounded: a stuck holder cannot block a waiter forever."""
+    """A waiter defers without scoring; the owner remains undisturbed."""
     monkeypatch.setattr(processor, "_ENTRY_LINK_WAIT_SECONDS", 0.1)
     held = threading.Event()
     release = threading.Event()
@@ -349,8 +349,6 @@ def test_same_link_wait_timeout_proceeds_while_holder_still_holds(
     def hold():
         with processor._entry_link_single_flight(LINK):
             held.set()
-            # Keep the lock until the waiter has finished (bounded only by a
-            # test-level guard so an unbounded wait fails instead of hanging).
             observed["waiter_finished_while_held"] = waiter_done.wait(5)
             release.wait(5)
 
@@ -368,7 +366,7 @@ def test_same_link_wait_timeout_proceeds_while_holder_still_holds(
         )
         waiter_done.set()
 
-    with caplog.at_level("WARNING", logger=processor.logger.name):
+    with caplog.at_level("INFO", logger=processor.logger.name):
         waiter = threading.Thread(target=wait_then_score)
         waiter.start()
         waiter.join(timeout=5)
@@ -380,14 +378,15 @@ def test_same_link_wait_timeout_proceeds_while_holder_still_holds(
         waiter.join(timeout=5)
 
     assert not waiter_alive, "same-link wait was not bounded"
-    assert holder_alive, "holder released before the waiter proceeded"
+    assert holder_alive, "holder released before the waiter deferred"
     assert observed["waiter_finished_while_held"] is True
     assert slots_while_held == 1
-    assert result["value"] == (None, "filtered")
-    assert calls == ["test-stage1"]
+    assert result["value"] == (None, processor.SCORE_DEFERRED_REASON)
+    assert calls == []
+    assert _rows() == ([], [])
     assert any(
-        "same-link wait timed out" in record.getMessage()
-        and record.levelname == "WARNING"
+        "entry deferred before any write" in record.getMessage()
+        and "same-link wait timed out" in record.getMessage()
         for record in caplog.records
     )
     assert not holder.is_alive()
