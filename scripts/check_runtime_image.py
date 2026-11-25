@@ -40,15 +40,14 @@ DEBIAN_FIX_FLOORS = {
 
 
 # GHSA-6q48-6c7w-9gw2: .18 removed all emSign roots; .19 restores the
-# unaffected roots. Inspect DER certificates, never bundle comments/names.
+# unaffected roots. 2026.10.23 removes emSign Root CA - C1 and ECC Root CA - C3
+# upstream; keep the remaining anchors and the G3 distrust guard.
 CERTIFI_FIXED_VERSION = "2026.10.19"
 CERTIFI_DISTRUSTED_SHA256 = (
     "86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b"
 )
 CERTIFI_RETAINED_ROOTS = {
     "emSign Root CA - G1": "40f6af0346a99aa1cd1d555a4e9cce62c7f9634603ee406615833dc8c8d00367",
-    "emSign Root CA - C1": "125609aa301da0a249b97a8239cb6a34216f44dcac9f3954b14292f2e8c8608f",
-    "emSign ECC Root CA - C3": "bc4d809b15189d78db3e1d8cf4f9726a795da1643ca5f1358e1ddb0edc0d7eb3",
     "ISRG Root X1": "96bcec06264976f37460779acf28c5a7cfe8a3c0aae11a8ffcee05c0bddf08c6",
     "DigiCert Global Root G2": "cb3ccbb76031e5e0138f8dd39a23f9de47ffc35e43c1144cea27d46a5ab1cb5f",
 }

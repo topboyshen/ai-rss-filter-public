@@ -49,12 +49,12 @@ def _root_pem(bundle, fingerprint):
 def test_installed_package_and_actual_bundle_meet_security_fix():
     version = importlib.metadata.version("certifi")
     assert f"certifi=={version}" in (ROOT / "requirements-prod.txt").read_text().splitlines()
-    assert version == certifi.__version__ == "2026.10.19"
+    assert version == certifi.__version__ == "2026.10.23"
     report = checker.installed_certifi_report({"certifi": version})
     assert report["errors"] == []
     assert report["distrusted_root_present"] is False
     assert all(report["retained_roots_present"].values())
-    assert report["ca_count"] == 120
+    assert report["ca_count"] == 118
     assert report["bundle_sha256"] == hashlib.sha256(Path(certifi.where()).read_bytes()).hexdigest()
 
 
