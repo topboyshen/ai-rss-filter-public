@@ -1984,10 +1984,7 @@ def _score_in_background(task: dict) -> bool | str:
         prompt_text = resolve_prompt(feed_url, cfg)[1]
         notify_threshold = _find_notify_threshold(cfg, feed_url)
         feed_cfg = DB.get_feed_config(cfg, feed_url)
-        feed_name = (
-            str(feed_cfg.get("name") or "").strip()
-            or feed_url.rsplit("/", 1)[-1]
-        )
+        feed_name = str(feed_cfg.get("name") or "").strip() or feed_url.rsplit("/", 1)[-1]
         passed_count = max(
             0,
             int(getattr(_task_execution_context, "start_passed_count", 0) or 0),
