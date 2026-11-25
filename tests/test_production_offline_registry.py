@@ -292,6 +292,22 @@ def test_https_endpoint_restrictions(url):
         registry._url(url, {registry.REGISTRY, *registry.CDN_HOSTS})
 
 
+def test_docker_hub_us_east_1_s3_redirect_is_allowed():
+    parsed = registry._url(
+        "https://docker-images-prod.s3.dualstack.us-east-1.amazonaws.com/registry-v2/docker/registry/v2/blobs/sha256/54/abc/data?X-Amz-Signature=signed",
+        {registry.REGISTRY, *registry.CDN_HOSTS})
+    assert parsed.hostname == "docker-images-prod.s3.dualstack.us-east-1.amazonaws.com"
+
+
+@pytest.mark.parametrize("url", [
+    "https://docker-images-prod.s3.dualstack.us-east-1.amazonaws.com.evil.invalid/v2/",
+    "https://docker-images-prod.s3.dualstack.us-west-2.amazonaws.com/v2/",
+])
+def test_docker_hub_s3_redirect_lookalikes_are_rejected(url):
+    with pytest.raises(registry.RegistryError):
+        registry._url(url, {registry.REGISTRY, *registry.CDN_HOSTS})
+
+
 @pytest.mark.parametrize("address", ["127.0.0.1", "10.0.0.1", "169.254.169.254", "100.64.0.1", "::1", "fc00::1",
     "::ffff:8.8.8.8", "64:ff9b::808:808", "2002:0808:0808::1", "224.0.0.1", "ff0e::1", "0.0.0.0", "::",
     "240.0.0.1", "2001:db8::1", "fec0::1"])
