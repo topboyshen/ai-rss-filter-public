@@ -344,7 +344,7 @@ def test_no_today_evidence_preserves_empty_result_without_any_lookback_semantic_
     assert calls == []
 
 
-@pytest.mark.parametrize("path", ["daily", "home"])
+@pytest.mark.parametrize("path", ["daily", "home", "weekly"])
 def test_candidate_headline_keys_are_normalized_once_per_group(database, monkeypatch, path):
     _seed(database, "once-a", "甲公司发布新产品")
     _seed(database, "once-b", "乙公司发布新产品")

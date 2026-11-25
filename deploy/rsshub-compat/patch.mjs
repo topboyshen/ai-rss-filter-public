@@ -9,6 +9,7 @@ export const MODULES = Object.freeze({
   'wallstreetcn-news-BKjmaYn2.mjs': '80539407f40be2ed181c6e5853a7c3e26247a1ecedb372d5b0e7ab0ccea0fee7',
   'wallstreetcn-live-Dn6YC-py.mjs': '5601de068e2c74be984fb99171e3350d03500842a9a70b33083f3a1a76aaff9a',
   'cls-telegraph-DFOzEo9d.mjs': '06d7f8eed8704604c0848084a1f595ce1dc0c2926c5444b6f1fc38eefcd604de',
+  'yicai-latest-CkhpqUUe.mjs': '26d83dde8d93ca9536a4dc7302886e75ed229b3a76358541ebf1d0a73635eff1',
 });
 export const DEPENDENCIES = Object.freeze({
   'not-found-CaYyolkS.mjs': 'd3c82ed3470436d32741c63525a505b0ae1dcf7e2958daa9d5b9877a76ca07c2',
@@ -44,6 +45,11 @@ export function patchModule(name, bytes) {
     source = replaceExactlyOnce(source,
       'link:e.shareurl||`https://www.cls.cn/detail/${e.id}`,',
       'link:s===void 0?e.shareurl:e.shareurl||`https://www.cls.cn/detail/${e.id}`,');
+  } else if (name === 'yicai-latest-CkhpqUUe.mjs') {
+    // Reject an empty feed before RSSHub can put the handler result in its route cache.
+    source = replaceExactlyOnce(source,
+      'a=await n(i);return{',
+      'a=await n(i);if(a.length===0)throw Error(`this route is empty, please check the original site or create an issue`);return{');
   }
   if (name === 'wallstreetcn-news-BKjmaYn2.mjs' || name === 'wallstreetcn-live-Dn6YC-py.mjs') {
     source = replaceExactlyOnce(source,
@@ -99,7 +105,7 @@ export function patchTree(dist, manifestPath, contextSha256) {
   }
   const manifest = {
     schema_version: 1,
-    compat_version: 'v1',
+    compat_version: 'v2-yicai-empty-cache',
     base_image: BASE_IMAGE,
     base_revision: BASE_REVISION,
     context_sha256: contextSha256,
