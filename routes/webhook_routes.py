@@ -9,6 +9,7 @@ import json
 import base64
 import hashlib
 import fcntl
+import inspect
 import logging
 import math
 import os
@@ -2012,6 +2013,12 @@ def _score_in_background(task: dict) -> bool | str:
                 time.monotonic() + _webhook_task_deadline_seconds,
             )
         )
+        try:
+            accepts_coordination_deadline = (
+                "coordination_deadline" in inspect.signature(process_entry).parameters
+            )
+        except (TypeError, ValueError):
+            accepts_coordination_deadline = False
 
         for entry_index, entry_data in enumerate(
             entries[start_index:], start=start_index
@@ -2038,16 +2045,18 @@ def _score_in_background(task: dict) -> bool | str:
 
             try:
                 with processing_origin("webhook"):
-                    scored_entry, reason = process_entry(
-                        wrapper,
-                        recent_entries=[],
-                        prompt_text=prompt_text,
-                        cfg=cfg,
-                        scorer=scorer,
-                        feed_url=feed_url,
-                        notify_threshold=notify_threshold,
-                        few_shot_context=few_shot_context,
-                    )
+                    process_kwargs = {
+                        "recent_entries": [],
+                        "prompt_text": prompt_text,
+                        "cfg": cfg,
+                        "scorer": scorer,
+                        "feed_url": feed_url,
+                        "notify_threshold": notify_threshold,
+                        "few_shot_context": few_shot_context,
+                    }
+                    if accepts_coordination_deadline:
+                        process_kwargs["coordination_deadline"] = deadline
+                    scored_entry, reason = process_entry(wrapper, **process_kwargs)
             except Exception as e:
                 logger.warning("[Webhook] process_entry failed for '%s...': %s", title[:40], e)
                 # The durable task is the retry boundary.  A partial batch must

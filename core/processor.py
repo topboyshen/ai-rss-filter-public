@@ -26,7 +26,14 @@ from utils.helpers import (
     clean_title_for_compare, max_entries_for_feed_url,
     normalize_direction, direction_emoji, plain_text_from_markup,
 )
-from core.scorer import Scorer, capture_llm_calls, is_usable_score_result
+from core.scorer import (
+    ScoreFlightRetryable,
+    Scorer,
+    bounded_coordination_deadline,
+    capture_llm_calls,
+    coordination_deadline_scope,
+    is_usable_score_result,
+)
 from services.score_evidence_capture import (
     capture_article_score,
     persist_scoring_evidence,
@@ -81,13 +88,13 @@ SCORE_TERMINAL_UNSCORED_REASON = "score_terminal_unscored"
 class ScoringTransportRetryable(Exception):
     """Nothing was persisted; the caller should retry this entry later."""
 
-    def __init__(self, link: str, attempt: int):
-        message = (
+    def __init__(self, link: str, attempt: int, message: Optional[str] = None):
+        default_message = (
             "score deferred: transport retry capacity is full; waiting for a commit slot"
             if attempt == 0 else
             f"score deferred: backup backend gave no verdict (retry {attempt}/{TRANSPORT_RETRY_MAX})"
         )
-        super().__init__(message)
+        super().__init__(message or default_message)
         self.link = link
         self.attempt = attempt
 
@@ -1481,6 +1488,8 @@ def _score_entry_with_llm(
                 reasons,
             )
         _annotate_entry_model_score(ctx, result, similar_info)
+    except ScoreFlightRetryable:
+        raise
     except (ValueError, TypeError) as error:
         logger.warning("Scoring parsing error for '%s': %s", ctx.raw_title[:50], error)
         result.score, result.tag, result.logic, result.sentiment = (
@@ -1734,7 +1743,7 @@ _entry_link_slots_guard = threading.Lock()
 
 
 @contextmanager
-def _entry_link_single_flight(link: str):
+def _entry_link_single_flight(link: str, coordination_deadline: Optional[float] = None):
     key = str(link or "").strip()
     if not key:
         yield
@@ -1744,19 +1753,24 @@ def _entry_link_single_flight(link: str):
         if slot is None:
             slot = _entry_link_slots[key] = [threading.RLock(), 0]
         slot[1] += 1
-    acquired = slot[0].acquire(timeout=_ENTRY_LINK_WAIT_SECONDS)
+    wait_seconds = _ENTRY_LINK_WAIT_SECONDS
+    if coordination_deadline is not None:
+        wait_seconds = min(
+            wait_seconds, max(0.0, coordination_deadline - time.monotonic())
+        )
+    acquired = slot[0].acquire(timeout=wait_seconds)
     if not acquired:
-        # Fall back to the previous unserialized behavior; the persistence
-        # guards still reject a conflicting write and the task stays retryable.
-        logger.warning(
-            "[Process] same-link wait timed out; continuing unserialized: %s",
-            key[:160],
+        with _entry_link_slots_guard:
+            slot[1] -= 1
+            if slot[1] <= 0 and _entry_link_slots.get(key) is slot:
+                del _entry_link_slots[key]
+        raise ScoringTransportRetryable(
+            key, 0, "score deferred: same-link wait timed out"
         )
     try:
         yield
     finally:
-        if acquired:
-            slot[0].release()
+        slot[0].release()
         with _entry_link_slots_guard:
             slot[1] -= 1
             if slot[1] <= 0 and _entry_link_slots.get(key) is slot:
@@ -1878,23 +1892,47 @@ def process_entry(
     notify_threshold: Optional[float] = None,
     similarity_identity=None,
     persist_deferred: bool = False,
+    coordination_deadline: Optional[float] = None,
 ) -> Tuple[Optional[Any], str]:
     """Process one RSS item through ordered phases, preserving each early exit."""
     few_shot_context = _validate_entry_feedback_context(cfg, few_shot_context)
-    with _entry_link_single_flight(getattr(entry, "link", "")):
-        def run(original, prompt, source, context):
-            threshold = notify_threshold
-            if natural_scoring.bound_feed():
-                threshold = DB.get_feed_thresholds(cfg, source)["notify"]
-            return _traced_process_entry(
-                original, recent_entries, prompt, cfg, scorer,
-                few_shot_context=context, link_cache=link_cache, feed_url=source,
-                notify_threshold=threshold, similarity_identity=similarity_identity,
+    coordination_deadline = bounded_coordination_deadline(coordination_deadline)
+
+    def run(original, prompt, source, context):
+        threshold = notify_threshold
+        if natural_scoring.bound_feed():
+            threshold = DB.get_feed_thresholds(cfg, source)["notify"]
+        return _traced_process_entry(
+            original, recent_entries, prompt, cfg, scorer,
+            few_shot_context=context, link_cache=link_cache, feed_url=source,
+            notify_threshold=threshold, similarity_identity=similarity_identity,
+        )
+
+    try:
+        # Keep every precheck and the journal capture inside the same-link lock.
+        with _entry_link_single_flight(
+            getattr(entry, "link", ""), coordination_deadline
+        ), coordination_deadline_scope(coordination_deadline):
+            return natural_scoring.run_with_continuation(
+                entry, prompt_text, cfg, DB.canonical_feed_url(cfg, feed_url),
+                few_shot_context, run, capture=persist_deferred,
             )
+    except ScoringTransportRetryable as exc:
+        # Only the link-lock acquisition reaches this boundary. Scoring and
+        # flight retryables are converted by _traced_process_entry above.
+        logger.info("[Score] entry deferred before any write: %s", exc)
+        if not persist_deferred:
+            return None, SCORE_DEFERRED_REASON
+
+        attempt = exc.attempt
+
+        def defer_without_scoring(original, prompt, source, context):
+            natural_scoring.note_deferred_attempt(attempt)
+            return None, SCORE_DEFERRED_REASON
 
         return natural_scoring.run_with_continuation(
             entry, prompt_text, cfg, DB.canonical_feed_url(cfg, feed_url),
-            few_shot_context, run, capture=persist_deferred,
+            few_shot_context, defer_without_scoring, capture=True,
         )
 
 
@@ -1904,7 +1942,7 @@ def _traced_process_entry(entry, recent_entries, prompt_text, cfg, scorer, **kwa
             outcome = _process_entry_phases(
                 entry, recent_entries, prompt_text, cfg, scorer, **kwargs,
             )
-        except ScoringTransportRetryable as exc:
+        except (ScoringTransportRetryable, ScoreFlightRetryable) as exc:
             natural_scoring.note_deferred_attempt(exc.attempt)
             logger.info("[Score] entry deferred before any write: %s", exc)
             outcome = None, SCORE_DEFERRED_REASON

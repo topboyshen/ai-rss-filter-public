@@ -2,7 +2,11 @@
 import time
 from concurrent.futures import Future
 
-from tests.test_webhook_durable_spool import _pending_files, _task, isolated_spool  # noqa: F401
+from tests.test_webhook_durable_spool import (  # noqa: F401
+    _pending_files,
+    _task,
+    isolated_spool as isolated_spool,
+)
 
 
 def _finish(webhook_routes, result):
@@ -158,3 +162,40 @@ def test_transport_cap_does_not_consume_lock_budget(isolated_spool):  # noqa: F8
     assert persisted["lock_deferrals"] == 1
     assert persisted["score_transport_deferrals"] == webhook_routes._SCORE_TRANSPORT_DEFERRAL_MAX
     assert persisted["next_attempt_at"] >= started + 5.0 - 0.5
+
+
+def test_existing_deadline_is_narrowly_passed_without_breaking_legacy_double(
+    isolated_spool, monkeypatch,
+):  # noqa: F811
+    webhook_routes = isolated_spool
+    monkeypatch.setattr(webhook_routes, "resolve_scoring_contract", lambda cfg, **_k: cfg)
+    monkeypatch.setattr(webhook_routes, "resolve_prompt", lambda *_a: ("p", "prompt"))
+    monkeypatch.setattr(webhook_routes, "_queue_committed_dashboard_inputs", lambda: None)
+    task = {
+        "feed_url": "https://example.com/feed",
+        "entries": [{"title": "entry", "url": "https://example.com/1", "content": "c"}],
+    }
+    deadline = time.monotonic() + 60
+    webhook_routes._task_execution_context.deadline = deadline
+    seen = []
+
+    def compatible(wrapper, coordination_deadline=None, **_kwargs):
+        seen.append(coordination_deadline)
+        return None, "filtered"
+
+    monkeypatch.setattr(webhook_routes, "process_entry", compatible)
+    try:
+        assert webhook_routes._score_in_background(task) is True
+        assert seen == [deadline]
+
+        def legacy(
+            wrapper, recent_entries, prompt_text, cfg, scorer, feed_url,
+            notify_threshold, few_shot_context,
+        ):
+            return None, "filtered"
+
+        monkeypatch.setattr(webhook_routes, "process_entry", legacy)
+        assert webhook_routes._score_in_background(task) is True
+    finally:
+        if hasattr(webhook_routes._task_execution_context, "deadline"):
+            delattr(webhook_routes._task_execution_context, "deadline")

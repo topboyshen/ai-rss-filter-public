@@ -56,6 +56,48 @@ from openai import OpenAI, APIError, APIStatusError, APITimeoutError, Authentica
 
 logger = logging.getLogger(__name__)
 
+# Coordination waits share one monotonic deadline per processor round. Backend
+# elapsed time consumes this budget, but provider timeouts/fallbacks are not
+# changed and an owner is never cancelled when a waiter runs out of budget.
+_COORDINATION_WAIT_SECONDS = 120.0
+_runtime_state_init_guard = threading.Lock()
+_coordination_wait_deadline: ContextVar[Optional[float]] = ContextVar(
+    "score_coordination_wait_deadline", default=None
+)
+_score_flight_generation: ContextVar[Optional[int]] = ContextVar(
+    "score_flight_generation", default=None
+)
+
+
+def bounded_coordination_deadline(existing: Optional[float] = None) -> float:
+    deadline = time.monotonic() + _COORDINATION_WAIT_SECONDS
+    return min(deadline, float(existing)) if existing is not None else deadline
+
+
+@contextmanager
+def coordination_deadline_scope(deadline: float):
+    token = _coordination_wait_deadline.set(deadline)
+    try:
+        yield
+    finally:
+        _coordination_wait_deadline.reset(token)
+
+
+def _remaining_coordination_wait() -> float:
+    deadline = _coordination_wait_deadline.get()
+    if deadline is None:
+        deadline = bounded_coordination_deadline()
+    return max(0.0, deadline - time.monotonic())
+
+
+class ScoreFlightRetryable(Exception):
+    """No shared verdict arrived within the coordination contract."""
+
+    attempt = 1
+
+    def __init__(self):
+        super().__init__("score deferred: score flight coordination unavailable")
+
 _NumericClaimContext: TypeAlias = Tuple[
     str,
     str,
@@ -1463,6 +1505,14 @@ class ScoringResult:
 
 
 @dataclass
+class _ScoreFlight:
+    event: threading.Event = field(default_factory=threading.Event)
+    result: Optional[ScoringResult] = None
+    failed: bool = False
+    waiters: int = 0
+
+
+@dataclass
 class LLMBackend:
     """单个 LLM 后端配置"""
 
@@ -1719,6 +1769,11 @@ class Scorer:
         self._score_cache_lock = threading.Lock()
         self._score_cache_ttl = 3600
         self._score_cache_max = 500
+        # Lock order is runtime guard -> backend/cache lock. Transport calls
+        # never hold these locks. A generation isolates overlapping hot reloads.
+        self._runtime_guard = threading.RLock()
+        self._runtime_generation = 0
+        self._score_flights: Dict[Tuple[int, str], _ScoreFlight] = {}
         self._structured_output_modes: Dict[Tuple[str, str, str, str], str] = {}
         self._init_backends()
 
@@ -1759,20 +1814,35 @@ class Scorer:
         )
         return hashlib.sha256(text.encode("utf-8")).hexdigest()[:24]
 
+    def _runtime_lock(self) -> threading.RLock:
+        """Support lightweight Scorer doubles constructed without __init__."""
+        guard = getattr(self, "_runtime_guard", None)
+        if guard is None:
+            with _runtime_state_init_guard:
+                guard = getattr(self, "_runtime_guard", None)
+                if guard is None:
+                    guard = self._runtime_guard = threading.RLock()
+                    self._runtime_generation = 0
+                    self._score_flights = {}
+        return guard
+
     def clear_runtime_cache(self) -> None:
-        """清空运行态 LLM 评分缓存，供配置热加载/策略切换后调用。"""
-        with self._score_cache_lock:
-            self._score_cache.clear()
+        """Clear one generation without orphaning its in-flight waiters."""
+        with self._runtime_lock():
+            self._runtime_generation += 1
+            with self._score_cache_lock:
+                self._score_cache.clear()
         logger.info("[ScoreCache] runtime cache cleared")
 
     def reload_backends(self) -> None:
-        """重新读取 LLM 后端配置，并清空运行态缓存。"""
-        with self._backend_lock:
-            self.backends = []
-            self.last_backend_name = ""
-            self._structured_output_modes = {}
-            self._init_backends()
-        self.clear_runtime_cache()
+        """Replace backends and clear the cache in one generation transition."""
+        with self._runtime_lock():
+            with self._backend_lock:
+                self.backends = []
+                self.last_backend_name = ""
+                self._structured_output_modes = {}
+                self._init_backends()
+            self.clear_runtime_cache()
         logger.info("[LLM] backends reloaded: %d available", len(self.backends))
 
     def _get_cached_score(self, key: str) -> Optional[ScoringResult]:
@@ -1801,15 +1871,19 @@ class Scorer:
             return result
 
     def _set_cached_score(self, key: str, result: ScoringResult) -> None:
-        """存入缓存"""
+        """Write only into the owner's still-current generation."""
         if not isinstance(result, ScoringResult) or not result.model_name.strip():
             raise ValueError("score cache entries require a bound model identity")
-        with self._score_cache_lock:
-            self._score_cache[key] = (result, time.monotonic())
-            self._score_cache.move_to_end(key)
-            # LRU 淘汰：超过上限时移除最旧的条目（O(1)）
-            while len(self._score_cache) > self._score_cache_max:
-                self._score_cache.popitem(last=False)
+        generation = _score_flight_generation.get()
+        with self._runtime_lock():
+            if generation is not None and generation != self._runtime_generation:
+                return
+            with self._score_cache_lock:
+                self._score_cache[key] = (result, time.monotonic())
+                self._score_cache.move_to_end(key)
+                # LRU 淘汰：超过上限时移除最旧的条目（O(1)）
+                while len(self._score_cache) > self._score_cache_max:
+                    self._score_cache.popitem(last=False)
 
     def _discard_cached_score(self, key: str, expected: ScoringResult) -> None:
         """Remove a cache entry that no longer passes the source-grounding gate."""
@@ -2489,21 +2563,38 @@ class Scorer:
         stage: str = "stage1",
         few_shot_context: str = "",
     ) -> ScoringResult:
-        """评分：按优先级尝试所有 LLM 后端，全部失败后本地降级"""
-        routed_backends = self.backends_for(stage or "score", cfg=cfg)
+        """Share one immutable result only for an identical cache identity."""
+        with self._runtime_lock():
+            generation = self._runtime_generation
+            routed_backends = self.backends_for(stage or "score", cfg=cfg)
         cache_cfg = cfg.get("llm_score_cache", {})
-        key = ""
-        if cache_cfg.get("enabled", False):
-            key = self._cache_key(
-                title,
-                summary,
-                cfg,
-                stage=stage,
-                prompt_text=prompt_text,
-                few_shot_context=few_shot_context,
-                routed_backends=routed_backends,
+        if not cache_cfg.get("enabled", False):
+            return self._score_with_identity_uncached(
+                title, summary, prompt_text, cfg, stage, few_shot_context,
+                routed_backends, cache_cfg, "",
             )
-            self._score_cache_ttl = float(cache_cfg.get("ttl_seconds", 3600))
+        key = self._cache_key(
+            title,
+            summary,
+            cfg,
+            stage=stage,
+            prompt_text=prompt_text,
+            few_shot_context=few_shot_context,
+            routed_backends=routed_backends,
+        )
+        self._score_cache_ttl = float(cache_cfg.get("ttl_seconds", 3600))
+        cached = self._cached_grounded_score(key, title, summary)
+        if cached is not None:
+            try:
+                mark_news_processing_reuse("score_cache")
+            except Exception:
+                logger.warning("[NewsProcessing] score cache accounting unavailable")
+            return cached
+
+        flight_key = (generation, key)
+        with self._runtime_lock():
+            # Close the miss/register race: an earlier owner may have completed
+            # between the first lookup and this registration.
             cached = self._cached_grounded_score(key, title, summary)
             if cached is not None:
                 try:
@@ -2511,7 +2602,66 @@ class Scorer:
                 except Exception:
                     logger.warning("[NewsProcessing] score cache accounting unavailable")
                 return cached
+            flight = self._score_flights.get(flight_key)
+            owner = flight is None
+            if owner:
+                flight = _ScoreFlight()
+                self._score_flights[flight_key] = flight
+            else:
+                flight.waiters += 1
 
+        if not owner:
+            try:
+                remaining = _remaining_coordination_wait()
+                if remaining <= 0 or not flight.event.wait(remaining):
+                    raise ScoreFlightRetryable()
+            finally:
+                with self._runtime_lock():
+                    flight.waiters -= 1
+            if flight.failed or flight.result is None:
+                raise ScoreFlightRetryable()
+            try:
+                mark_news_processing_reuse("score_flight")
+            except Exception:
+                logger.warning("[NewsProcessing] score flight accounting unavailable")
+            return flight.result
+
+        generation_token = _score_flight_generation.set(generation)
+        try:
+            result = self._score_with_identity_uncached(
+                title, summary, prompt_text, cfg, stage, few_shot_context,
+                routed_backends, cache_cfg, key,
+            )
+        except BaseException:
+            with self._runtime_lock():
+                flight.failed = True
+                flight.event.set()
+                if self._score_flights.get(flight_key) is flight:
+                    self._score_flights.pop(flight_key, None)
+            raise
+        else:
+            with self._runtime_lock():
+                flight.result = result
+                flight.event.set()
+                if self._score_flights.get(flight_key) is flight:
+                    self._score_flights.pop(flight_key, None)
+            return result
+        finally:
+            _score_flight_generation.reset(generation_token)
+
+    def _score_with_identity_uncached(
+        self,
+        title: str,
+        summary: str,
+        prompt_text: str,
+        cfg: dict,
+        stage: str,
+        few_shot_context: str,
+        routed_backends: List[LLMBackend],
+        cache_cfg: dict,
+        key: str,
+    ) -> ScoringResult:
+        """评分：按优先级尝试所有 LLM 后端，全部失败后本地降级"""
         exhausted_semantic = None
         unverdicted = 0
         request_id = uuid.uuid4().hex
