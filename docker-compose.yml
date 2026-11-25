@@ -355,9 +355,9 @@ services:
       disable: true
 
   rsshub:
-    # Derived from fixed e7cd1bd8; compatibility context 210bc6246409e212.
+    # Derived from fixed e7cd1bd8; compatibility context 38ac9fe1e3a97388.
     # Pin the validated derived artifact, not its unpatched upstream base.
-    image: ghcr.io/topboyshen/ai-rss-filter-rsshub-compat@sha256:9554a2cbf77ea112b51072ad7a9fd65f3540444542b60abc5e67ff9ec7d43a2b
+    image: ghcr.io/topboyshen/ai-rss-filter-rsshub-compat@sha256:75e83ea300ba883de3d2d0877071c4bd54c46eabbd82c6a4cba30526ef795610
     mem_limit: 768m
     pids_limit: 256
     # Publish for Glance (host-gateway/172.17.0.1) and Miniflux (127.0.0.1).
