@@ -73,6 +73,14 @@ class SyntheticRoot:
 def guarded(tmp_path):
     guard, source = _actual_guard()
     virtual = SyntheticRoot()
+    # Other pytest workers create siblings under the shared temporary parents.
+    # Model stable directory contents above the test's own filesystem tree.
+    for parent in tmp_path.parents:
+        metadata = parent.lstat()
+        virtual.overrides[str(parent)] = {
+            field: getattr(metadata, field)
+            for field in ("st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
+        }
     guard.stage.__globals__["os"] = virtual
     tool = tmp_path / "tools" / "bin" / "node"
     tool.parent.mkdir(parents=True, mode=0o755)
@@ -216,7 +224,7 @@ def test_actual_guard_uses_nofollow_cloexec_and_no_command_execution(guarded):
                    for node in ast.walk(tree))
 
 
-@pytest.mark.parametrize("change", ["same_length_rewrite", "source_replacement", "source_mode", "source_owner", "parent_owner", "copy_rewrite", "copy_mode", "private_owner", "proof_mode", "extra_executable"])
+@pytest.mark.parametrize("change", ["same_length_rewrite", "source_replacement", "source_mode", "source_owner", "parent_owner", "parent_entry", "copy_rewrite", "copy_mode", "private_owner", "proof_mode", "extra_executable"])
 def test_actual_guard_rejects_drift_before_attestation(guarded, change):
     case = guarded
     case.guard.stage(*case.args)
@@ -235,6 +243,8 @@ def test_actual_guard_rejects_drift_before_attestation(guarded, change):
         case.os.overrides[str(case.node)] = {"st_uid": 1001}
     elif change == "parent_owner":
         case.os.overrides[str(case.node.parent)] = {"st_uid": 1001}
+    elif change == "parent_entry":
+        (case.node.parent / "new-directory").mkdir()
     elif change == "copy_rewrite":
         private.chmod(0o700)
         private.write_bytes(b"changed")
