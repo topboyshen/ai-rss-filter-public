@@ -28,7 +28,15 @@ const dependencies = {
   './parse-date-LfqgAehp.mjs': { t: date },
   './got-CzLN7yeY.mjs': { t: got },
   'p-map': { default: async (items, work) => Promise.all(items.map(work)) },
-  './route-limit-BCAfTOfE.mjs': { t: () => 50 },
+  './route-limit-BCAfTOfE.mjs': { t: (_context, fallback) => input.limit ?? fallback },
+  './yicai-utils-CJpOKEQb.mjs': {
+    a: 'https://www.yicai.com',
+    i: async (url) => {
+      calls.push(url);
+      if (input.upstreamError) throw new TypeError(input.upstreamError);
+      return input.items;
+    },
+  },
   './ofetch-DgM1MIL7.mjs': { t: async (url, options) => {
     calls.push({ url, options });
     return { data: { roll_data: input.items ?? [] } };

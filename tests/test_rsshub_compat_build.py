@@ -17,11 +17,13 @@ FIXTURES = json.loads((CONTEXT / "fixtures" / "candidate-modules.json").read_tex
 NEWS = "wallstreetcn-news-BKjmaYn2.mjs"
 LIVE = "wallstreetcn-live-Dn6YC-py.mjs"
 CLS = "cls-telegraph-DFOzEo9d.mjs"
+YICAI = "yicai-latest-CkhpqUUe.mjs"
 ERROR = "not-found-CaYyolkS.mjs"
 AFTER = {
     NEWS: "81465413a6be812cfa16a45002bf39abf1c5ae8cb484611d7bd113da66c6fde1",
     LIVE: "cac09bd189c96257c08b3feb3aabfb3c83004920ee8262867564ca16dec8289a",
     CLS: "c69222247c422099080f835c222a9a7f58053ef238b23a88df597b79ce25c9ce",
+    YICAI: "5a5ea6b1acaae4e10f4ee98100d067680267a170f45394c780ede203f526f45d",
 }
 
 
@@ -93,12 +95,13 @@ def test_exact_modules_and_manifest(tmp_path):
     manifest = json.loads(manifest_path.read_text())
     assert manifest == result["manifest"]
     assert manifest["schema_version"] == 1
-    assert manifest["compat_version"] == "v1"
+    assert manifest["compat_version"] == "v2-yicai-empty-cache"
     assert manifest["context_sha256"] == "a" * 64
     assert manifest["base_image"].endswith(
         "e7cd1bd8838b91f89c2ed56b0889f3754edc6aa1f1f5dac002e2e97e1079bd54"
     )
     assert manifest["base_revision"] == "f23ada8a636fbbb5f92d8e91558cf4e8ffaca66a"
+    assert {Path(module["path"]).name for module in manifest["modules"]} == set(AFTER)
     for module in manifest["modules"]:
         name = Path(module["path"]).name
         assert module["after_sha256"] == AFTER[name]
@@ -111,7 +114,7 @@ def test_exact_modules_and_manifest(tmp_path):
     }]
 
 
-@pytest.mark.parametrize("name", [NEWS, LIVE, CLS, ERROR])
+@pytest.mark.parametrize("name", [NEWS, LIVE, CLS, YICAI, ERROR])
 @pytest.mark.parametrize("mode", ["changed", "missing", "symlink"])
 def test_any_input_drift_fails_before_module_write(tmp_path, name, mode):
     dist = _tree(tmp_path)
@@ -324,6 +327,26 @@ def test_categorized_cls_links_and_request_are_unchanged(category, shareurl):
     after = _handler(CLS, **args)
     assert before == after
     assert after["result"]["item"][0]["link"] == (shareurl or "https://www.cls.cn/detail/123")
+
+
+def test_yicai_latest_rejects_empty_items_before_returning_a_cacheable_feed():
+    before = _handler(YICAI, unpatched=True, items=[])
+    after = _handler(YICAI, items=[])
+    assert before["ok"] and before["result"]["item"] == []
+    assert not after["ok"] and after["error_name"] == "Error"
+    assert after["error_message"] == "this route is empty, please check the original site or create an issue"
+    assert after["calls"] == before["calls"] == ["https://www.yicai.com/api/ajax/getlatest?page=1&pagesize=30"]
+
+
+def test_yicai_latest_preserves_items_limits_and_upstream_errors():
+    items = [{"title": "Example article", "link": "https://example.invalid/item/1", "description": "Body"}]
+    result = _handler(YICAI, limit=1, items=items)
+    assert result == _handler(YICAI, unpatched=True, limit=1, items=items)
+    assert result["ok"] and result["result"]["item"] == items
+    assert result["calls"] == ["https://www.yicai.com/api/ajax/getlatest?page=1&pagesize=1"]
+    error = _handler(YICAI, upstreamError="Invalid feed response")
+    assert error == _handler(YICAI, unpatched=True, upstreamError="Invalid feed response")
+    assert not error["ok"] and error["error_name"] == "TypeError"
 
 
 def test_dockerfile_keeps_runtime_and_only_uses_pinned_base():

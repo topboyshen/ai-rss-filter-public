@@ -206,8 +206,9 @@ services:
       AI_FILTER_QUANT_TOKEN_FILE: /run/secrets/quant_market_context_token
       AI_FILTER_QUANT_CONTEXT_POLL_SECONDS: 45
       AI_FILTER_QUANT_CONTEXT_TIMEOUT_SECONDS: 3
-      # 10-22 实测 107137 字节（含本服务不用的 research_pool）；留约 2.4 倍余量。
-      AI_FILTER_QUANT_CONTEXT_MAX_BYTES: 262144
+      # Worker response limit in bytes. Set AI_FILTER_QUANT_CONTEXT_MAX_BYTES=65536
+      # for smaller Quant responses. The default allows 256 KiB.
+      AI_FILTER_QUANT_CONTEXT_MAX_BYTES: ${AI_FILTER_QUANT_CONTEXT_MAX_BYTES:-262144}
       AI_FILTER_QUANT_CONTEXT_CACHE_TTL_SECONDS: 150
       AI_FILTER_QUANT_CONTEXT_MAX_AGE_SECONDS: 120
       JIN10_SOURCE_URL: http://rsshub:1200/jin10

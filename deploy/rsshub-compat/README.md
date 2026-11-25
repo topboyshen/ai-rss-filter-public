@@ -9,7 +9,9 @@
 - 其他已列明合法分类保留候选原来的 channel。`china` 并非合法分类，已明确退役；它和其他未知分类在任何上游请求前抛出候选实际 `NotFoundError`，由 RSSHub 返回 404。不能使用 `InvalidParameterError`：该候选的错误处理中它会落到 503。
 - 仅 `/cls/telegraph` 的 category 参数缺失时，恢复旧版直接使用 `shareurl` 的行为：上游提供真实链接则保留；没有链接时不拼接 detail 地址、不设置显式 guid，原 RSS 序列化器使用规范化后的 title 生成 GUID。`watch` 等分类仍保留候选的真实链接或 detail 回退，`/cls/depth` 完全不修改。标题、内容和发布时间原样交给候选处理逻辑。
 
-这不是泛化补丁，也不在运行时装载外部目录。三个编译模块与错误类的完整 SHA256 必须匹配，替换片段必须恰好出现一次；任何漂移或二次执行都会失败。先验证所有输入再写模块。构建没有下载依赖，不改变基础镜像的 ENTRYPOINT、CMD、USER。
+- 第一财经 `/yicai/latest` 在上游返回空列表时抛出错误，避免空列表进入路由缓存。有新闻时保留原有返回值。
+
+这不是泛化补丁，也不在运行时装载外部目录。四个编译模块与错误类的完整 SHA256 必须匹配，替换片段必须恰好出现一次；任何漂移或二次执行都会失败。先验证所有输入再写模块。构建没有下载依赖，不改变基础镜像的 ENTRYPOINT、CMD、USER。
 
 AI-Filter 同时在读取入口明确退役 `wallstreetcn/news/china`：`/filter`、`/filter/multi`、`cached_feed` 和 `/feed/json|rss|html` 不再从已有缓存返回该路由的旧文，返回 410 提示。这是应用侧的缓存入口保护，与 RSSHub 的 404 拒绝互补；不删除历史数据，不改变 feed 配置或评分阈值。
 

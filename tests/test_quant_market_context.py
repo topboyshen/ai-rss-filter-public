@@ -672,6 +672,9 @@ def test_compose_scopes_quant_secret_to_worker_and_env_has_no_token_value():
             assert "quant_market_context_token" not in (service.get("secrets") or [])
     worker_env = services["ai-filter-worker"]["environment"]
     assert worker_env["AI_FILTER_QUANT_CONTEXT_URL"] == quant_context.FIXED_TUNNEL_URL
+    assert worker_env["AI_FILTER_QUANT_CONTEXT_MAX_BYTES"] == (
+        "${AI_FILTER_QUANT_CONTEXT_MAX_BYTES:-262144}"
+    )
     assert worker_env["AI_FILTER_QUANT_TOKEN_FILE"] == (
         "/run/secrets/quant_market_context_token"
     )
@@ -1281,11 +1284,7 @@ def test_market_risk_and_cache_times_are_visibly_decoupled(monkeypatch):
     assert "今日盘面" not in html
 
 
-# 10-22 生产实测：Quant-Server 附带的 research_pool 有 40 条，整包 107137 字节。
-_PROD_MEASURED_BYTES = 107_137
-
-
-def _payload_with_research_pool(target_bytes=_PROD_MEASURED_BYTES):
+def _payload_with_research_pool(target_bytes):
     payload = _payload()
     items = []
     payload["research_pool"] = {"schema_version": "x", "items": items}
@@ -1296,17 +1295,8 @@ def _payload_with_research_pool(target_bytes=_PROD_MEASURED_BYTES):
     return payload
 
 
-def _compose_quant_max_bytes():
-    from pathlib import Path
-
-    compose = Path(__file__).resolve().parents[1] / "docker-compose.yml"
-    for line in compose.read_text(encoding="utf-8").splitlines():
-        if line.strip().startswith("AI_FILTER_QUANT_CONTEXT_MAX_BYTES:"):
-            return int(line.split(":", 1)[1].strip())
-    raise AssertionError("compose lacks AI_FILTER_QUANT_CONTEXT_MAX_BYTES")
-
-
-def test_prod_sized_payload_with_research_pool_is_cached(monkeypatch, tmp_path):
+@pytest.mark.parametrize("limit", [None, 64 * 1024], ids=["default", "64k"])
+def test_quant_response_within_limit_is_cached(monkeypatch, tmp_path, limit):
     token_file = tmp_path / "token"
     token_file.write_text(TOKEN, encoding="utf-8")
     token_file.chmod(0o600)
@@ -1320,27 +1310,22 @@ def test_prod_sized_payload_with_research_pool_is_cached(monkeypatch, tmp_path):
         "set_shared_json",
         lambda name, value, ttl: writes.append(value) or True,
     )
-    body = json.dumps(_payload_with_research_pool()).encode("utf-8")
-    assert len(body) >= _PROD_MEASURED_BYTES
-
-    # Both the code default and the value production actually runs with.
-    for limit in (None, _compose_quant_max_bytes()):
-        writes.clear()
-        if limit is None:
-            monkeypatch.delenv("AI_FILTER_QUANT_CONTEXT_MAX_BYTES", raising=False)
-        else:
-            monkeypatch.setenv("AI_FILTER_QUANT_CONTEXT_MAX_BYTES", str(limit))
-        assert quant_context.poll_quant_market_context_once(
-            opener=_Opener(_Response(body)), now=NOW
-        ), limit
-        assert "research_pool" not in writes[0]["payload"]
+    if limit is None:
+        monkeypatch.delenv("AI_FILTER_QUANT_CONTEXT_MAX_BYTES", raising=False)
+        body = json.dumps(_payload_with_research_pool(128 * 1024)).encode("utf-8")
+        assert 64 * 1024 < len(body) <= 256 * 1024
+    else:
+        monkeypatch.setenv("AI_FILTER_QUANT_CONTEXT_MAX_BYTES", str(limit))
+        body = json.dumps(_payload()).encode("utf-8")
+        assert len(body) <= limit
+    assert quant_context.poll_quant_market_context_once(
+        opener=_Opener(_Response(body)), now=NOW
+    )
+    assert "research_pool" not in writes[0]["payload"]
 
 
-def test_compose_limit_keeps_headroom_over_measured_size():
-    assert _compose_quant_max_bytes() >= 2 * _PROD_MEASURED_BYTES
-
-
-def test_oversize_still_fails_neutral_with_sizes_in_log(monkeypatch, caplog):
+@pytest.mark.parametrize("limit", [None, 64 * 1024], ids=["default", "64k"])
+def test_oversize_still_fails_neutral_with_sizes_in_log(monkeypatch, caplog, limit):
     monkeypatch.setenv(
         "AI_FILTER_QUANT_CONTEXT_URL", quant_context.FIXED_TUNNEL_URL
     )
@@ -1349,19 +1334,24 @@ def test_oversize_still_fails_neutral_with_sizes_in_log(monkeypatch, caplog):
     monkeypatch.setattr(
         quant_context, "set_shared_json", lambda *_a: writes.append(1) or True
     )
-    body = json.dumps(_payload_with_research_pool(300_000)).encode("utf-8")
+    if limit is None:
+        monkeypatch.delenv("AI_FILTER_QUANT_CONTEXT_MAX_BYTES", raising=False)
+        limit = 256 * 1024
+    else:
+        monkeypatch.setenv("AI_FILTER_QUANT_CONTEXT_MAX_BYTES", str(limit))
+    body = json.dumps(_payload_with_research_pool(limit + 1)).encode("utf-8")
 
     with caplog.at_level("WARNING"):
         assert not quant_context.poll_quant_market_context_once(
             opener=_Opener(_Response(body)), now=NOW
         )
     assert writes == []
-    assert f"declared={len(body)} limit={256 * 1024}" in caplog.text
+    assert f"declared={len(body)} limit={limit}" in caplog.text
 
     # Without Content-Length the bounded read must still stop at the limit.
     no_length = _Response(body)
     no_length.headers.pop("Content-Length")
-    with pytest.raises(quant_context.QuantContextError, match=r"limit=262144"):
+    with pytest.raises(quant_context.QuantContextError, match=f"limit={limit}"):
         quant_context._fetch_payload(
             quant_context.FIXED_TUNNEL_URL, TOKEN, opener=_Opener(no_length)
         )

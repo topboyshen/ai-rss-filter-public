@@ -70,6 +70,7 @@ def test_compose_projects_only_explicit_role_credentials_without_env_file():
         "ai-filter-web": set(),
         "ai-filter-worker": {
             "AI_FILTER_API_KEY",
+            "AI_FILTER_QUANT_CONTEXT_MAX_BYTES",
             "KIMI_CODE_API_KEY",
             "LLM_API_KEY",
             "TELEGRAM_BOT_TOKEN",
