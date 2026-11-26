@@ -179,3 +179,64 @@ def test_all_unknown_rows_are_failed_and_cannot_advance_refresh(monkeypatch):
     assert database.get_last_full_refresh_ts() == 123
     assert database.get_feed_health()[0][4:6] == (0, 1)
     assert shared._staleness_info(cfg)["degraded"] is True
+
+
+def test_deferred_only_partial_does_not_mark_readiness_degraded(monkeypatch):
+    from routes import shared
+
+    attempt = {
+        "status": "partial",
+        "failed_sources": 0,
+        "source_unrecognized_entries": 0,
+        "score_terminal_unscored_entries": 0,
+        "score_deferred_entries": 1,
+        "score_continuations": {
+            "errors": 0,
+            "terminal_unscored": 0,
+            "deferred": 0,
+            "remaining": {"active": 1},
+        },
+    }
+    monkeypatch.setattr(shared, "get_last_full_refresh_ts", lambda: 123)
+    monkeypatch.setattr(
+        shared.DB,
+        "get_app_meta",
+        lambda key: json.dumps(attempt) if key == "last_refresh_result" else "0",
+    )
+
+    info = shared._staleness_info(
+        {"feeds": [{"enabled": True}], "staleness_warn_seconds": 10**9}
+    )
+
+    assert info["degraded"] is False
+    assert info["last_attempt"] == attempt
+
+
+def test_terminal_unscored_partial_still_marks_readiness_degraded(monkeypatch):
+    from routes import shared
+
+    attempt = {
+        "status": "partial",
+        "failed_sources": 0,
+        "source_unrecognized_entries": 0,
+        "score_terminal_unscored_entries": 1,
+        "score_deferred_entries": 0,
+        "score_continuations": {
+            "errors": 0,
+            "terminal_unscored": 1,
+            "deferred": 0,
+            "remaining": {"active": 0},
+        },
+    }
+    monkeypatch.setattr(shared, "get_last_full_refresh_ts", lambda: 123)
+    monkeypatch.setattr(
+        shared.DB,
+        "get_app_meta",
+        lambda key: json.dumps(attempt) if key == "last_refresh_result" else "0",
+    )
+
+    info = shared._staleness_info(
+        {"feeds": [{"enabled": True}], "staleness_warn_seconds": 10**9}
+    )
+
+    assert info["degraded"] is True

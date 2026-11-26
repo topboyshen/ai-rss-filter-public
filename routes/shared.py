@@ -187,6 +187,38 @@ def try_acquire_refresh_lock() -> bool:
 
 # ---------- Staleness ----------
 
+def _deferred_only_partial(attempt: dict | None) -> bool:
+    """A partial refresh caused only by durably queued scoring is not degraded.
+
+    Deferred entries are retried by the continuation worker.  They remain
+    visible in ``score_deferred_entries`` and the continuation journal, but
+    they should not page as a failed collection while no terminal or source
+    error exists.
+    """
+    if not isinstance(attempt, dict) or attempt.get("status") != "partial":
+        return False
+    if int(attempt.get("failed_sources") or 0) != 0:
+        return False
+    if int(attempt.get("source_unrecognized_entries") or 0) != 0:
+        return False
+    if int(attempt.get("score_terminal_unscored_entries") or 0) != 0:
+        return False
+    continuation = attempt.get("score_continuations")
+    if not isinstance(continuation, dict):
+        return False
+    if int(continuation.get("errors") or 0) != 0:
+        return False
+    if int(continuation.get("terminal_unscored") or 0) != 0:
+        return False
+    remaining = continuation.get("remaining")
+    active = int(remaining.get("active") or 0) if isinstance(remaining, dict) else 0
+    return bool(
+        int(attempt.get("score_deferred_entries") or 0)
+        or int(continuation.get("deferred") or 0)
+        or active
+    )
+
+
 def _staleness_info(cfg: dict) -> dict:
     """可观测性：全量拉源时间是否超出预期（用于 /status、Dashboard）。"""
     last_ts = get_last_full_refresh_ts()
@@ -218,7 +250,16 @@ def _staleness_info(cfg: dict) -> dict:
     except Exception:
         logger.warning("Could not read last ingestion timestamp", exc_info=True)
     last_attempt_status = str((last_attempt or {}).get("status") or "unknown")
-    degraded = bool(has_feeds and last_attempt_status in {"partial", "failed"})
+    degraded = bool(
+        has_feeds
+        and (
+            last_attempt_status == "failed"
+            or (
+                last_attempt_status == "partial"
+                and not _deferred_only_partial(last_attempt)
+            )
+        )
+    )
     return {
         "last_full_refresh_at": beijing_fromtimestamp(last_ts).isoformat() if last_ts else None,
         "seconds_since_full_refresh": age,
