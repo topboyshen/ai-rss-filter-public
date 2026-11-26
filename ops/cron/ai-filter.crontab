@@ -3,7 +3,9 @@
 # NO_BACKUP 2026-09-10: historical weekly schedule retained as a comment; no automatic drill.
 # NO_BACKUP 2026-09-10 | 30 4 * * 0 umask 077; timeout --signal=TERM --kill-after=60s 45m /usr/local/sbin/ai-filter-restore-drill >> /var/log/ai-filter-restore-drill.log 2>&1
 * * * * * /root/health_check.sh
-0 * * * * umask 077; timeout --signal=TERM --kill-after=5s 90s /usr/local/sbin/ai-filter-ops-check --quiet >> /var/log/ai-filter-ops-check.log 2>&1
+# Run after the :00 refresh has had time to finish, so a stale partial state
+# cannot race the refresh that is about to replace it.
+7 * * * * umask 077; timeout --signal=TERM --kill-after=5s 90s /usr/local/sbin/ai-filter-ops-check --quiet >> /var/log/ai-filter-ops-check.log 2>&1
 # Trading session: fresh intelligence every 30 minutes on weekdays.
 */30 8-16 * * 1-5 umask 077; /root/ai-rss-filter/scripts/cron_refresh.sh >> /var/log/ai-filter-refresh.log 2>&1
 # Weekday off-hours and weekends: retain coverage without 48 full sweeps/day.
