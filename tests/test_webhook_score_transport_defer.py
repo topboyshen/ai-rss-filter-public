@@ -199,3 +199,41 @@ def test_existing_deadline_is_narrowly_passed_without_breaking_legacy_double(
     finally:
         if hasattr(webhook_routes._task_execution_context, "deadline"):
             delattr(webhook_routes._task_execution_context, "deadline")
+
+
+def test_delayed_retry_binds_the_original_envelope_receipt_clock(
+    isolated_spool, tmp_path, monkeypatch
+):  # noqa: F811
+    webhook_routes = isolated_spool
+    seen = []
+
+    def fake_process_entry(wrapper, **_kw):
+        seen.append(wrapper.received_at)
+        return None, "filtered"
+
+    monkeypatch.setattr(webhook_routes, "process_entry", fake_process_entry)
+    monkeypatch.setattr(webhook_routes, "resolve_scoring_contract", lambda cfg, **_k: cfg)
+    monkeypatch.setattr(webhook_routes, "resolve_prompt", lambda *_a: ("p", "prompt"))
+    monkeypatch.setattr(webhook_routes, "_queue_committed_dashboard_inputs", lambda: None)
+    envelope = {
+        "version": 1,
+        "digest": "d" * 64,
+        "created_at": 1_700_000_100.0,
+        "enqueued_at": 1_700_000_700.0,
+        "attempts": 1,
+        "owner": "",
+        "next_entry_index": 0,
+        "progress": {},
+        "task": {
+            "feed_url": "https://example.com/feed",
+            "entries": [{
+                "title": "t", "url": "https://example.com/1", "content": "c",
+            }],
+        },
+    }
+    path = tmp_path / "task.json"
+    path.write_text("{}", encoding="utf-8")
+
+    webhook_routes._execute_claimed_spooled_task(path, envelope)
+
+    assert seen == [1_700_000_100]

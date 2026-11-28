@@ -5157,6 +5157,7 @@ def set_cached_entry(
     stage1_model: str = "", stage2_score: Optional[float] = None,
     stage2_model: str = "", score_confidence: float = 0.0, review_reason: str = "",
     direction: str = "中性", created_at: Optional[int] = None,
+    first_seen_at: Optional[int] = None,
     backtest_signal: Optional[Dict[str, Any]] = None,
     score_explanation: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, int]:
@@ -5329,7 +5330,6 @@ def set_cached_entry(
                     quarantine_event_id,
                     quarantine_event_version,
                 )
-
             if quarantined_identity is not None:
                 resolved_event_id, resolved_event_version = (
                     _current_canonical_event_identity(
@@ -5365,7 +5365,7 @@ def set_cached_entry(
                 )
             )
             if not quality_repair:
-                _upsert_article_source(conn, link, feed_url)
+                _upsert_article_source(conn, link, feed_url, min(int(first_seen_at), observed_at) if first_seen_at else None)
                 _record_article_evidence(
                     conn,
                     event_id=event_id,

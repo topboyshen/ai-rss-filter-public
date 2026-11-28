@@ -255,3 +255,21 @@ def test_coerce_entry_epoch_normalizes_supported_shapes(value, expected):
     from core.processor import _coerce_entry_epoch
 
     assert _coerce_entry_epoch(value) == expected
+
+
+def test_webhook_receipt_clock_is_bound_outside_the_task_identity():
+    from routes import webhook_routes
+
+    out = webhook_routes._normalize_webhook_entries(
+        [{"title": "x", "url": "https://example.test/a"}], {}
+    )
+    assert "received_at" not in out[0]
+
+    wrapper = webhook_routes._WebhookEntry("x", "https://example.test/a", "")
+    webhook_routes._task_execution_context.received_at = 1_700_000_100
+    try:
+        webhook_routes._bind_webhook_times(wrapper, {"published_at": 100})
+    finally:
+        del webhook_routes._task_execution_context.received_at
+    assert wrapper.published_at == 100
+    assert wrapper.received_at == 1_700_000_100

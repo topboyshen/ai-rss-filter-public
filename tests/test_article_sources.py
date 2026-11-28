@@ -219,3 +219,25 @@ def test_metadata_repair_records_timestamp_less_cached_items(monkeypatch):
 
     assert link in cached
     assert sightings == [(link, "feed-c")]
+
+
+def test_retry_keeps_the_original_receipt_clock(tmp_path, monkeypatch):
+    database, _ = _use_temp_database(tmp_path, monkeypatch)
+    database.init_db()
+    link = "https://example.com/delayed-retry"
+    feed = "https://example.com/feed"
+    received_at = 1_700_000_100
+
+    database.set_cached_entry(
+        link, "scored title", "raw title", 8.0, "tag", "logic", "summary",
+        feed_url=feed, score_path="llm", strategy_version="test-v1",
+        created_at=1_700_000_000, first_seen_at=received_at,
+    )
+    database.set_cached_entry(
+        link, "scored title", "raw title", 8.0, "tag", "logic", "summary",
+        feed_url=feed, score_path="llm", strategy_version="test-v1",
+        created_at=1_700_000_000, first_seen_at=received_at + 3600,
+    )
+
+    [source] = database.get_article_sources(link)
+    assert source["first_seen_at"] == received_at

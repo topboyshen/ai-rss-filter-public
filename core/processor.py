@@ -1274,6 +1274,7 @@ def _persist_similar_entry(ctx, similar_info, notify_threshold):
         strategy_version=str(cfg.get("scoring_strategy_version", "")),
         direction=direction,
         created_at=_entry_timestamp(entry),
+        first_seen_at=getattr(entry, "received_at", None),
         backtest_signal=signal_snapshot,
     )
     event_id, event_version = _persisted_event_identity(entry, write_result)
@@ -1699,6 +1700,7 @@ def _commit_filtered_entry(ctx, result, meta, scored_at, snapshot):
             summary,
             feed_url=ctx.feed_url,
             created_at=_entry_timestamp(ctx.entry),
+            first_seen_at=getattr(ctx.entry, "received_at", None),
             backtest_signal=snapshot,
             **meta,
         )
@@ -1761,6 +1763,7 @@ def _commit_scored_entry(ctx, result, meta, scored_at, snapshot, summary, notify
         summary,
         feed_url=ctx.feed_url,
         created_at=_entry_timestamp(ctx.entry),
+        first_seen_at=getattr(ctx.entry, "received_at", None),
         backtest_signal=snapshot,
         **meta,
     )
