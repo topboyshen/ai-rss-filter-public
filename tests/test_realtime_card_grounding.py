@@ -483,3 +483,27 @@ def test_safe_neutral_card_without_record_says_reason_not_fully_recorded():
 def test_normal_formal_card_has_no_evidence_note():
     html = _render_cards([_polluted_innovative_drug_entry()])
     assert "保守处理说明：" not in html
+
+
+def test_cache_card_entry_labels_first_sighting_not_publish_time():
+    from sse_engine import _cache_card_entry
+
+    row = {
+        "title": "t", "score": 8.0, "direction": "中性", "tag": "政策",
+        "logic": "l", "created_at": 100, "first_seen_at": 200,
+        "score_path": "llm", "strategy_version": "v",
+        "safe_neutral_reason": "", "display_score_strategy_version": "v",
+        "display_direction_strategy_version": "v",
+        "display_logic_strategy_version": "v",
+    }
+    entry = _cache_card_entry(
+        row, title="t", raw_title="t", link="l", event_id="",
+        event_version=0, feed_url="f", source="s",
+    )
+    assert entry["time"] == 200
+
+    row["first_seen_at"] = 0
+    assert _cache_card_entry(
+        row, title="t", raw_title="t", link="l", event_id="",
+        event_version=0, feed_url="f", source="s",
+    )["time"] == 100

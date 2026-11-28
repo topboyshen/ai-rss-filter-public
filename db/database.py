@@ -1801,6 +1801,64 @@ def _init_event_reference_triggers(cursor) -> None:
     )
 
 
+def _trading_calendar_paths():
+    env_path = os.environ.get("AI_FILTER_TRADING_CALENDAR")
+    if env_path:
+        yield env_path
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    yield os.path.join(base, "config", "trading_calendar.json")
+    yield "/app/config/trading_calendar.json"
+    yield "/etc/ai-filter/trading_calendar.json"
+
+
+def _load_trading_calendar() -> Dict[int, set]:
+    """Load the reviewed holiday file; a malformed file never guesses dates."""
+    for path in _trading_calendar_paths():
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            logger.warning("Trading calendar unreadable: %s", path, exc_info=False)
+            continue
+        years = payload.get("years") if isinstance(payload, dict) else None
+        if not isinstance(years, dict):
+            logger.warning("Trading calendar has no years mapping: %s", path)
+            continue
+        parsed: Dict[int, set] = {}
+        for raw_year, dates in years.items():
+            year_text = str(raw_year)
+            if not re.fullmatch(r"\d{4}", year_text) or not isinstance(dates, list):
+                parsed = {}
+                break
+            entries = set()
+            for raw_date in dates:
+                if not isinstance(raw_date, str) or not re.fullmatch(
+                    r"\d{4}-\d{2}-\d{2}", raw_date
+                ):
+                    entries = set()
+                    break
+                try:
+                    day = datetime.strptime(raw_date, "%Y-%m-%d").date()
+                except ValueError:
+                    entries = set()
+                    break
+                if day.year != int(year_text):
+                    entries = set()
+                    break
+                entries.add(raw_date)
+            if not entries:
+                parsed = {}
+                break
+            parsed[int(year_text)] = entries
+        if not parsed:
+            logger.warning("Trading calendar rejected: %s", path)
+            continue
+        return parsed
+    return {}
+
+
 CHINA_HOLIDAYS_2026 = {
     "2026-01-01", "2026-01-02", "2026-01-03",
     "2026-02-16", "2026-02-17", "2026-02-18", "2026-02-19", "2026-02-20",
@@ -1813,6 +1871,7 @@ CHINA_HOLIDAYS_2026 = {
     "2026-10-06", "2026-10-07",
 }
 CHINA_HOLIDAYS_BY_YEAR = {2026: CHINA_HOLIDAYS_2026}
+CHINA_HOLIDAYS_BY_YEAR.update(_load_trading_calendar())
 
 
 def _is_trading_day_local(date_str: str) -> bool:

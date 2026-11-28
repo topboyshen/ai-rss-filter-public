@@ -87,3 +87,51 @@ def test_loader_opens_sqlite_with_read_only_uri_and_busy_timeout(tmp_path, monke
     assert len(calls) == 1
     assert calls[0][0][0] == path.resolve().as_uri() + "?mode=ro"
     assert calls[0][1] == {"uri": True, "timeout": SQLITE_BUSY_TIMEOUT_SECONDS}
+
+
+def test_realtime_card_uses_first_sighting_for_the_ingest_label(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "first-seen.db"
+    now = int(time.time())
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE news_cache ("
+            "title TEXT, link TEXT, score REAL, tag TEXT, logic TEXT, "
+            "created_at INTEGER, feed_url TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO news_cache VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("晚到条目", "https://example.com/late", 8.5, "宏观",
+             "影响流动性", now - 4 * 3600, FEED),
+        )
+        conn.execute(
+            "CREATE TABLE article_sources ("
+            "link TEXT, feed_url TEXT, first_seen_at INTEGER, last_seen_at INTEGER)"
+        )
+        conn.execute(
+            "INSERT INTO article_sources VALUES (?, ?, ?, ?)",
+            ("https://example.com/late", FEED, now, now),
+        )
+    monkeypatch.setattr("db.database.DB_PATH", str(path))
+
+    entries = sse_engine._load_from_db(cfg=_cfg(), strict=True)
+
+    assert len(entries) == 1
+    assert entries[0]["time"] == now
+
+
+def test_cache_card_entry_without_first_seen_falls_back_to_publish_time():
+    row = {
+        "title": "t", "score": 8.0, "direction": "中性", "tag": "政策",
+        "logic": "l", "created_at": 100, "score_path": "llm",
+        "strategy_version": "v", "safe_neutral_reason": "",
+        "display_score_strategy_version": "v",
+        "display_direction_strategy_version": "v",
+        "display_logic_strategy_version": "v",
+    }
+    entry = sse_engine._cache_card_entry(
+        row, title="t", raw_title="t", link="l", event_id="",
+        event_version=0, feed_url="f", source="s",
+    )
+    assert entry["time"] == 100

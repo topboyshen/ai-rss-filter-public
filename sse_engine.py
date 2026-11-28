@@ -225,11 +225,11 @@ _CARD_TZ = ZoneInfo("Asia/Shanghai")
 
 
 def _card_ingest_time_label(time_ts, *, now_ts: Optional[int] = None) -> str:
-    """Format news_cache.created_at for Glance.
+    """Format the first-sighting timestamp for Glance.
 
-    This is ingest/storage time, not publisher time.  The visible label must
-    say so, and must include a calendar day so overnight cards are not read
-    as "this morning".
+    The card passes article_sources.first_seen_at, not publisher time.  The
+    visible label must say so, and must include a calendar day so overnight
+    cards are not read as "this morning".
     """
     try:
         stamp = int(time_ts or 0)
@@ -794,8 +794,25 @@ def _cache_table_columns(conn, table: str) -> set[str]:
     return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
 
+def _first_seen_cache_projection(conn) -> str:
+    """Expose the source-ingest clock when the additive table exists."""
+    has_sources = bool(conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='article_sources'"
+    ).fetchone())
+    if not has_sources:
+        return "NULL AS first_seen_at"
+    return (
+        "(SELECT MIN(s.first_seen_at) FROM article_sources AS s "
+        "WHERE s.link = cache.link) AS first_seen_at"
+    )
+
+
 def _cache_card_entry(row, *, title, raw_title, link, event_id, event_version, feed_url, source):
     """Keep query/selection fields stable and carry the full stored display title."""
+    try:
+        first_seen_at = int(row["first_seen_at"] or 0)
+    except (IndexError, KeyError, TypeError, ValueError):
+        first_seen_at = 0
     entry = {
         "event_id": event_id,
         "event_version": event_version,
@@ -809,7 +826,7 @@ def _cache_card_entry(row, *, title, raw_title, link, event_id, event_version, f
         "raw_tag": str(row["tag"] or ""),
         "tag": _normalize_tag(row["tag"]),
         "logic": _sanitize_card_logic(row["logic"] or ""),
-        "time": row["created_at"],
+        "time": first_seen_at or row["created_at"],
         "feed_url": feed_url,
         "source": source,
         "score_path": str(row["score_path"] or ""),
@@ -905,7 +922,8 @@ def _realtime_candidate_rows(conn, query, params, *, cfg, feed_urls, min_score, 
             ) AS freshness_rank FROM identified
         ), representatives AS (
             SELECT semantic.title, semantic.raw_title, fresh.link, semantic.score,
-                   semantic.tag, semantic.logic, fresh.created_at, fresh.feed_url,
+                   semantic.tag, semantic.logic, fresh.created_at,
+                   fresh.first_seen_at, fresh.feed_url,
                    semantic.direction, semantic.event_id, semantic.event_version,
                    semantic.score_path, semantic.strategy_version, semantic.safe_neutral_reason,
                    semantic.display_score_strategy_version, semantic.display_direction_strategy_version,
@@ -1043,7 +1061,7 @@ def _load_from_db(
         query = f"""
             SELECT cache.title, {raw_title_projection}, cache.link,
                    {importance_projection} AS score,
-                   cache.tag, cache.logic, cache.created_at, cache.feed_url,
+                   cache.tag, cache.logic, cache.created_at, {_first_seen_cache_projection(conn)}, cache.feed_url,
                    {direction_projection},
                    {event_projection},
                    {score_path_projection}, {strategy_projection},

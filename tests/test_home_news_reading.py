@@ -218,3 +218,41 @@ def test_reading_keeps_trusted_mapping_and_hides_polluted_model_fields():
     assert title in html and "标题匹配主题：创新药" in html
     assert "AI算力" not in html and "中际旭创" not in html and "GPU需求增长" not in html
     assert "服务器需求扩张" not in html
+
+
+def test_briefing_article_row_maps_first_seen_and_uses_it_for_display():
+    from routes import dashboard_routes
+
+    row = (
+        "https://example.test/a", "Title", "Title", 8.0, "政策", "logic",
+        "summary", 1795838400 - 4 * 3600, "https://example.test/feed",
+        "中性", "", 0, 1795838400,
+    )
+    article = dashboard_routes._briefing_article_from_row(row)
+    assert article["created_at"] == 1795838400 - 4 * 3600
+    assert article["first_seen_at"] == 1795838400
+    assert dashboard_routes._article_ingest_timestamp(article) == 1795838400
+
+
+def test_article_time_label_handles_missing_and_invalid_stamps():
+    from routes import dashboard_routes
+
+    assert dashboard_routes._article_time_label({}) == ""
+    assert dashboard_routes._article_time_label({"first_seen_at": "bad"}) == ""
+    assert dashboard_routes._article_time_label({"created_at": 1795838400}) == "11-28 12:00"
+    legacy = (
+        "l", "t", "t", 8, "tag", "logic", "summary", 1795838400,
+        "feed", "中性", "", 0,
+    )
+    assert dashboard_routes._briefing_article_from_row(legacy)["first_seen_at"] == 0
+
+
+def test_briefing_articles_from_rows_uses_first_seen_for_display():
+    from routes import dashboard_routes
+
+    row = (
+        "l", "t", "t", 8, "tag", "logic", "summary", 1795838400 - 4 * 3600,
+        "feed", "中性", "", 0, 1795838400,
+    )
+    [article] = dashboard_routes._briefing_articles_from_rows([row])
+    assert article["time"] == "11-28 12:00"

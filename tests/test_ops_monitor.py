@@ -1833,3 +1833,76 @@ def test_parse_availability_gauges_skips_comments_bad_values_and_other_metrics()
         "ai_filter_llm_alerts_available": [1.0],
         "ai_filter_score_quality_available": [0.0],
     }
+
+
+def test_alert_state_and_notification_carry_the_refresh_batch(tmp_path):
+    import sqlite3
+
+    settings = _settings(tmp_path)
+    database = tmp_path / "cache.db"
+    connection = sqlite3.connect(database)
+    connection.execute("CREATE TABLE app_meta (k TEXT PRIMARY KEY, v TEXT)")
+    connection.execute(
+        "INSERT INTO app_meta VALUES ('last_refresh_result', ?)",
+        (json.dumps({
+            "refresh_id": "batch-1",
+            "status": "partial",
+            "finished_at": 123,
+        }),),
+    )
+    connection.commit()
+    connection.close()
+    settings = dataclasses.replace(settings, database_path=database)
+
+    batch = monitor._last_refresh_batch(settings)
+    assert batch == {
+        "refresh_id": "batch-1", "status": "partial", "finished_at": 123,
+    }
+    text = monitor._notification_text("failure", [], 999, batch)
+    assert "refresh=batch-1" in text
+    assert "refresh=batch-1" in monitor._notification_text(
+        "recovery", [], 999, batch
+    )
+
+
+def test_alert_notification_omits_an_unsafe_refresh_batch_id(tmp_path):
+    import sqlite3
+
+    settings = _settings(tmp_path)
+    database = tmp_path / "cache.db"
+    connection = sqlite3.connect(database)
+    connection.execute("CREATE TABLE app_meta (k TEXT PRIMARY KEY, v TEXT)")
+    connection.execute(
+        "INSERT INTO app_meta VALUES ('last_refresh_result', ?)",
+        (json.dumps({"refresh_id": "../secret"}),),
+    )
+    connection.commit()
+    connection.close()
+    settings = dataclasses.replace(settings, database_path=database)
+
+    batch = monitor._last_refresh_batch(settings)
+    assert batch["refresh_id"] == ""
+    assert "refresh=" not in monitor._notification_text("failure", [], 999, batch)
+
+
+def test_refresh_batch_ignores_non_mapping_payload(tmp_path):
+    import sqlite3
+
+    settings = _settings(tmp_path)
+    database = tmp_path / "cache.db"
+    connection = sqlite3.connect(database)
+    connection.execute("CREATE TABLE app_meta (k TEXT PRIMARY KEY, v TEXT)")
+    connection.execute(
+        "INSERT INTO app_meta VALUES ('last_refresh_result', '[]')"
+    )
+    connection.commit()
+    connection.close()
+    settings = dataclasses.replace(settings, database_path=database)
+
+    assert monitor._last_refresh_batch(settings) == {}
+
+
+def test_calendar_loader_skips_a_missing_file(tmp_path, monkeypatch):
+    missing = tmp_path / "missing.json"
+    monkeypatch.setattr(monitor, "_calendar_paths", lambda: iter([missing]))
+    assert monitor._load_calendar_file() == {}

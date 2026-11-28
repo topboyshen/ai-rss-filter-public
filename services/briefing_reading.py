@@ -25,7 +25,7 @@ _EVIDENCE_STYLE = (
 
 def _ingest_label(article: dict) -> str:
     """Explicit ingest timestamp first; a display string stays as-is."""
-    for key in ("created_at", "time"):
+    for key in ("first_seen_at", "created_at", "time"):
         try:
             stamp = int(article.get(key))
         except (TypeError, ValueError):

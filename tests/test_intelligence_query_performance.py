@@ -124,3 +124,42 @@ def test_missing_event_schema_keeps_legacy_rows_and_hides_broken_references():
             [_article(1), _article(2, event_id="")], conn
         )
     assert [item.link for item in result] == ["https://example.test/2"]
+
+
+def test_briefing_tuple_keeps_publish_time_and_adds_first_sighting(
+    event_connection, monkeypatch
+):
+    conn = event_connection
+    conn.execute(
+        "CREATE TABLE news_cache (link TEXT, title TEXT, raw_title TEXT, "
+        "score REAL, tag TEXT, logic TEXT, summary TEXT, created_at INTEGER, "
+        "feed_url TEXT, direction TEXT, event_id TEXT, event_version INTEGER, "
+        "score_path TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE article_sources (link TEXT, feed_url TEXT, "
+        "first_seen_at INTEGER, last_seen_at INTEGER)"
+    )
+    now = int(time.time())
+    link = "https://example.test/late"
+    conn.execute(
+        "INSERT INTO news_cache VALUES (?, 'Late', 'Late', 8.0, 'policy', "
+        "'logic', 'summary', ?, 'https://example.test/feed', 'neutral', '', 0, 'llm')",
+        (link, now - 4 * 3600),
+    )
+    conn.execute(
+        "INSERT INTO article_sources VALUES (?, 'https://example.test/feed', ?, ?)",
+        (link, now, now),
+    )
+
+    @contextmanager
+    def connection():
+        yield conn
+
+    monkeypatch.setattr(intelligence_query, "get_connection", connection)
+    rows = intelligence_query.query_briefing_tuples(
+        {"threshold": {"pass": 7}}, min_score=7, limit=5
+    )
+
+    assert rows[0][7] == now - 4 * 3600
+    assert rows[0][12] == now

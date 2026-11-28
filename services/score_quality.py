@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import logging
 
-from db.score_quality import read_score_quality
+from db.score_quality import read_score_quality, read_score_quality_history
 from scoring_provenance import (
     INSUFFICIENT_INPUT_SCORE_PATHS,
     NON_SUBSTANTIVE_SCORE_PATHS,
@@ -86,6 +86,11 @@ def score_quality_snapshot(strategy_version: str, hours: int = 24) -> dict:
     )
     result['warning_min_samples'] = 50
     result['warning_ratio'] = 0.10
+    try:
+        result['history'] = read_score_quality_history(hours, strategy_version)
+    except Exception:
+        logger.warning('[ScoreQuality] history unavailable', exc_info=False)
+        result['history'] = {'hours': hours, 'versions': []}
     return result
 
 
@@ -96,11 +101,13 @@ def _labels(values: dict) -> str:
 def score_quality_prometheus(strategy_version: str) -> list[str]:
     """Windowed gauges, not cumulative counters; unknown ratios are omitted."""
     lines = []
+    history_versions: list[dict] = []
     for hours in (2, 24):
         data = score_quality_snapshot(strategy_version, hours)
-        # The series follows the contract bucket; the full patch stays in JSON.
-        contract = data.get('contract_version') or strategy_version
-        window = {'window': f'{hours}h', 'strategy_version': contract}
+        # Formal statistics follow the exact rule identity, not the contract
+        # bucket.  Cross-version trends are exported as separate gauges below.
+        exact = data.get('strategy_version') or strategy_version
+        window = {'window': f'{hours}h', 'strategy_version': exact}
         lines.append(f'ai_filter_score_quality_available{{{_labels(window)}}} {int(data["available"])}')
         if not data['available']:
             continue
@@ -125,5 +132,21 @@ def score_quality_prometheus(strategy_version: str) -> list[str]:
             if value is not None:
                 lines.append(f'ai_filter_score_final_{key}{{{labels}}} {value}')
         lines.append(f'ai_filter_score_safe_neutral_warning{{{labels}}} {int(data["safe_neutral_warning"])}')
+        if hours == 24:
+            history_versions = list((data.get('history') or {}).get('versions') or [])
+    for row in history_versions:
+        labels = _labels({
+            'window': '24h',
+            'strategy_version': row.get('strategy_version', ''),
+        })
+        lines.append(
+            f'ai_filter_score_quality_history_final_total{{{labels}}} '
+            f'{int(row.get("final_total") or 0)}'
+        )
+        if row.get('usable_ratio') is not None:
+            lines.append(
+                f'ai_filter_score_quality_history_usable_ratio{{{labels}}} '
+                f'{row["usable_ratio"]}'
+            )
     types = [f'# TYPE {name} gauge' for name in sorted({line.split('{', 1)[0] for line in lines})]
     return types + lines
