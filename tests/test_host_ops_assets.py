@@ -405,7 +405,7 @@ def test_versioned_units_and_backup_hook_are_fail_closed():
     assert "systemctl enable --now ai-filter-market-close-history.timer" in install_script
     assert "--kill-after=60s 18m /root/ai-rss-filter/scripts/cron_event_enrichment.sh" in cron
     ops_jobs = [line for line in cron.splitlines() if "/usr/local/sbin/ai-filter-ops-check" in line]
-    assert len(ops_jobs) == 1 and ops_jobs[0].startswith("0 * * * * ")
+    assert len(ops_jobs) == 1 and ops_jobs[0].startswith("7 * * * * ")
     assert "* * * * * /root/health_check.sh" in cron
     assert "src_conn.backup(dst_conn)" in backup
     assert "PRAGMA quick_check" in backup

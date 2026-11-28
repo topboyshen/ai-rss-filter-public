@@ -338,6 +338,9 @@ def _strategy_fingerprint(cfg: dict) -> str:
         "local_reject_rules",
         "local_fast_reject_max_rule_score",
         "local_scoring",
+        # Caps an explicitly irrelevant model verdict to a source-specific
+        # floor, so changing it changes the persisted score.
+        "irrelevance_policy",
         "similarity_window_hours",
         "similarity_rescore_keywords",
         "prompts",

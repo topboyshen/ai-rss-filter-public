@@ -1680,3 +1680,14 @@ def test_fast_pass_hint_records_bounded_tag_without_undefined_tier(
     assert reason == "scored"
     assert entry.scoring_meta["score_path"] == "llm"
     metrics.record_fast_pass.assert_called_once_with("宏观政策")
+
+
+def test_irrelevance_floor_change_changes_score_and_fingerprint():
+    """A rule that changes a stored score must change the strategy identity."""
+    base = {"irrelevance_policy": {"default_floor": 4.0}}
+    raised = {"irrelevance_policy": {"default_floor": 6.5}}
+    assert _cap_irrelevant_high_score(9.0, "无关", "无相关内容", base)[0] == 4.0
+    assert _cap_irrelevant_high_score(9.0, "无关", "无相关内容", raised)[0] == 6.5
+    assert config_module._strategy_fingerprint(base) != config_module._strategy_fingerprint(
+        raised
+    )

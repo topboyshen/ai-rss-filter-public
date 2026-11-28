@@ -30,7 +30,8 @@ from flask import Blueprint, Response, g, request
 from routes.shared import _cfg, DB
 from core.article_identity import per_item_link, shared_section_urls
 from core.processor import (
-    SCORE_DEFERRED_REASON, SCORE_TERMINAL_UNSCORED_REASON, process_entry,
+    SCORE_DEFERRED_REASON, SCORE_TERMINAL_UNSCORED_REASON,
+    _coerce_entry_epoch, process_entry,
 )
 from core.prompts import resolve_prompt
 from core.scorer import Scorer
@@ -2039,7 +2040,7 @@ def _score_in_background(task: dict) -> bool | str:
                 continue
 
             wrapper = _WebhookEntry(title, link, content)
-
+            wrapper.published_at = entry_data.get("published_at")
             try:
                 with processing_origin("webhook"):
                     process_kwargs = {
@@ -2113,21 +2114,35 @@ def _normalize_webhook_entries(entries: list, cfg: Any) -> list:
         source_title = plain_text_from_markup(entry.get("title", ""))
         title = _clip_text(source_title, _MAX_TITLE_CHARS)
         url = _clip_text(entry.get("url", "") or entry.get("link", ""), _MAX_URL_CHARS)
-        normalized_entries.append({
+        published_at = None
+        for key in (
+            "published_at", "published", "pubDate", "date_published",
+            "created_at", "updated_at", "updated",
+        ):
+            published_at = _coerce_entry_epoch(entry.get(key))
+            if published_at is not None:
+                break
+        normalized = {
             "title": title,
             "url": _clip_text(per_item_link(entry, url, source_title, shared), _MAX_URL_CHARS),
             "content": _clip_utf8(content, _MAX_CONTENT_BYTES),
-        })
+        }
+        if published_at is not None:
+            normalized["published_at"] = published_at
+        normalized_entries.append(normalized)
     return normalized_entries
 
 
 class _WebhookEntry:
     """Minimal entry wrapper compatible with process_entry"""
 
-    def __init__(self, title: str, link: str, summary: str = ""):
+    def __init__(
+        self, title: str, link: str, summary: str = "", published_at=None
+    ):
         self.title = title
         self.link = link
         self.summary = summary
+        self.published_at = published_at
 
     def get(self, key: str, default: Any = None) -> Any:
         return getattr(self, key, default)

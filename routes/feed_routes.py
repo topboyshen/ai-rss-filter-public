@@ -88,8 +88,12 @@ def _published_parsed_from_ts(ts) -> object:
 
 
 def _cached_rss_has_item_dates(xml: str) -> bool:
-    if not xml or "<item>" not in xml:
+    if not xml:
         return False
+    if "<item>" not in xml:
+        # A successful round may select zero items.  Only refresh writes this
+        # marker, so it proves completeness without inventing an item.
+        return "<rss" in xml and "<!-- ai-filter-round-complete -->" in xml
     item_count = xml.count("<item>")
     if item_count <= 0:
         return False

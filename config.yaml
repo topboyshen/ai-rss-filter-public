@@ -63,7 +63,7 @@ llm:
   priority: 9
   rate_limit: 2.0
   max_wait_seconds: 8
-  timeout: 12
+  timeout: 30
   max_fail_count: 3
   fail_decay_seconds: 300
   # SiliconFlow 的兼容端点稳定支持 json_object。避免先发送会得到 HTTP 成功、

@@ -9,7 +9,8 @@ from copy import copy, deepcopy
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Dict, Any, Tuple, Optional
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
@@ -525,6 +526,41 @@ def _pass_threshold_for_feed(cfg: dict, feed_url: str = "") -> float:
     return DB.get_feed_thresholds(cfg, feed_url)["pass"]
 
 
+def _coerce_entry_epoch(value) -> Optional[int]:
+    """Normalize a webhook/API publish time to epoch seconds, or None."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        seconds = float(value)
+    elif isinstance(value, datetime):
+        stamp = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        seconds = stamp.timestamp()
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if re.fullmatch(r"\d{10,13}", text):
+            seconds = float(text)
+        else:
+            try:
+                stamp = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except ValueError:
+                try:
+                    stamp = parsedate_to_datetime(text)
+                except (TypeError, ValueError):
+                    return None
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            seconds = stamp.timestamp()
+    else:
+        return None
+    if not math.isfinite(seconds) or seconds <= 0:
+        return None
+    if seconds >= 1e12:  # milliseconds
+        seconds /= 1000.0
+    return int(seconds)
+
+
 def _parsed_entry_timestamp(entry) -> Optional[int]:
     for attr in ("published_parsed", "updated_parsed"):
         value = getattr(entry, attr, None)
@@ -536,6 +572,10 @@ def _parsed_entry_timestamp(entry) -> Optional[int]:
                 return int(calendar.timegm(value))
             except (OverflowError, TypeError, ValueError):
                 continue
+    for attr in ("published_at", "updated_at"):
+        coerced = _coerce_entry_epoch(getattr(entry, attr, None))
+        if coerced is not None:
+            return coerced
     return None
 
 
@@ -2455,6 +2495,10 @@ def build_rss_xml(
         f'<lastBuildDate>{rfc822_date()}</lastBuildDate>',
         f'<atom:link href="{escape_xml(safe_http_url(request_url, fallback=""))}" rel="self" type="application/rss+xml"/>'
     ]
+    if not passed_entries:
+        # A successful round can select nothing.  This marker lets readers
+        # serve the empty result as complete instead of the previous round.
+        xml_parts.append("<!-- ai-filter-round-complete -->")
 
     for entry in passed_entries:
         pub_date = ""

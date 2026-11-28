@@ -1747,3 +1747,89 @@ def test_only_loopback_http_urls_are_allowed():
     assert not monitor._is_loopback_url("https://127.0.0.1/metrics")
     assert not monitor._is_loopback_url("http://example.com/metrics")
     assert not monitor._is_loopback_url("http://user:pass@127.0.0.1/metrics")
+
+
+def _with_availability(payload: bytes, llm: int = 1, quality: tuple[int, ...] = (1, 1)) -> bytes:
+    text = payload.decode().rstrip("\n")
+    lines = [text, f"ai_filter_llm_alerts_available {llm}"]
+    for window, value in zip(("2h", "24h"), quality):
+        lines.append(
+            'ai_filter_score_quality_available'
+            f'{{window="{window}",strategy_version="v-test"}} {value}'
+        )
+    return ("\n".join(lines) + "\n").encode()
+
+
+def test_metrics_probe_accepts_readable_zero_calls(monkeypatch, tmp_path):
+    settings = _settings(tmp_path)
+    monkeypatch.setenv("AI_FILTER_API_KEY", "safe-test-key")
+    payload = _with_availability(
+        _healthy_metrics(ai_filter_llm_calls_last_hour=0), llm=1
+    )
+    monkeypatch.setattr(monitor, "_http_get", lambda *_a, **_k: (200, payload))
+
+    result = monitor.check_metrics(settings, 1)
+
+    assert result.ok is True
+    assert result.warning is False
+
+
+def test_metrics_probe_fails_when_call_stats_are_unreadable(monkeypatch, tmp_path):
+    settings = _settings(tmp_path)
+    monkeypatch.setenv("AI_FILTER_API_KEY", "safe-test-key")
+    payload = _with_availability(_healthy_metrics(), llm=0)
+    monkeypatch.setattr(monitor, "_http_get", lambda *_a, **_k: (200, payload))
+
+    result = monitor.check_metrics(settings, 1)
+
+    assert result.ok is False
+    assert "llm_alerts_unavailable" in result.detail
+
+
+def test_metrics_probe_fails_when_score_quality_read_is_unavailable(monkeypatch, tmp_path):
+    settings = _settings(tmp_path)
+    monkeypatch.setenv("AI_FILTER_API_KEY", "safe-test-key")
+    payload = _with_availability(_healthy_metrics(), llm=1, quality=(1, 0))
+    monkeypatch.setattr(monitor, "_http_get", lambda *_a, **_k: (200, payload))
+
+    result = monitor.check_metrics(settings, 1)
+
+    assert result.ok is False
+    assert "score_quality_unavailable" in result.detail
+
+
+def test_metrics_probe_recovers_after_availability_returns(monkeypatch, tmp_path):
+    settings = _settings(tmp_path)
+    monkeypatch.setenv("AI_FILTER_API_KEY", "safe-test-key")
+    monkeypatch.setattr(
+        monitor,
+        "_http_get",
+        lambda *_a, **_k: (200, _with_availability(_healthy_metrics(), llm=0)),
+    )
+    assert monitor.check_metrics(settings, 1).ok is False
+
+    monkeypatch.setattr(
+        monitor,
+        "_http_get",
+        lambda *_a, **_k: (200, _with_availability(_healthy_metrics(), llm=1)),
+    )
+    assert monitor.check_metrics(settings, 1).ok is True
+
+
+def test_parse_availability_gauges_skips_comments_bad_values_and_other_metrics():
+    text = "\n".join([
+        "# comment",
+        "",
+        "ai_filter_refresh_stale 0",
+        "ai_filter_llm_alerts_available 1",
+        "ai_filter_llm_alerts_available not-a-number",
+        'ai_filter_score_quality_available{window="2h"} nan',
+        'ai_filter_score_quality_available{window="24h"} 0',
+    ])
+
+    found = monitor._parse_availability_gauges(text)
+
+    assert found == {
+        "ai_filter_llm_alerts_available": [1.0],
+        "ai_filter_score_quality_available": [0.0],
+    }
