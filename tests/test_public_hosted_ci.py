@@ -32,6 +32,7 @@ EXPECTED_TIMEOUTS = {
     "webhook-capacity.yml": {"native-amd64": 40},
     "private-release-config.yml": {"native-amd64": 25},
 }
+MANUAL_WORKFLOWS = {"rsshub-compat-publish.yml"}
 POSTGRES_JOBS = {
     "miniflux-outbox.yml": "fixed-source",
     "miniflux-pause.yml": "native-fixed-image",
@@ -45,8 +46,23 @@ def _workflow(name):
 
 
 def test_all_existing_workflows_and_job_names_are_preserved():
-    assert {path.name for path in WORKFLOWS.glob("*.yml")} == set(EXPECTED_JOBS)
+    assert {path.name for path in WORKFLOWS.glob("*.yml")} == set(EXPECTED_JOBS) | MANUAL_WORKFLOWS
     assert sum(len(jobs) for jobs in EXPECTED_JOBS.values()) == 11
+
+
+def test_manual_publish_workflow_is_explicitly_not_a_public_pr_gate():
+    source, workflow = _workflow("rsshub-compat-publish.yml")
+    triggers = workflow.get("on", workflow.get(True))
+    assert set(triggers) == {"workflow_dispatch"}
+    assert workflow["permissions"] == {"contents": "read", "packages": "write"}
+    job = workflow["jobs"]["publish"]
+    assert job["runs-on"] == "ubuntu-24.04"
+    assert job["timeout-minutes"] == 30
+    checkouts = [step for step in job["steps"]
+                 if step.get("uses", "").startswith("actions/checkout@")]
+    assert len(checkouts) == 1
+    assert checkouts[0]["with"]["persist-credentials"] is False
+    assert "GITHUB_TOKEN" in source
 
 
 def _assert_hosted_jobs(name, source, workflow):

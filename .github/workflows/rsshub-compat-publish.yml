@@ -1,0 +1,41 @@
+name: Publish RSSHub compatibility image
+
+permissions:
+  contents: read
+  packages: write
+
+on:
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24.21.0'
+          package-manager-cache: false
+
+      - name: Build compatibility image
+        run: |
+          set -euo pipefail
+          context_sha="$(node deploy/rsshub-compat/patch.mjs --context-digest deploy/rsshub-compat)"
+          echo "context_sha256=${context_sha}" | tee -a "$GITHUB_STEP_SUMMARY"
+          docker build --platform linux/amd64 \
+            --build-arg COMPAT_CONTEXT_SHA256="$context_sha" \
+            --tag ghcr.io/topboyshen/ai-rss-filter-rsshub-compat:wallstreetcn-20261125 \
+            deploy/rsshub-compat
+
+      - name: Push compatibility image
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push ghcr.io/topboyshen/ai-rss-filter-rsshub-compat:wallstreetcn-20261125
+          digest="$(docker image inspect ghcr.io/topboyshen/ai-rss-filter-rsshub-compat:wallstreetcn-20261125 \
+            --format '{{index .RepoDigests 0}}')"
+          echo "published=${digest}" | tee -a "$GITHUB_STEP_SUMMARY"
