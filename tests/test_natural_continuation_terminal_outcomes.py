@@ -149,7 +149,9 @@ def test_pending_news_stays_deferred_through_two_real_refreshes(monkeypatch, pip
         assert result["score_terminal_unscored_entries"] == 0
         assert result["score_continuations"]["remaining"]["active"] == 1
         assert stats[-1]["score_deferred"] == 1 and stats[-1]["score_terminal_unscored"] == 0
-        assert counts[-1]["filtered_count"] == 0 and recorded[-1] == (result, None)
+        assert result["collection_complete"] is True
+        assert counts[-1]["filtered_count"] == 0
+        assert recorded[-1] == (result, result["finished_at"])
         assert cached == []
         assert _record(p.cfg) == saved and len(p.calls) == paid
         assert _rows() == ([], [])

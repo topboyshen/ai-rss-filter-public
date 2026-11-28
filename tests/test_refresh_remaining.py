@@ -59,7 +59,8 @@ def test_refresh_reports_deferrals_created_by_its_own_feeds(monkeypatch):
     state, text = describe_refresh_coverage(result)
     assert state == "incomplete"
     assert "待续作 1 条" in text
-    assert recorded == [(result, None)]
+    assert result["collection_complete"] is True
+    assert recorded == [(result, result["finished_at"])]
 
 
 def test_unreadable_post_batch_journal_is_unknown_not_stale(monkeypatch):
