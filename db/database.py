@@ -5804,12 +5804,18 @@ def record_refresh_attempt(result: Dict[str, Any], successful_at: Optional[int] 
     """Persist refresh observability and freshness in one transaction.
 
     The caller supplies ``successful_at`` only after every enabled source
-    completed successfully. Keeping both keys in the same transaction prevents
-    a partial refresh from being recorded as a full-source freshness update.
-    The changed latest attempt also commits an existing cheap-snapshot
-    publication obligation, including all-failed attempts with no new news.
+    completed.  A deferred-only partial still sets ``collection_complete``
+    because the source pull finished; scoring stays partial.  Keeping both keys
+    in the same transaction prevents a failed collection from advancing the
+    full-source freshness clock.  The changed latest attempt also commits an
+    existing cheap-snapshot publication obligation, including all-failed
+    attempts with no new news.
     """
-    if successful_at is not None and result.get("status") != "success":
+    if (
+        successful_at is not None
+        and result.get("status") != "success"
+        and not result.get("collection_complete")
+    ):
         logger.warning(
             "Ignoring full-refresh timestamp for non-success status: %s",
             result.get("status"),

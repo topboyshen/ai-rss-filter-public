@@ -293,3 +293,38 @@ def test_cached_zero_selection_round_is_complete_not_a_cache_miss():
     assert _cached_rss_has_item_dates(xml) is True
     assert _cached_rss_has_item_dates("<html>maintenance</html>") is False
     assert _cached_rss_has_item_dates("<rss><channel></channel></rss>") is False
+
+
+def test_deferred_only_partial_advances_the_full_refresh_clock(monkeypatch):
+    refresh, recorded = _configure_refresh(monkeypatch, [_feed_result()])
+    monkeypatch.setattr(
+        refresh,
+        "run_continuations_batch",
+        lambda *_a, **_k: {
+            "attempted": 0, "completed": 0, "deferred": 1,
+            "terminal_unscored": 0, "errors": 0,
+            "remaining": {"active": 0},
+        },
+    )
+    monkeypatch.setattr(refresh, "remaining_overview", lambda *_a, **_k: {"active": 0})
+
+    result = refresh._execute_feed_refresh()
+
+    assert result["status"] == "partial"
+    assert result["collection_complete"] is True
+    assert recorded == [(result, result["finished_at"])]
+
+
+def test_record_refresh_attempt_requires_collection_complete(isolate_ai_filter_db):
+    from db import database
+
+    database.init_db()
+    database.record_refresh_attempt(
+        {"status": "partial", "collection_complete": True}, successful_at=123,
+    )
+    assert database.get_last_full_refresh_ts() == 123
+
+    database.record_refresh_attempt(
+        {"status": "partial", "collection_complete": False}, successful_at=456,
+    )
+    assert database.get_last_full_refresh_ts() == 123
