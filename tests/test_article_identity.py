@@ -8,6 +8,7 @@ already-persisted events.  No network, no model calls.
 """
 
 import hashlib
+from datetime import datetime, timezone
 
 import pytest
 
@@ -225,3 +226,32 @@ def test_webhook_entry_publish_time_reaches_the_processor():
     )._WebhookEntry("t", "https://example.test/a", "s", published_at=entry["published_at"])
     assert _parsed_entry_timestamp(wrapper) == 1795838400
     assert _entry_timestamp(wrapper) == 1795838400
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (True, None),
+        (None, None),
+        ([], None),
+        (1795838400, 1795838400),
+        (1795838400.9, 1795838400),
+        (datetime(2026, 11, 28, 4, tzinfo=timezone.utc), 1795838400),
+        (datetime(2026, 11, 28, 4), 1795838400),
+        ("1795838400", 1795838400),
+        ("1795838400000", 1795838400),
+        ("2026-11-28T04:00:00Z", 1795838400),
+        ("2026-11-28T04:00:00", 1795838400),
+        ("Sat, 28 Nov 2026 04:00:00 GMT", 1795838400),
+        ("Sat, 28 Nov 2026 04:00:00", 1795838400),
+        ("", None),
+        ("not a date", None),
+        (0, None),
+        (-1, None),
+        (float("nan"), None),
+    ],
+)
+def test_coerce_entry_epoch_normalizes_supported_shapes(value, expected):
+    from core.processor import _coerce_entry_epoch
+
+    assert _coerce_entry_epoch(value) == expected

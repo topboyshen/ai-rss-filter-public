@@ -1814,3 +1814,22 @@ def test_metrics_probe_recovers_after_availability_returns(monkeypatch, tmp_path
         lambda *_a, **_k: (200, _with_availability(_healthy_metrics(), llm=1)),
     )
     assert monitor.check_metrics(settings, 1).ok is True
+
+
+def test_parse_availability_gauges_skips_comments_bad_values_and_other_metrics():
+    text = "\n".join([
+        "# comment",
+        "",
+        "ai_filter_refresh_stale 0",
+        "ai_filter_llm_alerts_available 1",
+        "ai_filter_llm_alerts_available not-a-number",
+        'ai_filter_score_quality_available{window="2h"} nan',
+        'ai_filter_score_quality_available{window="24h"} 0',
+    ])
+
+    found = monitor._parse_availability_gauges(text)
+
+    assert found == {
+        "ai_filter_llm_alerts_available": [1.0],
+        "ai_filter_score_quality_available": [0.0],
+    }

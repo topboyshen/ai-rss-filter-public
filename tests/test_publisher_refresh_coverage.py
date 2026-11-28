@@ -240,3 +240,23 @@ def test_terminal_unscored_partial_still_marks_readiness_degraded(monkeypatch):
     )
 
     assert info["degraded"] is True
+
+
+@pytest.mark.parametrize(
+    "attempt",
+    [
+        None,
+        [],
+        {"status": "success"},
+        {"status": "partial", "failed_sources": 1},
+        {"status": "partial", "source_unrecognized_entries": 1},
+        {"status": "partial", "score_terminal_unscored_entries": 1},
+        {"status": "partial", "score_continuations": None},
+        {"status": "partial", "score_continuations": {"errors": 1}},
+        {"status": "partial", "score_continuations": {"terminal_unscored": 1}},
+    ],
+)
+def test_deferred_only_partial_rejects_every_non_deferred_error(attempt):
+    from routes.shared import _deferred_only_partial
+
+    assert _deferred_only_partial(attempt) is False
