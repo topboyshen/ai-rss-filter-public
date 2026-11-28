@@ -1691,3 +1691,37 @@ def test_irrelevance_floor_change_changes_score_and_fingerprint():
     assert config_module._strategy_fingerprint(base) != config_module._strategy_fingerprint(
         raised
     )
+
+
+def test_process_entry_passes_the_receipt_clock_to_the_cache_writer(
+    no_same_strategy_ledger,
+):
+    entry = MagicMock()
+    entry.title = "央行宣布降准"
+    entry.link = "http://example.com/delayed-retry"
+    entry.summary = ""
+    entry.received_at = 1_700_000_100
+    cfg = {
+        "scoring_strategy_version": "test-strategy",
+        "threshold": {"pass": 7, "similarity": 0.6, "notify": 99},
+        "_blacklist_re": None,
+        "cache_rejected_entries": True,
+        "generate_summary": False,
+        "fast_pass": {
+            "enabled": True, "skip_llm": True,
+            "tiers": [{
+                "keywords": ["降准"], "score": 9, "tag": "宏观政策",
+                "logic": "宏观政策命中", "skip_llm": True,
+            }],
+        },
+        "prompts": {"macro": "macro prompt body"},
+        "feeds": [{"url": "u", "prompt": "macro", "tier": "primary_news"}],
+    }
+    with patch("core.processor.DB.get_cached_entry", return_value=None), \
+         patch("core.processor.DB.record_score"), \
+         patch("core.processor.DB.set_cached_entry") as set_cached:
+        process_entry(
+            entry, [], "macro prompt body", cfg,
+            scorer=MagicMock(backends=[]), feed_url="u",
+        )
+    assert set_cached.call_args.kwargs["first_seen_at"] == 1_700_000_100

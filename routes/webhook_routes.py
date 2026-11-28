@@ -1631,6 +1631,7 @@ def _execute_claimed_spooled_task(path: Path, envelope: dict) -> bool | str:
         time.monotonic() + _webhook_task_deadline_seconds
     )
     _task_execution_context.receipt_contract = (envelope.get("receipt_context") or {}).get("strategy")
+    _task_execution_context.received_at = int(envelope.get("created_at") or time.time())
     try:
         return _execute_spooled_task(task)
     finally:
@@ -1642,6 +1643,7 @@ def _execute_claimed_spooled_task(path: Path, envelope: dict) -> bool | str:
             "progress_callback",
             "deadline",
             "receipt_contract",
+            "received_at",
         ):
             try:
                 delattr(_task_execution_context, name)
@@ -2040,7 +2042,7 @@ def _score_in_background(task: dict) -> bool | str:
                 continue
 
             wrapper = _WebhookEntry(title, link, content)
-            wrapper.published_at = entry_data.get("published_at")
+            _bind_webhook_times(wrapper, entry_data)
             try:
                 with processing_origin("webhook"):
                     process_kwargs = {
@@ -2137,15 +2139,23 @@ class _WebhookEntry:
     """Minimal entry wrapper compatible with process_entry"""
 
     def __init__(
-        self, title: str, link: str, summary: str = "", published_at=None
+        self, title: str, link: str, summary: str = "",
+        published_at=None, received_at=None,
     ):
         self.title = title
         self.link = link
         self.summary = summary
         self.published_at = published_at
+        self.received_at = received_at
 
     def get(self, key: str, default: Any = None) -> Any:
         return getattr(self, key, default)
+
+
+def _bind_webhook_times(entry: _WebhookEntry, data: dict) -> None:
+    """Carry receipt and publisher clocks together through every retry."""
+    entry.published_at = data.get("published_at")
+    entry.received_at = getattr(_task_execution_context, "received_at", None)
 
 
 # ── 路由 ─────────────────────────────────────────────────────
