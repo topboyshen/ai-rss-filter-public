@@ -2039,10 +2039,8 @@ def _score_in_background(task: dict) -> bool | str:
                 progress_callback(entry_index + 1, passed_count, filtered_count)
                 continue
 
-            wrapper = _WebhookEntry(
-                title, link, content, published_at=entry_data.get("published_at")
-            )
-
+            wrapper = _WebhookEntry(title, link, content)
+            wrapper.published_at = entry_data.get("published_at")
             try:
                 with processing_origin("webhook"):
                     process_kwargs = {
