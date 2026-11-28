@@ -194,3 +194,34 @@ def test_identity_module_is_outside_the_scoring_fingerprint():
 
     source = inspect.getsource(config._strategy_code_fingerprint)
     assert "article_identity" not in source
+
+
+def test_webhook_normalisation_keeps_upstream_publish_time():
+    from routes import webhook_routes
+
+    out = webhook_routes._normalize_webhook_entries(
+        [{
+            "title": "x",
+            "url": "https://example.test/a",
+            "published_at": "2026-11-28T04:00:00Z",
+        }],
+        {},
+    )
+    assert out[0]["published_at"] == 1795838400
+
+    missing = webhook_routes._normalize_webhook_entries(
+        [{"title": "y", "url": "https://example.test/b"}], {}
+    )
+    assert "published_at" not in missing[0]
+
+
+def test_webhook_entry_publish_time_reaches_the_processor():
+    from core.processor import _entry_timestamp, _parsed_entry_timestamp
+
+    # 2026-11-28 04:00:00 UTC, four hours before the 08:00 ingest.
+    entry = {"published_at": 1795838400}
+    wrapper = __import__(
+        "routes.webhook_routes", fromlist=["_WebhookEntry"]
+    )._WebhookEntry("t", "https://example.test/a", "s", published_at=entry["published_at"])
+    assert _parsed_entry_timestamp(wrapper) == 1795838400
+    assert _entry_timestamp(wrapper) == 1795838400

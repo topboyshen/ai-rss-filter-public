@@ -258,3 +258,38 @@ def test_refresh_attempt_and_freshness_are_persisted_together():
 
     assert database.get_last_full_refresh_ts() == 456
     assert json.loads(database.get_app_meta("last_refresh_result")) == success
+
+
+def test_zero_selection_success_replaces_the_previous_complete_cache(monkeypatch):
+    import feedparser
+
+    refresh, recorded = _configure_refresh(monkeypatch, [_feed_result()])
+    cached = []
+    monkeypatch.setattr(
+        refresh, "set_cached", lambda key, xml: cached.append((key, xml))
+    )
+
+    result = refresh._execute_feed_refresh()
+
+    assert result["status"] == "success"
+    assert recorded == [(result, result["finished_at"])]
+    assert len(cached) == 1
+    _, xml = cached[0]
+    assert "<item>" not in xml
+    assert "<!-- ai-filter-round-complete -->" in xml
+    parsed = feedparser.parse(xml)
+    assert not parsed.bozo and parsed.version.startswith("rss")
+    assert parsed.entries == []
+
+
+def test_cached_zero_selection_round_is_complete_not_a_cache_miss():
+    from core.processor import build_rss_xml
+    from routes.feed_routes import _cached_rss_has_item_dates
+
+    xml = build_rss_xml(
+        [], "AI 智能过滤: source", "https://example.com/rss",
+        "https://example.com/filter?url=https://example.com/rss", {},
+    )
+    assert _cached_rss_has_item_dates(xml) is True
+    assert _cached_rss_has_item_dates("<html>maintenance</html>") is False
+    assert _cached_rss_has_item_dates("<rss><channel></channel></rss>") is False

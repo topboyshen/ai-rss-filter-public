@@ -2668,6 +2668,10 @@ class Scorer:
         attempted_backends = 0
         for backend in routed_backends:
             if not backend.is_healthy():
+                # A circuit-open backend gave no verdict.  If an earlier
+                # backend already rejected the text, this must stay retryable
+                # instead of being frozen into the final safe-neutral.
+                unverdicted += 1
                 continue
             try:
                 requested_tokens = 128 if stage == "stage2" else 100

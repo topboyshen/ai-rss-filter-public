@@ -225,3 +225,34 @@ def test_process_entry_persists_nothing_until_retry_budget_is_spent(monkeypatch,
     processor.process_entry(FeedEntry("公司发布日常经营信息", link), [], "prompt", cfg,
                             scorer=scorer, feed_url=feed)
     assert len(calls) == 2 * (processor.TRANSPORT_RETRY_MAX + 1)
+
+
+def test_semantic_reject_with_circuit_open_backup_stays_retryable(monkeypatch, scorer):
+    """A skipped open circuit is 'no verdict', not a final neutral verdict."""
+    import time
+
+    first, second = scorer.backends
+    second.fail_count = second.max_fail_count
+    second.last_fail_time = time.monotonic()
+    calls = _route(monkeypatch, scorer, POLLUTED_TECH_EXAMPLE, POLLUTED_TECH_EXAMPLE)
+
+    result = scorer.score_stage1_with_identity(
+        "company demand update", "reported demand", "prompt", CFG
+    )
+    assert calls == ["first"]
+    assert result.transport_unverdicted is True
+    assert result.model_name == "local_safe_neutral"
+    assert result.values == SAFE_NEUTRAL_CONTRACT_VALUES
+    assert scorer.cache_writes == []
+
+    # Recovery must allow the same article to reach the backup again.
+    second.record_success()
+    calls = _route(
+        monkeypatch, scorer, POLLUTED_TECH_EXAMPLE, _valid_quality_circuit_response()
+    )
+    recovered = scorer.score_stage1_with_identity(
+        "company demand update", "reported demand", "prompt", CFG
+    )
+    assert calls == ["first", "second"]
+    assert recovered.model_name == "second-model"
+    assert recovered.transport_unverdicted is False

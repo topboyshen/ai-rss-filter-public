@@ -122,7 +122,7 @@ def _refresh_one_feed(feed, cfg, name):
         url, prompt, name, cfg, check_output_cache=False, persist_deferred=True
     )
     incomplete = _incomplete_feed_reason(stats)
-    if passed and not error and not incomplete:
+    if not error and not incomplete:
         passed.sort(key=lambda entry: extract_score_from_title(entry.title), reverse=True)
         max_items = cfg.get("output", {}).get("max_items", 0)
         if max_items > 0:
@@ -131,6 +131,9 @@ def _refresh_one_feed(feed, cfg, name):
             passed, "AI 智能过滤: " + name, url,
             "http://localhost:5000/filter?url=" + url, cfg,
         )
+        # Cache the zero-selection round too: otherwise /filter keeps serving
+        # the previous round's items and labels them as this round's complete
+        # result.  The empty feed carries an explicit complete-round marker.
         set_cached(strategy_cache_key(url, cfg), xml)
     logger.info(
         "[Refresh] %s done in %.1fs | total=%d passed=%d api=%d error=%s",

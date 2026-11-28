@@ -511,6 +511,33 @@ _OPTIONAL_ALERT_GAUGES = (
     "ai_filter_dead_letter_new_alert",
 )
 
+# These gauges separate a genuine zero (readable, no calls) from a failed
+# read.  Older images do not export them, so absence is not a failure.
+_AVAILABILITY_GAUGES = {
+    "ai_filter_llm_alerts_available": "llm_alerts_unavailable",
+    "ai_filter_score_quality_available": "score_quality_unavailable",
+}
+
+
+def _parse_availability_gauges(text: str) -> dict[str, list[float]]:
+    """Read named gauges, including labelled series such as score quality."""
+    found: dict[str, list[float]] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        name = line.split("{", 1)[0].split(" ", 1)[0]
+        if name not in _AVAILABILITY_GAUGES:
+            continue
+        try:
+            value = float(line.rsplit(None, 1)[-1])
+        except (IndexError, ValueError):
+            continue
+        if not math.isfinite(value):
+            continue
+        found.setdefault(name, []).append(value)
+    return found
+
 
 def check_metrics(settings: Settings, _now: int) -> CheckResult:
     key = _load_api_key(settings)
@@ -543,6 +570,10 @@ def check_metrics(settings: Settings, _now: int) -> CheckResult:
             )
 
         failures: list[str] = []
+        availability = _parse_availability_gauges(text)
+        for gauge, label in _AVAILABILITY_GAUGES.items():
+            if any(value == 0 for value in availability.get(gauge, [])):
+                failures.append(label)
         if values["ai_filter_refresh_stale"] != 0:
             failures.append("refresh_stale")
         if values["ai_filter_refresh_degraded"] != 0:
