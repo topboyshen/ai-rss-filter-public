@@ -81,7 +81,7 @@ def test_briefing_query_returns_canonical_event_and_current_version(event_db):
         {"threshold": {"pass": 7}}, min_score=7, hours=48, limit=5
     )
     assert len(rows) == 1
-    assert rows[0][10:] == (target_id, current_version)
+    assert rows[0][10:12] == (target_id, current_version)
     article = _briefing_article_from_row(rows[0])
     assert article["event_id"] == target_id
     assert article["event_version"] == current_version

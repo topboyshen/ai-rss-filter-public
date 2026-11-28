@@ -87,6 +87,61 @@ _CHINA_HOLIDAYS_BY_YEAR = {
         "2026-10-06", "2026-10-07",
     }
 }
+
+
+def _calendar_paths() -> Iterable[Path]:
+    env_path = os.environ.get("AI_FILTER_TRADING_CALENDAR")
+    if env_path:
+        yield Path(env_path)
+    yield Path(__file__).resolve().parents[1] / "config" / "trading_calendar.json"
+    yield Path("/etc/ai-filter/trading_calendar.json")
+    yield Path("/root/ai-rss-filter/config/trading_calendar.json")
+
+
+def _load_calendar_file() -> dict[int, set[str]]:
+    """Read the reviewed holiday file; invalid content keeps the in-code copy."""
+    for path in _calendar_paths():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            continue
+        years = payload.get("years") if isinstance(payload, dict) else None
+        if not isinstance(years, dict):
+            continue
+        parsed: dict[int, set[str]] = {}
+        for raw_year, dates in years.items():
+            year_text = str(raw_year)
+            if not re.fullmatch(r"\d{4}", year_text) or not isinstance(dates, list):
+                parsed = {}
+                break
+            entries: set[str] = set()
+            for raw_date in dates:
+                if not isinstance(raw_date, str) or not re.fullmatch(
+                    r"\d{4}-\d{2}-\d{2}", raw_date
+                ):
+                    entries = set()
+                    break
+                try:
+                    day = datetime.strptime(raw_date, "%Y-%m-%d").date()
+                except ValueError:
+                    entries = set()
+                    break
+                if day.year != int(year_text):
+                    entries = set()
+                    break
+                entries.add(raw_date)
+            if not entries:
+                parsed = {}
+                break
+            parsed[int(year_text)] = entries
+        if parsed:
+            return parsed
+    return {}
+
+
+_CHINA_HOLIDAYS_BY_YEAR.update(_load_calendar_file())
 # 提前量：官方次年休市安排通常在年前公布，留一个月处理窗口。
 _CALENDAR_HORIZON_DAYS = 30
 
@@ -1830,11 +1885,53 @@ def _worker_queue_alert_active(values: dict[str, float]) -> bool:
     return not dlq_only
 
 
-def _notification_text(kind: str, results: list[CheckResult], now: int) -> str:
+def _last_refresh_batch(settings: Settings) -> dict[str, object]:
+    """Read the latest refresh batch id for alert-to-batch correlation."""
+    path = settings.database_path or (settings.root / "data" / "cache.db")
+    try:
+        connection = sqlite3.connect(
+            f"file:{path}?mode=ro", uri=True,
+            timeout=min(10, settings.command_timeout_seconds),
+        )
+        try:
+            row = connection.execute(
+                "SELECT v FROM app_meta WHERE k='last_refresh_result'"
+            ).fetchone()
+        finally:
+            connection.close()
+        payload = json.loads(row[0]) if row and row[0] else {}
+        if not isinstance(payload, dict):
+            return {}
+        refresh_id = str(payload.get("refresh_id") or "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", refresh_id):
+            refresh_id = ""
+        return {
+            "refresh_id": refresh_id,
+            "status": str(payload.get("status") or "")[:20],
+            "finished_at": int(payload.get("finished_at") or 0),
+        }
+    except Exception:
+        return {}
+
+
+def _notification_text(
+    kind: str,
+    results: list[CheckResult],
+    now: int,
+    refresh_batch: dict[str, object] | None = None,
+) -> str:
+    batch = refresh_batch or {}
+    suffix = (
+        f" | refresh={batch['refresh_id']}"
+        if batch.get("refresh_id") else ""
+    )
     if kind == "recovery":
-        return f"AI-Filter 运维检查已恢复 | ts={now}"
+        return f"AI-Filter 运维检查已恢复 | ts={now}{suffix}"
     failed_names = ",".join(item.name for item in results if not item.ok)
-    text = f"AI-Filter 运维检查失败 | checks={failed_names or 'unknown'} | ts={now}"
+    text = (
+        f"AI-Filter 运维检查失败 | checks={failed_names or 'unknown'} "
+        f"| ts={now}{suffix}"
+    )
     # Never forward arbitrary exception/detail text (URLs can contain secrets).
     # These are the exact fixed reason tokens emitted by check_metrics.
     allowed = {
@@ -2092,6 +2189,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         dashboard_identity = _dashboard_release_identity(settings)
         results = evaluate(settings, now)
+        refresh_batch = _last_refresh_batch(settings)
         _export_dashboard_snapshot(
             settings, results, now, int(time.time()), dashboard_identity
         )
@@ -2104,7 +2202,7 @@ def main(argv: list[str] | None = None) -> int:
         if decision:
             notice_attempted = True
             notice_sent, notice_result = send_telegram(
-                settings, _notification_text(decision, results, now)
+                settings, _notification_text(decision, results, now, refresh_batch)
             )
             if not notice_sent:
                 print(f"WARN notification: {notice_result}", file=sys.stderr)
@@ -2115,6 +2213,7 @@ def main(argv: list[str] | None = None) -> int:
             "backup_policy_epoch": _BACKUP_POLICY_EPOCH,
             "status": "failing" if failing else "healthy",
             "fingerprint": _fingerprint(results),
+            "refresh_batch": refresh_batch,
             "last_run_at": now,
             "last_notice_at": now
             if notice_sent

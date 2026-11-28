@@ -26,7 +26,6 @@
   "modules/a_stock_data.py:fetch_historical_daily_prices": 123,
   "ops/ai_filter_ops_check.py:settings_from_env": 142,
   "routes/admin_routes.py:metrics": 165,
-  "routes/dashboard_routes.py:briefing": 127,
   "routes/event_radar_routes.py:_outcome_views": 123,
   "routes/security_history_routes.py:_chart_model": 131,
   "scripts/capture_release_diagnostics.py:collect": 197,

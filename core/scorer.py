@@ -1468,6 +1468,9 @@ class ScoringResult:
     # gave no verdict (timeout, API/transport error, rate-limit wait).  Such a
     # safe-neutral is a retryable outcome, not a final one; see processor.
     transport_unverdicted: bool = False
+    # True when every routed backend was circuit-open before any call.  The
+    # local fallback is then a temporary placeholder, not a final verdict.
+    retryable_no_verdict: bool = False
 
     @property
     def input_status(self) -> str:
@@ -1481,6 +1484,8 @@ class ScoringResult:
     def __post_init__(self) -> None:
         if self.transport_unverdicted and self.model_name != "local_safe_neutral":
             raise ValueError("an unverdicted result must be the local safe-neutral")
+        if self.retryable_no_verdict and self.model_name != "fallback_local":
+            raise ValueError("a retryable no-verdict result must be the local fallback")
         if self.semantic_resolution not in ALLOWED_SEMANTIC_RESOLUTIONS:
             raise ValueError("unsupported semantic resolution")
         if self.neutral_reason and self.neutral_reason not in NEUTRAL_EVIDENCE_REASONS:
@@ -2745,6 +2750,16 @@ class Scorer:
         if exhausted_semantic is not None:
             return self._exhausted_local_neutral(
                 exhausted_semantic, cache_cfg, key, stage
+            )
+        if routed_backends and attempted_backends == 0:
+            logger.warning(
+                "[Score] all routed backends are circuit-open; "
+                "local fallback stays retryable"
+            )
+            return ScoringResult(
+                self._fallback_local_score(title, cfg),
+                "fallback_local",
+                retryable_no_verdict=True,
             )
         logger.warning("[Score] All LLM backends failed, using local scoring")
         return ScoringResult(self._fallback_local_score(title, cfg), "fallback_local")

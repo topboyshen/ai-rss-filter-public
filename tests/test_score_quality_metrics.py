@@ -30,32 +30,72 @@ def test_format_unknown_grounding_and_transport_are_distinct(monkeypatch):
     assert read_score_quality(24, 'other-contract')['validation'] == []
 
 
-def test_patch_only_identity_keeps_the_posterior_series(isolate_ai_filter_db):
+def test_formal_statistics_read_only_the_exact_patch(isolate_ai_filter_db):
+    import time
+
     database.init_db()
+    version = '2026-11-17-rrp-v9:patch-a'
     database.log_llm_call(
-        'stage1', 'qwen', 'fixture', success=True,
-        strategy_version='2026-11-17-rrp-v9:patch-a',
+        'stage1', 'qwen', 'fixture', success=True, strategy_version=version,
     )
+    record_score_validation(
+        strategy_version=version, backend_name='qwen', model_name='fixture',
+        stage='stage1', attempt='initial', contract_valid=True,
+        source_grounded=True, accepted=True, reason='',
+    )
+    with database.get_connection() as conn:
+        conn.execute(
+            'INSERT INTO backtest_signals (signal_key,link,available_at,scored_at,'
+            'recorded_at,score,aggregation_threshold,strategy_version,signal_stage,'
+            'is_similarity_copy,score_path) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+            ('hist-1', 'https://fixture.invalid/hist', int(time.time()),
+             int(time.time()), int(time.time()), 8, 6, version, 'base', 0, 'llm'),
+        )
+        conn.commit()
 
     same_contract = read_score_quality(24, '2026-11-17-rrp-v9:patch-b')
+    exact_patch = read_score_quality(24, version)
     other_contract = read_score_quality(24, '2026-11-16-rrp-v8:patch-a')
 
-    assert [row['attempts'] for row in same_contract['transport']] == [1]
+    assert same_contract['transport'] == []
+    assert [row['attempts'] for row in exact_patch['transport']] == [1]
     assert other_contract['transport'] == []
 
+    history = score_quality.score_quality_snapshot(
+        '2026-11-17-rrp-v9:patch-b'
+    )['history']
+    assert [row['strategy_version'] for row in history['versions']] == [version]
+    [row] = history['versions']
+    assert row['transport_attempts'] == 1
+    assert row['transport_succeeded'] == 1
+    assert row['validation_observed'] == 1
+    assert row['validation_accepted'] == 1
+    assert row['final_usable'] == 1
+    assert row['final_total'] == 1
+    assert row['usable_ratio'] == 1.0
 
-def test_prometheus_labels_follow_the_contract_bucket(monkeypatch):
+
+def test_prometheus_labels_follow_the_exact_patch(monkeypatch):
     fixture = {
         'available': True, 'transport': [], 'validation': [],
         'final_paths': {'llm': 1},
         'strategy_version': 'manual:patch', 'contract_version': 'manual',
     }
     monkeypatch.setattr(score_quality, 'read_score_quality', lambda *a: dict(fixture))
+    monkeypatch.setattr(
+        score_quality, 'read_score_quality_history',
+        lambda *a: {'versions': [{
+            'strategy_version': 'manual:old', 'final_total': 2,
+            'usable_ratio': 0.5, 'final_usable': 1,
+        }]},
+    )
 
     text = '\n'.join(score_quality.score_quality_prometheus('manual:patch'))
 
-    assert 'strategy_version="manual"' in text
-    assert 'strategy_version="manual:patch"' not in text
+    assert 'strategy_version="manual:patch"' in text
+    assert 'strategy_version="manual"' not in text
+    assert 'ai_filter_score_quality_history_final_total' in text
+    assert 'ai_filter_score_quality_history_usable_ratio' in text
 
 
 def test_legacy_transport_does_not_fabricate_validation_or_final_success():
@@ -229,3 +269,10 @@ def test_zero_output_reason_separates_transport_safe_neutral_and_parse(monkeypat
     data = score_quality.score_quality_snapshot('fixture')
     assert data['final']['usable'] == 3
     assert data['final']['zero_output_reason'] == ''
+
+
+def test_history_without_a_contract_identity_stays_empty():
+    database.init_db()
+    history = score_quality.score_quality_snapshot('')['history']
+    assert history['contract_version'] == ''
+    assert history['versions'] == []

@@ -104,6 +104,7 @@ class _StageOutcome(tuple):
     """The historical 4-tuple, plus whether the stage lacked a backup verdict."""
 
     transport_unverdicted = False
+    retryable_no_verdict = False
 _INTERNAL_WEB_HOSTS = {"ai-filter-web", "127.0.0.1", "localhost", "172.17.0.1"}
 
 
@@ -346,6 +347,9 @@ def _score_stage_with_identity(
         stage_outcome.transport_unverdicted = bool(
             getattr(outcome, "transport_unverdicted", False)
         ) and bool(semantic_resolution)
+        stage_outcome.retryable_no_verdict = bool(
+            getattr(outcome, "retryable_no_verdict", False)
+        )
         return stage_outcome
 
     public_method = getattr(scorer, f"score_{stage}")
@@ -1006,6 +1010,7 @@ class _EntryScore:
     fast_pass_hint: Optional[dict] = None
     raw_score: float = -1.0
     transport_unverdicted: bool = False
+    retryable_no_verdict: bool = False
 
 
 @dataclass
@@ -1435,6 +1440,9 @@ def _review_entry_score(
     result.transport_unverdicted = bool(
         getattr(stage2_outcome, "transport_unverdicted", False)
     )
+    result.retryable_no_verdict = bool(
+        getattr(stage2_outcome, "retryable_no_verdict", False)
+    )
     score, tag, logic, sentiment = values
     result.score_latency_ms += int((time.time() - t0) * 1000)
     result.stage2_score = score
@@ -1503,6 +1511,9 @@ def _score_entry_with_llm(
         result.transport_unverdicted = bool(
             getattr(stage1_outcome, "transport_unverdicted", False)
         )
+        result.retryable_no_verdict = bool(
+            getattr(stage1_outcome, "retryable_no_verdict", False)
+        )
         result.score, result.tag, result.logic, result.sentiment = values
         result.stage1_score = result.score
         result.selected_model = result.stage1_model
@@ -1541,6 +1552,7 @@ def _score_entry_with_llm(
         result.score_path = "parse_error"
         result.error_type = "parse_error"
         result.transport_unverdicted = False
+        result.retryable_no_verdict = False
     except Exception:
         logger.exception("Scoring failed for: %s", ctx.raw_title[:50])
         result.score, result.tag, result.logic, result.sentiment = (
@@ -1550,6 +1562,7 @@ def _score_entry_with_llm(
         result.error_type = "score_error"
         result.selected_model = "fallback_local"
         result.transport_unverdicted = False
+        result.retryable_no_verdict = False
 
 
 def _entry_quality_repair_is_usable(ctx, result):
@@ -1884,18 +1897,21 @@ def _resume_transport_write(ctx):
 
 
 def _defer_unverdicted_safe_neutral(ctx, result) -> None:
-    """Raise before any write when a safe-neutral still lacks a backup verdict.
+    """Raise before any write when scoring had no model verdict.
 
-    Bounded by ``TRANSPORT_RETRY_MAX`` per (strategy, link): once exhausted
-    the safe-neutral is persisted as final, exactly as before this change.
+    Covers both a safe-neutral after a semantic rejection and a local fallback
+    taken while every routed backend was circuit-open.  Bounded by
+    ``TRANSPORT_RETRY_MAX`` per (strategy, link): once exhausted the result is
+    persisted as final, so one article still produces one final record.
     """
     key = _transport_retry_key(ctx)
     unverdicted = (
-        result.transport_unverdicted
-        and result.score_path in NON_SUBSTANTIVE_SCORE_PATHS
-        and not ctx.quality_repair
-        and bool(key[1])
-    )
+        (
+            result.transport_unverdicted
+            and result.score_path in NON_SUBSTANTIVE_SCORE_PATHS
+        )
+        or getattr(result, "retryable_no_verdict", False)
+    ) and not ctx.quality_repair and bool(key[1])
     persisted_attempt = natural_scoring.durable_attempt()
     if persisted_attempt is not None:
         if unverdicted and persisted_attempt <= TRANSPORT_RETRY_MAX:
@@ -1913,7 +1929,7 @@ def _defer_unverdicted_safe_neutral(ctx, result) -> None:
         _transport_retry_counts[key] = attempt
         if attempt > TRANSPORT_RETRY_MAX:
             logger.warning(
-                "[Score] unverdicted safe-neutral retries exhausted; persisting as final"
+                "[Score] no-verdict scoring retries exhausted; persisting as final"
             )
             return
     raise ScoringTransportRetryable(key[1], attempt)

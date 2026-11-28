@@ -256,3 +256,61 @@ def test_semantic_reject_with_circuit_open_backup_stays_retryable(monkeypatch, s
     assert calls == ["first", "second"]
     assert recovered.model_name == "second-model"
     assert recovered.transport_unverdicted is False
+
+
+def test_all_backends_circuit_open_stays_retryable(monkeypatch, scorer):
+    """No backend was asked, so the local fallback is not a final verdict."""
+    import time
+
+    for backend in scorer.backends:
+        backend.fail_count = backend.max_fail_count
+        backend.last_fail_time = time.monotonic()
+    calls = _route(monkeypatch, scorer, POLLUTED_TECH_EXAMPLE, POLLUTED_TECH_EXAMPLE)
+
+    result = scorer.score_stage1_with_identity(
+        "company demand update", "reported demand", "prompt", CFG
+    )
+    assert calls == []
+    assert result.model_name == "fallback_local"
+    assert result.retryable_no_verdict is True
+    assert result.transport_unverdicted is False
+    assert scorer.cache_writes == []
+
+    for backend in scorer.backends:
+        backend.record_success()
+    calls = _route(
+        monkeypatch, scorer, POLLUTED_TECH_EXAMPLE, _valid_quality_circuit_response()
+    )
+    recovered = scorer.score_stage1_with_identity(
+        "company demand update", "reported demand", "prompt", CFG
+    )
+    assert calls == ["first", "second"]
+    assert recovered.model_name == "second-model"
+    assert recovered.retryable_no_verdict is False
+
+
+def test_processor_defers_circuit_open_fallback_with_the_same_bound():
+    from core import processor
+    from core.processor import _EntryScore
+
+    processor._transport_retry_counts.clear()
+
+    class Ctx:
+        strategy_version = "v-test"
+        quality_repair = False
+        entry = _Entry("https://example.test/circuit-open")
+
+    result = _EntryScore(score_path="fallback_local", retryable_no_verdict=True)
+    for attempt in (1, 2):
+        with pytest.raises(processor.ScoringTransportRetryable) as raised:
+            processor._defer_unverdicted_safe_neutral(Ctx, result)
+        assert raised.value.attempt == attempt
+    processor._defer_unverdicted_safe_neutral(Ctx, result)
+    assert processor._transport_retry_counts[("v-test", "https://example.test/circuit-open")] == 3
+
+
+def test_retryable_no_verdict_requires_the_local_fallback_identity():
+    with pytest.raises(ValueError):
+        __import__('core.scorer', fromlist=['ScoringResult']).ScoringResult(
+            (4.0, '其他', 'x', '⚖️'), 'qwen', retryable_no_verdict=True,
+        )

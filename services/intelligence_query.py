@@ -41,6 +41,7 @@ class IntelligenceItem:
     direction: str
     event_id: str = ""
     event_version: int = 0
+    first_seen_at: int = 0
 
     def as_briefing_tuple(self) -> tuple:
         return (
@@ -56,6 +57,7 @@ class IntelligenceItem:
             self.direction,
             self.event_id,
             self.event_version,
+            self.first_seen_at,
         )
 
     def as_feed_tuple(self, *, include_event_identity: bool = False) -> tuple:
@@ -87,6 +89,7 @@ class IntelligenceItem:
             "direction": self.direction,
             "event_id": self.event_id,
             "event_version": self.event_version,
+            "first_seen_at": self.first_seen_at,
         }
 
 
@@ -255,9 +258,25 @@ def _rows_to_items(rows, conn=None) -> list[IntelligenceItem]:
                 ),
                 event_id=str(event_id or ""),
                 event_version=max(0, int(event_version or 0)),
+                first_seen_at=(
+                    int(r[12] or 0) if len(r) > 12 and r[12] is not None else 0
+                ),
             )
         )
     return items
+
+
+def _first_seen_projection(conn) -> str:
+    """Expose the source-ingest clock without requiring the new table."""
+    has_sources = bool(conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='article_sources'"
+    ).fetchone())
+    if not has_sources:
+        return "0 AS first_seen_at"
+    return (
+        "(SELECT MIN(s.first_seen_at) FROM article_sources AS s "
+        "WHERE s.link = news_cache.link) AS first_seen_at"
+    )
 
 
 def query_intelligence_items(
@@ -406,7 +425,7 @@ def query_intelligence_items(
             public_params.append(sql_limit)
             sql = (
                 "SELECT link, title, raw_title, score, tag, logic, summary, "
-                f"created_at, feed_url, direction, {event_projection} "
+                f"created_at, feed_url, direction, {event_projection}, {_first_seen_projection(conn)} "
                 f"FROM news_cache WHERE {' AND '.join(public_where)} {strategy_clause}"
                 f"ORDER BY {order_clause} LIMIT ?"
             )

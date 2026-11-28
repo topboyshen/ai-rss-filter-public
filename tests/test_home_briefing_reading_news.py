@@ -113,3 +113,12 @@ def test_font_sizes_are_inline_important_to_beat_old_selectors():
     html = _one(_theme())
     assert 'style="font-size:17px !important' in html
     assert 'style="font-size:12px !important' in html
+
+
+def test_briefing_ingest_label_prefers_first_seen_over_publish_time():
+    from services.briefing_reading import _ingest_label
+
+    article = {"created_at": 1795838400 - 4 * 3600, "first_seen_at": 1795838400}
+    assert _ingest_label(article) == "收录 11-28 12:00"
+    article.pop("first_seen_at")
+    assert _ingest_label(article) == "收录 11-28 08:00"

@@ -16,6 +16,7 @@ from core.metrics import get_metrics
 from core.scorer import capture_llm_calls
 from core.processor import process_feed, process_entry, build_rss_xml
 from services.natural_scoring import remaining_overview, resume_continuations
+from services.refresh_state import deferred_only_partial
 from services.news_processing_trace import processing_origin
 from services.admission_fence import guarded
 from db.database import (
@@ -230,9 +231,16 @@ def _execute_feed_refresh():
             "failures": failures,
             "score_continuations": continuations,
         }
+        # The source pull can be complete while scoring is still queued.  Keep
+        # the partial status for scoring, but advance the full-refresh clock
+        # so a deferred-only round does not alert as a stale collection.
+        collection_complete = status == "success" or (
+            status == "partial" and deferred_only_partial(result)
+        )
+        result["collection_complete"] = collection_complete
         DB.record_refresh_attempt(
             result,
-            successful_at=finished_at if status == "success" else None,
+            successful_at=finished_at if collection_complete else None,
         )
 
         if succeeded_sources > 0:

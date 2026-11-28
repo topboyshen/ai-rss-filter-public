@@ -352,6 +352,9 @@ install_if_changed \
 mkdir -p "$CONFIG_DIR"
 chmod 0700 "$CONFIG_DIR"
 if (( INSTALL_UID == 0 )); then chown 0:0 "$CONFIG_DIR"; fi
+install_if_changed \
+    "$SOURCE_ROOT/config/trading_calendar.json" \
+    "$CONFIG_DIR/trading_calendar.json" 0600
 if [[ ! -e "$CONFIG_DIR/ops-monitor.env" ]]; then
     install -m 0600 -- "$SOURCE_ROOT/ops/ops-monitor.env.example" \
         "$CONFIG_DIR/ops-monitor.env"

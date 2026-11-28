@@ -90,8 +90,9 @@ def test_canonical_copies_do_not_consume_candidate_slots_or_issue_per_row_querie
     assert len(candidates) == 2
     assert len({entry["event_id"] for entry in candidates}) == 2
     assert any("independent" in entry["link"] for entry in candidates)
-    # Source discovery, two schema reads, and one bounded result query.
-    assert len(queries) == 4
+    # Source discovery, two schema reads, one source-table check, and one
+    # bounded result query.  The count stays constant as copies grow.
+    assert len(queries) == 5
 
 
 def test_filtering_precedes_candidate_rank_and_observations_keep_timeline_order(news_db):

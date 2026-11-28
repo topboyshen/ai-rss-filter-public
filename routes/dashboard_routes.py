@@ -1052,9 +1052,34 @@ def _briefing_article_from_row(row):
         "feed_url": row[8] if len(row) > 8 else "",
         "event_id": row[10] if len(row) > 10 else "",
         "event_version": int(row[11] or 0) if len(row) > 11 else 0,
+        "first_seen_at": int(row[12] or 0) if len(row) > 12 else 0,
     }
     article["direction"] = _briefing_direction_for_article(article, raw_direction=raw_direction)
     return article
+
+
+def _article_ingest_timestamp(article):
+    """First sighting wins; publish time is only a legacy fallback."""
+    try:
+        return int(article.get("first_seen_at") or article.get("created_at") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _article_time_label(article):
+    """Render the same ingest clock on every Briefing surface."""
+    stamp = _article_ingest_timestamp(article)
+    return beijing_fromtimestamp(stamp).strftime("%m-%d %H:%M") if stamp else ""
+
+
+def _briefing_articles_from_rows(rows):
+    """Map Briefing rows to articles with the shared ingest clock."""
+    articles = []
+    for row in rows:
+        article = _briefing_article_from_row(row)
+        article["time"] = _article_time_label(article)
+        articles.append(article)
+    return articles
 
 
 def _briefing_rows_fingerprint(rows):
@@ -1189,14 +1214,7 @@ def _run_briefing_refresh_admitted(task):
         feed_url=feed_url or None,
         overfetch=True,
     )
-    articles = []
-    for row in rows:
-        article = _briefing_article_from_row(row)
-        article["time"] = (
-            beijing_fromtimestamp(article["created_at"]).strftime("%m-%d %H:%M")
-            if article.get("created_at") else ""
-        )
-        articles.append(article)
+    articles = _briefing_articles_from_rows(rows)
     enriched, assembly_audit = _prepare_briefing_candidates(
         articles,
         limit=limit,
@@ -2019,15 +2037,9 @@ def dashboard():
         hours=briefing_hours,
         overfetch=True,
     )
-    briefing_articles = []
-    for row in briefing_rows:
-        article = _briefing_article_from_row(row)
+    briefing_articles = _briefing_articles_from_rows(briefing_rows)
+    for article in briefing_articles:
         article["link"] = safe_http_url(article.get("link"))
-        article["time"] = (
-            beijing_fromtimestamp(article["created_at"]).strftime("%m-%d %H:%M")
-            if article.get("created_at") else ""
-        )
-        briefing_articles.append(article)
     briefing = attach_quant_market_context(
         _local_briefing_from_articles(
             briefing_articles,
@@ -2380,14 +2392,7 @@ def briefing_card_widget():
         feed_url=feed_url or None,
         overfetch=True,
     )
-    articles_info = []
-    for row in rows:
-        article = _briefing_article_from_row(row)
-        article["time"] = (
-            beijing_fromtimestamp(article["created_at"]).strftime("%m-%d %H:%M")
-            if article.get("created_at") else ""
-        )
-        articles_info.append(article)
+    articles_info = _briefing_articles_from_rows(rows)
     briefing, refresh_state = _select_briefing_result(
         rows,
         articles_info,
@@ -2578,14 +2583,7 @@ def briefing():
         content, mimetype = _render_briefing_content(empty_result, format_type, hours)
         return Response(content, mimetype=mimetype)
 
-    articles_info = []
-    for r in rows:
-        article = _briefing_article_from_row(r)
-        article["time"] = (
-            beijing_fromtimestamp(article["created_at"]).strftime("%m-%d %H:%M")
-            if article.get("created_at") else ""
-        )
-        articles_info.append(article)
+    articles_info = _briefing_articles_from_rows(rows)
 
     enriched_articles = dedupe_articles([
         enrich_article_analysis(article, trusted_only=True)
